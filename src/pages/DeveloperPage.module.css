@@ -1,0 +1,206 @@
+.card {
+  background: rgba(255,255,255,.72);
+  backdrop-filter: blur(40px) saturate(200%);
+  -webkit-backdrop-filter: blur(40px) saturate(200%);
+  border: 1px solid rgba(255,255,255,.95);
+  box-shadow: 0 2px 32px rgba(0,0,0,.06), 0 1px 0 rgba(255,255,255,1) inset;
+  border-radius: 20px;
+  padding: 1.5rem 1.75rem;
+}
+.cardHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1.25rem;
+}
+.cardTitle {
+  font-family: 'Cormorant Garamond', Georgia, serif;
+  font-size: 20px;
+  font-weight: 500;
+  color: #1a1814;
+}
+.btnCreate {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 11px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  padding: 8px 18px;
+  border-radius: 8px;
+  background: #1a1814;
+  color: #faf8f4;
+  border: none;
+  cursor: pointer;
+}
+.empty {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 13px;
+  color: #a8a5a0;
+  text-align: center;
+  padding: 2rem 0;
+}
+.keyRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  border-top: 1px solid rgba(0,0,0,.06);
+}
+.keyIcon {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: rgba(176,92,8,.07);
+  border: 1px solid rgba(176,92,8,.13);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.keyInfo { flex: 1; min-width: 0; }
+.keyName {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  color: #1a1814;
+  margin-bottom: 4px;
+}
+.scopePills { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 4px; }
+.scope {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 9px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: rgba(55,138,221,.07);
+  color: #185fa5;
+  border: 1px solid rgba(55,138,221,.13);
+}
+.keyMeta {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 11px;
+  color: #a8a5a0;
+}
+.keyHash {
+  font-family: 'DM Mono', monospace, sans-serif;
+  font-size: 11px;
+  color: #6b6760;
+  background: rgba(0,0,0,.04);
+  border: 1px solid rgba(0,0,0,.07);
+  border-radius: 5px;
+  padding: 3px 8px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.keyActions { flex-shrink: 0; }
+.btnSm {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 10px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid rgba(224,60,60,.2);
+  background: none;
+  color: #c0392b;
+  transition: all .15s;
+}
+.btnSm:hover { background: rgba(224,60,60,.04); }
+.form {
+  border-top: 1px solid rgba(0,0,0,.06);
+  padding-top: 1.25rem;
+  margin-top: .25rem;
+}
+.field { margin-bottom: 1rem; }
+.field label {
+  display: block;
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 10px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: #a8a5a0;
+  margin-bottom: 6px;
+}
+.field input, .field select {
+  width: 100%;
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 13px;
+  color: #1a1814;
+  background: rgba(255,255,255,.8);
+  border: 1px solid rgba(0,0,0,.1);
+  border-radius: 8px;
+  padding: 9px 12px;
+  outline: none;
+  box-sizing: border-box;
+}
+.scopeGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.scopeCheck {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(0,0,0,.07);
+  background: rgba(255,255,255,.5);
+  cursor: pointer;
+}
+.scopeCheck input { width: 14px; height: 14px; cursor: pointer; accent-color: #b05c08; margin-top: 2px; flex-shrink: 0; }
+.scopeCheck span { font-family: 'DM Sans', system-ui, sans-serif; font-size: 11px; color: #1a1814; display: block; }
+.scopeCheck small { font-family: 'DM Sans', system-ui, sans-serif; font-size: 10px; color: #a8a5a0; display: block; margin-top: 1px; }
+.formBtns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 1.25rem; }
+.btnCancel {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 12px;
+  padding: 9px 20px;
+  border-radius: 8px;
+  background: none;
+  border: 1px solid rgba(0,0,0,.1);
+  color: #6b6760;
+  cursor: pointer;
+}
+.btnConfirm {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 12px;
+  padding: 9px 20px;
+  border-radius: 8px;
+  background: #1a1814;
+  border: none;
+  color: #faf8f4;
+  cursor: pointer;
+}
+.btnConfirm:disabled { opacity: .3; cursor: default; }
+.reveal {
+  border-top: 1px solid rgba(0,0,0,.06);
+  padding-top: 1.25rem;
+  margin-top: .25rem;
+}
+.revealLabel {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 10px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: #1a7a35;
+  margin-bottom: 8px;
+}
+.revealValue {
+  font-family: 'DM Mono', monospace, sans-serif;
+  font-size: 12px;
+  color: #1a1814;
+  background: rgba(52,199,89,.06);
+  border: 1px solid rgba(52,199,89,.2);
+  border-radius: 8px;
+  padding: 12px;
+  word-break: break-all;
+  line-height: 1.6;
+  margin-bottom: 8px;
+}
+.revealWarn {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 11px;
+  color: #a8a5a0;
+}

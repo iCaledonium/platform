@@ -1,15 +1,311 @@
-import { Routes, Route, Navigate } from "react-router-dom";
+import { Routes, Route, Navigate, useLocation } from "react-router-dom";
+import { useState, useEffect, useRef, useCallback } from "react";
 import LoginPage from "./pages/LoginPage.jsx";
 import EnrollPage from "./pages/EnrollPage.jsx";
 import HomePage from "./pages/HomePage.jsx";
+import DeveloperPage from "./pages/DeveloperPage.jsx";
+import MessagesPage from "./pages/MessagesPage.jsx";
+
+function BellIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+      <path d="M8 2C5.8 2 4 3.8 4 6v4l-1.5 2h11L12 10V6c0-2.2-1.8-4-4-4z" stroke="currentColor" strokeWidth="1.1"/>
+      <path d="M6.5 13.5a1.5 1.5 0 003 0" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round"/>
+    </svg>
+  );
+}
+
+function formatTime(isoStr) {
+  if (!isoStr) return "";
+  const d = new Date(isoStr);
+  return d.toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit" });
+}
+
+function formatSection(isoStr) {
+  if (!isoStr) return "Earlier";
+  const d = new Date(isoStr);
+  const now = new Date();
+  const diff = Math.floor((now - d) / 86400000);
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Yesterday";
+  return d.toLocaleDateString("sv-SE", { weekday: "long" });
+}
+
+function groupByDate(notifs) {
+  const groups = [];
+  let currentSection = null;
+  for (const n of notifs) {
+    const section = formatSection(n.inserted_at);
+    if (section !== currentSection) {
+      groups.push({ type: "header", label: section });
+      currentSection = section;
+    }
+    groups.push({ type: "notif", ...n });
+  }
+  return groups;
+}
+
+function initials(name) {
+  return name?.split(" ").map(n => n[0]).join("").slice(0,2).toUpperCase() || "?";
+}
 
 export default function App() {
+  const [notifications, setNotifications] = useState([]);
+  const [toasts, setToasts]               = useState([]);
+  const [showCentre, setShowCentre]       = useState(false);
+  const esRef                              = useRef(null);
+  const location                           = useLocation();
+  const isAuthPage = ["/login", "/enroll"].includes(location.pathname);
+
+  useEffect(() => {
+    if (isAuthPage) return;
+    loadNotifications();
+    connectSSE();
+    return () => { if (esRef.current) esRef.current.close(); };
+  }, [isAuthPage]);
+
+  function loadNotifications() {
+    fetch("/api/notifications")
+      .then(r => r.ok ? r.json() : [])
+      .then(setNotifications)
+      .catch(() => {});
+  }
+
+  function connectSSE() {
+    if (esRef.current) esRef.current.close();
+    const es = new EventSource("/api/stream");
+    esRef.current = es;
+    es.onmessage = (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+        if (payload.type === "new_message") {
+          // Add to notifications list immediately
+          const notif = {
+            id:              payload.notif_id || crypto.randomUUID(),
+            sender_actor_id: payload.sender_id,
+            sender_name:     payload.sender_name,
+            content:         payload.content,
+            app_id:          payload.app_id || null,
+            read_at:         null,
+            inserted_at:     payload.sent_at || new Date().toISOString(),
+          };
+          setNotifications(prev => [notif, ...prev]);
+          // Show toast if not on messages page
+          if (location.pathname !== "/messages") {
+            showToast(notif);
+          }
+        }
+      } catch {}
+    };
+    es.onerror = () => { es.close(); setTimeout(connectSSE, 5000); };
+  }
+
+  function showToast(notif) {
+    const id = notif.id;
+    setToasts(prev => [...prev.slice(-2), { ...notif, toastId: id }]);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.toastId !== id)), 6000);
+  }
+
+  async function markRead(id) {
+    await fetch(`/api/notifications/${id}/read`, { method: "PATCH" }).catch(() => {});
+    setNotifications(prev => prev.map(n => n.id === id ? { ...n, read_at: new Date().toISOString() } : n));
+  }
+
+  async function clearNotif(id) {
+    await fetch(`/api/notifications/${id}`, { method: "DELETE" }).catch(() => {});
+    setNotifications(prev => prev.filter(n => n.id !== id));
+  }
+
+  async function clearAll() {
+    await fetch("/api/notifications", { method: "DELETE" }).catch(() => {});
+    setNotifications([]);
+  }
+
+  function openFromNotif(notif) {
+    markRead(notif.id);
+    setShowCentre(false);
+    const appId = notif.app_id;
+    const contactParam = notif.sender_actor_id ? `&contact=${notif.sender_actor_id}` : "";
+    if (appId) {
+      window.open(`/messages?app=${appId}${contactParam}`, "_blank");
+    } else {
+      fetch("/api/apps")
+        .then(r => r.ok ? r.json() : [])
+        .then(apps => {
+          const app = apps.find(a => a.tool_type === "messages");
+          if (app) window.open(`/messages?app=${app.id}${contactParam}`, "_blank");
+        });
+    }
+  }
+
+  function openFromToast(toast) {
+    setToasts(prev => prev.filter(t => t.toastId !== toast.toastId));
+    openFromNotif(toast);
+  }
+
+  const unreadCount = notifications.filter(n => !n.read_at).length;
+  const grouped = groupByDate(notifications);
+
+  if (isAuthPage) {
+    return (
+      <Routes>
+        <Route path="/login"  element={<LoginPage />} />
+        <Route path="/enroll" element={<EnrollPage />} />
+        <Route path="*"       element={<Navigate to="/login" replace />} />
+      </Routes>
+    );
+  }
+
   return (
-    <Routes>
-      <Route path="/login"  element={<LoginPage />} />
-      <Route path="/enroll" element={<EnrollPage />} />
-      <Route path="/home"   element={<HomePage />} />
-      <Route path="*"       element={<Navigate to="/login" replace />} />
-    </Routes>
+    <>
+      <Routes>
+        <Route path="/home"      element={<HomePage bellSlot={<BellSlot unread={unreadCount} onClick={() => setShowCentre(v => !v)} />} />} />
+        <Route path="/developer" element={<DeveloperPage />} />
+        <Route path="/messages"  element={<MessagesPage />} />
+        <Route path="*"          element={<Navigate to="/login" replace />} />
+      </Routes>
+
+      {/* Notification centre panel */}
+      {showCentre && (
+        <div
+          onClick={() => setShowCentre(false)}
+          style={{position:"fixed",inset:0,zIndex:9990}}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              position:"fixed", top:0, right:0, bottom:0, width:380,
+              background:"rgba(245,242,239,.97)",
+              backdropFilter:"blur(40px)", WebkitBackdropFilter:"blur(40px)",
+              borderLeft:"1px solid rgba(0,0,0,.07)",
+              display:"flex", flexDirection:"column",
+              zIndex:9991,
+              animation:"ncSlide .2s ease",
+            }}
+          >
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"1.1rem 1.25rem .9rem",borderBottom:"1px solid rgba(0,0,0,.06)",flexShrink:0}}>
+              <span style={{fontFamily:"'Cormorant Garamond',Georgia,serif",fontSize:19,fontWeight:500,color:"#1a1814"}}>Notifications</span>
+              {notifications.length > 0 && (
+                <button onClick={clearAll} style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#a8a5a0",background:"none",border:"none",cursor:"pointer",letterSpacing:".04em"}}>
+                  Clear all
+                </button>
+              )}
+            </div>
+
+            <div style={{flex:1,overflowY:"auto"}}>
+              {notifications.length === 0 ? (
+                <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:13,color:"#a8a5a0",textAlign:"center",padding:"3rem 0"}}>No notifications</p>
+              ) : (
+                grouped.map((item, i) => item.type === "header" ? (
+                  <p key={i} style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:10,letterSpacing:".12em",textTransform:"uppercase",color:"#a8a5a0",padding:"10px 14px 4px"}}>{item.label}</p>
+                ) : (
+                  <NotifItem key={item.id} notif={item} onOpen={openFromNotif} onClear={clearNotif} />
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toast notifications */}
+      <div style={{position:"fixed",top:20,right:showCentre?400:20,display:"flex",flexDirection:"column",gap:8,zIndex:9999,pointerEvents:"none",transition:"right .2s ease"}}>
+        {toasts.map(t => (
+          <div key={t.toastId} onClick={() => openFromToast(t)} style={{
+            pointerEvents:"all", cursor:"pointer",
+            background:"rgba(26,24,20,.92)", backdropFilter:"blur(20px)", WebkitBackdropFilter:"blur(20px)",
+            border:"1px solid rgba(255,255,255,.07)", borderRadius:14,
+            padding:"11px 14px", width:300,
+            display:"flex", alignItems:"flex-start", gap:10,
+            boxShadow:"0 8px 32px rgba(0,0,0,.3)",
+            animation:"toastIn .25s ease",
+          }}>
+            <div style={{width:34,height:34,borderRadius:"50%",background:"rgba(181,148,90,.15)",border:"1px solid rgba(181,148,90,.2)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:500,color:"#b5945a",flexShrink:0,fontFamily:"'DM Sans',system-ui,sans-serif"}}>
+              {initials(t.sender_name)}
+            </div>
+            <div style={{flex:1,minWidth:0}}>
+              <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:13,fontWeight:500,color:"rgba(255,255,255,.9)",margin:"0 0 2px"}}>{t.sender_name}</p>
+              <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"rgba(255,255,255,.4)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",margin:0}}>{t.content}</p>
+            </div>
+            <button onClick={e => { e.stopPropagation(); setToasts(prev => prev.filter(x => x.toastId !== t.toastId)); }}
+              style={{background:"none",border:"none",color:"rgba(255,255,255,.3)",cursor:"pointer",fontSize:13,flexShrink:0}}>✕</button>
+          </div>
+        ))}
+      </div>
+
+      <style>{`
+        @keyframes ncSlide { from { transform: translateX(100%); } to { transform: translateX(0); } }
+        @keyframes toastIn { from { transform: translateX(120%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+      `}</style>
+    </>
+  );
+}
+
+function BellSlot({ unread, onClick }) {
+  return (
+    <button onClick={onClick} style={{
+      position:"relative", width:36, height:36, borderRadius:"50%",
+      background:"none", border:"1px solid rgba(0,0,0,.08)",
+      display:"flex", alignItems:"center", justifyContent:"center",
+      cursor:"pointer", color:"#1a1814", transition:"all .15s",
+    }}>
+      <BellIcon />
+      {unread > 0 && (
+        <span style={{
+          position:"absolute", top:-3, right:-3,
+          width:16, height:16, borderRadius:"50%",
+          background:"#378add", color:"#fff",
+          display:"flex", alignItems:"center", justifyContent:"center",
+          fontSize:9, fontWeight:500,
+          fontFamily:"'DM Sans',system-ui,sans-serif",
+          border:"2px solid #eeecea",
+        }}>{unread > 9 ? "9+" : unread}</span>
+      )}
+    </button>
+  );
+}
+
+function NotifItem({ notif, onOpen, onClear }) {
+  const [hover, setHover] = useState(false);
+  return (
+    <div
+      onClick={() => onOpen(notif)}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        display:"flex", alignItems:"flex-start", gap:10,
+        padding:"11px 14px", borderBottom:"1px solid rgba(0,0,0,.04)",
+        cursor:"pointer", position:"relative",
+        background: hover ? "rgba(255,255,255,.6)" : "transparent",
+        opacity: notif.read_at ? .55 : 1,
+        transition:"all .1s",
+      }}
+    >
+      <div style={{width:34,height:34,borderRadius:"50%",background:"rgba(181,148,90,.1)",border:"1px solid rgba(181,148,90,.18)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:500,color:"#b5945a",flexShrink:0,fontFamily:"'DM Sans',system-ui,sans-serif"}}>
+        {initials(notif.sender_name)}
+      </div>
+      <div style={{flex:1,minWidth:0}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:2}}>
+          <span style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:13,fontWeight:500,color:"#1a1814"}}>{notif.sender_name}</span>
+          <span style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:10,color:"#a8a5a0"}}>{formatTime(notif.inserted_at)}</span>
+        </div>
+        <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#6b6760",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",margin:0}}>{notif.content}</p>
+      </div>
+      {!notif.read_at && (
+        <div style={{width:6,height:6,borderRadius:"50%",background:"#378add",flexShrink:0,marginTop:5}} />
+      )}
+      {hover && (
+        <button
+          onClick={e => { e.stopPropagation(); onClear(notif.id); }}
+          style={{
+            position:"absolute", right:10, top:"50%", transform:"translateY(-50%)",
+            width:18, height:18, borderRadius:"50%",
+            background:"#b05c08", border:"none",
+            display:"flex", alignItems:"center", justifyContent:"center",
+            cursor:"pointer", flexShrink:0,
+            fontSize:10, color:"#fff", fontWeight:500, lineHeight:1,
+          }}
+        >✕</button>
+      )}
+    </div>
   );
 }

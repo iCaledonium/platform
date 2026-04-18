@@ -59,6 +59,51 @@ db.exec(`
     updated_at  TEXT NOT NULL,
     UNIQUE(user_id, world_id, actor_id)
   );
+
+  CREATE TABLE IF NOT EXISTS api_keys (
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL REFERENCES users(id),
+    world_id     TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    key_hash     TEXT NOT NULL UNIQUE,
+    key_prefix   TEXT NOT NULL,
+    scopes       TEXT NOT NULL DEFAULT '[]',
+    last_used_at TEXT,
+    expires_at   TEXT,
+    revoked_at   TEXT,
+    inserted_at  TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS registered_tools (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL REFERENCES users(id),
+    world_id    TEXT NOT NULL,
+    actor_id    TEXT NOT NULL,
+    api_key_id  TEXT NOT NULL REFERENCES api_keys(id),
+    tool_type   TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    url         TEXT,
+    built_by    TEXT NOT NULL DEFAULT 'anima',
+    contact_ids TEXT NOT NULL DEFAULT '[]',
+    inserted_at TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS notifications (
+    id               TEXT PRIMARY KEY,
+    user_id          TEXT NOT NULL REFERENCES users(id),
+    world_id         TEXT NOT NULL,
+    sender_actor_id  TEXT NOT NULL,
+    sender_name      TEXT NOT NULL,
+    content          TEXT NOT NULL,
+    app_id           TEXT,
+    read_at          TEXT,
+    cleared_at       TEXT,
+    inserted_at      TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS notifications_user_id_idx ON notifications (user_id, cleared_at, inserted_at);
 `);
 
 // ── Seed Anima employees if not present ─────────────────────────────────────

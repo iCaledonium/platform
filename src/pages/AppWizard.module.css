@@ -1,0 +1,165 @@
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(238,236,234,.85);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+.modal {
+  background: rgba(255,255,255,.92);
+  border: 1px solid rgba(255,255,255,.95);
+  box-shadow: 0 8px 60px rgba(0,0,0,.1);
+  border-radius: 20px;
+  width: 100%;
+  max-width: 480px;
+  overflow: hidden;
+}
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1.25rem 1.5rem 0;
+}
+.title {
+  font-family: 'Cormorant Garamond', Georgia, serif;
+  font-size: 22px;
+  font-weight: 500;
+  color: #1a1814;
+}
+.closeBtn {
+  background: none;
+  border: none;
+  font-size: 14px;
+  color: #a8a5a0;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+.steps {
+  display: flex;
+  gap: 0;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid rgba(0,0,0,.06);
+}
+.step {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1;
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 11px;
+  color: #a8a5a0;
+}
+.step::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: rgba(0,0,0,.08);
+  margin: 0 6px;
+}
+.step:last-child::after { display: none; }
+.stepActive { color: #1a1814; }
+.stepDone { color: #1a7a35; }
+.stepDot {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: rgba(0,0,0,.06);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 500;
+  flex-shrink: 0;
+}
+.stepActive .stepDot { background: #1a1814; color: #faf8f4; }
+.stepDone .stepDot { background: rgba(52,199,89,.15); color: #1a7a35; }
+.body { padding: 1.25rem 1.5rem 1.5rem; }
+.stepLabel {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 10px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: #a8a5a0;
+  margin-bottom: 1rem;
+}
+.toolList { display: flex; flex-direction: column; gap: 8px; margin-bottom: 1.25rem; }
+.toolOption {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(0,0,0,.08);
+  cursor: pointer;
+  transition: all .12s;
+}
+.toolOption:hover { border-color: rgba(55,138,221,.2); background: rgba(255,255,255,.8); }
+.toolOptionSel { border-color: rgba(55,138,221,.3); background: rgba(55,138,221,.04); }
+.toolOptionIcon { width: 32px; height: 32px; border-radius: 8px; background: rgba(55,138,221,.07); border: 1px solid rgba(55,138,221,.13); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.toolOptionName { font-family: 'DM Sans', system-ui, sans-serif; font-size: 13px; font-weight: 500; color: #1a1814; margin-bottom: 2px; }
+.toolOptionDesc { font-family: 'DM Sans', system-ui, sans-serif; font-size: 11px; color: #a8a5a0; }
+.field { margin-bottom: 1rem; }
+.field label { display: block; font-family: 'DM Sans', system-ui, sans-serif; font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: #a8a5a0; margin-bottom: 6px; }
+.field input { width: 100%; font-family: 'DM Sans', system-ui, sans-serif; font-size: 13px; color: #1a1814; background: rgba(255,255,255,.8); border: 1px solid rgba(0,0,0,.1); border-radius: 8px; padding: 9px 12px; outline: none; box-sizing: border-box; }
+.keyList { display: flex; flex-direction: column; gap: 8px; margin-bottom: 1.25rem; }
+.keyOption { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border-radius: 10px; border: 1px solid rgba(0,0,0,.08); cursor: pointer; transition: all .12s; }
+.keyOption:hover { border-color: rgba(176,92,8,.2); }
+.keyOptionSel { border-color: rgba(176,92,8,.3); background: rgba(176,92,8,.03); }
+.keyOptionLeft { flex: 1; min-width: 0; }
+.keyOptionName { font-family: 'DM Sans', system-ui, sans-serif; font-size: 13px; font-weight: 500; color: #1a1814; margin-bottom: 4px; }
+.scopePills { display: flex; gap: 4px; flex-wrap: wrap; }
+.scope { font-family: 'DM Sans', system-ui, sans-serif; font-size: 9px; letter-spacing: .08em; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; background: rgba(55,138,221,.07); color: #185fa5; border: 1px solid rgba(55,138,221,.13); }
+.keyHash { font-family: 'DM Mono', monospace, sans-serif; font-size: 10px; color: #6b6760; background: rgba(0,0,0,.04); border: 1px solid rgba(0,0,0,.07); border-radius: 5px; padding: 2px 7px; white-space: nowrap; flex-shrink: 0; }
+.noKeys { text-align: center; padding: 2rem 0; font-family: 'DM Sans', system-ui, sans-serif; font-size: 13px; color: #a8a5a0; }
+.link { color: #b05c08; text-decoration: none; display: block; margin-top: 6px; }
+.footer { display: flex; gap: 8px; justify-content: flex-end; padding-top: 1rem; border-top: 1px solid rgba(0,0,0,.06); margin-top: 1rem; }
+.btnNext { font-family: 'DM Sans', system-ui, sans-serif; font-size: 12px; letter-spacing: .05em; text-transform: uppercase; padding: 9px 22px; border-radius: 8px; background: #1a1814; color: #faf8f4; border: none; cursor: pointer; }
+.btnNext:disabled { opacity: .3; cursor: default; }
+.pathGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 1.5rem; }
+.pathCard { padding: 1.25rem; border-radius: 12px; border: 1px solid rgba(0,0,0,.08); background: rgba(255,255,255,.5); cursor: pointer; transition: all .12s; }
+.pathCard:hover { border-color: rgba(0,0,0,.16); background: rgba(255,255,255,.8); }
+.pathIcon { width: 38px; height: 38px; border-radius: 10px; display: flex; align-items: center; justify-content: center; margin-bottom: .85rem; }
+.pathName { font-family: 'DM Sans', system-ui, sans-serif; font-size: 13px; font-weight: 500; color: #1a1814; margin-bottom: 5px; }
+.pathDesc { font-family: 'DM Sans', system-ui, sans-serif; font-size: 11px; color: #a8a5a0; line-height: 1.5; }
+.btnCancel { font-family: 'DM Sans', system-ui, sans-serif; font-size: 12px; padding: 9px 20px; border-radius: 8px; background: none; border: 1px solid rgba(0,0,0,.1); color: #6b6760; cursor: pointer; }
+.loadingMsg { font-family: 'DM Sans', system-ui, sans-serif; font-size: 13px; color: #a8a5a0; text-align: center; padding: 1.5rem 0; }
+.contactGrid { display: flex; flex-direction: column; gap: 6px; margin-bottom: .75rem; max-height: 260px; overflow-y: auto; }
+.contactChip { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(0,0,0,.07); background: rgba(255,255,255,.5); cursor: pointer; transition: all .12s; }
+.contactChip:hover { border-color: rgba(0,0,0,.14); background: rgba(255,255,255,.75); }
+.contactChipSel { border-color: rgba(176,92,8,.25); background: rgba(176,92,8,.03); }
+.chipAv { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-family: 'DM Sans', system-ui, sans-serif; font-size: 12px; font-weight: 500; flex-shrink: 0; overflow: hidden; }
+.chipInfo { flex: 1; min-width: 0; }
+.chipName { font-family: 'DM Sans', system-ui, sans-serif; font-size: 13px; font-weight: 500; color: #1a1814; margin: 0 0 1px; }
+.chipRole { font-family: 'DM Sans', system-ui, sans-serif; font-size: 11px; color: #a8a5a0; }
+.chipCheck { width: 18px; height: 18px; border-radius: 50%; border: 1px solid rgba(0,0,0,.12); flex-shrink: 0; display: flex; align-items: center; justify-content: center; transition: all .12s; }
+.chipCheckOn { background: #b5945a; border-color: #b5945a; }
+.contactHint { font-family: 'DM Sans', system-ui, sans-serif; font-size: 11px; color: #a8a5a0; margin-bottom: .5rem; }
+.inlineKeyCreate { background: rgba(176,92,8,.03); border: 1px solid rgba(176,92,8,.12); border-radius: 10px; padding: 1rem; margin-bottom: 1rem; }
+.inlineKeyLabel { font-family: 'DM Sans', system-ui, sans-serif; font-size: 12px; font-weight: 500; color: #1a1814; margin-bottom: .75rem; }
+.inlineKeyHint { font-family: 'DM Sans', system-ui, sans-serif; font-size: 10px; color: #a8a5a0; margin-top: -.25rem; margin-bottom: .75rem; }
+.inlineKeyBtns { display: flex; gap: 8px; justify-content: flex-end; }
+.createKeyLink { font-family: 'DM Sans', system-ui, sans-serif; font-size: 11px; color: #b05c08; background: none; border: none; cursor: pointer; padding: 4px 0; letter-spacing: .04em; }
+.contactChipDim { opacity: 0.45; }
+.chipTop { display: flex; align-items: center; justify-content: space-between; }
+.privacyRow {
+  display: flex;
+  gap: 16px;
+  padding: 6px 0 0 24px;
+  border-top: 1px solid rgba(0,0,0,.05);
+  margin-top: 8px;
+}
+.radioLabel {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 11px;
+  color: #6b6760;
+}
+.radioLabel input { cursor: pointer; }

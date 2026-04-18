@@ -1,0 +1,220 @@
+.shell {
+  display: flex;
+  height: 100vh;
+  background: #eeecea;
+  position: relative;
+}
+.shell::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(ellipse at 12% 18%, rgba(230,180,100,.22) 0%, transparent 45%),
+    radial-gradient(ellipse at 88% 78%, rgba(160,185,230,.18) 0%, transparent 45%),
+    #eeecea;
+  pointer-events: none;
+  z-index: 0;
+}
+.sidebar {
+  position: relative;
+  z-index: 1;
+  width: 280px;
+  flex-shrink: 0;
+  background: rgba(255,255,255,.6);
+  backdrop-filter: blur(40px);
+  -webkit-backdrop-filter: blur(40px);
+  border-right: 1px solid rgba(255,255,255,.8);
+  display: flex;
+  flex-direction: column;
+}
+.sideHeader {
+  padding: 1.25rem 1.25rem 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid rgba(0,0,0,.06);
+}
+.appName {
+  font-family: 'Cormorant Garamond', Georgia, serif;
+  font-size: 18px;
+  font-weight: 500;
+  color: #1a1814;
+}
+.homeLink {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 11px;
+  color: #a8a5a0;
+  text-decoration: none;
+  letter-spacing: .04em;
+}
+.homeLink:hover { color: #1a1814; }
+.contactList { flex: 1; overflow-y: auto; padding: .5rem 0; }
+.contactRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  cursor: pointer;
+  transition: background .12s;
+}
+.contactRow:hover { background: rgba(255,255,255,.5); }
+.contactRowSel { background: rgba(255,255,255,.7); }
+.contactAv {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+.contactInfo { flex: 1; min-width: 0; }
+.contactName {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  color: #1a1814;
+  margin: 0 0 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.contactLast {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 11px;
+  color: #a8a5a0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.empty {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 12px;
+  color: #a8a5a0;
+  text-align: center;
+  padding: 2rem;
+}
+.main {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.noSel {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 13px;
+  color: #a8a5a0;
+}
+.threadHeader {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 1rem 1.5rem;
+  background: rgba(255,255,255,.6);
+  backdrop-filter: blur(40px);
+  -webkit-backdrop-filter: blur(40px);
+  border-bottom: 1px solid rgba(255,255,255,.8);
+}
+.threadName {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  color: #1a1814;
+  margin: 0 0 1px;
+}
+.threadRole {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 11px;
+  color: #a8a5a0;
+}
+.thread {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.25rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.bubble {
+  max-width: 72%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.bubbleMe { align-self: flex-end; align-items: flex-end; }
+.bubbleThem { align-self: flex-start; align-items: flex-start; }
+.bubbleText {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.55;
+  padding: 9px 13px;
+  border-radius: 16px;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+.bubbleMe .bubbleText {
+  background: #1a1814;
+  color: #faf8f4;
+  border-bottom-right-radius: 4px;
+}
+.bubbleThem .bubbleText {
+  background: rgba(255,255,255,.75);
+  backdrop-filter: blur(20px);
+  color: #1a1814;
+  border: 1px solid rgba(255,255,255,.9);
+  border-bottom-left-radius: 4px;
+}
+.bubbleTime {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 10px;
+  color: #a8a5a0;
+  padding: 0 4px;
+}
+.composer {
+  display: flex;
+  gap: 8px;
+  padding: 1rem 1.5rem;
+  background: rgba(255,255,255,.6);
+  backdrop-filter: blur(40px);
+  -webkit-backdrop-filter: blur(40px);
+  border-top: 1px solid rgba(255,255,255,.8);
+  align-items: flex-end;
+}
+.input {
+  flex: 1;
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 13px;
+  color: #1a1814;
+  background: rgba(255,255,255,.8);
+  border: 1px solid rgba(0,0,0,.1);
+  border-radius: 12px;
+  padding: 9px 14px;
+  outline: none;
+  resize: none;
+  line-height: 1.5;
+}
+.input:focus { border-color: rgba(176,92,8,.3); }
+.sendBtn {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 12px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  padding: 9px 20px;
+  border-radius: 10px;
+  background: #1a1814;
+  color: #faf8f4;
+  border: none;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.sendBtn:disabled { opacity: .3; cursor: default; }

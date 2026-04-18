@@ -72,6 +72,15 @@ app.post("/api/auth/verify", (req, res) => {
   const expires = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString();
   db.prepare(`INSERT INTO auth_tokens (id, user_id, token_hash, expires_at, inserted_at) VALUES (?, ?, ?, ?, datetime('now'))`).run(randomUUID(), user_id, hash, expires);
   res.setHeader("Set-Cookie", `anima_token=${raw}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=28800`);
+  // Push presence online to simulator
+  const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? LIMIT 1`).get(user_id);
+  if (membership) {
+    fetch(`${SIMULATOR_URL}/internal/presence/${membership.actor_id}`, {
+      method: "POST",
+      headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "online" })
+    }).catch(() => {});
+  }
   res.json({ ok: true });
 });
 
@@ -106,7 +115,19 @@ app.post("/api/auth/signout", (req, res) => {
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (match) {
     const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+    const token = db.prepare(`SELECT user_id FROM auth_tokens WHERE token_hash = ?`).get(hash);
     db.prepare(`UPDATE auth_tokens SET revoked_at = datetime('now') WHERE token_hash = ?`).run(hash);
+    // Push presence offline to simulator
+    if (token) {
+      const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? LIMIT 1`).get(token.user_id);
+      if (membership) {
+        fetch(`${SIMULATOR_URL}/internal/presence/${membership.actor_id}`, {
+          method: "POST",
+          headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+          body: JSON.stringify({ status: "offline" })
+        }).catch(() => {});
+      }
+    }
   }
   res.setHeader("Set-Cookie", "anima_token=; Path=/; Max-Age=0; SameSite=None; Secure");
   res.json({ ok: true });
@@ -133,6 +154,323 @@ app.post("/api/worlds/:id/start", async (req, res) => {
 app.post("/api/worlds/:id/stop", async (req, res) => {
   try { res.json(await simFetch(`/internal/worlds/${req.params.id}/stop`, "POST")); }
   catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/keys ─────────────────────────────────────────────────────────────
+app.get("/api/keys", (req, res) => {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  if (!match) return res.status(401).json({ error: "not authenticated" });
+  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const keys = db.prepare(`SELECT id, name, world_id, key_prefix, scopes, last_used_at, inserted_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY inserted_at DESC`).all(user.id);
+  res.json(keys.map(k => ({ ...k, scopes: JSON.parse(k.scopes) })));
+});
+
+// ── POST /api/keys  { name, world_id, scopes[] } ──────────────────────────────
+app.post("/api/keys", (req, res) => {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  if (!match) return res.status(401).json({ error: "not authenticated" });
+  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const { name, world_id, scopes } = req.body;
+  if (!name || !world_id || !scopes?.length) return res.status(400).json({ error: "name, world_id, scopes required" });
+  const raw = `sk-an-${crypto.randomBytes(32).toString("hex")}`;
+  const keyHash = crypto.createHash("sha256").update(raw).digest("hex");
+  const prefix = raw.slice(0, 12) + "••••••••" + raw.slice(-4);
+  db.prepare(`INSERT INTO api_keys (id, user_id, world_id, name, key_hash, key_prefix, scopes, inserted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`).run(randomUUID(), user.id, world_id, name, keyHash, prefix, JSON.stringify(scopes));
+  res.json({ key: raw, prefix });
+});
+
+// ── DELETE /api/keys/:id ───────────────────────────────────────────────────────
+app.delete("/api/keys/:id", (req, res) => {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  if (!match) return res.status(401).json({ error: "not authenticated" });
+  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  db.prepare(`UPDATE api_keys SET revoked_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND user_id = ?`).run(req.params.id, user.id);
+  res.json({ ok: true });
+});
+
+// ── GET /api/apps ─────────────────────────────────────────────────────────────
+app.get("/api/apps", (req, res) => {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  if (!match) return res.status(401).json({ error: "not authenticated" });
+  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const apps = db.prepare(`
+    SELECT r.id, r.name, r.tool_type, r.world_id, r.actor_id, r.api_key_id, r.inserted_at,
+           r.url, r.built_by, r.contact_ids, k.key_prefix, k.scopes
+    FROM registered_tools r
+    JOIN api_keys k ON k.id = r.api_key_id
+    WHERE r.user_id = ?
+    ORDER BY r.inserted_at DESC
+  `).all(user.id);
+  res.json(apps.map(a => ({ ...a, scopes: JSON.parse(a.scopes), contact_ids: JSON.parse(a.contact_ids || '[]') })));
+});
+
+// ── POST /api/apps  { name, tool_type, world_id, actor_id, api_key_id, url?, built_by? } ───
+app.post("/api/apps", (req, res) => {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  if (!match) return res.status(401).json({ error: "not authenticated" });
+  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const { name, tool_type, world_id, actor_id, api_key_id, url, built_by, contact_ids } = req.body;
+  if (!name || !tool_type || !world_id || !actor_id || !api_key_id) return res.status(400).json({ error: "all fields required" });
+  const key = db.prepare(`SELECT id FROM api_keys WHERE id = ? AND user_id = ? AND revoked_at IS NULL`).get(api_key_id, user.id);
+  if (!key) return res.status(403).json({ error: "invalid api key" });
+  const id = randomUUID();
+  db.prepare(`INSERT INTO registered_tools (id, user_id, world_id, actor_id, api_key_id, tool_type, name, url, built_by, contact_ids, inserted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`).run(id, user.id, world_id, actor_id, api_key_id, tool_type, name, url || null, built_by || "anima", JSON.stringify(contact_ids || []));
+  res.json({ id, name, tool_type, url, built_by: built_by || "anima" });
+});
+
+// ── PATCH /api/apps/:id  { contact_ids } ──────────────────────────────────────
+app.patch("/api/apps/:id", (req, res) => {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  if (!match) return res.status(401).json({ error: "not authenticated" });
+  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const { contact_ids } = req.body;
+  if (!contact_ids) return res.status(400).json({ error: "contact_ids required" });
+  db.prepare(`UPDATE registered_tools SET contact_ids = ?, updated_at = datetime('now') WHERE id = ? AND user_id = ?`)
+    .run(JSON.stringify(contact_ids), req.params.id, user.id);
+  res.json({ ok: true });
+});
+
+// ── DELETE /api/apps/:id ───────────────────────────────────────────────────────
+app.delete("/api/apps/:id", (req, res) => {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  if (!match) return res.status(401).json({ error: "not authenticated" });
+  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  db.prepare(`DELETE FROM registered_tools WHERE id = ? AND user_id = ?`).run(req.params.id, user.id);
+  res.json({ ok: true });
+});
+
+// ── GET /api/worlds/:world_id/actors/:actor_id/contacts ───────────────────────
+app.get("/api/worlds/:world_id/actors/:actor_id/contacts", async (req, res) => {
+  try {
+    const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/contacts`);
+    res.json(data);
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/worlds/:world_id/actors/:actor_id/messages/:contact_id ───────────
+app.get("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id", async (req, res) => {
+  try {
+    const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/messages/${req.params.contact_id}`);
+    res.json(data);
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── POST /api/worlds/:world_id/actors/:actor_id/messages/:contact_id ──────────
+app.post("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id", async (req, res) => {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  let visibility = "private"; // safe default
+  if (match) {
+    const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+    const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+    if (user) {
+      const app = db.prepare(`SELECT contact_ids FROM registered_tools WHERE user_id = ? AND world_id = ? AND tool_type != 'custom' ORDER BY inserted_at DESC LIMIT 1`).get(user.id, req.params.world_id);
+      if (app) {
+        const contacts = JSON.parse(app.contact_ids || "[]");
+        const contact = contacts.find(c => c.id === req.params.contact_id);
+        if (contact) visibility = contact.privacy || "private";
+      }
+    }
+  }
+  try {
+    const resp = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/messages/${req.params.contact_id}`, {
+      method: "POST",
+      headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({ ...req.body, visibility }),
+    });
+    res.json(await resp.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/viewer-token?world_id= ───────────────────────────────────────────
+app.get("/api/viewer-token", (req, res) => {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  if (!match) return res.status(401).json({ error: "not authenticated" });
+  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+  const user = db.prepare(`
+    SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id
+    WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')
+  `).get(hash);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+
+  const { world_id } = req.query;
+  if (!world_id) return res.status(400).json({ error: "world_id required" });
+
+  const membership = db.prepare(`
+    SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?
+  `).get(user.id, world_id);
+  if (!membership) return res.status(403).json({ error: "not a member of this world" });
+
+  const payload = JSON.stringify({
+    actor_id: membership.actor_id,
+    world_id,
+    exp: Math.floor(Date.now() / 1000) + 300, // 5 min TTL
+  });
+  const b64 = Buffer.from(payload).toString("base64url");
+  const sig  = crypto.createHmac("sha256", SERVICE_TOKEN).update(b64).digest("hex");
+  res.json({ token: `${b64}.${sig}` });
+});
+
+// ── Notification helpers ──────────────────────────────────────────────────────
+function getAuthUser(req) {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  if (!match) return null;
+  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+  return db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash) || null;
+}
+
+// ── GET /api/notifications ────────────────────────────────────────────────────
+app.get("/api/notifications", (req, res) => {
+  const user = getAuthUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const notifs = db.prepare(`
+    SELECT id, sender_actor_id, sender_name, content, app_id, read_at, inserted_at
+    FROM notifications
+    WHERE user_id = ? AND cleared_at IS NULL
+    ORDER BY inserted_at DESC
+    LIMIT 100
+  `).all(user.id);
+  res.json(notifs);
+});
+
+// ── PATCH /api/notifications/:id/read ────────────────────────────────────────
+app.patch("/api/notifications/:id/read", (req, res) => {
+  const user = getAuthUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  db.prepare(`UPDATE notifications SET read_at = datetime('now') WHERE id = ? AND user_id = ? AND read_at IS NULL`).run(req.params.id, user.id);
+  res.json({ ok: true });
+});
+
+// ── DELETE /api/notifications/:id ────────────────────────────────────────────
+app.delete("/api/notifications/:id", (req, res) => {
+  const user = getAuthUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  db.prepare(`UPDATE notifications SET cleared_at = datetime('now') WHERE id = ? AND user_id = ?`).run(req.params.id, user.id);
+  res.json({ ok: true });
+});
+
+// ── DELETE /api/notifications ─────────────────────────────────────────────────
+app.delete("/api/notifications", (req, res) => {
+  const user = getAuthUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  db.prepare(`UPDATE notifications SET cleared_at = datetime('now') WHERE user_id = ? AND cleared_at IS NULL`).run(user.id);
+  res.json({ ok: true });
+});
+
+// ── GET /api/pending-messages ─────────────────────────────────────────────────
+// Returns count of unread inbox messages for the user's actor
+app.get("/api/pending-messages", async (req, res) => {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  if (!match) return res.status(401).json({ count: 0 });
+  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  if (!user) return res.status(401).json({ count: 0 });
+  const membership = db.prepare(`SELECT actor_id, world_id FROM world_memberships WHERE user_id = ? LIMIT 1`).get(user.id);
+  if (!membership) return res.json({ count: 0 });
+  try {
+    const data = await simFetch(`/internal/worlds/${membership.world_id}/actors/${membership.actor_id}/unread-count`);
+    res.json(data);
+  } catch { res.json({ count: 0 }); }
+});
+
+// ── GET /api/stream — SSE proxy ───────────────────────────────────────────────
+app.get("/api/stream", async (req, res) => {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  if (!match) return res.status(401).end();
+  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+  const user = db.prepare(`SELECT u.id, u.name FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  if (!user) return res.status(401).end();
+
+  const membership = db.prepare(`SELECT actor_id, world_id FROM world_memberships WHERE user_id = ? LIMIT 1`).get(user.id);
+  if (!membership) return res.status(403).end();
+
+  const { actor_id, world_id } = membership;
+
+  // Load this user's contact privacy settings
+  const appRow = db.prepare(`SELECT contact_ids FROM registered_tools WHERE user_id = ? AND world_id = ? AND tool_type != 'custom' ORDER BY inserted_at DESC LIMIT 1`).get(user.id, world_id);
+  const contactIds = appRow ? JSON.parse(appRow.contact_ids || "[]") : [];
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  res.write(`data: ${JSON.stringify({ type: "connected", actor_id })}\n\n`);
+
+  // Connect to simulator SSE stream
+  let simRes;
+  try {
+    simRes = await fetch(`${SIMULATOR_URL}/internal/actors/${actor_id}/stream`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN },
+    });
+  } catch {
+    res.write(`data: ${JSON.stringify({ type: "error", message: "simulator unreachable" })}\n\n`);
+    return res.end();
+  }
+
+  const reader = simRes.body.getReader();
+  const decoder = new TextDecoder();
+
+  req.on("close", () => { reader.cancel(); });
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value);
+
+      // Parse SSE lines from simulator
+      for (const line of text.split("\n")) {
+        if (!line.startsWith("data: ")) continue;
+        try {
+          const payload = JSON.parse(line.slice(6));
+          if (payload.type === "new_message") {
+            // Check privacy — find contact settings
+            const contact = contactIds.find(c => c.id === payload.sender_id);
+            const privacy = contact?.privacy || "private";
+            // Find the user's messages app
+            const app = db.prepare(`SELECT id FROM registered_tools WHERE user_id = ? AND world_id = ? AND tool_type = 'messages' LIMIT 1`).get(user.id, world_id);
+            // Persist notification to DB
+            const notifId = crypto.randomUUID();
+            db.prepare(`INSERT INTO notifications (id, user_id, world_id, sender_actor_id, sender_name, content, app_id, inserted_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))`)
+              .run(notifId, user.id, world_id, payload.sender_id, payload.sender_name, payload.content, app?.id || null);
+            // Forward to client with notification id
+            res.write(`data: ${JSON.stringify({ ...payload, privacy, notif_id: notifId })}\n\n`);
+          } else {
+            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+          }
+        } catch { /* skip malformed lines */ }
+      }
+    }
+  } catch { /* client disconnected */ }
+
+  res.end();
 });
 
 const PORT = 4002;
