@@ -1,0 +1,342 @@
+.page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1rem;
+}
+
+.inner {
+  width: 100%;
+  max-width: 400px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* wordmark */
+.wordmark {
+  text-align: center;
+  margin-bottom: 2rem;
+}
+.logo {
+  display: block;
+  font-family: var(--serif);
+  font-size: 32px;
+  font-weight: 500;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--text);
+}
+.tagline {
+  display: block;
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  margin-top: 4px;
+}
+
+/* card */
+.card {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(40px) saturate(200%);
+  -webkit-backdrop-filter: blur(40px) saturate(200%);
+  border: 1px solid rgba(255, 255, 255, 0.95);
+  box-shadow: 0 2px 32px rgba(0, 0, 0, 0.06), 0 1px 0 rgba(255, 255, 255, 1) inset;
+  border-radius: 20px;
+  padding: 1.75rem;
+}
+.cardCenter {
+  text-align: center;
+  padding: 2.5rem 1.75rem;
+}
+
+/* card title */
+.cardTitle {
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  margin-bottom: 1rem;
+}
+
+/* back button */
+.backBtn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--text-2);
+  padding: 0;
+  margin-bottom: 1.25rem;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  transition: color 0.15s;
+}
+.backBtn:hover { color: var(--text); }
+
+/* org tiles */
+.orgTile {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  cursor: pointer;
+  border: 1px solid rgba(0, 0, 0, 0.07);
+  background: rgba(255, 255, 255, 0.5);
+  margin-bottom: 8px;
+  transition: all 0.15s;
+  text-align: left;
+}
+.orgTile:hover {
+  background: rgba(255, 255, 255, 0.85);
+  border-color: rgba(0, 0, 0, 0.12);
+}
+.orgTileDim {
+  opacity: 0.45;
+  cursor: default;
+}
+.orgTileDim:hover {
+  background: rgba(255, 255, 255, 0.5);
+  border-color: rgba(0, 0, 0, 0.07);
+}
+.orgIcon {
+  width: 38px;
+  height: 38px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.orgInfo { flex: 1; }
+.orgName {
+  font-family: var(--sans);
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--text);
+  margin: 0;
+}
+.orgMeta {
+  font-family: var(--sans);
+  font-size: 11px;
+  color: var(--text-3);
+  margin: 2px 0 0;
+}
+
+/* badges */
+.badge {
+  font-size: 9px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+.badgeActive {
+  background: rgba(52, 199, 89, 0.1);
+  color: #1a7a35;
+  border: 1px solid rgba(52, 199, 89, 0.2);
+}
+.badgeSoon {
+  background: rgba(0, 0, 0, 0.04);
+  color: var(--text-3);
+  border: 1px solid rgba(0, 0, 0, 0.07);
+}
+
+/* account list */
+.accountList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.accountRow {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  background: none;
+  transition: all 0.12s;
+  text-align: left;
+}
+.accountRow:hover {
+  background: rgba(255, 255, 255, 0.6);
+  border-color: rgba(0, 0, 0, 0.07);
+}
+.accountRowSel {
+  background: rgba(255, 255, 255, 0.7);
+  border-color: rgba(176, 92, 8, 0.25);
+}
+.accountInfo { flex: 1; min-width: 0; }
+.accountName {
+  font-family: var(--sans);
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--text);
+  margin: 0;
+}
+.accountEmail {
+  font-family: var(--sans);
+  font-size: 11px;
+  color: var(--text-3);
+  margin: 2px 0 0;
+}
+
+/* check circle */
+.check {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.12s;
+}
+.checkOn {
+  background: var(--amber);
+  border-color: var(--amber);
+  color: #fff;
+}
+
+/* divider */
+.divider {
+  height: 1px;
+  background: rgba(0, 0, 0, 0.06);
+  margin: 12px 0;
+}
+
+/* primary button */
+.primaryBtn {
+  width: 100%;
+  background: var(--text);
+  border: none;
+  border-radius: 10px;
+  padding: 12px;
+  font-family: var(--sans);
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #faf8f4;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.primaryBtn:hover { background: #2a2620; }
+.primaryBtn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+/* totp */
+.totpUser {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 1.25rem;
+}
+.totpHint {
+  font-size: 12px;
+  color: var(--text-2);
+  margin-bottom: 1.25rem;
+  line-height: 1.6;
+}
+.digitRow {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  align-items: center;
+  margin-bottom: 1.25rem;
+}
+.digit {
+  width: 42px;
+  height: 52px;
+  text-align: center;
+  font-family: var(--serif);
+  font-size: 24px;
+  font-weight: 400;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 8px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.digit:focus {
+  border-color: var(--amber);
+  background: rgba(255, 255, 255, 0.9);
+}
+.digitSep {
+  font-size: 20px;
+  color: var(--text-3);
+  padding: 0 2px;
+}
+.errorMsg {
+  font-size: 12px;
+  color: #c0392b;
+  text-align: center;
+  margin-bottom: 0.75rem;
+}
+
+/* success */
+.successIcon {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: rgba(52, 199, 89, 0.1);
+  border: 1px solid rgba(52, 199, 89, 0.2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 1rem;
+}
+.successHeading {
+  font-family: var(--serif);
+  font-size: 26px;
+  font-weight: 300;
+  font-style: italic;
+  color: var(--text);
+  margin-bottom: 0.4rem;
+}
+.successEmail {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.successSub {
+  font-size: 12px;
+  color: var(--text-3);
+  margin-top: 0.4rem;
+}
+
+/* misc */
+.hint {
+  font-size: 11px;
+  color: var(--text-3);
+  text-align: center;
+  margin-top: 1rem;
+  line-height: 1.6;
+}
+.link { color: var(--amber); text-decoration: none; }
+.link:hover { text-decoration: underline; }
+
+.footer {
+  font-size: 11px;
+  color: var(--text-3);
+  font-style: italic;
+  text-align: center;
+  margin-top: 1.5rem;
+}
