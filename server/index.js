@@ -276,6 +276,20 @@ app.get("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id", async (re
   } catch { res.status(502).json({ error: "simulator unreachable" }); }
 });
 
+// ── GET /api/worlds/:world_id/actors/:actor_id/context/:contact_id ────────────
+app.get("/api/worlds/:world_id/actors/:actor_id/context/:contact_id", async (req, res) => {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  if (!match) return res.status(401).json({ error: "unauthorized" });
+  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/context/${req.params.contact_id}`);
+    res.json(data);
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
 // ── POST /api/worlds/:world_id/actors/:actor_id/messages/:contact_id ──────────
 app.post("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id", async (req, res) => {
   const cookieHeader = req.headers["cookie"] || "";
@@ -354,7 +368,26 @@ app.get("/api/notifications", (req, res) => {
     ORDER BY inserted_at DESC
     LIMIT 100
   `).all(user.id);
-  res.json(notifs);
+
+  const CONV_TO_TOOL = {
+    text_thread:   "messages",
+    voice_message: "voice",
+    email_thread:  "email",
+    call:          "voice",
+    video_call:    "video",
+  };
+
+  // Get all installed tool types for this user
+  const installedTools = new Set(
+    db.prepare(`SELECT DISTINCT tool_type FROM registered_tools WHERE user_id = ? AND built_by = 'anima'`).all(user.id).map(r => r.tool_type)
+  );
+
+  const enriched = notifs.map(n => ({
+    ...n,
+    has_app: installedTools.has(CONV_TO_TOOL[n.conversation_type] || "messages"),
+  }));
+
+  res.json(enriched);
 });
 
 // ── PATCH /api/notifications/:id/read ────────────────────────────────────────
