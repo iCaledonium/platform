@@ -1,17 +1,90 @@
 import { Routes, Route, Navigate, useLocation } from "react-router-dom";
 import { useState, useEffect, useRef, useCallback } from "react";
+import ReactDOM from "react-dom";
 import LoginPage from "./pages/LoginPage.jsx";
 import EnrollPage from "./pages/EnrollPage.jsx";
 import HomePage from "./pages/HomePage.jsx";
 import DeveloperPage from "./pages/DeveloperPage.jsx";
 import MessagesPage from "./pages/MessagesPage.jsx";
 
-function BellIcon() {
+const CONV_TO_TOOL = {
+  text_thread:   "messages",
+  voice_message: "voice",
+  email_thread:  "email",
+  call:          "voice",
+  video_call:    "video",
+};
+
+const TOOL_LABELS = {
+  messages: { label: "SMS",   color: "#378add", bg: "rgba(55,138,221,.1)" },
+  voice:    { label: "Voice", color: "#1d9e75", bg: "rgba(29,158,117,.1)" },
+  email:    { label: "Email", color: "#7f77dd", bg: "rgba(127,119,221,.1)" },
+  video:    { label: "Video", color: "#b05c08", bg: "rgba(176,92,8,.1)"   },
+};
+
+function TypeBadge({ convType }) {
+  const toolType = CONV_TO_TOOL[convType] || "messages";
+  const meta = TOOL_LABELS[toolType] || TOOL_LABELS.messages;
   return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-      <path d="M8 2C5.8 2 4 3.8 4 6v4l-1.5 2h11L12 10V6c0-2.2-1.8-4-4-4z" stroke="currentColor" strokeWidth="1.1"/>
-      <path d="M6.5 13.5a1.5 1.5 0 003 0" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round"/>
-    </svg>
+    <span style={{
+      fontFamily: "'DM Sans',system-ui,sans-serif",
+      fontSize: 9, letterSpacing: ".1em", textTransform: "uppercase",
+      padding: "2px 6px", borderRadius: 4,
+      background: meta.bg, color: meta.color,
+      border: `1px solid ${meta.color}33`,
+      flexShrink: 0,
+    }}>{meta.label}</span>
+  );
+}
+
+function BellSlot({ unread, onClick, notifications }) {
+  const [hover, setHover] = useState(false);
+  const breakdown = Object.entries(
+    (notifications || []).filter(n => !n.read_at).reduce((acc, n) => {
+      const tool = CONV_TO_TOOL[n.conversation_type] || "messages";
+      acc[tool] = (acc[tool] || 0) + 1;
+      return acc;
+    }, {})
+  );
+  return (
+    <div style={{ position: "relative" }} onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}>
+      <button onClick={onClick} style={{
+        position:"relative", width:36, height:36, borderRadius:"50%",
+        background:"none", border:"1px solid rgba(0,0,0,.08)",
+        display:"flex", alignItems:"center", justifyContent:"center",
+        cursor:"pointer", color:"#1a1814",
+      }}>
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <path d="M8 2C5.8 2 4 3.8 4 6v4l-1.5 2h11L12 10V6c0-2.2-1.8-4-4-4z" stroke="currentColor" strokeWidth="1.1"/>
+          <path d="M6.5 13.5a1.5 1.5 0 003 0" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round"/>
+        </svg>
+        {unread > 0 && (
+          <span style={{
+            position:"absolute", top:-3, right:-3, width:16, height:16, borderRadius:"50%",
+            background:"#378add", color:"#fff", display:"flex", alignItems:"center", justifyContent:"center",
+            fontSize:9, fontWeight:500, fontFamily:"'DM Sans',system-ui,sans-serif", border:"2px solid #eeecea",
+          }}>{unread > 9 ? "9+" : unread}</span>
+        )}
+      </button>
+      {hover && breakdown.length > 0 && (
+        <div style={{
+          position:"absolute", top:44, right:0,
+          background:"rgba(26,24,20,.92)", backdropFilter:"blur(20px)",
+          border:"1px solid rgba(255,255,255,.07)", borderRadius:10,
+          padding:"8px 12px", minWidth:120, zIndex:9999,
+        }}>
+          {breakdown.map(([tool, count]) => {
+            const meta = TOOL_LABELS[tool] || TOOL_LABELS.messages;
+            return (
+              <div key={tool} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,padding:"3px 0"}}>
+                <span style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:meta.color}}>{meta.label}</span>
+                <span style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"rgba(255,255,255,.6)",fontWeight:500}}>{count}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -81,17 +154,25 @@ export default function App() {
         if (payload.type === "new_message") {
           // Add to notifications list immediately
           const notif = {
-            id:              payload.notif_id || crypto.randomUUID(),
-            sender_actor_id: payload.sender_id,
-            sender_name:     payload.sender_name,
-            content:         payload.content,
-            app_id:          payload.app_id || null,
-            read_at:         null,
-            inserted_at:     payload.sent_at || new Date().toISOString(),
+            id:                payload.notif_id || crypto.randomUUID(),
+            sender_actor_id:   payload.sender_id,
+            sender_name:       payload.sender_name,
+            sender_actor_type: payload.sender_actor_type,
+            content:           payload.content,
+            app_id:            payload.app_id || null,
+            conv_type:         payload.conv_type || "text_thread",
+            has_app:           payload.has_app !== false,
+            read_at:           null,
+            inserted_at:       payload.sent_at || new Date().toISOString(),
           };
-          setNotifications(prev => [notif, ...prev]);
-          // Show toast if not on messages page
-          if (location.pathname !== "/messages") {
+          setNotifications(prev => {
+            if (prev.find(n => n.id === notif.id)) return prev;
+            return [notif, ...prev];
+          });
+          // Suppress toast if this conversation is already open
+          const currentUrl = window.location.href;
+          const alreadyOpen = currentUrl.includes(`contact=${payload.sender_id}`);
+          if (!alreadyOpen) {
             showToast(notif);
           }
         }
@@ -124,6 +205,14 @@ export default function App() {
   function openFromNotif(notif) {
     markRead(notif.id);
     setShowCentre(false);
+
+    // No app installed — open wizard pre-selecting the right tool type
+    if (!notif.has_app) {
+      const toolType = CONV_TO_TOOL[notif.conversation_type] || "messages";
+      if (toolType === 'messages') { window.location.href = `/home?install=${toolType}`; } else { alert(toolType.charAt(0).toUpperCase() + toolType.slice(1) + ' app coming soon.'); }
+      return;
+    }
+
     const appId = notif.app_id;
     const contactParam = notif.sender_actor_id ? `&contact=${notif.sender_actor_id}` : "";
     if (appId) {
@@ -132,8 +221,10 @@ export default function App() {
       fetch("/api/apps")
         .then(r => r.ok ? r.json() : [])
         .then(apps => {
-          const app = apps.find(a => a.tool_type === "messages");
+          const toolType = CONV_TO_TOOL[notif.conversation_type] || "messages";
+          const app = apps.find(a => a.tool_type === toolType);
           if (app) window.open(`/messages?app=${app.id}${contactParam}`, "_blank");
+          else if (toolType === 'messages') { window.location.href = `/home?install=${toolType}`; } else { alert(toolType.charAt(0).toUpperCase() + toolType.slice(1) + ' app coming soon.'); }
         });
     }
   }
@@ -159,11 +250,19 @@ export default function App() {
   return (
     <>
       <Routes>
-        <Route path="/home"      element={<HomePage bellSlot={<BellSlot unread={unreadCount} onClick={() => setShowCentre(v => !v)} />} />} />
+        <Route path="/home"      element={<HomePage />} />
         <Route path="/developer" element={<DeveloperPage />} />
         <Route path="/messages"  element={<MessagesPage />} />
         <Route path="*"          element={<Navigate to="/login" replace />} />
       </Routes>
+
+      {/* Bell — portalled into HomePage topbar */}
+      {location.pathname === "/home" && document.getElementById("topbar-bell") &&
+        ReactDOM.createPortal(
+          <BellSlot unread={unreadCount} onClick={() => setShowCentre(v => !v)} notifications={notifications} />,
+          document.getElementById("topbar-bell")
+        )
+      }
 
       {/* Notification centre panel */}
       {showCentre && (
@@ -240,32 +339,13 @@ export default function App() {
   );
 }
 
-function BellSlot({ unread, onClick }) {
-  return (
-    <button onClick={onClick} style={{
-      position:"relative", width:36, height:36, borderRadius:"50%",
-      background:"none", border:"1px solid rgba(0,0,0,.08)",
-      display:"flex", alignItems:"center", justifyContent:"center",
-      cursor:"pointer", color:"#1a1814", transition:"all .15s",
-    }}>
-      <BellIcon />
-      {unread > 0 && (
-        <span style={{
-          position:"absolute", top:-3, right:-3,
-          width:16, height:16, borderRadius:"50%",
-          background:"#378add", color:"#fff",
-          display:"flex", alignItems:"center", justifyContent:"center",
-          fontSize:9, fontWeight:500,
-          fontFamily:"'DM Sans',system-ui,sans-serif",
-          border:"2px solid #eeecea",
-        }}>{unread > 9 ? "9+" : unread}</span>
-      )}
-    </button>
-  );
-}
 
 function NotifItem({ notif, onOpen, onClear }) {
   const [hover, setHover] = useState(false);
+  const hasApp = notif.has_app !== false;
+  const toolType = CONV_TO_TOOL[notif.conversation_type] || "messages";
+  const toolMeta = TOOL_LABELS[toolType] || TOOL_LABELS.messages;
+
   return (
     <div
       onClick={() => onOpen(notif)}
@@ -284,11 +364,18 @@ function NotifItem({ notif, onOpen, onClear }) {
         {initials(notif.sender_name)}
       </div>
       <div style={{flex:1,minWidth:0}}>
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:2}}>
+        <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:2}}>
           <span style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:13,fontWeight:500,color:"#1a1814"}}>{notif.sender_name}</span>
-          <span style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:10,color:"#a8a5a0"}}>{formatTime(notif.inserted_at)}</span>
+          <TypeBadge convType={notif.conversation_type} />
+          <span style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:10,color:"#a8a5a0",marginLeft:"auto"}}>{formatTime(notif.inserted_at)}</span>
         </div>
-        <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#6b6760",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",margin:0}}>{notif.content}</p>
+        {hasApp ? (
+          <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#6b6760",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",margin:0}}>{notif.content}</p>
+        ) : (
+          <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:toolMeta.color,margin:0}}>
+            Install {toolMeta.label} app to {toolType === "voice" ? "listen" : toolType === "email" ? "read" : "view"} →
+          </p>
+        )}
       </div>
       {!notif.read_at && (
         <div style={{width:6,height:6,borderRadius:"50%",background:"#378add",flexShrink:0,marginTop:5}} />
@@ -301,8 +388,7 @@ function NotifItem({ notif, onOpen, onClear }) {
             width:18, height:18, borderRadius:"50%",
             background:"#b05c08", border:"none",
             display:"flex", alignItems:"center", justifyContent:"center",
-            cursor:"pointer", flexShrink:0,
-            fontSize:10, color:"#fff", fontWeight:500, lineHeight:1,
+            cursor:"pointer", fontSize:10, color:"#fff", fontWeight:500, lineHeight:1,
           }}
         >✕</button>
       )}

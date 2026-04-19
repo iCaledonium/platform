@@ -22,10 +22,10 @@ function initials(name) {
   return name?.split(" ").map(n => n[0]).join("").slice(0,2).toUpperCase() || "?";
 }
 
-export default function AppWizard({ user, onClose, onCreated }) {
-  const [path, setPath]             = useState(null);
-  const [step, setStep]             = useState(1);
-  const [toolType, setToolType]     = useState("messages");
+export default function AppWizard({ user, directTool, onClose, onCreated }) {
+  const [path, setPath]             = useState(directTool ? "prebuilt" : null);
+  const [step, setStep]             = useState(directTool ? 2 : 1);
+  const [toolType, setToolType]     = useState(directTool || "messages");
   const [name, setName]             = useState("");
   const [url, setUrl]               = useState("");
   const [keyId, setKeyId]           = useState("");
@@ -96,11 +96,11 @@ export default function AppWizard({ user, onClose, onCreated }) {
     <div className={styles.overlay}>
       <div className={styles.modal}>
         <div className={styles.header}>
-          <p className={styles.title}>New application</p>
+          <p className={styles.title}>{directTool ? `Set up ${TOOL_TYPES.find(t=>t.id===directTool)?.label || directTool}` : "New application"}</p>
           <button className={styles.closeBtn} onClick={onClose}>✕</button>
         </div>
 
-        {!path && (
+        {!path && !directTool && (
           <div className={styles.body}>
             <p className={styles.stepLabel}>How do you want to build this?</p>
             <div className={styles.pathGrid}>
@@ -125,12 +125,16 @@ export default function AppWizard({ user, onClose, onCreated }) {
         {path === "prebuilt" && (
           <>
             <div className={styles.steps}>
-              {["Tool","Name","Contacts","Key"].map((l,i) => (
-                <div key={l} className={`${styles.step} ${step===i+1?styles.stepActive:""} ${step>i+1?styles.stepDone:""}`}>
-                  <div className={styles.stepDot}>{step>i+1?"✓":i+1}</div>
-                  <span>{l}</span>
-                </div>
-              ))}
+              {(directTool ? ["Name","Contacts","Key"] : ["Tool","Name","Contacts","Key"]).map((l,i) => {
+                const idx = directTool ? i+1 : i+1;
+                const adjustedStep = directTool ? step - 1 : step;
+                return (
+                  <div key={l} className={`${styles.step} ${adjustedStep===idx?styles.stepActive:""} ${adjustedStep>idx?styles.stepDone:""}`}>
+                    <div className={styles.stepDot}>{adjustedStep>idx?"✓":idx}</div>
+                    <span>{l}</span>
+                  </div>
+                );
+              })}
             </div>
 
             {step === 1 && (
@@ -166,7 +170,7 @@ export default function AppWizard({ user, onClose, onCreated }) {
                   <input type="text" value={WORLD_NAME} disabled style={{opacity:.5}} />
                 </div>
                 <div className={styles.footer}>
-                  <button className={styles.btnCancel} onClick={() => setStep(1)}>← Back</button>
+                  <button className={styles.btnCancel} onClick={() => directTool ? onClose() : setStep(1)}>← Back</button>
                   <button className={styles.btnNext} disabled={!name} onClick={() => { loadContacts(); setStep(3); }}>Next →</button>
                 </div>
               </div>

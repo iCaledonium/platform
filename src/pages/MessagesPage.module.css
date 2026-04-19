@@ -218,3 +218,21 @@
   flex-shrink: 0;
 }
 .sendBtn:disabled { opacity: .3; cursor: default; }
+/* ADD to MessagesPage.module.css — append at the bottom */
+
+.attachBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: transparent;
+  border: 1px solid rgba(0,0,0,.1);
+  color: #a8a5a0;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background .12s, color .12s;
+}
+.attachBtn:hover { background: rgba(255,255,255,.8); color: #1a1814; }
+.attachBtn:disabled { opacity: .3; cursor: default; }

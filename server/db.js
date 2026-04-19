@@ -112,8 +112,6 @@ const employees = [
   { id: "mk", name: "Magnus Klack",     email: "magnus.klack@anima.se" },
   { id: "tn", name: "Tommy Norberg",    email: "tommy.norberg@anima.se" },
   { id: "jm", name: "Johan Molin",      email: "johan.molin@anima.se" },
-  { id: "as", name: "Amber Söderström", email: "amber.soderstrom@anima.se" },
-  { id: "cb", name: "Clark Bennet",     email: "clark.bennet@anima.se" },
   { id: "dn", name: "David Norberg",    email: "david.norberg@anima.se" },
 ];
 
@@ -132,10 +130,10 @@ for (const e of employees) {
 const STOCKHOLM_ID = "e7368020-fc19-4914-95ac-2f7c5508a13c";
 
 const memberships = [
-  { user_id: "mk", world_id: STOCKHOLM_ID, actor_id: "magnus-klack-actor", role: "owner" },
-  { user_id: "tn", world_id: STOCKHOLM_ID, actor_id: "magnus-klack-actor", role: "viewer" },
-  { user_id: "jm", world_id: STOCKHOLM_ID, actor_id: "magnus-klack-actor", role: "viewer" },
-  { user_id: "dn", world_id: STOCKHOLM_ID, actor_id: "magnus-klack-actor", role: "viewer" },
+  { user_id: "mk", world_id: STOCKHOLM_ID, actor_id: "magnus-klack-actor",   role: "owner" },
+  { user_id: "tn", world_id: STOCKHOLM_ID, actor_id: "tommy-norberg-actor",  role: "viewer" },
+  { user_id: "jm", world_id: STOCKHOLM_ID, actor_id: "johan-molin-actor",    role: "viewer" },
+  { user_id: "dn", world_id: STOCKHOLM_ID, actor_id: "david-norberg-actor",  role: "viewer" },
 ];
 
 const insertMembership = db.prepare(`

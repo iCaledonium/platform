@@ -347,7 +347,8 @@ app.get("/api/notifications", (req, res) => {
   const user = getAuthUser(req);
   if (!user) return res.status(401).json({ error: "not authenticated" });
   const notifs = db.prepare(`
-    SELECT id, sender_actor_id, sender_name, content, app_id, read_at, inserted_at
+    SELECT id, sender_actor_id, sender_name, content, app_id, read_at, inserted_at,
+           conversation_type, sender_actor_type
     FROM notifications
     WHERE user_id = ? AND cleared_at IS NULL
     ORDER BY inserted_at DESC
@@ -451,17 +452,38 @@ app.get("/api/stream", async (req, res) => {
         try {
           const payload = JSON.parse(line.slice(6));
           if (payload.type === "new_message") {
-            // Check privacy — find contact settings
+            // Conversation type → tool type mapping
+            const CONV_TO_TOOL = {
+              text_thread:   "messages",
+              voice_message: "voice",
+              email_thread:  "email",
+              call:          "voice",
+              video_call:    "video",
+            };
+            const convType = payload.conversation_type || "text_thread";
+            const toolType = CONV_TO_TOOL[convType] || "messages";
+
+            // Check privacy
             const contact = contactIds.find(c => c.id === payload.sender_id);
             const privacy = contact?.privacy || "private";
-            // Find the user's messages app
-            const app = db.prepare(`SELECT id FROM registered_tools WHERE user_id = ? AND world_id = ? AND tool_type = 'messages' LIMIT 1`).get(user.id, world_id);
-            // Persist notification to DB
-            const notifId = crypto.randomUUID();
-            db.prepare(`INSERT INTO notifications (id, user_id, world_id, sender_actor_id, sender_name, content, app_id, inserted_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))`)
-              .run(notifId, user.id, world_id, payload.sender_id, payload.sender_name, payload.content, app?.id || null);
-            // Forward to client with notification id
-            res.write(`data: ${JSON.stringify({ ...payload, privacy, notif_id: notifId })}\n\n`);
+
+            // Find matching installed app
+            const app = db.prepare(`SELECT id FROM registered_tools WHERE user_id = ? AND world_id = ? AND tool_type = ? LIMIT 1`).get(user.id, world_id, toolType);
+            const hasApp = !!app;
+
+            // Deduplicate by message_id
+            const existing = db.prepare(`SELECT id FROM notifications WHERE user_id = ? AND message_id = ? LIMIT 1`).get(user.id, payload.message_id);
+
+            let notifId;
+            if (!existing) {
+              notifId = crypto.randomUUID();
+              db.prepare(`INSERT OR IGNORE INTO notifications (id, user_id, world_id, sender_actor_id, sender_name, content, app_id, message_id, conversation_type, sender_actor_type, inserted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`)
+                .run(notifId, user.id, world_id, payload.sender_id, payload.sender_name, payload.content, app?.id || null, payload.message_id || null, convType, payload.sender_actor_type || null);
+            } else {
+              notifId = existing.id;
+            }
+
+            res.write(`data: ${JSON.stringify({ ...payload, privacy, notif_id: notifId, conv_type: convType, tool_type: toolType, has_app: hasApp })}\n\n`);
           } else {
             res.write(`data: ${JSON.stringify(payload)}\n\n`);
           }
