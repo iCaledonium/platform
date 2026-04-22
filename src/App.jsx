@@ -6,6 +6,9 @@ import EnrollPage from "./pages/EnrollPage.jsx";
 import HomePage from "./pages/HomePage.jsx";
 import DeveloperPage from "./pages/DeveloperPage.jsx";
 import MessagesPage from "./pages/MessagesPage.jsx";
+import CalendarPage from "./pages/CalendarPage.jsx";
+import ActorsGalleryPage from "./pages/ActorsGalleryPage.jsx";
+import ActorsEditorPage from "./pages/ActorsEditorPage.jsx";
 
 const CONV_TO_TOOL = {
   text_thread:   "messages",
@@ -17,6 +20,7 @@ const CONV_TO_TOOL = {
 
 const TOOL_LABELS = {
   messages: { label: "SMS",   color: "#378add", bg: "rgba(55,138,221,.1)" },
+  calendar: { label: "Calendar", color: "#b05c08", bg: "rgba(176,92,8,.1)" },
   voice:    { label: "Voice", color: "#1d9e75", bg: "rgba(29,158,117,.1)" },
   email:    { label: "Email", color: "#7f77dd", bg: "rgba(127,119,221,.1)" },
   video:    { label: "Video", color: "#b05c08", bg: "rgba(176,92,8,.1)"   },
@@ -250,10 +254,13 @@ export default function App() {
   return (
     <>
       <Routes>
-        <Route path="/home"      element={<HomePage />} />
-        <Route path="/developer" element={<DeveloperPage />} />
-        <Route path="/messages"  element={<MessagesPage />} />
-        <Route path="*"          element={<Navigate to="/login" replace />} />
+        <Route path="/home"         element={<HomePage />} />
+        <Route path="/developer"    element={<DeveloperPage />} />
+        <Route path="/messages"     element={<MessagesPage />} />
+        <Route path="/calendar"     element={<CalendarPage />} />
+        <Route path="/actors"       element={<ActorsGalleryPage />} />
+        <Route path="/actors/:id"   element={<ActorsEditorPage />} />
+        <Route path="*"             element={<Navigate to="/login" replace />} />
       </Routes>
 
       {/* Bell — portalled into HomePage topbar */}

@@ -2,9 +2,7 @@ import { useState, useEffect } from "react";
 import homeStyles from "./HomePage.module.css";
 import AppWizard from "./AppWizard.jsx";
 import AppConfig from "./AppConfig.jsx";
-
-const WORLD_ID   = "e7368020-fc19-4914-95ac-2f7c5508a13c";
-const WORLD_NAME = "Anima — Stockholm";
+import WorldEnterOverlay from "./WorldEnterOverlay.jsx";
 
 function greeting() {
   const h = new Date().getHours();
@@ -15,16 +13,19 @@ function greeting() {
 
 const TOOL_ICON = {
   messages: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="3" width="12" height="8" rx="1.5" stroke="#378add" stroke-width="1.1"/><path d="M5 7h6M5 9h4" stroke="#378add" stroke-width="1.1" stroke-linecap="round"/></svg>',
+  calendar: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="3" width="12" height="11" rx="1.5" stroke="#b05c08" stroke-width="1.1"/><path d="M5 2v2M11 2v2M2 7h12" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round"/><rect x="5" y="9" width="2" height="2" rx="0.5" fill="#b05c08"/></svg>',
 };
 
 export default function HomePage() {
   const [user, setUser]               = useState(null);
+  const [worlds, setWorlds]           = useState([]);
   const [worldStatus, setWorldStatus] = useState(null);
   const [toggling, setToggling]       = useState(false);
   const [apps, setApps]               = useState([]);
-  const [showWizard, setShowWizard]   = useState(false);
-  const [configApp, setConfigApp]     = useState(null);
-  const [directTool, setDirectTool]   = useState(null);
+  const [showWizard, setShowWizard]         = useState(false);
+  const [configApp, setConfigApp]           = useState(null);
+  const [directTool, setDirectTool]         = useState(null);
+  const [showEnterOverlay, setShowEnterOverlay] = useState(false);
 
   const [pendingCount, setPendingCount] = useState(0);
 
@@ -37,7 +38,13 @@ export default function HomePage() {
         document.title = `Anima — ${data.name}`;
       })
       .catch(() => { window.location.href = "/login"; });
-    fetchStatus();
+    fetch("/api/worlds")
+      .then(r => r.ok ? r.json() : [])
+      .then(data => {
+        setWorlds(data);
+        if (data.length > 0) fetchStatus(data[0].id);
+      })
+      .catch(() => {});
     loadApps();
     checkPendingMessages();
 
@@ -57,8 +64,10 @@ export default function HomePage() {
       .catch(() => {});
   }
 
-  function fetchStatus() {
-    fetch(`/api/worlds/${WORLD_ID}/status`)
+  function fetchStatus(id) {
+    const worldId = id || worlds[0]?.id;
+    if (!worldId) return;
+    fetch(`/api/worlds/${worldId}/status`)
       .then(r => r.json())
       .then(data => setWorldStatus(data.status))
       .catch(() => setWorldStatus("stopped"));
@@ -72,11 +81,12 @@ export default function HomePage() {
   }
 
   async function toggleWorld() {
-    if (toggling) return;
+    const worldId = worlds[0]?.id;
+    if (toggling || !worldId) return;
     setToggling(true);
     const action = worldStatus === "running" ? "stop" : "start";
     try {
-      const res = await fetch(`/api/worlds/${WORLD_ID}/${action}`, { method: "POST" });
+      const res = await fetch(`/api/worlds/${worldId}/${action}`, { method: "POST" });
       const data = await res.json();
       setWorldStatus(data.status);
     } catch { fetchStatus(); }
@@ -97,12 +107,14 @@ export default function HomePage() {
   }
 
   async function openWorld() {
+    const worldId = worlds[0]?.id;
+    if (!worldId) return;
     try {
-      const res = await fetch(`/api/viewer-token?world_id=${WORLD_ID}`);
+      const res = await fetch(`/api/viewer-token?world_id=${worldId}`);
       const { token } = await res.json();
-      window.open(`/worlds/${WORLD_ID}?viewer=${token}`, "_blank");
+      window.open(`https://anima.simulator.ngrok.dev/worlds/${worldId}?viewer=${token}`, "_blank");
     } catch {
-      window.open(`/worlds/${WORLD_ID}`, "_blank");
+      window.open(`https://anima.simulator.ngrok.dev/worlds/${worldId}`, "_blank");
     }
   }
 
@@ -134,9 +146,18 @@ export default function HomePage() {
         {showWizard && (
           <AppWizard
             user={user}
+            worlds={worlds}
             directTool={directTool}
             onClose={() => { setShowWizard(false); setDirectTool(null); }}
             onCreated={onAppCreated}
+          />
+        )}
+
+        {showEnterOverlay && worlds[0] && (
+          <WorldEnterOverlay
+            world={worlds[0]}
+            user={user}
+            onClose={() => setShowEnterOverlay(false)}
           />
         )}
 
@@ -171,7 +192,7 @@ export default function HomePage() {
             <div className={homeStyles.worldLeft}>
               <div className={`${homeStyles.dot} ${running ? homeStyles.dotRunning : homeStyles.dotStopped}`} />
               <div>
-                <p className={homeStyles.worldName}>{WORLD_NAME}</p>
+                <p className={homeStyles.worldName}>{worlds[0]?.name || "—"}</p>
                 <p className={`${homeStyles.worldStatusText} ${running ? homeStyles.statusRunning : homeStyles.statusStopped}`}>
                   {worldStatus === null ? "Checking..." : running ? "Running" : "Stopped"}
                 </p>
@@ -182,12 +203,15 @@ export default function HomePage() {
                 {toggling ? "..." : running ? "Stop" : "Start"}
               </button>
               <button className={homeStyles.btnOpen} disabled={!running} onClick={openWorld}>
-                Open →
+                Monitor →
+              </button>
+              <button className={homeStyles.btnEnter} disabled={!running} onClick={() => setShowEnterOverlay(true)}>
+                Enter →
               </button>
             </div>
           </div>
           <div className={homeStyles.worldStats}>
-            {[["12","Actors"],["3","Companions"],["9","NPCs"],["4","Players"]].map(([n,l]) => (
+            {[["11","Characters"],["4","Users"]].map(([n,l]) => (
               <div key={l} className={homeStyles.stat}>
                 <p className={homeStyles.statN}>{n}</p>
                 <p className={homeStyles.statL}>{l}</p>
@@ -207,7 +231,7 @@ export default function HomePage() {
               </span>
               </div>
               <p className={homeStyles.appName}>{app.name}</p>
-              <p className={homeStyles.appMeta}>{WORLD_NAME}</p>
+              <p className={homeStyles.appMeta}>{worlds.find(w => w.id === app.world_id)?.name || app.world_id}</p>
               <div className={homeStyles.appFooter}>
                 <button className={homeStyles.btnAppConfigure} onClick={e => { e.stopPropagation(); setConfigApp(app); }}>Configure</button>
                 <button className={homeStyles.btnAppOpen} onClick={e => { e.stopPropagation(); openApp(app); }}>Open →</button>
@@ -258,12 +282,23 @@ export default function HomePage() {
         <p className={homeStyles.sectionLabel}>Builder tools</p>
         <div className={homeStyles.toolsGrid} style={{marginBottom: "2.5rem"}}>
           {BUILDER_TOOLS.map(t => (
-            <div key={t.name} className={homeStyles.toolCard}>
-              <span className={homeStyles.soonBadge}>soon</span>
-              <div className={homeStyles.toolIcon} dangerouslySetInnerHTML={{__html: t.svg}} />
-              <p className={homeStyles.toolName}>{t.name}</p>
-              <p className={homeStyles.toolDesc}>{t.desc}</p>
-            </div>
+            t.name === "Character editor"
+              ? (
+                <div key={t.name} className={`${homeStyles.toolCard} ${homeStyles.toolCardLive}`} style={{cursor:"pointer"}} onClick={() => window.location.href="/actors"}>
+                  <span className={homeStyles.liveBadge}>live</span>
+                  <div className={homeStyles.toolIcon} dangerouslySetInnerHTML={{__html: t.svg}} />
+                  <p className={homeStyles.toolName}>{t.name}</p>
+                  <p className={homeStyles.toolDesc}>{t.desc}</p>
+                </div>
+              )
+              : (
+                <div key={t.name} className={homeStyles.toolCard}>
+                  <span className={homeStyles.soonBadge}>soon</span>
+                  <div className={homeStyles.toolIcon} dangerouslySetInnerHTML={{__html: t.svg}} />
+                  <p className={homeStyles.toolName}>{t.name}</p>
+                  <p className={homeStyles.toolDesc}>{t.desc}</p>
+                </div>
+              )
           ))}
         </div>
 
@@ -350,7 +385,7 @@ const INTEGRATIONS = [
 
 const BUILDER_TOOLS = [
   { name: "World wizard",      desc: "Create new simulation worlds.",  svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="5" height="5" rx="1" stroke="#b05c08" stroke-width="1.1"/><rect x="9" y="2" width="5" height="5" rx="1" stroke="#b05c08" stroke-width="1.1"/><rect x="2" y="9" width="5" height="5" rx="1" stroke="#b05c08" stroke-width="1.1"/><rect x="9" y="9" width="5" height="5" rx="1" stroke="#b05c08" stroke-width="1.1"/></svg>' },
-  { name: "Actor editor",      desc: "Design psychology and voice.",   svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="5" r="3" stroke="#b05c08" stroke-width="1.1"/><path d="M2 14c0-3.314 2.686-5 6-5s6 1.686 6 5" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round"/></svg>' },
+  { name: "Character editor",      desc: "Design psychology and voice.",   svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="5" r="3" stroke="#b05c08" stroke-width="1.1"/><path d="M2 14c0-3.314 2.686-5 6-5s6 1.686 6 5" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round"/></svg>' },
   { name: "Place editor",      desc: "Map-first venue setup.",         svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="5.5" stroke="#b05c08" stroke-width="1.1"/><circle cx="8" cy="8" r="1.5" fill="#b05c08"/><path d="M8 2.5v2M8 11.5v2M2.5 8h2M11.5 8h2" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round"/></svg>' },
   { name: "Scenario designer", desc: "Timeline events and arcs.",      svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 12V6l6-4 6 4v6" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/><rect x="5" y="8" width="6" height="6" rx="0.5" stroke="#b05c08" stroke-width="1.1"/></svg>' },
   { name: "Narrative weaver",  desc: "Relationship graph design.",     svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="4" cy="8" r="2" stroke="#b05c08" stroke-width="1.1"/><circle cx="12" cy="4" r="2" stroke="#b05c08" stroke-width="1.1"/><circle cx="12" cy="12" r="2" stroke="#b05c08" stroke-width="1.1"/><path d="M6 8h2.5M10.2 5.2L6.8 7.2M10.2 10.8L6.8 8.8" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round"/></svg>' },

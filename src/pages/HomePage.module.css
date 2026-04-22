@@ -147,6 +147,22 @@
 }
 .btnOpen:hover { background: #2a2620; }
 .btnOpen:disabled { opacity: .3; cursor: default; }
+.btnEnter {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  padding: 10px 22px;
+  border-radius: 10px;
+  background: #c9973a;
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  transition: background .2s;
+}
+.btnEnter:hover { background: #b07f2a; }
+.btnEnter:disabled { opacity: .3; cursor: default; }
 .btnBoot {
   font-family: 'DM Sans', system-ui, sans-serif;
   font-size: 12px;

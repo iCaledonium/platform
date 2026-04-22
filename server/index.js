@@ -1,9 +1,14 @@
 import express from "express";
+import { createProxyMiddleware } from "http-proxy-middleware";
 import crypto from "crypto";
 import { randomUUID } from "crypto";
 import * as OTPAuth from "otpauth";
 import QRCode from "qrcode";
+import path from "path";
+import { fileURLToPath } from "url";
 import db from "./db.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 app.use(express.json());
@@ -94,6 +99,14 @@ app.get("/api/auth/check", (req, res) => {
   res.status(200).end();
 });
 
+// ── GET /api/users — org members for share picker ────────────────────────────
+app.get("/api/users", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const users = db.prepare(`SELECT id, name, email FROM users WHERE id != ? AND status = 'active' ORDER BY name`).all(user.id);
+  res.json(users);
+});
+
 app.get("/api/me", (req, res) => {
   const cookieHeader = req.headers["cookie"] || "";
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
@@ -107,6 +120,43 @@ app.get("/api/me", (req, res) => {
   if (!row) return res.status(401).json({ error: "not authenticated" });
   const worlds = db.prepare(`SELECT world_id, actor_id, role FROM world_memberships WHERE user_id = ?`).all(row.id);
   res.json({ id: row.id, name: row.name, email: row.email, worlds });
+});
+
+// ── GET /api/worlds ───────────────────────────────────────────────────────────
+app.get("/api/worlds", async (req, res) => {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  if (!match) return res.status(401).json({ error: "not authenticated" });
+  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+  const user = db.prepare(`
+    SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id
+    WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')
+  `).get(hash);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+
+  const memberships = db.prepare(`
+    SELECT world_id, actor_id, role FROM world_memberships WHERE user_id = ?
+  `).all(user.id);
+
+  if (memberships.length === 0) return res.json([]);
+
+  const ids = memberships.map(m => m.world_id).join(",");
+  try {
+    const simRes = await fetch(`${SIMULATOR_URL}/internal/worlds?ids=${ids}`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN },
+    });
+    const worlds = await simRes.json();
+    // Merge simulator metadata with platform role/actor
+    const membershipMap = Object.fromEntries(memberships.map(m => [m.world_id, m]));
+    const enriched = worlds.map(w => ({
+      ...w,
+      role:     membershipMap[w.id]?.role,
+      actor_id: membershipMap[w.id]?.actor_id,
+    }));
+    res.json(enriched);
+  } catch {
+    res.status(502).json({ error: "simulator unreachable" });
+  }
 });
 
 // ── POST /api/auth/signout ───────────────────────────────────────────────────
@@ -133,7 +183,7 @@ app.post("/api/auth/signout", (req, res) => {
   res.json({ ok: true });
 });
 
-const SIMULATOR_URL = "http://localhost:4000";
+const SIMULATOR_URL = "http://192.168.1.58:4000";
 const SERVICE_TOKEN = process.env.PLATFORM_SERVICE_TOKEN || "";
 
 async function simFetch(path, method = "GET") {
@@ -493,7 +543,7 @@ app.get("/api/stream", async (req, res) => {
               call:          "voice",
               video_call:    "video",
             };
-            const convType = payload.conversation_type || "text_thread";
+            const convType = payload.conversation_type || (payload.message_type === "voice_message" ? "voice_message" : payload.message_type === "email" ? "email_thread" : "text_thread");
             const toolType = CONV_TO_TOOL[convType] || "messages";
 
             // Check privacy
@@ -528,5 +578,493 @@ app.get("/api/stream", async (req, res) => {
   res.end();
 });
 
+// ── GET /api/actors/:id/shares ────────────────────────────────────────────────
+app.get("/api/actors/:id/shares", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
+  if (!actor) return res.status(404).json({ error: "not found" });
+  const shares = db.prepare(`
+    SELECT s.id, s.shared_with_id, s.permission, s.inserted_at, u.name, u.email
+    FROM actor_shares s JOIN users u ON u.id = s.shared_with_id
+    WHERE s.actor_id = ?
+    ORDER BY s.inserted_at
+  `).all(req.params.id);
+  res.json(shares);
+});
+
+// ── POST /api/actors/:id/shares ───────────────────────────────────────────────
+app.post("/api/actors/:id/shares", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
+  if (!actor) return res.status(404).json({ error: "not found" });
+  const { email, permission = "read" } = req.body;
+  if (!email) return res.status(400).json({ error: "email required" });
+  const target = db.prepare(`SELECT id, name FROM users WHERE email = ?`).get(email);
+  if (!target) return res.status(404).json({ error: "user not found" });
+  if (target.id === user.id) return res.status(400).json({ error: "cannot share with yourself" });
+  const now = new Date().toISOString();
+  try {
+    db.prepare(`INSERT INTO actor_shares (id, actor_id, owner_id, shared_with_id, shared_with_type, permission, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(randomUUID(), req.params.id, user.id, target.id, "user", permission, now, now);
+    res.json({ ok: true, name: target.name, shared_with_id: target.id, permission });
+  } catch (e) {
+    if (e.message?.includes("UNIQUE")) return res.status(409).json({ error: "already shared" });
+    throw e;
+  }
+});
+
+// ── DELETE /api/actors/:id/shares/:shared_with_id ─────────────────────────────
+app.delete("/api/actors/:id/shares/:shared_with_id", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  db.prepare(`DELETE FROM actor_shares WHERE actor_id = ? AND shared_with_id = ? AND owner_id = ?`)
+    .run(req.params.id, req.params.shared_with_id, user.id);
+  res.json({ ok: true });
+});
+
+// ── Update actors gallery to include shared actors ────────────────────────────
+app.get("/api/actors/shared", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const actors = db.prepare(`
+    SELECT a.id, a.name, a.age, a.gender, a.occupation, a.status,
+           p.attachment_style, b.openness, b.neuroticism, s.permission,
+           (SELECT url FROM actor_media WHERE actor_id = a.id AND media_type = 'photo' AND state_slug IN ('photo_close','profile') LIMIT 1) as photo_url
+    FROM actor_shares s
+    JOIN actors a ON a.id = s.actor_id
+    LEFT JOIN actor_psychology p ON p.actor_id = a.id
+    LEFT JOIN actor_big5 b ON b.actor_id = a.id
+    WHERE s.shared_with_id = ?
+    ORDER BY a.name
+  `).all(user.id);
+  res.json(actors);
+});
+app.get("/api/actors/:id/media", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
+  if (!actor) return res.status(404).json({ error: "not found" });
+  const media = db.prepare(`SELECT * FROM actor_media WHERE actor_id = ? ORDER BY media_type, inserted_at`).all(req.params.id);
+  res.json(media);
+});
+
+// ── GET /api/actors/:id/worlds — worlds this actor is running in ──────────────
+app.get("/api/actors/:id/worlds", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const { id } = req.params;
+  const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND (owner_id = ? OR id IN (SELECT actor_id FROM actor_shares WHERE shared_with_id = ?))`).get(id, user.id, user.id);
+  if (!actor) return res.status(404).json({ error: "not found" });
+  try {
+    const simRes = await fetch(`${SIMULATOR_URL}/internal/actor-worlds/${id}`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN }
+    });
+    if (!simRes.ok) return res.json([]);
+    const data = await simRes.json();
+    res.json(data);
+  } catch {
+    res.json([]);
+  }
+});
+
+// ── Static media ─────────────────────────────────────────────────────────────
+app.use("/media", express.static(path.join(__dirname, "../public/media")));
+
 const PORT = 4002;
-app.listen(PORT, () => console.log(`Platform API running on :${PORT}`));
+// ── Simulator proxies ─────────────────────────────────────────────────────────
+// ── Simulator proxies — each route gets its own instance (v2 requirement) ─────
+const SIM = "http://192.168.1.58:4000";
+
+// /sim/* — LiveView pages
+app.use("/sim", createProxyMiddleware({ target: SIM, changeOrigin: true, ws: true, pathRewrite: { "^/sim": "" } }));
+
+// /js — LiveView JS assets
+app.use("/js", createProxyMiddleware({ target: SIM, changeOrigin: true }));
+
+// /assets/* — proxy simulator assets if not in platform dist
+app.use("/assets", (req, res, next) => {
+  const localPath = path.join(__dirname, "../dist/assets", path.basename(req.path));
+  if (!fs.existsSync(localPath)) return createProxyMiddleware({ target: SIM, changeOrigin: true })(req, res, next);
+  next();
+});
+
+// /live — LiveView WebSocket
+app.use("/live", createProxyMiddleware({ target: SIM, changeOrigin: true, ws: true }));
+
+// /phoenix — Phoenix channels WebSocket
+app.use("/phoenix", createProxyMiddleware({ target: SIM, changeOrigin: true, ws: true }));
+
+// Create HTTP server explicitly so WebSocket upgrades can be forwarded
+import { createServer } from "http";
+const server = createServer(app);
+
+// Attach WebSocket upgrade handlers for LiveView
+const liveWsProxy  = createProxyMiddleware({ target: SIM, changeOrigin: true, ws: true });
+const simPageProxy = createProxyMiddleware({ target: SIM, changeOrigin: true, ws: true, pathRewrite: { "^/sim": "" } });
+
+server.on("upgrade", (req, socket, head) => {
+  if (req.url.startsWith("/live")) {
+    liveWsProxy.upgrade(req, socket, head);
+  } else if (req.url.startsWith("/sim")) {
+    simPageProxy.upgrade(req, socket, head);
+  } else if (req.url.startsWith("/phoenix")) {
+    liveWsProxy.upgrade(req, socket, head);
+  }
+});
+
+server.listen(PORT, () => console.log(`Platform API running on :${PORT}`));
+
+// ── GET /api/actors — list canonical actors owned by or shared with the user ─
+app.get("/api/actors", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const actors = db.prepare(`
+    SELECT a.id, a.name, a.age, a.gender, a.occupation, a.status,
+           p.attachment_style, b.openness, b.conscientiousness, b.extraversion, b.agreeableness, b.neuroticism,
+           (SELECT url FROM actor_media WHERE actor_id = a.id AND media_type = 'photo' AND state_slug IN ('photo_close','profile') LIMIT 1) as photo_url
+    FROM actors a
+    LEFT JOIN actor_psychology p ON p.actor_id = a.id
+    LEFT JOIN actor_big5 b ON b.actor_id = a.id
+    WHERE a.owner_id = ?
+    ORDER BY a.name
+  `).all(user.id);
+  res.json(actors);
+});
+
+// ── GET /api/actors/:id — full canonical profile ──────────────────────────────
+app.get("/api/actors/:id", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const { id } = req.params;
+
+  // Allow owner or anyone with a share
+  let actor = db.prepare(`SELECT a.*, (SELECT url FROM actor_media WHERE actor_id = a.id AND media_type = 'photo' AND state_slug IN ('photo_close','profile') LIMIT 1) as photo_url FROM actors a WHERE a.id = ? AND a.owner_id = ?`).get(id, user.id);
+  if (!actor) {
+    const share = db.prepare(`SELECT permission FROM actor_shares WHERE actor_id = ? AND shared_with_id = ?`).get(id, user.id);
+    if (!share) return res.status(404).json({ error: "not found" });
+    actor = db.prepare(`SELECT a.*, (SELECT url FROM actor_media WHERE actor_id = a.id AND media_type = 'photo' AND state_slug IN ('photo_close','profile') LIMIT 1) as photo_url, ? as permission FROM actors a WHERE a.id = ?`).get(share.permission, id);
+    if (!actor) return res.status(404).json({ error: "not found" });
+  }
+
+  const psychology = db.prepare(`SELECT * FROM actor_psychology WHERE actor_id = ?`).get(id);
+  const big5       = db.prepare(`SELECT * FROM actor_big5 WHERE actor_id = ?`).get(id);
+  const disc       = db.prepare(`SELECT * FROM actor_disc WHERE actor_id = ?`).get(id);
+  const hds        = db.prepare(`SELECT * FROM actor_hds WHERE actor_id = ?`).get(id);
+  const lifestyle  = db.prepare(`SELECT * FROM actor_lifestyle WHERE actor_id = ?`).get(id);
+  const economic   = db.prepare(`SELECT * FROM actor_economic WHERE actor_id = ?`).get(id);
+  const mental     = db.prepare(`SELECT * FROM actor_mental_health WHERE actor_id = ?`).get(id);
+  const upbringing = db.prepare(`SELECT * FROM actor_upbringing WHERE actor_id = ?`).get(id);
+  const education  = db.prepare(`SELECT * FROM actor_education WHERE actor_id = ? ORDER BY inserted_at`).all(id);
+  const diagnoses  = db.prepare(`SELECT * FROM actor_diagnoses WHERE actor_id = ? ORDER BY inserted_at`).all(id);
+  const expenses   = db.prepare(`SELECT * FROM actor_expense_defaults WHERE actor_id = ? ORDER BY name`).all(id);
+
+  res.json({ actor, psychology, big5, disc, hds, lifestyle, economic, mental, upbringing, education, diagnoses, expenses });
+});
+
+// ── PUT /api/actors/:id — update canonical profile ────────────────────────────
+app.put("/api/actors/:id", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const { id } = req.params;
+  const { section, data } = req.body;
+
+  const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(id, user.id);
+  if (!actor) return res.status(404).json({ error: "not found" });
+
+  const now = new Date().toISOString();
+
+  const TABLES = {
+    actor:      { table: "actors",            pk: "id" },
+    psychology: { table: "actor_psychology",  pk: "actor_id" },
+    big5:       { table: "actor_big5",        pk: "actor_id" },
+    disc:       { table: "actor_disc",        pk: "actor_id" },
+    hds:        { table: "actor_hds",         pk: "actor_id" },
+    lifestyle:  { table: "actor_lifestyle",   pk: "actor_id" },
+    economic:   { table: "actor_economic",    pk: "actor_id" },
+    mental:     { table: "actor_mental_health", pk: "actor_id" },
+    upbringing: { table: "actor_upbringing",  pk: "actor_id" },
+  };
+
+  const target = TABLES[section];
+  if (!target) return res.status(400).json({ error: "unknown section" });
+
+  const fields = Object.keys(data).filter(k => k !== target.pk && k !== "inserted_at");
+  const sets   = fields.map(f => `${f} = ?`).join(", ");
+  const values = fields.map(f => data[f]);
+
+  db.prepare(`UPDATE ${target.table} SET ${sets}, updated_at = ? WHERE ${target.pk} = ?`)
+    .run(...values, now, id);
+
+  res.json({ ok: true });
+});
+
+// ── Helper: auth from cookie ──────────────────────────────────────────────────
+function authUser(req) {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  if (!match) return null;
+  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+  return db.prepare(`SELECT u.id, u.name FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+}
+
+
+// ── POST /api/worlds/:world_id/meetings/confirm ───────────────────────────────
+// Player accepts a meetup proposal — writes PlannedMeeting on simulator,
+// Amber's engine fires the meeting when scheduled_at is reached.
+app.post("/api/worlds/:world_id/meetings/confirm", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  try {
+    const resp = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/meetings/confirm`, {
+      method: "POST",
+      headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify(req.body),
+    });
+    res.json(await resp.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── POST /api/worlds/:world_id/actors/:actor_id/messages/:contact_id/respond/:msg_id
+// Marks a proposal message as responded on the simulator.
+app.post("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id/respond/:msg_id", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  try {
+    const resp = await fetch(
+      `${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/messages/${req.params.contact_id}/respond/${req.params.msg_id}`,
+      { method: "POST", headers: { "X-Service-Token": SERVICE_TOKEN } }
+    );
+    res.json(await resp.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/worlds/:world_id/actors/:actor_id/calendar ──────────────────────
+// Returns today's schedule slots + upcoming confirmed planned meetings.
+app.get("/api/worlds/:world_id/actors/:actor_id/calendar", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  try {
+    const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/calendar`);
+    res.json(data);
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+
+// ── GET /api/worlds/:world_id/presence ───────────────────────────────────────
+app.get("/api/worlds/:world_id/presence", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  try {
+    const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ? LIMIT 1`).get(user.id, req.params.world_id);
+    const playerActorId = membership?.actor_id || "";
+    res.json(await simFetch(`/internal/worlds/${req.params.world_id}/presence?player_actor_id=${playerActorId}`));
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── POST /api/worlds/:world_id/spawn ─────────────────────────────────────────
+app.post("/api/worlds/:world_id/spawn", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const { world_id } = req.params;
+  const { location_id } = req.body;
+  if (!location_id) return res.status(400).json({ error: "location_id required" });
+  const membership = db.prepare(
+    `SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`
+  ).get(user.id, world_id);
+  if (!membership) return res.status(403).json({ error: "not a member of this world" });
+  try {
+    const resp = await fetch(
+      `${SIMULATOR_URL}/internal/worlds/${world_id}/player/${membership.actor_id}/spawn`,
+      {
+        method:  "POST",
+        headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+        body:    JSON.stringify({ location_id }),
+      }
+    );
+    res.json(await resp.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/actors/:actor_id/stream — SSE proxy ─────────────────────────────
+app.get("/api/actors/:actor_id/stream", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).end();
+  const { actor_id } = req.params;
+  const membership = db.prepare(
+    `SELECT actor_id FROM world_memberships WHERE user_id = ? AND actor_id = ?`
+  ).get(user.id, actor_id);
+  if (!membership) return res.status(403).end();
+  try {
+    const simResp = await fetch(
+      `${SIMULATOR_URL}/internal/actors/${actor_id}/stream`,
+      { headers: { "X-Service-Token": SERVICE_TOKEN } }
+    );
+    res.setHeader("Content-Type",      "text/event-stream");
+    res.setHeader("Cache-Control",     "no-cache");
+    res.setHeader("Connection",        "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+    const reader = simResp.body.getReader();
+    const pump = async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(Buffer.from(value));
+        }
+      } catch {}
+      res.end();
+    };
+    pump();
+    req.on("close", () => { try { reader.cancel(); } catch {} });
+  } catch { res.status(502).end(); }
+});
+
+// ── POST /api/worlds/:world_id/encounter/start ───────────────────────────────
+app.post("/api/worlds/:world_id/encounter/start", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const { world_id } = req.params;
+  const membership = db.prepare(
+    `SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`
+  ).get(user.id, world_id);
+  if (!membership) return res.status(403).json({ error: "not a member of this world" });
+  const { target_actor_id, location_id, trigger } = req.body;
+  try {
+    const resp = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/encounter/start`, {
+      method:  "POST",
+      headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+      body:    JSON.stringify({
+        trigger:         trigger || "knock",
+        target_actor_id: target_actor_id,
+        player_actor_id: membership.actor_id,
+        location_id:     location_id
+      })
+    });
+    res.json(await resp.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── POST /api/worlds/:world_id/encounter/:encounter_id/end ────────────────────
+app.post("/api/worlds/:world_id/encounter/:encounter_id/end", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  try {
+    const resp = await fetch(
+      `${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/encounter/${req.params.encounter_id}/end`,
+      { method: "POST", headers: { "X-Service-Token": SERVICE_TOKEN } }
+    );
+    res.json(await resp.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/worlds/:world_id/encounter/:encounter_id ─────────────────────────
+app.get("/api/worlds/:world_id/encounter/:encounter_id", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  try {
+    res.json(await simFetch(
+      `/internal/worlds/${req.params.world_id}/encounter/${req.params.encounter_id}`
+    ));
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── POST /api/worlds/:world_id/encounter/:encounter_id/enter ─────────────────
+app.post("/api/worlds/:world_id/encounter/:encounter_id/enter", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  try {
+    const resp = await fetch(
+      `${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/encounter/${req.params.encounter_id}/enter`,
+      { method: "POST", headers: { "X-Service-Token": SERVICE_TOKEN } }
+    );
+    res.json(await resp.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── POST /api/worlds/:world_id/encounter/:encounter_id/message ────────────────
+app.post("/api/worlds/:world_id/encounter/:encounter_id/message", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const { content } = req.body;
+  if (!content) return res.status(400).json({ error: "content required" });
+  try {
+    const resp = await fetch(
+      `${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/encounter/${req.params.encounter_id}/message`,
+      {
+        method:  "POST",
+        headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+        body:    JSON.stringify({ content })
+      }
+    );
+    res.json(await resp.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── POST /api/worlds/:world_id/leave — clear player location ─────────────────
+app.post("/api/worlds/:world_id/leave", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const { world_id } = req.params;
+  const membership = db.prepare(
+    `SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`
+  ).get(user.id, world_id);
+  if (!membership) return res.status(403).json({ error: "not a member of this world" });
+  try {
+    const resp = await fetch(
+      `${SIMULATOR_URL}/internal/worlds/${world_id}/player/${membership.actor_id}/leave`,
+      { method: "POST", headers: { "X-Service-Token": SERVICE_TOKEN } }
+    );
+    res.json(await resp.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/places/:place_id/photos — venue photos list ─────────────────────
+app.get("/api/places/:place_id/photos", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const { place_id } = req.params;
+  if (!/^[a-zA-Z0-9_\-]+$/.test(place_id)) return res.status(400).end();
+  try {
+    res.json(await simFetch(`/internal/places/${place_id}/photos`));
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/places/:place_id/photo — venue photo proxy ──────────────────────
+app.get("/api/places/:place_id/photo", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).end();
+  const { place_id } = req.params;
+  if (!/^[a-zA-Z0-9_\-]+$/.test(place_id)) return res.status(400).end();
+  try {
+    const simResp = await fetch(
+      `${SIMULATOR_URL}/internal/places/${place_id}/photo`,
+      { headers: { "X-Service-Token": SERVICE_TOKEN } }
+    );
+    if (!simResp.ok) return res.status(simResp.status).end();
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    const buf = await simResp.arrayBuffer();
+    res.send(Buffer.from(buf));
+  } catch { res.status(502).end(); }
+});
+
+// ── Serve React SPA ───────────────────────────────────────────────────────────
+import { createRequire } from "module";
+const _require = createRequire(import.meta.url);
+const fs = _require("fs");
+
+
+const distPath = path.join(__dirname, "../dist");
+if (fs.existsSync(distPath)) {
+  app.use(express.static(distPath));
+  app.get("*", (req, res) => {
+    if (req.path.startsWith("/assets/")) { return res.status(404).end(); }
+    if (!req.path.startsWith("/api") && !req.path.startsWith("/media")) {
+      res.sendFile(path.join(distPath, "index.html"));
+    }
+  });
+}
+

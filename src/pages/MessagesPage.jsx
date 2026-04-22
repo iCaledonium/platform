@@ -78,7 +78,7 @@ function DocBubble({ attachment, fromMe }) {
   );
 }
 
-function ProposalBubble({ message, onAccept, onDecline }) {
+function ProposalBubble({ message, onAccept, onDecline, hasCalendar }) {
   const payload = (() => {
     try { return message.payload ? JSON.parse(message.payload) : null; }
     catch { return null; }
@@ -112,19 +112,32 @@ function ProposalBubble({ message, onAccept, onDecline }) {
         <p style={{fontFamily:"DM Sans,system-ui,sans-serif",fontSize:12,color:"#6b6760",margin:0}}>🕐 {time}</p>
       </div>
       {!responded ? (
-        <div style={{display:"flex",gap:7}}>
-          <button onClick={() => onAccept(message, venue, time)} style={{
-            flex:1,padding:"7px 0",borderRadius:9,
-            background:"#1a7a35",color:"white",border:"none",
-            fontFamily:"DM Sans,system-ui,sans-serif",fontSize:12,fontWeight:500,cursor:"pointer"
-          }}>✓ Accept</button>
-          <button onClick={() => onDecline(message, venue)} style={{
-            flex:1,padding:"7px 0",borderRadius:9,
-            background:"rgba(0,0,0,.06)",color:"#6b6760",
-            border:"1px solid rgba(0,0,0,.1)",
-            fontFamily:"DM Sans,system-ui,sans-serif",fontSize:12,fontWeight:500,cursor:"pointer"
-          }}>✗ Decline</button>
-        </div>
+        hasCalendar ? (
+          <div style={{display:"flex",gap:7}}>
+            <button onClick={() => onAccept(message, venue, time)} style={{
+              flex:1,padding:"7px 0",borderRadius:9,
+              background:"#1a7a35",color:"white",border:"none",
+              fontFamily:"DM Sans,system-ui,sans-serif",fontSize:12,fontWeight:500,cursor:"pointer"
+            }}>✓ Accept</button>
+            <button onClick={() => onDecline(message, venue)} style={{
+              flex:1,padding:"7px 0",borderRadius:9,
+              background:"rgba(0,0,0,.06)",color:"#6b6760",
+              border:"1px solid rgba(0,0,0,.1)",
+              fontFamily:"DM Sans,system-ui,sans-serif",fontSize:12,fontWeight:500,cursor:"pointer"
+            }}>✗ Decline</button>
+          </div>
+        ) : (
+          <div style={{textAlign:"center",padding:"6px 0"}}>
+            <p style={{fontFamily:"DM Sans,system-ui,sans-serif",fontSize:11,color:"#a8a5a0",margin:"0 0 6px"}}>Install Calendar to respond</p>
+            <a href="/home?install=calendar" style={{
+              display:"inline-block",padding:"6px 14px",borderRadius:8,
+              background:"rgba(176,92,8,.08)",color:"#b05c08",
+              border:"1px solid rgba(176,92,8,.2)",
+              fontFamily:"DM Sans,system-ui,sans-serif",fontSize:12,fontWeight:500,
+              textDecoration:"none"
+            }}>+ Add Calendar</a>
+          </div>
+        )
       ) : (
         <p style={{fontFamily:"DM Sans,system-ui,sans-serif",fontSize:11,color:"#a8a5a0",textAlign:"center"}}>Responded</p>
       )}
@@ -149,6 +162,7 @@ export default function MessagesPage() {
   const [uploading, setUploading]         = useState(false);
   const [dragging, setDragging]           = useState(false);
   const [context, setContext]             = useState(null); // { memories, conflicts }
+  const [hasCalendar, setHasCalendar]     = useState(false);
   const pollRef     = useRef(null);
   const bottomRef   = useRef(null);
   const fileInputRef = useRef(null);
@@ -195,6 +209,13 @@ export default function MessagesPage() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // Check calendar app on mount — independent of conversation loading
+  useEffect(() => {
+    fetch("/api/apps")
+      .then(r => r.ok ? r.json() : [])
+      .then(apps => setHasCalendar(apps.some(a => a.tool_type === "calendar")));
+  }, []);
 
   function loadContacts(worldId, actorId, contactIds) {
     fetch(`/api/worlds/${worldId}/actors/${actorId}/contacts`)
@@ -289,15 +310,36 @@ export default function MessagesPage() {
   async function acceptProposal(message, venue, time) {
     const world = me?.worlds?.[0];
     if (!world || !selected) return;
+
+    const payload = (() => { try { return message.payload ? JSON.parse(message.payload) : {}; } catch { return {}; } })();
+
+    // 1. Confirm meeting on simulator
+    await fetch(`/api/worlds/${world.world_id}/meetings/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        actor_a_id:   selected.id,
+        actor_a_name: selected.name,
+        actor_b_id:   world.actor_id,
+        actor_b_name: me.name,
+        message_id:   message.id,
+        payload:      { ...payload, type: payload.type || "book" },
+      }),
+    });
+
+    // 2. Send acceptance text reply
     const reply = `Yes, ${venue} at ${time} works for me!`;
     await fetch(`/api/worlds/${world.world_id}/actors/${world.actor_id}/messages/${selected.id}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: reply, sender_name: me.name }),
     });
+
+    // 3. Mark proposal as responded
     await fetch(`/api/worlds/${world.world_id}/actors/${world.actor_id}/messages/${selected.id}/respond/${message.id}`, {
       method: "POST",
     });
+
     loadMessages(world.world_id, world.actor_id, selected.id);
   }
 
@@ -520,7 +562,7 @@ export default function MessagesPage() {
                     {m.attachment
                       ? <DocBubble attachment={m.attachment} fromMe={m.from_me} />
                       : (!m.from_me && m.payload && (() => { try { const p = JSON.parse(m.payload); return p.locationname || p.location_name; } catch { return false; } })())
-                        ? <ProposalBubble message={m} onAccept={acceptProposal} onDecline={declineProposal} />
+                        ? <ProposalBubble message={m} onAccept={acceptProposal} onDecline={declineProposal} hasCalendar={hasCalendar} />
                         : <p className={styles.bubbleText}>{m.content}</p>
                     }
                     <p className={styles.bubbleTime}>{fmtTime(m.sent_at)}</p>

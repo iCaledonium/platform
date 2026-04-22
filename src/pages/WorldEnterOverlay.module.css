@@ -1,0 +1,312 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500&family=Cormorant+Garamond:ital,wght@0,400;0,500;1,400&display=swap');
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: #eeecea;
+  display: flex;
+  flex-direction: column;
+  font-family: 'DM Sans', sans-serif;
+}
+
+/* ── Header ── */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  border-bottom: 0.5px solid rgba(0,0,0,0.1);
+  background: rgba(238,236,234,0.97);
+  flex-shrink: 0;
+}
+
+.headerLeft {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.worldDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4ade80;
+  box-shadow: 0 0 0 2px rgba(74,222,128,0.2);
+  flex-shrink: 0;
+}
+
+.worldName {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 18px;
+  font-weight: 500;
+  color: #1a1a1a;
+  display: block;
+  line-height: 1.2;
+}
+
+.worldSub {
+  font-size: 11px;
+  color: #999;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  display: block;
+}
+
+.headerRight {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.worldTime {
+  font-size: 12px;
+  color: #888;
+  font-variant-numeric: tabular-nums;
+}
+
+.closeBtn {
+  font-size: 12px;
+  color: #888;
+  cursor: pointer;
+  padding: 6px 12px;
+  border: 0.5px solid rgba(0,0,0,0.15);
+  border-radius: 6px;
+  background: transparent;
+  font-family: 'DM Sans', sans-serif;
+  transition: background 0.15s, color 0.15s;
+}
+
+.closeBtn:hover {
+  background: rgba(0,0,0,0.05);
+  color: #333;
+}
+
+/* ── Body ── */
+.body {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+/* ── Map ── */
+.mapWrap {
+  flex: 1;
+  position: relative;
+}
+
+.map {
+  width: 100%;
+  height: 100%;
+}
+
+.mapLoading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #ddd9d4;
+  z-index: 1;
+}
+
+.mapLoadingText {
+  font-size: 13px;
+  color: #888;
+  letter-spacing: 0.04em;
+}
+
+/* ── Side panel ── */
+.panel {
+  width: 0;
+  overflow: hidden;
+  background: #f5f3f0;
+  border-left: 0.5px solid rgba(0,0,0,0.1);
+  display: flex;
+  flex-direction: column;
+  transition: width 0.22s ease;
+  flex-shrink: 0;
+}
+
+.panelVisible {
+  width: 290px;
+}
+
+.panelInner {
+  flex: 1;
+  padding: 22px 20px 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 290px;
+}
+
+.panelMeta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panelType {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #aaa;
+}
+
+.panelArea {
+  font-size: 10px;
+  color: #bbb;
+  letter-spacing: 0.05em;
+}
+
+.panelArea::before {
+  content: "·";
+  margin-right: 8px;
+  color: #ccc;
+}
+
+.panelName {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 22px;
+  font-weight: 500;
+  color: #1a1a1a;
+  line-height: 1.2;
+  margin: 0;
+  min-width: 250px;
+}
+
+.panelAddress {
+  font-size: 12px;
+  color: #999;
+  margin: 0;
+  line-height: 1.4;
+  min-width: 250px;
+}
+
+.divider {
+  height: 0.5px;
+  background: rgba(0,0,0,0.08);
+}
+
+.sectionLabel {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #bbb;
+  margin: 0;
+}
+
+.emptyState {
+  font-size: 12px;
+  color: #ccc;
+  font-style: italic;
+  margin: 0;
+}
+
+/* ── Actor list ── */
+.actorList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.actorRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 0;
+  border-bottom: 0.5px solid rgba(0,0,0,0.05);
+}
+
+.actorRow:last-child {
+  border-bottom: none;
+}
+
+.actorAvWrap {
+  position: relative;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+}
+
+.actorPhoto {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 1.5px solid rgba(0,0,0,0.08);
+}
+
+.actorInitial {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: #d5cfc8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 500;
+  color: #666;
+  position: absolute;
+  inset: 0;
+}
+
+.actorInfo {
+  flex: 1;
+  min-width: 0;
+}
+
+.actorName {
+  font-size: 13px;
+  color: #1a1a1a;
+  font-weight: 500;
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.actorStatus {
+  font-size: 11px;
+  color: #aaa;
+  margin: 0;
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-transform: capitalize;
+}
+
+/* ── Panel footer ── */
+.panelFooter {
+  padding: 16px 20px;
+  border-top: 0.5px solid rgba(0,0,0,0.08);
+  min-width: 290px;
+}
+
+.spawnBtn {
+  width: 100%;
+  padding: 11px;
+  background: #1a1a1a;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.spawnBtn:hover:not(:disabled) {
+  background: #c9973a;
+}
+
+.spawnBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

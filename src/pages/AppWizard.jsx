@@ -2,12 +2,12 @@ import { useState, useEffect } from "react";
 import styles from "./AppWizard.module.css";
 import homeStyles from "./HomePage.module.css";
 
-const WORLD_ID   = "e7368020-fc19-4914-95ac-2f7c5508a13c";
-const WORLD_NAME = "Anima — Stockholm";
-
 const TOOL_TYPES = [
   { id: "messages", label: "Messages", desc: "SMS-style text with your contacts.", svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="3" width="12" height="8" rx="1.5" stroke="#378add" stroke-width="1.1"/><path d="M5 7h6M5 9h4" stroke="#378add" stroke-width="1.1" stroke-linecap="round"/></svg>' },
+  { id: "calendar", label: "Calendar", desc: "Your schedule and confirmed meetings.", svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="1.5" fill="none" stroke="#b05c08" stroke-width="1.1"/><line x1="2" y1="6" x2="14" y2="6" stroke="#b05c08" stroke-width="1.1"/><line x1="5" y1="1" x2="5" y2="3.5" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round"/><line x1="11" y1="1" x2="11" y2="3.5" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round"/></svg>' },
 ];
+
+const NO_CONTACTS_TOOLS = ["calendar"];
 
 const AVATARS = {
   "amber-soderstrom-actor": { bg: "#1a2e1a", col: "#5c9e5c" },
@@ -22,7 +22,7 @@ function initials(name) {
   return name?.split(" ").map(n => n[0]).join("").slice(0,2).toUpperCase() || "?";
 }
 
-export default function AppWizard({ user, directTool, onClose, onCreated }) {
+export default function AppWizard({ user, worlds, directTool, onClose, onCreated }) {
   const [path, setPath]             = useState(directTool ? "prebuilt" : null);
   const [step, setStep]             = useState(directTool ? 2 : 1);
   const [toolType, setToolType]     = useState(directTool || "messages");
@@ -35,8 +35,10 @@ export default function AppWizard({ user, directTool, onClose, onCreated }) {
   const [privacy, setPrivacy]       = useState({});  // contactId → "private" | "visible"
   const [loadingContacts, setLoadingContacts] = useState(false);
   const [creating, setCreating]     = useState(false);
+  const [worldId, setWorldId]       = useState(() => worlds?.[0]?.id || null);
 
-  const actorId = user?.worlds?.find(w => w.world_id === WORLD_ID)?.actor_id || "magnus-klack-actor";
+  const world    = worlds?.find(w => w.id === worldId);
+  const actorId  = user?.worlds?.find(m => m.world_id === worldId)?.actor_id || null;
 
   useEffect(() => {
     fetch("/api/keys")
@@ -47,7 +49,7 @@ export default function AppWizard({ user, directTool, onClose, onCreated }) {
   function loadContacts() {
     if (contacts.length > 0) return;
     setLoadingContacts(true);
-    fetch(`/api/worlds/${WORLD_ID}/actors/${actorId}/contacts`)
+    fetch(`/api/worlds/${worldId}/actors/${actorId}/contacts`)
       .then(r => r.ok ? r.json() : [])
       .then(data => {
         setContacts(data);
@@ -79,7 +81,7 @@ export default function AppWizard({ user, directTool, onClose, onCreated }) {
         body: JSON.stringify({
           name,
           tool_type: path === "prebuilt" ? toolType : "custom",
-          world_id: WORLD_ID,
+          world_id: worldId,
           actor_id: actorId,
           api_key_id: keyId,
           contact_ids: [...selected].map(id => ({ id, privacy: privacy[id] || "private" })),
@@ -125,7 +127,10 @@ export default function AppWizard({ user, directTool, onClose, onCreated }) {
         {path === "prebuilt" && (
           <>
             <div className={styles.steps}>
-              {(directTool ? ["Name","Contacts","Key"] : ["Tool","Name","Contacts","Key"]).map((l,i) => {
+              {(directTool
+                ? (NO_CONTACTS_TOOLS.includes(toolType) ? ["Name","Key"] : ["Name","Contacts","Key"])
+                : (NO_CONTACTS_TOOLS.includes(toolType) ? ["Tool","Name","Key"] : ["Tool","Name","Contacts","Key"])
+              ).map((l,i) => {
                 const idx = directTool ? i+1 : i+1;
                 const adjustedStep = directTool ? step - 1 : step;
                 return (
@@ -167,11 +172,11 @@ export default function AppWizard({ user, directTool, onClose, onCreated }) {
                 </div>
                 <div className={styles.field}>
                   <label>World</label>
-                  <input type="text" value={WORLD_NAME} disabled style={{opacity:.5}} />
+                  <input type="text" value={world?.name || worldId || ""} disabled style={{opacity:.5}} />
                 </div>
                 <div className={styles.footer}>
                   <button className={styles.btnCancel} onClick={() => directTool ? onClose() : setStep(1)}>← Back</button>
-                  <button className={styles.btnNext} disabled={!name} onClick={() => { loadContacts(); setStep(3); }}>Next →</button>
+                  <button className={styles.btnNext} disabled={!name} onClick={() => { if (NO_CONTACTS_TOOLS.includes(toolType)) { setStep(4); } else { loadContacts(); setStep(3); } }}>Next →</button>
                 </div>
               </div>
             )}
@@ -248,7 +253,7 @@ export default function AppWizard({ user, directTool, onClose, onCreated }) {
               </div>
             )}
 
-            {step === 4 && <KeyStep keys={keys} keyId={keyId} setKeyId={setKeyId} onBack={() => setStep(3)} onCreate={create} creating={creating} worldId={WORLD_ID} />}
+            {step === 4 && <KeyStep keys={keys} keyId={keyId} setKeyId={setKeyId} onBack={() => NO_CONTACTS_TOOLS.includes(toolType) ? setStep(2) : setStep(3)} onCreate={create} creating={creating} worldId={worldId} />}
           </>
         )}
 
@@ -276,7 +281,7 @@ export default function AppWizard({ user, directTool, onClose, onCreated }) {
                 </div>
                 <div className={styles.field}>
                   <label>World</label>
-                  <input type="text" value={WORLD_NAME} disabled style={{opacity:.5}} />
+                  <input type="text" value={world?.name || worldId || ""} disabled style={{opacity:.5}} />
                 </div>
                 <div className={styles.footer}>
                   <button className={styles.btnCancel} onClick={() => setPath(null)}>← Back</button>
@@ -285,7 +290,7 @@ export default function AppWizard({ user, directTool, onClose, onCreated }) {
               </div>
             )}
 
-            {step === 2 && <KeyStep keys={keys} keyId={keyId} setKeyId={setKeyId} onBack={() => setStep(1)} onCreate={create} creating={creating} worldId={WORLD_ID} />}
+            {step === 2 && <KeyStep keys={keys} keyId={keyId} setKeyId={setKeyId} onBack={() => setStep(1)} onCreate={create} creating={creating} worldId={worldId} />}
           </>
         )}
       </div>
