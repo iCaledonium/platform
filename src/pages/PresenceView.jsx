@@ -14,6 +14,14 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
   const [chatInput,   setChatInput]   = useState("");
   const [sending,     setSending]     = useState(false);
   const [vitals,      setVitals]      = useState(null);
+  const [modelName,   setModelName]   = useState("…");
+
+  useEffect(() => {
+    fetch("/api/encounter/model-status")
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d?.model) setModelName(d.model); })
+      .catch(() => setModelName("Haiku"));
+  }, []);
 
   const esRef        = useRef(null);
   const waveTimer    = useRef(null);
@@ -60,6 +68,7 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
     const payload = data.data || data;
     switch (payload.type) {
       case "encounter_first_words":
+        if (payload.vitals) setVitals(payload.vitals);
         if (payload.text) {
           setGlow("speaking");
           setOstText("Speaking");
@@ -79,6 +88,7 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
         setOstText("Speaking");
         startWave();
         setSending(false);
+        if (payload.model) setModelName(payload.model);
         currentSpeakerRef.current = actorName;
         startTypewriter(payload.text, () => {
           finaliseResponse(payload.text);
@@ -182,7 +192,7 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
   }
 
   async function leave() {
-    fetch(`/api/worlds/${world.id}/encounter/${encounter_id}/end`, { method: "POST" }).catch(() => {});
+    fetch(`/api/worlds/${world.id}/leave`, { method: "POST" }).catch(() => {});
     onLeave();
   }
 
@@ -196,6 +206,15 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
         <span className={styles.loc}>{location.name} · {location.area} · {timeStr}</span>
         <button className={styles.leaveBtn} onClick={leave}>Leave</button>
       </div>
+
+      {/* Model indicator */}
+      <div style={{
+        position: "absolute", bottom: 12, left: 14, zIndex: 20,
+        fontFamily: "'DM Sans',system-ui,sans-serif", fontSize: 10,
+        color: modelName === "Hermes-3-70B" ? "rgba(0,220,130,0.85)" : "rgba(220,220,220,0.6)",
+        letterSpacing: "0.06em", pointerEvents: "none",
+        textShadow: "0 1px 4px rgba(0,0,0,0.9)"
+      }}>◈ {modelName}</div>
 
       <div className={styles.body}>
         {/* Photo + vitals overlay */}
@@ -290,7 +309,12 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
                 className={styles.ci}
                 placeholder="Say something…"
                 value={chatInput}
-                onChange={e => setChatInput(e.target.value)}
+                onChange={e => {
+                  setChatInput(e.target.value);
+                  if (e.target.value.length > 0) {
+                    fetch(`/api/worlds/${world.id}/encounter/${encounter_id}/typing`, { method: "POST" }).catch(() => {});
+                  }
+                }}
                 onKeyDown={e => e.key === "Enter" && sendMessage()}
                 autoFocus
               />

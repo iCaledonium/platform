@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import PresenceView from "./PresenceView.jsx";
 
 const SIMULATOR_URL   = "https://anima.simulator.ngrok.dev";
 const ROTATION_MS     = 8000;
@@ -13,6 +14,9 @@ export default function VenueScene({ world, user, location, onLeave }) {
   const [leaving, setLeaving] = useState(false);
   const [toasts,  setToasts]  = useState([]);
   const [clock,   setClock]   = useState(stockholmTime());
+  const [encounter,   setEncounter]   = useState(null); // { actor, encounter_id }
+  const [approaching, setApproaching] = useState(null); // { actor_id, actor_name, photo_url, narrative, location_id }
+  const leftEncounterAt               = useRef(null);   // timestamp — suppress approaches for 5min after leaving
   const dwellRef              = useRef(0);
   const [dwell,   setDwell]   = useState("0:00");
   const rotateRef             = useRef(null);
@@ -90,7 +94,10 @@ export default function VenueScene({ world, user, location, onLeave }) {
               if (!knownActorIdsRef.current.has(a.actor_id)) {
                 console.log("[VenueScene] NEW ARRIVAL:", a.actor_id, a.name);
                 const toastId = crypto.randomUUID();
-                setToasts(prev => [...prev, { ...a, toastId }]);
+                setToasts(prev => {
+                  if (prev.some(t => t.actor_id === a.actor_id)) return prev;
+                  return [...prev, { ...a, toastId }];
+                });
                 setTimeout(() => setToasts(prev => prev.filter(t => t.toastId !== toastId)), 12000);
               }
             });
@@ -117,9 +124,24 @@ export default function VenueScene({ world, user, location, onLeave }) {
         const data = JSON.parse(e.data);
         if (data.type === "venue_event" && data.data?.type === "actor_arrived") {
           const arrival = data.data;
+          if (arrival.actor_id === playerActorId) return;
+          // Skip if already present in the venue (e.g. they were here when we arrived)
+          if (actors.some(a => a.actor_id === arrival.actor_id)) return;
           const toastId = crypto.randomUUID();
-          setToasts(prev => [...prev, { ...arrival, toastId }]);
+          // Mark as known so poll doesn't fire a second toast
+          if (knownActorIdsRef.current) {
+            knownActorIdsRef.current = new Set([...knownActorIdsRef.current, arrival.actor_id]);
+          }
+          setToasts(prev => {
+            if (prev.some(t => t.actor_id === arrival.actor_id)) return prev;
+            return [...prev, { ...arrival, toastId }];
+          });
           setTimeout(() => setToasts(prev => prev.filter(t => t.toastId !== toastId)), 12000);
+        }
+        if (data.type === "venue_event" && data.data?.type === "actor_approaching") {
+          const cooldownMs = 5 * 60 * 1000;
+          const sinceLeft = leftEncounterAt.current ? Date.now() - leftEncounterAt.current : Infinity;
+          if (!encounter && sinceLeft > cooldownMs) setApproaching(data.data);
         }
       } catch {}
     };
@@ -130,15 +152,95 @@ export default function VenueScene({ world, user, location, onLeave }) {
     setToasts(prev => prev.filter(t => t.toastId !== toastId));
   }
 
+  async function handleAcceptApproach() {
+    if (!approaching) return;
+    try {
+      const resp = await fetch(`/api/worlds/${world.id}/encounter/start`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({
+          target_actor_id: approaching.actor_id,
+          location_id:     approaching.location_id || location.place_id || location.id,
+          trigger:         "actor_approach"
+        })
+      });
+      const data = await resp.json();
+      const actor = { actor_id: approaching.actor_id, name: approaching.actor_name, photo_url: approaching.photo_url };
+      setApproaching(null);
+      setEncounter({ actor, encounter_id: data.encounter_id });
+    } catch (e) {
+      console.error("Accept approach failed", e);
+    }
+  }
+
+  async function handleReachOut(actor) {
+    try {
+      const resp = await fetch(`/api/worlds/${world.id}/encounter/start`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({
+          target_actor_id: actor.actor_id,
+          location_id:     location.place_id || location.id,
+          trigger:         "venue_approach"
+        })
+      });
+      const data = await resp.json();
+      setEncounter({ actor, encounter_id: data.encounter_id });
+    } catch (e) {
+      console.error("Reach out failed", e);
+    }
+  }
+
   async function leave() {
     if (leaving) return;
     setLeaving(true);
+    const playerActorId = user?.worlds?.find(w => w.world_id === world.id)?.actor_id;
     try { await fetch(`/api/worlds/${world.id}/leave`, { method: "POST" }); } catch {}
     onLeave();
   }
 
   const glass     = { background: "rgba(238,236,234,0.82)", backdropFilter: "blur(28px)", WebkitBackdropFilter: "blur(28px)", border: "1px solid rgba(255,255,255,0.7)" };
   const glassDark = { background: "rgba(20,18,16,0.62)",   backdropFilter: "blur(28px)", WebkitBackdropFilter: "blur(28px)", border: "1px solid rgba(255,255,255,0.1)" };
+
+  if (encounter) {
+    const photoUrl = encounter.actor.photo_url ? `${SIMULATOR_URL}${encounter.actor.photo_url}` : null;
+    return (
+      <PresenceView
+        world={world}
+        user={user}
+        sceneData={{ location }}
+        actorName={encounter.actor.name}
+        actorPhoto={photoUrl}
+        encounter_id={encounter.encounter_id}
+        onLeave={() => { leftEncounterAt.current = Date.now(); setEncounter(null); setApproaching(null); }}
+      />
+    );
+  }
+
+  if (approaching) {
+    const photoUrl = approaching.photo_url ? `${SIMULATOR_URL}${approaching.photo_url}` : null;
+    return (
+      <div style={{ fontFamily: "'DM Sans',system-ui,sans-serif", position: "fixed", inset: 0, zIndex: 1000, background: "#1a1814", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 32, gap: 24 }}>
+        <style>{`@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap');`}</style>
+        {photoUrl && (
+          <div style={{ width: 72, height: 72, borderRadius: "50%", overflow: "hidden", border: "2px solid rgba(255,255,255,0.2)" }}>
+            <img src={photoUrl} style={{ width: "100%", height: "100%", objectFit: "cover" }} alt="" />
+          </div>
+        )}
+        <p style={{ fontFamily: "'Cormorant Garamond',Georgia,serif", fontSize: 20, color: "rgba(255,255,255,0.9)", textAlign: "center", maxWidth: 480, lineHeight: 1.6, margin: 0 }}>
+          {approaching.narrative}
+        </p>
+        <div style={{ display: "flex", gap: 12, marginTop: 8 }}>
+          <button onClick={handleAcceptApproach} style={{ background: "rgba(255,255,255,0.92)", border: "none", borderRadius: 20, padding: "10px 28px", fontSize: 13, fontWeight: 500, color: "#1a1814", cursor: "pointer", fontFamily: "inherit" }}>
+            {approaching.actor_name} approaches →
+          </button>
+          <button onClick={() => setApproaching(null)} style={{ background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.15)", borderRadius: 20, padding: "10px 20px", fontSize: 13, color: "rgba(255,255,255,0.5)", cursor: "pointer", fontFamily: "inherit" }}>
+            Look away
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   if (loading) {
     return (
@@ -199,7 +301,7 @@ export default function VenueScene({ world, user, location, onLeave }) {
         <div style={{ flex: 1, overflowY: "auto" }}>
           {actors.length === 0
             ? <p style={{ fontSize: 11, color: "#a8a5a0", padding: "16px 14px", margin: 0 }}>Nobody here right now</p>
-            : actors.map(a => <ActorRow key={a.actor_id} actor={a} playerActorId={user?.worlds?.find(w => w.world_id === world.id)?.actor_id} onReachOut={(a) => alert("Reach out to " + a.name + " — encounter flow coming next")} />)
+            : actors.map(a => <ActorRow key={a.actor_id} actor={a} playerActorId={user?.worlds?.find(w => w.world_id === world.id)?.actor_id} onReachOut={handleReachOut} />)
           }
         </div>
         {photos.length > 1 && (
@@ -232,7 +334,7 @@ export default function VenueScene({ world, user, location, onLeave }) {
           </div>
           <span style={{ fontSize: 12, fontWeight: 500, color: "#1a1814" }}>{toast.name} just arrived</span>
           <div style={{ display: "flex", gap: 6, marginLeft: 8 }}>
-            <button onClick={() => alert("Reach out to " + toast.name + " — encounter flow coming next")} style={{ background: "#1a1814", border: "none", borderRadius: 12, padding: "5px 12px", fontSize: 11, fontWeight: 500, color: "#fff", cursor: "pointer", fontFamily: "inherit" }}>
+            <button onClick={() => handleReachOut(toast)} style={{ background: "#1a1814", border: "none", borderRadius: 12, padding: "5px 12px", fontSize: 11, fontWeight: 500, color: "#fff", cursor: "pointer", fontFamily: "inherit" }}>
               Reach out
             </button>
             <button onClick={() => dismissToast(toast.toastId)} style={{ background: "rgba(0,0,0,0.06)", border: "1px solid rgba(0,0,0,0.1)", borderRadius: 12, padding: "5px 12px", fontSize: 11, color: "#6b6760", cursor: "pointer", fontFamily: "inherit" }}>

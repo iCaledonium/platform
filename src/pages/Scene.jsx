@@ -8,7 +8,7 @@ export default function Scene({ world, user, sceneData, onLeave }) {
   const { location, encounter_id, trigger } = sceneData;
 
   const playerActorId = user?.worlds?.find(w => w.world_id === world.id)?.actor_id;
-  const primaryActor  = location.actors && location.actors[0];
+  const primaryActor  = location.actors && location.actors.find(a => a.actor_id !== playerActorId);
 
   const [phase,        setPhase]        = useState(encounter_id ? "loading" : "empty");
   const [actorName,    setActorName]    = useState(primaryActor?.name || "");
@@ -40,11 +40,14 @@ export default function Scene({ world, user, sceneData, onLeave }) {
   // Poll on mount — handle case where SSE connected after encounter already resolved
   useEffect(() => {
     if (!encounter_id) return;
+    let stopped = false;
     const poll = async () => {
+      if (stopped) return;
       try {
         const r = await fetch(`/api/worlds/${world.id}/encounter/${encounter_id}`);
         const data = await r.json();
         if (data.decision && data.narrative && !displayed && !narrative) {
+          stopped = true;
           setPhase(data.phase || data.decision);
           setDecision(data.decision);
           if (data.actor_name) setActorName(data.actor_name);
@@ -55,10 +58,12 @@ export default function Scene({ world, user, sceneData, onLeave }) {
         }
       } catch {}
     };
-    // Poll at 3s and 6s as fallback
-    const t1 = setTimeout(poll, 3000);
-    const t2 = setTimeout(poll, 6000);
-    return () => { clearTimeout(t1); clearTimeout(t2); };
+    // Poll every 5s for up to 90s waiting for knock decision
+    const timers = [];
+    for (let i = 1; i <= 18; i++) {
+      timers.push(setTimeout(poll, i * 5000));
+    }
+    return () => { stopped = true; timers.forEach(clearTimeout); };
   }, [encounter_id]);
 
   // ── SSE connection ──────────────────────────────────────────────────────────
@@ -176,6 +181,7 @@ export default function Scene({ world, user, sceneData, onLeave }) {
       fetch(`/api/worlds/${world.id}/encounter/${encounter_id}/end`, { method: "POST" })
         .catch(() => {});
     }
+    fetch(`/api/worlds/${world.id}/leave`, { method: "POST" }).catch(() => {});
     onLeave();
   }
 

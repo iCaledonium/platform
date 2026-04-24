@@ -62,6 +62,8 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
   const markers       = useRef([]);
   const selectedRef   = useRef(null);
 
+  const spawnLock = useRef(false);
+
   const [locations, setLocations] = useState([]);
   const [selected,  setSelected]  = useState(null);
   const [mapReady,  setMapReady]  = useState(false);
@@ -209,9 +211,12 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
   }
 
   async function handleSpawn() {
-    if (!selected || spawning) return;
+    if (!selected || spawning || spawnLock.current) return;
+    spawnLock.current = true;
     setSpawning(true);
     try {
+      const playerActorId = user?.worlds?.find(w => w.world_id === world.id)?.actor_id;
+
       await fetch(`/api/worlds/${world.id}/spawn`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
@@ -219,15 +224,23 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
       });
 
       if (selected.category === "residential") {
-        // Knock flow — start encounter immediately, use Scene
         await new Promise(r => setTimeout(r, 1200));
         let encounter_id = null;
-        if (selected.actors && selected.actors.length > 0) {
+
+        // Find the target actor — never the player themselves
+        const locationId = selected.place_id || selected.id;
+        const targetActor = selected.actors && (
+          selected.actors.find(a => a.actor_id !== playerActorId && a.home_location === locationId) ||
+          selected.actors.find(a => a.actor_id !== playerActorId)
+        );
+
+        if (targetActor) {
           const encResp = await fetch(`/api/worlds/${world.id}/encounter/start`, {
             method:  "POST",
             headers: { "Content-Type": "application/json" },
             body:    JSON.stringify({
-              target_actor_id: selected.actors[0].actor_id,
+              target_actor_id: targetActor.actor_id,
+              player_actor_id: playerActorId,
               location_id:     selected.place_id || selected.id,
               trigger:         "knock"
             })
@@ -237,13 +250,13 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
         }
         setSceneData({ location: selected, encounter_id, trigger: "knock", mode: "scene" });
       } else {
-        // Public venue — hang around in VenueScene
         setSceneData({ location: selected, mode: "venue" });
       }
     } catch (e) {
       console.error("Spawn failed", e);
     } finally {
       setSpawning(false);
+      spawnLock.current = false;
     }
   }
 

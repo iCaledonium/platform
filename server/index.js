@@ -1003,6 +1003,19 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/message", async (req, re
   } catch { res.status(502).json({ error: "simulator unreachable" }); }
 });
 
+// ── POST /api/worlds/:world_id/encounter/:encounter_id/typing ─────────────────
+app.post("/api/worlds/:world_id/encounter/:encounter_id/typing", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  try {
+    fetch(
+      `${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/encounter/${req.params.encounter_id}/typing`,
+      { method: "POST", headers: { "X-Service-Token": SERVICE_TOKEN } }
+    ).catch(() => {});
+    res.json({ ok: true });
+  } catch { res.json({ ok: true }); }
+});
+
 // ── POST /api/worlds/:world_id/leave — clear player location ─────────────────
 app.post("/api/worlds/:world_id/leave", async (req, res) => {
   const user = authUser(req);
@@ -1019,6 +1032,19 @@ app.post("/api/worlds/:world_id/leave", async (req, res) => {
     );
     res.json(await resp.json());
   } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/encounter/model-status — which LLM is active ────────────────────
+app.get("/api/encounter/model-status", async (_req, res) => {
+  try {
+    const r = await fetch("http://212.147.242.70:11434/api/tags", { signal: AbortSignal.timeout(3000) });
+    if (r.ok) {
+      const d = await r.json();
+      const has70b = d?.models?.some(m => m.name?.includes("hermes3:70b"));
+      return res.json({ model: has70b ? "Hermes-3-70B" : "Haiku" });
+    }
+  } catch {}
+  res.json({ model: "Haiku" });
 });
 
 // ── GET /api/places/:place_id/photos — venue photos list ─────────────────────
