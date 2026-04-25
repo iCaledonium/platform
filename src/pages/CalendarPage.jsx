@@ -293,7 +293,7 @@ export default function CalendarPage() {
                   const top    = (isoToMinutes(m.scheduled_at) / 60) * HOUR_HEIGHT;
                   const height = Math.max(HOUR_HEIGHT - 2, 42);
                   return (
-                    <div key={mi} className="slot-ev" style={{ position: "absolute", top: top + 1, left: 2, right: 2, height, background: MEETING_COLOR.bg, borderLeft: `2px solid ${MEETING_COLOR.border}`, borderRadius: 4, padding: "4px 7px", overflow: "hidden", zIndex: 3, boxShadow: "0 1px 6px rgba(0,0,0,.08)" }}>
+                    <div key={mi} className="slot-ev" style={{ position: "absolute", top: top + 1, left: 2, right: 2, height, background: MEETING_COLOR.bg, borderLeft: `2px solid ${MEETING_COLOR.border}`, borderRadius: 4, padding: "4px 7px", overflow: "hidden", zIndex: 3, boxShadow: "0 1px 6px rgba(0,0,0,.08)", isolation: "isolate" }}>
                       <div style={{ fontSize: 10, fontWeight: 600, color: MEETING_COLOR.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{m.with_name || "Meeting"}</div>
                       <div style={{ fontSize: 9, color: MEETING_COLOR.text, opacity: .65, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{fmtShortTime(m.scheduled_at)} · {m.location_name || "TBD"}</div>
                     </div>

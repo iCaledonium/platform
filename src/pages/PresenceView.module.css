@@ -155,6 +155,92 @@
 .vFill  { height: 100%; border-radius: 1px; }
 .vg { background: rgba(201,151,58,.5); }
 .vw { background: rgba(216,90,48,.5); }
+.vDesire { background: rgba(176,92,8,.85); }
+
+.vFlashUp {
+  color: rgba(100,210,130,.95) !important;
+  animation: vNumFlash 2.5s ease-out forwards;
+}
+.vFlashDown {
+  color: rgba(216,90,48,.95) !important;
+  animation: vNumFlash 2.5s ease-out forwards;
+}
+.vBarFlash { animation: vBarPulse 2.5s ease-out forwards; }
+@keyframes vNumFlash {
+  0%   { opacity:1; transform:scale(1.15); }
+  20%  { opacity:1; }
+  100% { opacity:1; transform:scale(1); }
+}
+@keyframes vBarPulse {
+  0%   { filter: brightness(2); }
+  100% { filter: brightness(1); }
+}
+
+.relRow {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 6px;
+  padding-top: 5px;
+  border-top: 0.5px solid rgba(255,255,255,.07);
+  gap: 3px;
+}
+.relStatus {
+  font-size: 9px;
+  color: rgba(255,255,255,.3);
+  letter-spacing: .03em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+  transition: color .4s;
+}
+.relUp   { color: rgba(201,151,58,.9); animation: statusPulse .4s ease-out; }
+.relDown { color: rgba(216,90,48,.9);  animation: statusPulse .4s ease-out; }
+@keyframes statusPulse { 0%{opacity:0;transform:scale(1.1)} 100%{opacity:1;transform:scale(1)} }
+
+.bottomRight {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.needInline {
+  font-size: 8px;
+  color: rgba(228,152,60,.7);
+  letter-spacing: .03em;
+  font-style: italic;
+}
+.arcSignal {
+  font-size: 8px;
+  color: rgba(201,151,58,.55);
+  letter-spacing: .05em;
+  animation: arcFade 6s ease-out forwards;
+}
+@keyframes arcFade { 0%{opacity:1} 70%{opacity:.7} 100%{opacity:0} }
+
+/* ── Vital change toasts ── */
+.vitalToast {
+  position: absolute;
+  top: 130px;
+  left: 10px;
+  z-index: 30;
+  background: rgba(10,9,8,.9);
+  border: 0.5px solid rgba(201,151,58,.3);
+  border-radius: 5px;
+  padding: 5px 9px;
+  font-size: 10px;
+  font-family: 'DM Sans', sans-serif;
+  letter-spacing: .04em;
+  white-space: nowrap;
+  animation: toastFade 4s ease-out forwards;
+  pointer-events: none;
+}
+.vitalToastUp   { color: rgba(100,210,130,.9); border-color: rgba(100,210,130,.25); }
+.vitalToastDown { color: rgba(216,90,48,.9);   border-color: rgba(216,90,48,.25); }
+@keyframes toastFade { 0%{opacity:0;transform:translateY(4px)} 10%{opacity:1;transform:translateY(0)} 70%{opacity:1} 100%{opacity:0} }
 
 /* ── Chat column ── */
 .chatCol {

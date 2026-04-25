@@ -19,6 +19,7 @@ export default function Scene({ world, user, sceneData, onLeave }) {
   const [displayed,    setDisplayed]    = useState("");
   const [decision,     setDecision]     = useState(null);
   const [statusText,   setStatusText]   = useState(phaseStatus("loading", trigger));
+  const [isWarming,    setIsWarming]    = useState(false);
   const [chatInput,    setChatInput]    = useState("");
   const [messages,     setMessages]     = useState([]);
   const [sending,      setSending]      = useState(false);
@@ -58,9 +59,9 @@ export default function Scene({ world, user, sceneData, onLeave }) {
         }
       } catch {}
     };
-    // Poll every 5s for up to 90s waiting for knock decision
+    // Poll every 5s for up to 5 minutes — Hermes cold start can take ~3min
     const timers = [];
-    for (let i = 1; i <= 18; i++) {
+    for (let i = 1; i <= 60; i++) {
       timers.push(setTimeout(poll, i * 5000));
     }
     return () => { stopped = true; timers.forEach(clearTimeout); };
@@ -95,14 +96,33 @@ export default function Scene({ world, user, sceneData, onLeave }) {
   function handleEncounterEvent(data) {
     const payload = data.data || data;
     switch (payload.type) {
+      case "encounter_heartbeat":
+        // Keep spinner alive — update status text if still waiting
+        if (!decision) setStatusText(payload.message || "Still deciding…");
+        break;
+
+      case "encounter_warming":
+        setIsWarming(true);
+        setStatusText("Warming up the engine…");
+        break;
+
       case "encounter_started":
         setPhase("loading");
-        setStatusText(phaseStatus("loading", trigger));
+        if (!isWarming) setStatusText(phaseStatus("loading", trigger));
         break;
 
       case "encounter_phase":
         setPhase("perceiving");
-        setStatusText(phaseStatus("perceiving", trigger, payload.actor_name));
+        // After warming, show "Knocking…" as the next step
+        if (isWarming) {
+          setStatusText(phaseStatus("loading", trigger));
+          setTimeout(() => {
+            setStatusText(phaseStatus("perceiving", trigger, payload.actor_name));
+          }, 1500);
+        } else {
+          setStatusText(phaseStatus("perceiving", trigger, payload.actor_name));
+        }
+        setIsWarming(false);
         if (payload.actor_name)  setActorName(payload.actor_name);
         if (payload.actor_photo) setActorPhoto(`${SIMULATOR_URL}${payload.actor_photo}`);
         break;

@@ -14,8 +14,11 @@ export default function VenueScene({ world, user, location, onLeave }) {
   const [leaving, setLeaving] = useState(false);
   const [toasts,  setToasts]  = useState([]);
   const [clock,   setClock]   = useState(stockholmTime());
-  const [encounter,   setEncounter]   = useState(null); // { actor, encounter_id }
-  const [approaching, setApproaching] = useState(null); // { actor_id, actor_name, photo_url, narrative, location_id }
+  const [encounter,      setEncounter]      = useState(null); // { actor, encounter_id }
+  const [approaching,    setApproaching]    = useState(null); // { actor_id, actor_name, photo_url, narrative, location_id }
+  const [encounterLoading, setEncounterLoading] = useState(false);
+  const [encounterStatus,  setEncounterStatus]  = useState("Connecting…");
+  const encounterRef = useRef(null);
   const leftEncounterAt               = useRef(null);   // timestamp — suppress approaches for 5min after leaving
   const dwellRef              = useRef(0);
   const [dwell,   setDwell]   = useState("0:00");
@@ -143,6 +146,15 @@ export default function VenueScene({ world, user, location, onLeave }) {
           const sinceLeft = leftEncounterAt.current ? Date.now() - leftEncounterAt.current : Infinity;
           if (!encounter && sinceLeft > cooldownMs) setApproaching(data.data);
         }
+        // Encounter events — update loading overlay, dismiss only when actual content arrives
+        if (data.type === "encounter_event" && data.encounter_id === encounterRef.current?.encounter_id) {
+          const payload = data.data || data;
+          if (payload.type === "encounter_warming") {
+            setEncounterStatus("Warming up the engine…");
+          } else if (payload.type === "encounter_response" || payload.type === "encounter_narrative") {
+            setEncounterLoading(false);
+          }
+        }
       } catch {}
     };
     return () => { if (esRef.current) { esRef.current.close(); esRef.current = null; } };
@@ -167,6 +179,9 @@ export default function VenueScene({ world, user, location, onLeave }) {
       const data = await resp.json();
       const actor = { actor_id: approaching.actor_id, name: approaching.actor_name, photo_url: approaching.photo_url };
       setApproaching(null);
+      setEncounterStatus("Connecting…");
+      setEncounterLoading(true);
+      encounterRef.current = { actor, encounter_id: data.encounter_id };
       setEncounter({ actor, encounter_id: data.encounter_id });
     } catch (e) {
       console.error("Accept approach failed", e);
@@ -185,6 +200,9 @@ export default function VenueScene({ world, user, location, onLeave }) {
         })
       });
       const data = await resp.json();
+      setEncounterStatus("Connecting…");
+      setEncounterLoading(true);
+      encounterRef.current = { actor, encounter_id: data.encounter_id };
       setEncounter({ actor, encounter_id: data.encounter_id });
     } catch (e) {
       console.error("Reach out failed", e);
@@ -204,6 +222,27 @@ export default function VenueScene({ world, user, location, onLeave }) {
 
   if (encounter) {
     const photoUrl = encounter.actor.photo_url ? `${SIMULATOR_URL}${encounter.actor.photo_url}` : null;
+
+    if (encounterLoading) {
+      return (
+        <div style={{ fontFamily: "'DM Sans',system-ui,sans-serif", position: "fixed", inset: 0, zIndex: 1000, background: "#1a1814", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20 }}>
+          <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+          {photoUrl && (
+            <div style={{ width: 72, height: 72, borderRadius: "50%", overflow: "hidden", border: "2px solid rgba(255,255,255,0.15)", marginBottom: 4 }}>
+              <img src={photoUrl} style={{ width: "100%", height: "100%", objectFit: "cover" }} alt="" />
+            </div>
+          )}
+          <p style={{ fontFamily: "'Cormorant Garamond',Georgia,serif", fontSize: 22, color: "rgba(255,255,255,0.85)", letterSpacing: ".02em", margin: 0 }}>
+            {encounter.actor.name}
+          </p>
+          <div style={{ width: 28, height: 28, border: "2px solid rgba(255,255,255,0.12)", borderTopColor: "#c9973a", borderRadius: "50%", animation: "spin .8s linear infinite" }} />
+          <p style={{ fontSize: 11, color: "rgba(255,255,255,0.35)", letterSpacing: ".08em", margin: 0 }}>
+            {encounterStatus}
+          </p>
+        </div>
+      );
+    }
+
     return (
       <PresenceView
         world={world}
@@ -212,7 +251,7 @@ export default function VenueScene({ world, user, location, onLeave }) {
         actorName={encounter.actor.name}
         actorPhoto={photoUrl}
         encounter_id={encounter.encounter_id}
-        onLeave={() => { leftEncounterAt.current = Date.now(); setEncounter(null); setApproaching(null); }}
+        onLeave={() => { leftEncounterAt.current = Date.now(); setEncounter(null); setApproaching(null); setEncounterLoading(false); }}
       />
     );
   }

@@ -543,7 +543,12 @@ app.get("/api/stream", async (req, res) => {
               call:          "voice",
               video_call:    "video",
             };
-            const convType = payload.conversation_type || (payload.message_type === "voice_message" ? "voice_message" : payload.message_type === "email" ? "email_thread" : "text_thread");
+            const convType = payload.conversation_type || (
+              payload.message_type === "call_request"  ? "call_request"  :
+              payload.message_type === "voice_message" ? "voice_message" :
+              payload.message_type === "email"         ? "email_thread"  :
+              "text_thread"
+            );
             const toolType = CONV_TO_TOOL[convType] || "messages";
 
             // Check privacy

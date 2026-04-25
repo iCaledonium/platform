@@ -13,6 +13,7 @@ import ActorsEditorPage from "./pages/ActorsEditorPage.jsx";
 const CONV_TO_TOOL = {
   text_thread:   "messages",
   voice_message: "voice",
+  call_request:  "voice",
   email_thread:  "email",
   call:          "voice",
   video_call:    "video",
@@ -378,9 +379,17 @@ function NotifItem({ notif, onOpen, onClear }) {
         </div>
         {hasApp ? (
           <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#6b6760",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",margin:0}}>{notif.content}</p>
+        ) : notif.conversation_type === "call_request" ? (
+          <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:toolMeta.color,margin:0}}>
+            Missed call — Install Voice Call app to answer calls →
+          </p>
+        ) : toolType === "voice" ? (
+          <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:toolMeta.color,margin:0}}>
+            Install Voice app to listen →
+          </p>
         ) : (
           <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:toolMeta.color,margin:0}}>
-            Install {toolMeta.label} app to {toolType === "voice" ? "listen" : toolType === "email" ? "read" : "view"} →
+            Install {toolMeta.label} app to {toolType === "email" ? "read" : "view"} →
           </p>
         )}
       </div>
