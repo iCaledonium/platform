@@ -74,7 +74,7 @@ app.post("/api/auth/verify", (req, res) => {
   if (delta === null) return res.status(401).json({ error: "invalid code" });
   const raw = crypto.randomBytes(32).toString("hex");
   const hash = crypto.createHash("sha256").update(raw).digest("hex");
-  const expires = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString();
+  const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
   db.prepare(`INSERT INTO auth_tokens (id, user_id, token_hash, expires_at, inserted_at) VALUES (?, ?, ?, ?, datetime('now'))`).run(randomUUID(), user_id, hash, expires);
   res.setHeader("Set-Cookie", `anima_token=${raw}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=28800`);
   // Push presence online to simulator
