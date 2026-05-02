@@ -9,6 +9,7 @@ import MessagesPage from "./pages/MessagesPage.jsx";
 import CalendarPage from "./pages/CalendarPage.jsx";
 import ActorsGalleryPage from "./pages/ActorsGalleryPage.jsx";
 import ActorsEditorPage from "./pages/ActorsEditorPage.jsx";
+import DeployWizardPage from "./pages/DeployWizardPage.jsx";
 
 const CONV_TO_TOOL = {
   text_thread:   "messages",
@@ -259,8 +260,9 @@ export default function App() {
         <Route path="/developer"    element={<DeveloperPage />} />
         <Route path="/messages"     element={<MessagesPage />} />
         <Route path="/calendar"     element={<CalendarPage />} />
-        <Route path="/actors"       element={<ActorsGalleryPage />} />
-        <Route path="/actors/:id"   element={<ActorsEditorPage />} />
+        <Route path="/actors"            element={<ActorsGalleryPage />} />
+        <Route path="/actors/:id"        element={<ActorsEditorPage />} />
+        <Route path="/actors/:id/deploy" element={<DeployWizardPage />} />
         <Route path="*"             element={<Navigate to="/login" replace />} />
       </Routes>
 

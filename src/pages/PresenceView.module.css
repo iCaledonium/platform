@@ -135,7 +135,7 @@
 
 /* ── Vitals overlay ── */
 .vitalsBox {
-  position: absolute; top: 10px; left: 10px; z-index: 20;
+  position: absolute; top: 10px; right: 10px; z-index: 20;
   background: rgba(10,9,8,.85);
   border: 0.5px solid rgba(201,151,58,.2);
   border-radius: 6px; padding: 8px 10px; width: 112px;
@@ -159,20 +159,21 @@
 
 .vFlashUp {
   color: rgba(100,210,130,.95) !important;
-  animation: vNumFlash 2.5s ease-out forwards;
+  animation: vNumFlash 8s ease-out forwards;
 }
 .vFlashDown {
   color: rgba(216,90,48,.95) !important;
-  animation: vNumFlash 2.5s ease-out forwards;
+  animation: vNumFlash 8s ease-out forwards;
 }
-.vBarFlash { animation: vBarPulse 2.5s ease-out forwards; }
+.vBarFlash { animation: vBarPulse 8s ease-out forwards; }
 @keyframes vNumFlash {
-  0%   { opacity:1; transform:scale(1.15); }
-  20%  { opacity:1; }
+  0%   { opacity:1; transform:scale(1.25); font-weight:600; }
+  30%  { opacity:1; transform:scale(1.15); }
   100% { opacity:1; transform:scale(1); }
 }
 @keyframes vBarPulse {
-  0%   { filter: brightness(2); }
+  0%   { filter: brightness(3); }
+  50%  { filter: brightness(2); }
   100% { filter: brightness(1); }
 }
 
@@ -225,22 +226,23 @@
 .vitalToast {
   position: absolute;
   top: 130px;
-  left: 10px;
+  right: 10px;
   z-index: 30;
   background: rgba(10,9,8,.9);
   border: 0.5px solid rgba(201,151,58,.3);
   border-radius: 5px;
   padding: 5px 9px;
-  font-size: 10px;
+  font-size: 12px;
   font-family: 'DM Sans', sans-serif;
   letter-spacing: .04em;
+  font-weight: 500;
   white-space: nowrap;
   animation: toastFade 4s ease-out forwards;
   pointer-events: none;
 }
 .vitalToastUp   { color: rgba(100,210,130,.9); border-color: rgba(100,210,130,.25); }
 .vitalToastDown { color: rgba(216,90,48,.9);   border-color: rgba(216,90,48,.25); }
-@keyframes toastFade { 0%{opacity:0;transform:translateY(4px)} 10%{opacity:1;transform:translateY(0)} 70%{opacity:1} 100%{opacity:0} }
+@keyframes toastFade { 0%{opacity:0;transform:translateY(6px)} 5%{opacity:1;transform:translateY(0)} 75%{opacity:1} 100%{opacity:0;transform:translateY(-4px)} }
 
 /* ── Chat column ── */
 .chatCol {
@@ -254,7 +256,8 @@
 }
 .tlog {
   overflow-y: auto; display: flex; flex-direction: column;
-  gap: 8px; flex: 1; padding: 12px 14px;
+  gap: 8px; flex: 1; padding: 12px 14px 16px 14px;
+  scroll-padding-bottom: 16px;
 }
 .tlog::-webkit-scrollbar { width: 2px; }
 .tlog::-webkit-scrollbar-thumb { background: rgba(201,151,58,.15); }
@@ -269,6 +272,8 @@
 }
 .tlYou {
   align-self: flex-end;
+  margin-left: auto;
+  max-width: 80%;
   background: rgba(201,151,58,.08);
   border: 0.5px solid rgba(201,151,58,.2);
   color: rgba(255,255,255,.75);
@@ -302,30 +307,90 @@
 
 /* ── Input ── */
 .inputRow {
-  padding: 8px 12px 10px;
-  border-top: 0.5px solid rgba(255,255,255,.06);
-  display: flex; gap: 6px; align-items: center; flex-shrink: 0;
+  padding: 10px 14px 14px;
+  background: linear-gradient(transparent, rgba(13,12,10,.98) 30%);
+  display: flex; gap: 0; align-items: flex-end; flex-shrink: 0;
 }
 .inputShell {
-  flex: 1; background: rgba(255,255,255,.03);
-  border: 0.5px solid rgba(255,255,255,.1); border-radius: 8px;
-  padding: 8px 12px; display: flex; align-items: center;
-  transition: border-color .2s;
+  flex: 1;
+  background: rgba(255,255,255,.04);
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 14px;
+  padding: 10px 12px 10px 16px;
+  display: flex; align-items: flex-end; gap: 8px;
+  transition: border-color .25s, box-shadow .25s;
+  min-height: 56px;
+  max-height: 200px;
 }
-.inputShell:focus-within { border-color: rgba(201,151,58,.35); }
+.inputShell:focus-within {
+  border-color: rgba(201,151,58,.4);
+  box-shadow: 0 0 0 3px rgba(201,151,58,.06), inset 0 1px 0 rgba(255,255,255,.04);
+}
 .ci {
   flex: 1; background: transparent; border: none;
   color: #e8e2d8; font-family: 'DM Sans', sans-serif;
-  font-size: 13px; outline: none;
+  font-size: 14px; outline: none; resize: none;
+  line-height: 1.55; min-height: 34px; max-height: 120px;
+  overflow-y: auto; padding: 2px 0; align-self: flex-end;
 }
-.ci::placeholder { color: rgba(255,255,255,.18); }
+.ci::-webkit-scrollbar { width: 2px; }
+.ci::-webkit-scrollbar-thumb { background: rgba(255,255,255,.15); }
+.ci::placeholder { color: rgba(255,255,255,.2); }
+.inputActions {
+  display: flex; align-items: center; gap: 4px;
+  align-self: flex-end; padding-bottom: 2px; flex-shrink: 0;
+}
+.iconBtn {
+  width: 28px; height: 28px;
+  background: none; border: none;
+  font-size: 14px; cursor: pointer; opacity: .5;
+  border-radius: 6px; transition: opacity .15s, background .15s;
+  display: flex; align-items: center; justify-content: center;
+}
+.iconBtn:hover { opacity: .85; background: rgba(255,255,255,.06); }
 .sendBtn {
-  width: 32px; height: 32px;
-  background: rgba(201,151,58,.1);
-  border: 0.5px solid rgba(201,151,58,.25);
-  color: rgba(201,151,58,.7); border-radius: 7px;
-  font-size: 14px; cursor: pointer;
-  transition: background .15s;
+  width: 30px; height: 30px;
+  background: rgba(201,151,58,.18);
+  border: 1px solid rgba(201,151,58,.35);
+  color: rgba(201,151,58,.9); border-radius: 9px;
+  font-size: 15px; font-weight: 600; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: background .15s, border-color .15s, transform .1s;
 }
-.sendBtn:hover:not(:disabled) { background: rgba(201,151,58,.2); }
-.sendBtn:disabled { opacity: .4; }
+.sendBtn:hover:not(:disabled) {
+  background: rgba(201,151,58,.32);
+  border-color: rgba(201,151,58,.6);
+  transform: scale(1.05);
+}
+.sendBtn:active:not(:disabled) { transform: scale(0.95); }
+.sendBtn:disabled { opacity: .35; }
+
+/* ── Relationship type shift ── */
+.relShift {
+  font-size: 9px;
+  color: rgba(201,151,58,.9);
+  letter-spacing: .03em;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  animation: relShiftIn .3s ease-out;
+}
+.relShiftDim {
+  color: rgba(255,255,255,.25);
+  text-transform: uppercase;
+  font-size: 8px;
+  letter-spacing: .08em;
+  margin-right: 2px;
+}
+.relShiftFrom {
+  color: rgba(255,255,255,.35);
+  text-decoration: line-through;
+}
+.relShiftTo {
+  color: rgba(201,151,58,1.0);
+  font-weight: 500;
+}
+@keyframes relShiftIn {
+  from { opacity: 0; transform: translateY(3px); }
+  to   { opacity: 1; transform: translateY(0); }
+}

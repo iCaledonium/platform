@@ -1,5 +1,7 @@
-import { useState, useEffect } from "react";
+import React, { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
+import CharacterWizard from "./CharacterWizard.jsx";
+import DeployWizardModal from "./DeployWizardModal.jsx";
 
 const STYLE_COLOR = {
   fearful_avoidant:  { bg: "rgba(55,138,221,.10)",  border: "rgba(55,138,221,.2)",  text: "#185fa5", init: "rgba(55,138,221,.15)" },
@@ -154,7 +156,7 @@ function ShareModal({ actor, onClose }) {
   );
 }
 
-function ActorCard({ actor, shared, owned, onShare, onClick }) {
+function ActorCard({ actor, shared, owned, onShare, onDelete, onDeploy, onUndeploy, deployed, onClick }) {
   const c = sc(actor.attachment_style);
   const dots = COMPLETION.map(s => s.check(actor));
 
@@ -165,12 +167,37 @@ function ActorCard({ actor, shared, owned, onShare, onClick }) {
       onMouseLeave={e => { e.currentTarget.style.borderColor="rgba(255,255,255,.95)"; e.currentTarget.style.boxShadow="0 2px 32px rgba(0,0,0,.06), 0 1px 0 rgba(255,255,255,1) inset"; }}>
 
       {owned && (
-        <div onClick={e => { e.stopPropagation(); onShare(actor); }}
-          style={{ position:"absolute", top:10, right:10, width:26, height:26, borderRadius:"50%", background:"rgba(255,255,255,.8)", border:"1px solid rgba(0,0,0,.08)", display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", zIndex:1 }}
-          onMouseEnter={e => { e.currentTarget.style.background="#fff"; e.currentTarget.style.borderColor="rgba(0,0,0,.18)"; }}
-          onMouseLeave={e => { e.currentTarget.style.background="rgba(255,255,255,.8)"; e.currentTarget.style.borderColor="rgba(0,0,0,.08)"; }}>
-          <ShareIcon />
-        </div>
+        <>
+          <div onClick={e => { e.stopPropagation(); onShare(actor); }}
+            style={{ position:"absolute", top:10, right:40, width:26, height:26, borderRadius:"50%", background:"rgba(255,255,255,.8)", border:"1px solid rgba(0,0,0,.08)", display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", zIndex:1 }}
+            onMouseEnter={e => { e.currentTarget.style.background="#fff"; e.currentTarget.style.borderColor="rgba(0,0,0,.18)"; }}
+            onMouseLeave={e => { e.currentTarget.style.background="rgba(255,255,255,.8)"; e.currentTarget.style.borderColor="rgba(0,0,0,.08)"; }}>
+            <ShareIcon />
+          </div>
+          {!deployed && (
+            <div onClick={e => { e.stopPropagation(); if(confirm(`Permanently delete ${actor.name}? This cannot be undone.`)) onDelete(actor.id); }}
+              style={{ position:"absolute", top:10, right:10, width:26, height:26, borderRadius:"50%", background:"rgba(255,255,255,.8)", border:"1px solid rgba(0,0,0,.08)", display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", zIndex:1, fontSize:12, color:"#c0392b" }}
+              onMouseEnter={e => { e.currentTarget.style.background="#fff2f2"; e.currentTarget.style.borderColor="rgba(192,57,43,.3)"; }}
+              onMouseLeave={e => { e.currentTarget.style.background="rgba(255,255,255,.8)"; e.currentTarget.style.borderColor="rgba(0,0,0,.08)"; }}>
+              ✕
+            </div>
+          )}
+          {onDeploy && !deployed && (
+            <div onClick={e => { e.stopPropagation(); onDeploy(actor.id); }}
+              style={{ position:"absolute", bottom:10, right:10, padding:"4px 10px", borderRadius:8, background:"#1a1814", color:"#faf8f4", fontSize:10, fontFamily:"'DM Sans',system-ui,sans-serif", letterSpacing:".08em", textTransform:"uppercase", cursor:"pointer", zIndex:1 }}>
+              Deploy →
+            </div>
+          )}
+          {deployed && onUndeploy && (
+            <div onClick={e => { e.stopPropagation(); if(confirm(`Undeploy ${actor.name} from this world?`)) onUndeploy(actor.id); }}
+              style={{ position:"absolute", top:10, right:10, width:26, height:26, borderRadius:"50%", background:"rgba(255,255,255,.8)", border:"1px solid rgba(0,0,0,.08)", display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", zIndex:1, fontSize:9, color:"#a8a5a0", fontFamily:"'DM Sans',system-ui,sans-serif", letterSpacing:".04em", textTransform:"uppercase" }}
+              title="Undeploy"
+              onMouseEnter={e => { e.currentTarget.style.background="#fff"; e.currentTarget.style.borderColor="rgba(0,0,0,.18)"; e.currentTarget.style.color="#6b6760"; }}
+              onMouseLeave={e => { e.currentTarget.style.background="rgba(255,255,255,.8)"; e.currentTarget.style.borderColor="rgba(0,0,0,.08)"; e.currentTarget.style.color="#a8a5a0"; }}>
+              ↓
+            </div>
+          )}
+        </>
       )}
 
       {shared && (
@@ -200,21 +227,60 @@ function ActorCard({ actor, shared, owned, onShare, onClick }) {
   );
 }
 
-function SectionLabel({ label, count }) {
-  return <p style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".2em", textTransform:"uppercase", color:"#a8a5a0", marginBottom:14 }}>{label}{count!=null?` · ${count}`:""}</p>;
+function SectionLabel({ label, count, children }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div style={{ marginBottom: open ? 0 : "2.5rem" }}>
+      <div onClick={() => setOpen(p => !p)} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", cursor:"pointer", marginBottom: open ? 14 : 0, userSelect:"none" }}>
+        <p style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".2em", textTransform:"uppercase", color:"#a8a5a0", margin:0 }}>{label}{count!=null?` · ${count}`:""}</p>
+        <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, color:"#c8c5c0" }}>{open ? "▲" : "▼"}</span>
+      </div>
+      {open && children}
+    </div>
+  );
 }
 
 export default function ActorsGalleryPage() {
-  const [owned, setOwned]           = useState([]);
-  const [shared, setShared]         = useState([]);
-  const [shareActor, setShareActor] = useState(null);
+  const [owned, setOwned]             = useState([]);
+  const [shared, setShared]           = useState([]);
+  const [deployedIds, setDeployedIds] = useState(new Set());
+  const [deployments, setDeployments] = useState([]);
+  const [shareActor, setShareActor]   = useState(null);
+  const [showWizard, setShowWizard]   = useState(false);
+  const [deployActor, setDeployActor] = useState(null);
   const navigate = useNavigate();
 
   useEffect(() => {
     document.title = "Anima — Characters";
     fetch("/api/actors").then(r => r.ok ? r.json() : []).then(setOwned).catch(() => {});
     fetch("/api/actors/shared").then(r => r.ok ? r.json() : []).then(setShared).catch(() => {});
+    fetch("/api/actors/deployments").then(r => r.ok ? r.json() : []).then(d => {
+      setDeployments(d);
+      setDeployedIds(new Set(d.map(x => x.platform_actor_id)));
+    }).catch(() => {});
   }, []);
+
+  const deleteActor = async (id) => {
+    await fetch(`/api/actors/${id}`, { method: "DELETE" });
+    setOwned(p => p.filter(a => a.id !== id));
+  };
+
+  const undeployActor = async (id) => {
+    await fetch(`/api/actors/${id}/undeploy`, { method: "POST" });
+    setDeployedIds(p => { const n = new Set(p); n.delete(id); return n; });
+    setDeployments(p => p.filter(d => d.platform_actor_id !== id));
+  };
+
+  const inPlay    = owned.filter(a => deployedIds.has(a.id));
+  const notInPlay = owned.filter(a => !deployedIds.has(a.id));
+
+  // Group in-play owned actors by world name
+  const worldGroups = deployments.reduce((acc, d) => {
+    const key = d.world_name || d.world_id;
+    if (!acc[key]) acc[key] = new Set();
+    acc[key].add(d.platform_actor_id);
+    return acc;
+  }, {});
 
   return (
     <div style={{ background:"#eeecea", minHeight:"100vh", position:"relative" }}>
@@ -228,27 +294,58 @@ export default function ActorsGalleryPage() {
             <span style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", fontSize:24, fontWeight:500, letterSpacing:".22em", textTransform:"uppercase", color:"#1a1814" }}>Characters</span>
           </div>
           {owned.length > 0 && (
-            <button style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, letterSpacing:".06em", textTransform:"uppercase", padding:"10px 22px", borderRadius:10, background:"#1a1814", color:"#faf8f4", border:"none", cursor:"pointer" }}>New character +</button>
+            <button onClick={() => setShowWizard(true)} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, letterSpacing:".06em", textTransform:"uppercase", padding:"10px 22px", borderRadius:10, background:"#1a1814", color:"#faf8f4", border:"none", cursor:"pointer" }}>New character +</button>
           )}
         </div>
 
-        {owned.length > 0 && (
-          <>
-            <SectionLabel label="Your characters" count={owned.length} />
+        {Object.entries(worldGroups).map(([worldName, actorIds]) => {
+          const worldActors = owned.filter(a => actorIds.has(a.id));
+          if (!worldActors.length) return null;
+          return (
+            <SectionLabel key={worldName} label={`In Play · ${worldName}`} count={worldActors.length}>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(170px,1fr))", gap:12, marginBottom:"2.5rem" }}>
+                {worldActors.map(a => <ActorCard key={a.id} actor={a} owned deployed onShare={setShareActor} onDelete={deleteActor} onUndeploy={undeployActor} onClick={() => navigate(`/actors/${a.id}`)} />)}
+              </div>
+            </SectionLabel>
+          );
+        })}
+
+        {notInPlay.length > 0 && (
+          <SectionLabel label="Not in play" count={notInPlay.length}>
             <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(170px,1fr))", gap:12, marginBottom:"2.5rem" }}>
-              {owned.map(a => <ActorCard key={a.id} actor={a} owned onShare={setShareActor} onClick={() => navigate(`/actors/${a.id}`)} />)}
+              {notInPlay.map(a => {
+                const isDeployed = deployedIds.has(a.id);
+                return <ActorCard key={a.id} actor={a} owned deployed={isDeployed} onShare={setShareActor} onDelete={deleteActor}
+                  onDeploy={!isDeployed ? (id => setDeployActor(owned.find(x => x.id === id))) : undefined}
+                  onUndeploy={isDeployed ? undeployActor : undefined}
+                  onClick={() => navigate(`/actors/${a.id}`)} />;
+              })}
             </div>
-          </>
+          </SectionLabel>
         )}
 
-        {shared.length > 0 && (
-          <>
-            <SectionLabel label="Shared with you" count={shared.length} />
-            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(170px,1fr))", gap:12 }}>
-              {shared.map(a => <ActorCard key={a.id} actor={a} shared onClick={() => navigate(`/actors/${a.id}`)} />)}
-            </div>
-          </>
-        )}
+        {shared.length > 0 && (() => {
+          const sharedInPlay    = shared.filter(a => deployedIds.has(a.id));
+          const sharedNotInPlay = shared.filter(a => !deployedIds.has(a.id));
+          return (
+            <>
+              {sharedInPlay.length > 0 && (
+                <SectionLabel label="Shared · In play" count={sharedInPlay.length}>
+                  <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(170px,1fr))", gap:12, marginBottom:"2.5rem" }}>
+                    {sharedInPlay.map(a => <ActorCard key={a.id} actor={a} shared onClick={() => navigate(`/actors/${a.id}`)} />)}
+                  </div>
+                </SectionLabel>
+              )}
+              {sharedNotInPlay.length > 0 && (
+                <SectionLabel label="Shared · Not in play" count={sharedNotInPlay.length}>
+                  <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(170px,1fr))", gap:12, marginBottom:"2.5rem" }}>
+                    {sharedNotInPlay.map(a => <ActorCard key={a.id} actor={a} shared onClick={() => navigate(`/actors/${a.id}`)} />)}
+                  </div>
+                </SectionLabel>
+              )}
+            </>
+          );
+        })()}
 
         {owned.length===0 && shared.length===0 && (
           <p style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, color:"#a8a5a0" }}>No actors yet.</p>
@@ -256,6 +353,25 @@ export default function ActorsGalleryPage() {
       </div>
 
       {shareActor && <ShareModal actor={shareActor} onClose={() => setShareActor(null)} />}
+
+      {showWizard && (
+        <CharacterWizard
+          onClose={() => setShowWizard(false)}
+          onCreated={a => { setShowWizard(false); fetch("/api/actors").then(r=>r.ok?r.json():[]).then(setOwned).catch(()=>{}); }}
+        />
+      )}
+
+      {deployActor && (
+        <DeployWizardModal
+          actor={deployActor}
+          onClose={() => setDeployActor(null)}
+          onDeployed={dep => {
+            setDeployments(p => [...p, dep]);
+            setDeployedIds(p => new Set([...p, dep.platform_actor_id]));
+            setDeployActor(null);
+          }}
+        />
+      )}
     </div>
   );
 }

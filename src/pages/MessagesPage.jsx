@@ -155,6 +155,7 @@ export default function MessagesPage() {
   const [selected, setSelected]           = useState(null);
   const [messages, setMessages]           = useState([]);
   const [draft, setDraft]                 = useState("");
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [sending, setSending]             = useState(false);
   const [autoOpened, setAutoOpened]       = useState(false);
   const [appName, setAppName]             = useState("Messages");
@@ -390,10 +391,17 @@ export default function MessagesPage() {
 
   function fmtTime(isoStr) {
     if (!isoStr) return "";
-    return new Date(isoStr).toLocaleTimeString("sv-SE", {
-      hour: "2-digit", minute: "2-digit",
-      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone
-    });
+    const d   = new Date(isoStr);
+    const now = new Date();
+    const tz  = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const sameDay =
+      d.getFullYear() === now.getFullYear() &&
+      d.getMonth()    === now.getMonth()    &&
+      d.getDate()     === now.getDate();
+    const timeStr = d.toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit", timeZone: tz });
+    if (sameDay) return timeStr;
+    const dateStr = d.toLocaleDateString("sv-SE", { day: "numeric", month: "short", timeZone: tz });
+    return `${dateStr} ${timeStr}`;
   }
 
   function initials(name) {
@@ -628,7 +636,7 @@ export default function MessagesPage() {
               </div>
             )}
 
-            <div className={styles.composer}>
+            <div className={styles.composer} style={{ position: "relative" }}>
               {/* Hidden file input */}
               <input
                 ref={fileInputRef}
@@ -648,6 +656,31 @@ export default function MessagesPage() {
                     stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
                 </svg>
               </button>
+              <button
+                className={styles.attachBtn}
+                onClick={() => setShowEmojiPicker(v => !v)}
+                title="Emoji"
+                style={{ position: "relative" }}
+              >
+                😊
+              </button>
+              {showEmojiPicker && (
+                <div style={{
+                  position: "absolute", bottom: "56px", left: "48px",
+                  background: "#1e1e1e", border: "1px solid #333", borderRadius: "12px",
+                  padding: "10px", display: "flex", flexWrap: "wrap", gap: "6px",
+                  width: "240px", zIndex: 100, boxShadow: "0 4px 20px rgba(0,0,0,0.4)"
+                }}>
+                  {["😊","😂","❤️","😍","🥰","😘","😭","😩","🙈","🔥","✨","💯","👀","🥺","😏",
+                    "😎","🤭","😅","🤣","💀","🙏","💪","👋","🎉","💋","😈","🫦","🥵","😮‍💨","💦"].map(e => (
+                    <span
+                      key={e}
+                      onClick={() => { setDraft(d => d + e); setShowEmojiPicker(false); }}
+                      style={{ fontSize: "22px", cursor: "pointer", lineHeight: 1 }}
+                    >{e}</span>
+                  ))}
+                </div>
+              )}
               <textarea
                 className={styles.input}
                 placeholder={pendingAttachment ? "Add a message (optional)…" : `Message ${selected.name}…`}

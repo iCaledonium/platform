@@ -31,13 +31,13 @@ export default function HomePage() {
 
   useEffect(() => {
     fetch("/api/me")
-      .then(r => r.ok ? r.json() : null)
+      .then(r => { if (r.status === 401) { window.location.href = "/login"; return null; } return r.ok ? r.json() : null; })
       .then(data => {
-        if (!data) { window.location.href = "/login"; return; }
+        if (!data) return;
         setUser(data);
         document.title = `Anima — ${data.name}`;
       })
-      .catch(() => { window.location.href = "/login"; });
+      .catch(() => {});
     fetch("/api/worlds")
       .then(r => r.ok ? r.json() : [])
       .then(data => {
