@@ -79,9 +79,9 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   gap: 32px;
-  padding: 40px 24px;
+  padding: 60px 24px 40px;
   overflow-y: auto;
 }
 
@@ -105,6 +105,14 @@
   object-fit: cover;
   border: 1.5px solid rgba(255,255,255,0.12);
   filter: grayscale(20%);
+}
+
+.portraitCanvas {
+  width: 140px;
+  height: 140px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 1.5px solid rgba(255,255,255,0.12);
 }
 
 .actorName {
@@ -354,4 +362,44 @@
 .enterBtn:hover {
   background: rgba(201,151,58,.22);
   border-color: rgba(201,151,58,.7);
+}
+
+/* ── Green screen compositor ── */
+.compositorWrap {
+  position: relative;
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.compositor {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+}
+
+.actorNameOverlay {
+  position: absolute;
+  bottom: 12px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 15px;
+  font-weight: 400;
+  color: rgba(255,255,255,0.45);
+  letter-spacing: 0.06em;
+  pointer-events: none;
+}
+
+.photoFading {
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.photo {
+  transition: opacity 0.3s ease;
 }

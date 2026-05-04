@@ -19,15 +19,22 @@ const TOOL_ICON = {
 export default function HomePage() {
   const [user, setUser]               = useState(null);
   const [worlds, setWorlds]           = useState([]);
-  const [worldStatus, setWorldStatus] = useState(null);
-  const [toggling, setToggling]       = useState(false);
+  const [togglingId, setTogglingId]   = useState(null);
   const [apps, setApps]               = useState([]);
   const [showWizard, setShowWizard]         = useState(false);
   const [configApp, setConfigApp]           = useState(null);
   const [directTool, setDirectTool]         = useState(null);
   const [showEnterOverlay, setShowEnterOverlay] = useState(false);
+  const [selectedWorld,    setSelectedWorld]    = useState(null);
 
   const [pendingCount, setPendingCount] = useState(0);
+
+  function fetchWorlds() {
+    fetch("/api/worlds")
+      .then(r => r.ok ? r.json() : [])
+      .then(setWorlds)
+      .catch(() => {});
+  }
 
   useEffect(() => {
     fetch("/api/me")
@@ -38,18 +45,27 @@ export default function HomePage() {
         document.title = `Anima — ${data.name}`;
       })
       .catch(() => {});
-    fetch("/api/worlds")
-      .then(r => r.ok ? r.json() : [])
-      .then(data => {
-        setWorlds(data);
-        if (data.length > 0) fetchStatus(data[0].id);
-      })
-      .catch(() => {});
+    fetchWorlds();
     loadApps();
     checkPendingMessages();
 
-    // Auto-open wizard if ?install=toolType param present (from notification centre)
-    const installTool = new URLSearchParams(window.location.search).get("install");
+    // Subscribe to world events via SSE
+    const es = new EventSource("/api/events");
+    es.onmessage = (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        if (event.type === "world_started") {
+          setWorlds(p => p.map(w => w.id === event.world_id ? {...w, status: "running"} : w));
+        } else if (event.type === "world_stopped") {
+          setWorlds(p => p.map(w => w.id === event.world_id ? {...w, status: "stopped"} : w));
+        } else if (event.type === "world_created" || event.type === "world_deleted") {
+          fetchWorlds();
+        }
+      } catch {}
+    };
+    es.onerror = () => {}; // auto-reconnects
+
+    return () => es.close();
     if (installTool) {
       setDirectTool(installTool);
       setShowWizard(true);
@@ -64,33 +80,11 @@ export default function HomePage() {
       .catch(() => {});
   }
 
-  function fetchStatus(id) {
-    const worldId = id || worlds[0]?.id;
-    if (!worldId) return;
-    fetch(`/api/worlds/${worldId}/status`)
-      .then(r => r.json())
-      .then(data => setWorldStatus(data.status))
-      .catch(() => setWorldStatus("stopped"));
-  }
-
   function loadApps() {
     fetch("/api/apps")
       .then(r => r.ok ? r.json() : [])
       .then(setApps)
       .catch(() => {});
-  }
-
-  async function toggleWorld() {
-    const worldId = worlds[0]?.id;
-    if (toggling || !worldId) return;
-    setToggling(true);
-    const action = worldStatus === "running" ? "stop" : "start";
-    try {
-      const res = await fetch(`/api/worlds/${worldId}/${action}`, { method: "POST" });
-      const data = await res.json();
-      setWorldStatus(data.status);
-    } catch { fetchStatus(); }
-    finally { setToggling(false); }
   }
 
   async function signOut() {
@@ -106,25 +100,12 @@ export default function HomePage() {
     }
   }
 
-  async function openWorld() {
-    const worldId = worlds[0]?.id;
-    if (!worldId) return;
-    try {
-      const res = await fetch(`/api/viewer-token?world_id=${worldId}`);
-      const { token } = await res.json();
-      window.open(`https://anima.simulator.ngrok.dev/worlds/${worldId}?viewer=${token}`, "_blank");
-    } catch {
-      window.open(`https://anima.simulator.ngrok.dev/worlds/${worldId}`, "_blank");
-    }
-  }
-
   function onAppCreated(app) {
     setShowWizard(false);
     loadApps();
     window.open(`/${app.tool_type}?app=${app.id}`, "_blank");
   }
 
-  const running    = worldStatus === "running";
   const firstName  = user?.name?.split(" ")[0] ?? "";
 
   return (
@@ -153,9 +134,9 @@ export default function HomePage() {
           />
         )}
 
-        {showEnterOverlay && worlds[0] && (
+        {showEnterOverlay && selectedWorld && (
           <WorldEnterOverlay
-            world={worlds[0]}
+            world={selectedWorld}
             user={user}
             onClose={() => setShowEnterOverlay(false)}
           />
@@ -172,6 +153,12 @@ export default function HomePage() {
           </div>
           <div style={{display:"flex",alignItems:"center",gap:10}}>
             <div id="topbar-bell" />
+            {user && (
+              <img src={`/media/users/${user.id}/photo.png`}
+                onError={e => e.target.style.display="none"}
+                style={{width:32,height:32,borderRadius:"50%",objectFit:"cover",
+                  objectPosition:"top center",border:"1.5px solid rgba(0,0,0,0.1)",flexShrink:0}}/>
+            )}
             <button className={homeStyles.signOutBtn} onClick={signOut}>Sign out</button>
           </div>
         </div>
@@ -187,62 +174,81 @@ export default function HomePage() {
         )}
 
         <p className={homeStyles.sectionLabel}>Your worlds</p>
-        <div className={homeStyles.worldCard}>
-          <div className={homeStyles.worldTop}>
-            <div className={homeStyles.worldLeft}>
-              <div className={`${homeStyles.dot} ${running ? homeStyles.dotRunning : homeStyles.dotStopped}`} />
-              <div>
-                <p className={homeStyles.worldName}>{worlds[0]?.name || "—"}</p>
-                <p className={`${homeStyles.worldStatusText} ${running ? homeStyles.statusRunning : homeStyles.statusStopped}`}>
-                  {worldStatus === null ? "Checking..." : running ? "Running" : "Stopped"}
-                </p>
+        {worlds.map(w => {
+          const isRunning = w.status === "running";
+          const worldApps = apps.filter(a => a.world_id === w.id);
+          return (
+            <div key={w.id} className={homeStyles.worldCard} style={{marginBottom:12}}>
+              <div className={homeStyles.worldTop}>
+                <div className={homeStyles.worldLeft}>
+                  <div className={`${homeStyles.dot} ${isRunning ? homeStyles.dotRunning : homeStyles.dotStopped}`} />
+                  <div>
+                    <p className={homeStyles.worldName}>{w.name}</p>
+                    <p className={`${homeStyles.worldStatusText} ${isRunning ? homeStyles.statusRunning : homeStyles.statusStopped}`}>
+                      {isRunning ? "Running" : "Stopped"}{w.city ? ` · ${w.city}` : ""}
+                    </p>
+                  </div>
+                </div>
+                <div className={homeStyles.worldActions}>
+                  <button className={isRunning ? homeStyles.btnStop : homeStyles.btnBoot}
+                    onClick={() => {
+                      fetch(`/api/worlds/${w.id}/${isRunning?"stop":"start"}`, {method:"POST"})
+                        .then(r=>r.json()).then(d => setWorlds(p=>p.map(x=>x.id===w.id?{...x,status:d.status}:x)));
+                    }}>
+                    {isRunning ? "Stop" : "Start"}
+                  </button>
+                  <button className={homeStyles.btnOpen} disabled={!isRunning} onClick={() => {
+                    fetch(`/api/viewer-token?world_id=${w.id}`).then(r=>r.json())
+                      .then(d=>window.open(`https://anima.simulator.ngrok.dev/worlds/${w.id}?viewer=${d.token}`,"_blank"))
+                      .catch(()=>window.open(`https://anima.simulator.ngrok.dev/worlds/${w.id}`,"_blank"));
+                  }}>Monitor →</button>
+                  <button className={homeStyles.btnEnter} disabled={!isRunning}
+                    onClick={() => { setSelectedWorld(w); setShowEnterOverlay(true); }}>
+                    Enter →
+                  </button>
+                </div>
               </div>
+              <div className={homeStyles.worldStats}>
+                {[[w.actor_count??0,"Characters"],[w.member_count??0,"Members"]].map(([n,l]) => (
+                  <div key={l} className={homeStyles.stat}>
+                    <p className={homeStyles.statN}>{n}</p>
+                    <p className={homeStyles.statL}>{l}</p>
+                  </div>
+                ))}
+              </div>
+              {worldApps.length > 0 && (
+                <div style={{borderTop:"1px solid rgba(0,0,0,.06)", padding:"12px 20px 16px", display:"flex", gap:10, flexWrap:"wrap"}}>
+                  {worldApps.map(app => (
+                    <div key={app.id} className={homeStyles.appCard} onClick={() => openApp(app)} style={{flex:"0 0 auto", width:180}}>
+                      <div className={homeStyles.appTop}>
+                        <div className={homeStyles.appIcon} dangerouslySetInnerHTML={{__html: TOOL_ICON[app.tool_type] || TOOL_ICON.messages}} />
+                        <span className={homeStyles.appTypeBadge}>{app.tool_type}</span>
+                      </div>
+                      <p className={homeStyles.appName}>{app.name}</p>
+                      <div className={homeStyles.appFooter}>
+                        <button className={homeStyles.btnAppConfigure} onClick={e => { e.stopPropagation(); setConfigApp(app); }}>Configure</button>
+                        <button className={homeStyles.btnAppOpen} onClick={e => { e.stopPropagation(); openApp(app); }}>Open →</button>
+                      </div>
+                    </div>
+                  ))}
+                  <div className={homeStyles.appCardNew} style={{flex:"0 0 auto", width:180}} onClick={() => { setDirectTool(null); setShowWizard(true); }}>
+                    <div className={homeStyles.newPlus}>+</div>
+                    <p className={homeStyles.newLabel}>New app</p>
+                  </div>
+                </div>
+              )}
+              {worldApps.length === 0 && (
+                <div style={{borderTop:"1px solid rgba(0,0,0,.06)", padding:"10px 20px 14px"}}>
+                  <span style={{fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, color:"#c0bdb8", cursor:"pointer"}}
+                    onClick={() => { setDirectTool(null); setShowWizard(true); }}>+ Install app</span>
+                </div>
+              )}
             </div>
-            <div className={homeStyles.worldActions}>
-              <button className={running ? homeStyles.btnStop : homeStyles.btnBoot} onClick={toggleWorld} disabled={toggling || worldStatus === null}>
-                {toggling ? "..." : running ? "Stop" : "Start"}
-              </button>
-              <button className={homeStyles.btnOpen} disabled={!running} onClick={openWorld}>
-                Monitor →
-              </button>
-              <button className={homeStyles.btnEnter} disabled={!running} onClick={() => setShowEnterOverlay(true)}>
-                Enter →
-              </button>
-            </div>
-          </div>
-          <div className={homeStyles.worldStats}>
-            {[["11","Characters"],["4","Users"]].map(([n,l]) => (
-              <div key={l} className={homeStyles.stat}>
-                <p className={homeStyles.statN}>{n}</p>
-                <p className={homeStyles.statL}>{l}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <p className={homeStyles.sectionLabel}>Your apps</p>
-        <div className={homeStyles.appGrid}>
-          {apps.map(app => (
-            <div key={app.id} className={homeStyles.appCard} onClick={() => openApp(app)}>
-              <div className={homeStyles.appTop}>
-                <div className={homeStyles.appIcon} dangerouslySetInnerHTML={{__html: TOOL_ICON[app.tool_type] || TOOL_ICON.messages}} />
-                <span className={homeStyles.appTypeBadge} style={app.built_by === "user" ? {background:"rgba(176,92,8,.07)",color:"#854f0b",borderColor:"rgba(176,92,8,.13)"} : {}}>
-                {app.built_by === "user" ? "custom" : app.tool_type}
-              </span>
-              </div>
-              <p className={homeStyles.appName}>{app.name}</p>
-              <p className={homeStyles.appMeta}>{worlds.find(w => w.id === app.world_id)?.name || app.world_id}</p>
-              <div className={homeStyles.appFooter}>
-                <button className={homeStyles.btnAppConfigure} onClick={e => { e.stopPropagation(); setConfigApp(app); }}>Configure</button>
-                <button className={homeStyles.btnAppOpen} onClick={e => { e.stopPropagation(); openApp(app); }}>Open →</button>
-              </div>
-            </div>
-          ))}
-          <div className={homeStyles.appCardNew} onClick={() => { setDirectTool(null); setShowWizard(true); }}>
-            <div className={homeStyles.newPlus}>+</div>
-            <p className={homeStyles.newLabel}>New application</p>
-          </div>
-        </div>
+          );
+        })}
+        {worlds.length === 0 && (
+          <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:13,color:"#a8a5a0",marginBottom:"2.5rem"}}>No worlds yet.</p>
+        )}
 
         <p className={homeStyles.sectionLabel}>Pre-built apps</p>
         <div className={homeStyles.toolsGrid} style={{marginBottom: "2.5rem"}}>
@@ -291,6 +297,15 @@ export default function HomePage() {
                   <p className={homeStyles.toolDesc}>{t.desc}</p>
                 </div>
               )
+              : t.name === "World editor"
+              ? (
+                <div key={t.name} className={`${homeStyles.toolCard} ${homeStyles.toolCardLive}`} style={{cursor:"pointer"}} onClick={() => window.location.href="/my-worlds"}>
+                  <span className={homeStyles.liveBadge}>live</span>
+                  <div className={homeStyles.toolIcon} dangerouslySetInnerHTML={{__html: t.svg}} />
+                  <p className={homeStyles.toolName}>{t.name}</p>
+                  <p className={homeStyles.toolDesc}>{t.desc}</p>
+                </div>
+              )
               : (
                 <div key={t.name} className={homeStyles.toolCard}>
                   <span className={homeStyles.soonBadge}>soon</span>
@@ -320,8 +335,9 @@ export default function HomePage() {
 }
 
 const COMM_TOOLS = [
-  { name: "Messages",         toolType: "messages", desc: "Text your contacts in the world.",     live: true,  iconBg: "rgba(55,138,221,.07)",  iconBd: "rgba(55,138,221,.13)",  svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="3" width="12" height="8" rx="1.5" stroke="#378add" stroke-width="1.1"/><path d="M5 7h6M5 9h4" stroke="#378add" stroke-width="1.1" stroke-linecap="round"/></svg>' },
-  { name: "Voice call",       toolType: "voice",    desc: "Call a contact, live TTS response.",   live: false, iconBg: "rgba(29,158,117,.07)",  iconBd: "rgba(29,158,117,.13)",  svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 4.5C4 3.1 5.1 2 6.5 2S9 3.1 9 4.5 7.9 7 6.5 7 4 5.9 4 4.5z" stroke="#1d9e75" stroke-width="1.1"/><path d="M2 13c0-2.5 2-4 4.5-4" stroke="#1d9e75" stroke-width="1.1" stroke-linecap="round"/><path d="M11 9l2 2-2 2M13 11H9" stroke="#1d9e75" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>' },
+  { name: "Messages",         toolType: "messages",  desc: "Text your contacts in the world.",          live: true,  iconBg: "rgba(55,138,221,.07)",  iconBd: "rgba(55,138,221,.13)",  svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="3" width="12" height="8" rx="1.5" stroke="#378add" stroke-width="1.1"/><path d="M5 7h6M5 9h4" stroke="#378add" stroke-width="1.1" stroke-linecap="round"/></svg>' },
+  { name: "Voicemail",        toolType: "voicemail", desc: "Voice messages from your contacts.",          live: true,  iconBg: "rgba(29,158,117,.07)",  iconBd: "rgba(29,158,117,.13)",  svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="5" cy="9" r="2.5" stroke="#1d9e75" stroke-width="1.1"/><circle cx="11" cy="9" r="2.5" stroke="#1d9e75" stroke-width="1.1"/><path d="M5 11.5h6" stroke="#1d9e75" stroke-width="1.1" stroke-linecap="round"/></svg>' },
+  { name: "Voice call",       toolType: "voice",     desc: "Call a contact, live TTS response.",         live: false, iconBg: "rgba(29,158,117,.07)",  iconBd: "rgba(29,158,117,.13)",  svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 4.5C4 3.1 5.1 2 6.5 2S9 3.1 9 4.5 7.9 7 6.5 7 4 5.9 4 4.5z" stroke="#1d9e75" stroke-width="1.1"/><path d="M2 13c0-2.5 2-4 4.5-4" stroke="#1d9e75" stroke-width="1.1" stroke-linecap="round"/><path d="M11 9l2 2-2 2M13 11H9" stroke="#1d9e75" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>' },
   { name: "Video call",       toolType: "video",    desc: "Face-to-face with your actor.",        live: false, iconBg: "rgba(127,119,221,.07)", iconBd: "rgba(127,119,221,.13)", svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="4" width="9" height="7" rx="1.5" stroke="#7f77dd" stroke-width="1.1"/><path d="M11 6.5l3-2v7l-3-2" stroke="#7f77dd" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>' },
   { name: "Live feed",        toolType: "feed",     desc: "Your actor's world right now.",        live: false, iconBg: "rgba(176,92,8,.07)",   iconBd: "rgba(176,92,8,.13)",   svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2v4M8 10v4M2 8h4M10 8h4" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round"/><circle cx="8" cy="8" r="2" stroke="#b05c08" stroke-width="1.1"/></svg>' },
   { name: "Notifications",    toolType: "notifs",   desc: "Alerts when things happen.",           live: false, iconBg: "rgba(216,90,48,.07)",  iconBd: "rgba(216,90,48,.13)",  svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2C5.8 2 4 3.8 4 6v4l-1.5 2h11L12 10V6c0-2.2-1.8-4-4-4z" stroke="#d85a30" stroke-width="1.1"/><path d="M6.5 13.5a1.5 1.5 0 003 0" stroke="#d85a30" stroke-width="1.1" stroke-linecap="round"/></svg>' },
@@ -384,7 +400,7 @@ const INTEGRATIONS = [
 ];
 
 const BUILDER_TOOLS = [
-  { name: "World wizard",      desc: "Create new simulation worlds.",  svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="5" height="5" rx="1" stroke="#b05c08" stroke-width="1.1"/><rect x="9" y="2" width="5" height="5" rx="1" stroke="#b05c08" stroke-width="1.1"/><rect x="2" y="9" width="5" height="5" rx="1" stroke="#b05c08" stroke-width="1.1"/><rect x="9" y="9" width="5" height="5" rx="1" stroke="#b05c08" stroke-width="1.1"/></svg>' },
+  { name: "World editor",      desc: "Build and manage simulation worlds.",  svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="5" height="5" rx="1" stroke="#b05c08" stroke-width="1.1"/><rect x="9" y="2" width="5" height="5" rx="1" stroke="#b05c08" stroke-width="1.1"/><rect x="2" y="9" width="5" height="5" rx="1" stroke="#b05c08" stroke-width="1.1"/><rect x="9" y="9" width="5" height="5" rx="1" stroke="#b05c08" stroke-width="1.1"/></svg>' },
   { name: "Character editor",      desc: "Design psychology and voice.",   svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="5" r="3" stroke="#b05c08" stroke-width="1.1"/><path d="M2 14c0-3.314 2.686-5 6-5s6 1.686 6 5" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round"/></svg>' },
   { name: "Place editor",      desc: "Map-first venue setup.",         svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="5.5" stroke="#b05c08" stroke-width="1.1"/><circle cx="8" cy="8" r="1.5" fill="#b05c08"/><path d="M8 2.5v2M8 11.5v2M2.5 8h2M11.5 8h2" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round"/></svg>' },
   { name: "Scenario designer", desc: "Timeline events and arcs.",      svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 12V6l6-4 6 4v6" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/><rect x="5" y="8" width="6" height="6" rx="0.5" stroke="#b05c08" stroke-width="1.1"/></svg>' },

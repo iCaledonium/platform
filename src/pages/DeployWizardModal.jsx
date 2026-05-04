@@ -62,7 +62,7 @@ function StepWorld({ actor, state, setState }) {
   const [mapReady,  setMapReady]  = useState(false);
 
   useEffect(() => {
-    fetch("/api/worlds").then(r=>r.ok?r.json():[]).then(setWorlds).catch(()=>{});
+    fetch("/api/worlds", { credentials: "include" }).then(r=>r.ok?r.json():[]).then(setWorlds).catch(()=>{});
   }, []);
 
   // Load Google Maps
@@ -85,7 +85,7 @@ function StepWorld({ actor, state, setState }) {
     const timer = setTimeout(() => {
       if (!mapRef.current || mapInst.current) return;
       mapInst.current = new window.google.maps.Map(mapRef.current, {
-      center: { lat: 59.3293, lng: 18.0686 },
+      center: { lat: state.world?.lat || 59.3293, lng: state.world?.lng || 18.0686 },
       zoom: 12,
       disableDefaultUI: true,
       zoomControl: true,
@@ -108,6 +108,13 @@ function StepWorld({ actor, state, setState }) {
     }, 100);
     return () => clearTimeout(timer);
   }, [mapReady, state.world]);
+
+  // Reset maps when world changes so they reinitialize centered on new city
+  useEffect(() => {
+    if (!state.world?.id) return;
+    if (mapInst.current) { mapInst.current = null; }
+    if (workMapInst.current) { workMapInst.current = null; }
+  }, [state.world?.id]);
 
   // Update marker when home changes
   useEffect(() => {
@@ -163,7 +170,8 @@ function StepWorld({ actor, state, setState }) {
     workTimer.current = setTimeout(async () => {
       setWorkSearching(true);
       try {
-        const r = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(q)}`);
+        const country = state.world?.country || '';
+        const r = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(q)}${country ? '&country='+country : ''}`, { credentials: 'include' });
         if (r.ok) { const d = await r.json(); setWorkResults(Array.isArray(d) ? d : []); }
       } catch {}
       setWorkSearching(false);
@@ -192,7 +200,7 @@ function StepWorld({ actor, state, setState }) {
     const timer = setTimeout(() => {
       if (!workMapRef.current || workMapInst.current) return;
       workMapInst.current = new window.google.maps.Map(workMapRef.current, {
-        center: { lat: 59.3293, lng: 18.0686 },
+        center: { lat: state.world?.lat || 59.3293, lng: state.world?.lng || 18.0686 },
         zoom: 12,
         disableDefaultUI: true,
         zoomControl: true,
@@ -235,15 +243,20 @@ function StepWorld({ actor, state, setState }) {
     searchTimer.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const r = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(q)}`);
-        if (r.ok) { const d = await r.json(); setSearchResults(Array.isArray(d) ? d : []); }
-      } catch {}
+        const country = state.world?.country || '';
+        const url = `/api/places/autocomplete?q=${encodeURIComponent(q)}${country ? '&country='+country : ''}`;
+        console.log('[searchPlaces] fetching', url);
+        const r = await fetch(url, { credentials: 'include' });
+        console.log('[searchPlaces] status', r.status);
+        if (r.ok) { const d = await r.json(); console.log('[searchPlaces] results', d.length); setSearchResults(Array.isArray(d) ? d : []); }
+      } catch(e) { console.error('[searchPlaces] error', e); }
       setSearching(false);
     }, 400);
   }
 
   function pickSuggestion(s) {
-    const q = s.neighbourhood + " Stockholm";
+    const city = state.world?.city || "Stockholm";
+    const q = s.neighbourhood + " " + city;
     setSearchQuery(q); searchPlaces(q);
   }
 
@@ -486,7 +499,7 @@ function StepRelationships({ actor, state, setState }) {
   useEffect(() => {
     if (!state.world) return;
     fetch(`/api/worlds/${state.world.id}/actors`).then(r=>r.ok?r.json():[]).then(d=>setCharacters(d.filter(c=>c.id!==actor?.id))).catch(()=>{});
-    fetch(`/api/users`).then(r=>r.ok?r.json():[]).then(d=>setUsers(Array.isArray(d)?d:[])).catch(()=>{});
+    fetch(`/api/worlds/${state.world.id}/members`).then(r=>r.ok?r.json():[]).then(d=>setUsers(Array.isArray(d)?d:[])).catch(()=>{});
     fetch(`/api/relationship-types`).then(r=>r.ok?r.json():null).then(data=>{
       if (!Array.isArray(data)) return;
       setRelTypes(data.filter(t => t.id.startsWith("rt-") || t.id.startsWith("custom-")));
@@ -737,7 +750,12 @@ function StepSchedule({ actor, state, setState }) {
       const r = await fetch(`/api/actors/${actor.id}/generate-schedule`, {
         method: "POST",
         headers: { "Content-Type":"application/json" },
-        body: JSON.stringify({ home_address: state.home?.address })
+        body: JSON.stringify({
+          home_address: state.home?.address,
+          employment_type: state.career?.employment_type,
+          career_level: state.career?.career_level,
+          world_id: state.world?.id,
+        })
       });
       if (r.ok) {
         const slots = await r.json();

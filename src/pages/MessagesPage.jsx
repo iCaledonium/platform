@@ -150,6 +150,27 @@ export default function MessagesPage() {
   const appId        = params.get("app");
   const autoContact  = params.get("contact");
 
+  // World key — resolved after app data loads, shared across all apps in the world
+  const apiKeyRef = useRef(null);
+  function apiFetch(url, opts = {}) {
+    const headers = { ...(opts.headers || {}) };
+    if (apiKeyRef.current) headers["x-api-key"] = apiKeyRef.current;
+    return fetch(url, { ...opts, headers });
+  }
+
+  function resolveWorldKey(worldId) {
+    const stored = localStorage.getItem(`anima_world_key_${worldId}`);
+    if (stored) { apiKeyRef.current = stored; return; }
+    fetch(`/api/worlds/${worldId}/issue-key`, { method: "POST" })
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (data?.key) {
+          localStorage.setItem(`anima_world_key_${worldId}`, data.key);
+          apiKeyRef.current = data.key;
+        }
+      });
+  }
+
   const [me, setMe]                       = useState(null);
   const [contacts, setContacts]           = useState([]);
   const [selected, setSelected]           = useState(null);
@@ -159,6 +180,7 @@ export default function MessagesPage() {
   const [sending, setSending]             = useState(false);
   const [autoOpened, setAutoOpened]       = useState(false);
   const [appName, setAppName]             = useState("Messages");
+  const [world, setWorld]                 = useState(null);
   const [pendingAttachment, setPendingAttachment] = useState(null); // { id, name, version, path }
   const [uploading, setUploading]         = useState(false);
   const [dragging, setDragging]           = useState(false);
@@ -180,28 +202,31 @@ export default function MessagesPage() {
   }, [contacts, me, autoContact]);
 
   useEffect(() => {
-    fetch("/api/me")
+    apiFetch("/api/me")
       .then(r => r.ok ? r.json() : null)
       .then(data => {
         if (!data) { window.location.href = "/login"; return; }
         setMe(data);
         const world = data.worlds?.[0];
         if (world) {
+          resolveWorldKey(world?.world_id);
           if (appId) {
-            fetch("/api/apps")
+            apiFetch("/api/apps")
               .then(r => r.ok ? r.json() : [])
               .then(apps => {
                 const app = apps.find(a => a.id === appId);
                 if (app) {
                   setAppName(app.name);
                   document.title = app.name;
-                  loadContacts(world.world_id, world.actor_id, app.contact_ids);
+                  setWorld({ world_id: app.world_id, actor_id: app.actor_id });
+                  resolveWorldKey(app.world_id);
+                  loadContacts(app.world_id, app.actor_id, app.contact_ids);
                 } else {
-                  loadContacts(world.world_id, world.actor_id, null);
+                  loadContacts(world?.world_id, world?.actor_id, null);
                 }
               });
           } else {
-            loadContacts(world.world_id, world.actor_id, null);
+            loadContacts(world?.world_id, world?.actor_id, null);
           }
         }
       });
@@ -213,13 +238,13 @@ export default function MessagesPage() {
 
   // Check calendar app on mount — independent of conversation loading
   useEffect(() => {
-    fetch("/api/apps")
+    apiFetch("/api/apps")
       .then(r => r.ok ? r.json() : [])
       .then(apps => setHasCalendar(apps.some(a => a.tool_type === "calendar")));
   }, []);
 
   function loadContacts(worldId, actorId, contactIds) {
-    fetch(`/api/worlds/${worldId}/actors/${actorId}/contacts`)
+    apiFetch(`/api/worlds/${worldId}/actors/${actorId}/contacts`)
       .then(r => r.ok ? r.json() : [])
       .then(data => {
         if (contactIds && contactIds.length > 0) {
@@ -237,22 +262,22 @@ export default function MessagesPage() {
     setPendingAttachment(null);
     setContext(null);
     if (pollRef.current) clearInterval(pollRef.current);
-    const world = me?.worlds?.[0];
+    const _world = world || me?.worlds?.[0];
     if (!world) return;
-    loadMessages(world.world_id, world.actor_id, contact.id);
+    loadMessages(world?.world_id, world?.actor_id, contact.id);
     // Load psychological context only for companion/character contacts
     if (contact.actor_type === "companion" || contact.actor_type === "character") {
-      fetch(`/api/worlds/${world.world_id}/actors/${world.actor_id}/context/${contact.id}`)
+      apiFetch(`/api/worlds/${world?.world_id}/actors/${world?.actor_id}/context/${contact.id}`)
         .then(r => r.ok ? r.json() : null)
         .then(data => { if (data) setContext(data); });
     }
     pollRef.current = setInterval(() => {
-      loadMessages(world.world_id, world.actor_id, contact.id);
+      loadMessages(world?.world_id, world?.actor_id, contact.id);
     }, 3000);
   }
 
   function loadMessages(worldId, actorId, contactId) {
-    fetch(`/api/worlds/${worldId}/actors/${actorId}/messages/${contactId}`)
+    apiFetch(`/api/worlds/${worldId}/actors/${actorId}/messages/${contactId}`)
       .then(r => r.ok ? r.json() : [])
       .then(setMessages);
   }
@@ -260,18 +285,18 @@ export default function MessagesPage() {
   async function handleFileChange(e) {
     const file = e.target.files?.[0];
     if (!file || !selected || !me) return;
-    const world = me.worlds?.[0];
+    const _world = world || me?.worlds?.[0];
     if (!world) return;
 
     setUploading(true);
     try {
       const form = new FormData();
       form.append("file", file);
-      form.append("world_id", world.world_id);
-      form.append("received_from", world.actor_id);
+      form.append("world_id", world?.world_id);
+      form.append("received_from", world?.actor_id);
 
-      const res = await fetch(
-        `/api/worlds/${world.world_id}/actors/${selected.id}/media`,
+      const res = await apiFetch(
+        `/api/worlds/${world?.world_id}/actors/${selected.id}/media`,
         { method: "POST", body: form }
       );
       if (res.ok) {
@@ -309,19 +334,19 @@ export default function MessagesPage() {
   }
 
   async function acceptProposal(message, venue, time) {
-    const world = me?.worlds?.[0];
+    const _world = world || me?.worlds?.[0];
     if (!world || !selected) return;
 
     const payload = (() => { try { return message.payload ? JSON.parse(message.payload) : {}; } catch { return {}; } })();
 
     // 1. Confirm meeting on simulator
-    await fetch(`/api/worlds/${world.world_id}/meetings/confirm`, {
+    await apiFetch(`/api/worlds/${world?.world_id}/meetings/confirm`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         actor_a_id:   selected.id,
         actor_a_name: selected.name,
-        actor_b_id:   world.actor_id,
+        actor_b_id:   world?.actor_id,
         actor_b_name: me.name,
         message_id:   message.id,
         payload:      { ...payload, type: payload.type || "book" },
@@ -330,33 +355,33 @@ export default function MessagesPage() {
 
     // 2. Send acceptance text reply
     const reply = `Yes, ${venue} at ${time} works for me!`;
-    await fetch(`/api/worlds/${world.world_id}/actors/${world.actor_id}/messages/${selected.id}`, {
+    await apiFetch(`/api/worlds/${world?.world_id}/actors/${world?.actor_id}/messages/${selected.id}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: reply, sender_name: me.name }),
     });
 
     // 3. Mark proposal as responded
-    await fetch(`/api/worlds/${world.world_id}/actors/${world.actor_id}/messages/${selected.id}/respond/${message.id}`, {
+    await apiFetch(`/api/worlds/${world?.world_id}/actors/${world?.actor_id}/messages/${selected.id}/respond/${message.id}`, {
       method: "POST",
     });
 
-    loadMessages(world.world_id, world.actor_id, selected.id);
+    loadMessages(world?.world_id, world?.actor_id, selected.id);
   }
 
   async function declineProposal(message, venue) {
-    const world = me?.worlds?.[0];
+    const _world = world || me?.worlds?.[0];
     if (!world || !selected) return;
     const reply = `Sorry, I can't make it to ${venue} this time.`;
-    await fetch(`/api/worlds/${world.world_id}/actors/${world.actor_id}/messages/${selected.id}`, {
+    await apiFetch(`/api/worlds/${world?.world_id}/actors/${world?.actor_id}/messages/${selected.id}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: reply, sender_name: me.name }),
     });
-    await fetch(`/api/worlds/${world.world_id}/actors/${world.actor_id}/messages/${selected.id}/respond/${message.id}`, {
+    await apiFetch(`/api/worlds/${world?.world_id}/actors/${world?.actor_id}/messages/${selected.id}/respond/${message.id}`, {
       method: "POST",
     });
-    loadMessages(world.world_id, world.actor_id, selected.id);
+    loadMessages(world?.world_id, world?.actor_id, selected.id);
   }
 
   async function send() {
@@ -364,7 +389,7 @@ export default function MessagesPage() {
     const hasAttachment = !!pendingAttachment;
     if ((!hasContent && !hasAttachment) || sending || !selected || !me) return;
 
-    const world = me.worlds?.[0];
+    const _world = world || me?.worlds?.[0];
     if (!world) return;
     setSending(true);
     const content = draft.trim() || `Shared a file: ${pendingAttachment.name}`;
@@ -372,7 +397,7 @@ export default function MessagesPage() {
     setDraft("");
     setPendingAttachment(null);
     try {
-      await fetch(`/api/worlds/${world.world_id}/actors/${world.actor_id}/messages/${selected.id}`, {
+      await apiFetch(`/api/worlds/${world?.world_id}/actors/${world?.actor_id}/messages/${selected.id}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -381,7 +406,7 @@ export default function MessagesPage() {
           ...(attachment ? { attachment } : {}),
         }),
       });
-      loadMessages(world.world_id, world.actor_id, selected.id);
+      loadMessages(world?.world_id, world?.actor_id, selected.id);
     } finally { setSending(false); }
   }
 

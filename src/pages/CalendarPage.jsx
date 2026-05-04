@@ -81,6 +81,27 @@ export default function CalendarPage() {
   const params = new URLSearchParams(window.location.search);
   const appId  = params.get("app");
 
+  // World key — resolved after app data loads, shared across all apps in the world
+  const apiKeyRef = useRef(null);
+  function apiFetch(url, opts = {}) {
+    const headers = { ...(opts.headers || {}) };
+    if (apiKeyRef.current) headers["x-api-key"] = apiKeyRef.current;
+    return fetch(url, { ...opts, headers });
+  }
+
+  function resolveWorldKey(worldId) {
+    const stored = localStorage.getItem(`anima_world_key_${worldId}`);
+    if (stored) { apiKeyRef.current = stored; return; }
+    fetch(`/api/worlds/${worldId}/issue-key`, { method: "POST" })
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (data?.key) {
+          localStorage.setItem(`anima_world_key_${worldId}`, data.key);
+          apiKeyRef.current = data.key;
+        }
+      });
+  }
+
   const [appName, setAppName]         = useState("Calendar");
   const [calendar, setCalendar]       = useState(null);
   const [loading, setLoading]         = useState(true);
@@ -92,17 +113,18 @@ export default function CalendarPage() {
   const HOUR_HEIGHT = 52;
 
   useEffect(() => {
-    fetch("/api/me")
+    apiFetch("/api/me")
       .then(r => r.ok ? r.json() : null)
       .then(me => {
         if (!me) { window.location.href = "/login"; return; }
         if (appId) {
-          fetch("/api/apps")
+          apiFetch("/api/apps")
             .then(r => r.ok ? r.json() : [])
             .then(apps => {
               const app = apps.find(a => a.id === appId);
               const src = app || me.worlds?.[0];
               if (src) {
+                resolveWorldKey(src.world_id);
                 if (app?.name) { setAppName(app.name); document.title = app.name; }
                 loadCalendar(src.world_id, src.actor_id || me.worlds?.[0]?.actor_id);
               } else setError("No world found.");
@@ -123,7 +145,7 @@ export default function CalendarPage() {
 
   function loadCalendar(wId, aId) {
     setLoading(true);
-    fetch(`/api/worlds/${wId}/actors/${aId}/calendar`)
+    apiFetch(`/api/worlds/${wId}/actors/${aId}/calendar`)
       .then(r => r.ok ? r.json() : null)
       .then(data => {
         setCalendar(data || null);

@@ -1,7 +1,6 @@
 import { useState, useEffect } from "react";
 import styles from "./AppWizard.module.css";
 
-const WORLD_ID = "e7368020-fc19-4914-95ac-2f7c5508a13c";
 
 const AVATARS = {
   "amber-soderstrom-actor": { bg: "#1a2e1a", col: "#5c9e5c" },
@@ -17,15 +16,15 @@ function initials(name) {
 }
 
 export default function AppConfig({ app, user, onClose, onSaved }) {
+  const worldId = app.world_id;
+  const actorId = app.actor_id;
   const [allContacts, setAllContacts] = useState([]);
   const [contactIds, setContactIds]   = useState(app.contact_ids || []);
   const [loading, setLoading]         = useState(true);
   const [saving, setSaving]           = useState(false);
 
-  const actorId = user?.worlds?.find(w => w.world_id === WORLD_ID)?.actor_id || "magnus-klack-actor";
-
   useEffect(() => {
-    fetch(`/api/worlds/${WORLD_ID}/actors/${actorId}/contacts`)
+    fetch(`/api/worlds/${worldId}/actors/${actorId}/contacts`)
       .then(r => r.ok ? r.json() : [])
       .then(data => { setAllContacts(data); setLoading(false); });
   }, []);

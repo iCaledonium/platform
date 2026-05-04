@@ -3,11 +3,12 @@ import styles from "./AppWizard.module.css";
 import homeStyles from "./HomePage.module.css";
 
 const TOOL_TYPES = [
-  { id: "messages", label: "Messages", desc: "SMS-style text with your contacts.", svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="3" width="12" height="8" rx="1.5" stroke="#378add" stroke-width="1.1"/><path d="M5 7h6M5 9h4" stroke="#378add" stroke-width="1.1" stroke-linecap="round"/></svg>' },
-  { id: "calendar", label: "Calendar", desc: "Your schedule and confirmed meetings.", svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="1.5" fill="none" stroke="#b05c08" stroke-width="1.1"/><line x1="2" y1="6" x2="14" y2="6" stroke="#b05c08" stroke-width="1.1"/><line x1="5" y1="1" x2="5" y2="3.5" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round"/><line x1="11" y1="1" x2="11" y2="3.5" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round"/></svg>' },
+  { id: "messages",  label: "Messages",  desc: "SMS-style text with your contacts.", svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="3" width="12" height="8" rx="1.5" stroke="#378add" stroke-width="1.1"/><path d="M5 7h6M5 9h4" stroke="#378add" stroke-width="1.1" stroke-linecap="round"/></svg>' },
+  { id: "calendar",  label: "Calendar",  desc: "Your schedule and confirmed meetings.", svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="1.5" fill="none" stroke="#b05c08" stroke-width="1.1"/><line x1="2" y1="6" x2="14" y2="6" stroke="#b05c08" stroke-width="1.1"/><line x1="5" y1="1" x2="5" y2="3.5" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round"/><line x1="11" y1="1" x2="11" y2="3.5" stroke="#b05c08" stroke-width="1.1" stroke-linecap="round"/></svg>' },
+  { id: "voicemail", label: "Voicemail", desc: "Listen to voice messages from your contacts.", svg: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="5" cy="9" r="2.5" stroke="#1d9e75" stroke-width="1.1"/><circle cx="11" cy="9" r="2.5" stroke="#1d9e75" stroke-width="1.1"/><path d="M5 11.5h6" stroke="#1d9e75" stroke-width="1.1" stroke-linecap="round"/></svg>' },
 ];
 
-const NO_CONTACTS_TOOLS = ["calendar"];
+const NO_CONTACTS_TOOLS = ["calendar", "voicemail"];
 
 const AVATARS = {
   "amber-soderstrom-actor": { bg: "#1a2e1a", col: "#5c9e5c" },
@@ -36,9 +37,18 @@ export default function AppWizard({ user, worlds, directTool, onClose, onCreated
   const [loadingContacts, setLoadingContacts] = useState(false);
   const [creating, setCreating]     = useState(false);
   const [worldId, setWorldId]       = useState(() => worlds?.[0]?.id || null);
+  const [rawKey, setRawKey]         = useState("");
 
   const world    = worlds?.find(w => w.id === worldId);
   const actorId  = user?.worlds?.find(m => m.world_id === worldId)?.actor_id || null;
+
+  // Auto-select existing world key when worldId changes
+  useEffect(() => {
+    if (!worldId) return;
+    const worldKey = keys.find(k => k.world_id === worldId && !k.revoked_at);
+    if (worldKey) setKeyId(worldKey.id);
+    else setKeyId("");
+  }, [worldId, keys]);
 
   useEffect(() => {
     fetch("/api/keys")
@@ -90,6 +100,9 @@ export default function AppWizard({ user, worlds, directTool, onClose, onCreated
         }),
       });
       const data = await res.json();
+      if (rawKey && data.id) {
+        localStorage.setItem(`anima_world_key_${worldId}`, rawKey);
+      }
       onCreated(data);
     } finally { setCreating(false); }
   }
@@ -253,7 +266,7 @@ export default function AppWizard({ user, worlds, directTool, onClose, onCreated
               </div>
             )}
 
-            {step === 4 && <KeyStep keys={keys} keyId={keyId} setKeyId={setKeyId} onBack={() => NO_CONTACTS_TOOLS.includes(toolType) ? setStep(2) : setStep(3)} onCreate={create} creating={creating} worldId={worldId} />}
+            {step === 4 && <KeyStep keys={keys} keyId={keyId} setKeyId={setKeyId} setRawKey={setRawKey} onBack={() => NO_CONTACTS_TOOLS.includes(toolType) ? setStep(2) : setStep(3)} onCreate={create} creating={creating} worldId={worldId} />}
           </>
         )}
 
@@ -290,7 +303,7 @@ export default function AppWizard({ user, worlds, directTool, onClose, onCreated
               </div>
             )}
 
-            {step === 2 && <KeyStep keys={keys} keyId={keyId} setKeyId={setKeyId} onBack={() => setStep(1)} onCreate={create} creating={creating} worldId={worldId} />}
+            {step === 2 && <KeyStep keys={keys} keyId={keyId} setKeyId={setKeyId} setRawKey={setRawKey} onBack={() => setStep(1)} onCreate={create} creating={creating} worldId={worldId} />}
           </>
         )}
       </div>
@@ -298,7 +311,7 @@ export default function AppWizard({ user, worlds, directTool, onClose, onCreated
   );
 }
 
-function KeyStep({ keys, keyId, setKeyId, onBack, onCreate, creating, worldId }) {
+function KeyStep({ keys, keyId, setKeyId, setRawKey, onBack, onCreate, creating, worldId }) {
   const [showCreate, setShowCreate] = useState(keys.length === 0);
   const [newKeyName, setNewKeyName] = useState("");
   const [creatingKey, setCreatingKey] = useState(false);
@@ -323,6 +336,7 @@ function KeyStep({ keys, keyId, setKeyId, onBack, onCreate, creating, worldId })
         }),
       });
       const data = await res.json();
+      if (data.key && setRawKey) setRawKey(data.key);
       const updated = await fetch("/api/keys").then(r => r.json());
       const active = updated.filter(k => !k.revoked_at);
       setLocalKeys(active);

@@ -116,7 +116,7 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
   useEffect(() => {
     if (!mapReady || !mapRef.current || mapInstance.current) return;
     mapInstance.current = new window.google.maps.Map(mapRef.current, {
-      center:           { lat: 59.334, lng: 18.065 },
+      center:           { lat: world.lat || 59.334, lng: world.lng || 18.065 },
       zoom:             13,
       disableDefaultUI: true,
       zoomControl:      true,
@@ -156,7 +156,7 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
         const div = document.createElement("div");
         div.style.cssText = "position:absolute;cursor:pointer;";
         const first    = hasActors ? loc.actors[0] : null;
-        const photoUrl = first?.photo_url ? `${SIMULATOR_URL}${first.photo_url}` : null;
+        const photoUrl = first?.photo_url ? (first.photo_url.startsWith('http') ? first.photo_url : `${SIMULATOR_URL}${first.photo_url}`) : null;
         const extra    = hasActors && loc.actors.length > 1 ? loc.actors.length - 1 : 0;
         const label    = loc.name.length > 18 ? loc.name.slice(0, 17) + "…" : loc.name;
         div.innerHTML = `
@@ -344,7 +344,7 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
                         <div className={styles.actorAvWrap}>
                           {a.photo_url
                             ? <img
-                                src={`${SIMULATOR_URL}${a.photo_url}`}
+                                src={a.photo_url.startsWith('http') ? a.photo_url : `${SIMULATOR_URL}${a.photo_url}`}
                                 className={styles.actorPhoto}
                                 onError={e => { e.target.style.display = "none"; e.target.nextSibling.style.display = "flex"; }}
                               />

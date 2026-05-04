@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
+import DeployWizardModal from "./DeployWizardModal.jsx";
 
 const STYLE_COLOR = {
   fearful_avoidant:  { bg: "rgba(55,138,221,.10)",  border: "rgba(55,138,221,.2)",  text: "#185fa5", init: "rgba(55,138,221,.15)" },
@@ -465,12 +466,40 @@ const PHOTO_SLOTS = [
 ];
 
 function MediaPanel({ actorId }) {
-  const [media, setMedia]       = useState([]);
-  const [loading, setLoading]   = useState(true);
-  const [uploading, setUploading] = useState(null);
+  const [media, setMedia]           = useState([]);
+  const [loading, setLoading]       = useState(true);
+  const [uploading, setUploading]   = useState(null);
+  const [worlds, setWorlds]         = useState([]);
+  const [selectedWorld, setSelectedWorld] = useState(null); // null = canonical
   const fileRef = useRef(null);
   const activeSlotRef = useRef(null);
   const stateFileRef = useRef(null);
+
+  // Fetch worlds this actor is deployed in
+  useEffect(() => {
+    if (!actorId) return;
+    fetch(`/api/actors/${actorId}/worlds`)
+      .then(r => r.ok ? r.json() : [])
+      .then(d => {
+        const list = Array.isArray(d) ? d : (d.worlds || d.data || []);
+        setWorlds(list);
+        if (list.length > 0) setSelectedWorld(list[0].world_id);
+      })
+      .catch(() => {});
+  }, [actorId]);
+
+  // Fetch media whenever actorId or selectedWorld changes
+  useEffect(() => {
+    if (!actorId) return;
+    setLoading(true);
+    const url = selectedWorld
+      ? `/api/actors/${actorId}/media?world_id=${selectedWorld}`
+      : `/api/actors/${actorId}/media`;
+    fetch(url)
+      .then(r => r.ok ? r.json() : [])
+      .then(d => { setMedia(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [actorId, selectedWorld]);
 
   async function resizeFile(file, maxPx) {
     return new Promise(res => {
@@ -499,19 +528,12 @@ function MediaPanel({ actorId }) {
     fd.append("state_slug", slug);
     fd.append("media_type", "state_image");
     fd.append("filename", slug+".jpg");
+    if (selectedWorld) fd.append("world_id", selectedWorld);
     const r = await fetch(`/api/actors/${actorId}/media`, { method:"POST", body:fd });
     const d = await r.json();
     setMedia(prev => [...prev, { id:d.id, media_type:"state_image", state_slug:slug, url:d.url, filename:d.filename }]);
     setUploading(null);
   }
-
-  useEffect(() => {
-    if (!actorId) return;
-    fetch(`/api/actors/${actorId}/media`)
-      .then(r => r.ok ? r.json() : [])
-      .then(d => { setMedia(d); setLoading(false); })
-      .catch(() => setLoading(false));
-  }, [actorId]);
 
   async function uploadSlot(slug, file) {
     if (!file) return;
@@ -536,6 +558,7 @@ function MediaPanel({ actorId }) {
     fd.append("state_slug", slug);
     fd.append("media_type", "photo");
     fd.append("filename", slug+".jpg");
+    if (selectedWorld) fd.append("world_id", selectedWorld);
     const r = await fetch(`/api/actors/${actorId}/media`, { method:"POST", body:fd });
     const d = await r.json();
     setMedia(prev => {
@@ -560,6 +583,30 @@ function MediaPanel({ actorId }) {
 
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:28 }}>
+
+      {/* World tabs */}
+      {worlds.length > 0 && (
+        <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+          {worlds.map(w => (
+            <button key={w.world_id}
+              onClick={() => setSelectedWorld(w.world_id)}
+              style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, padding:"5px 14px", borderRadius:20, border:"1px solid", cursor:"pointer",
+                borderColor: selectedWorld===w.world_id ? "#b05c08" : "rgba(0,0,0,0.12)",
+                background: selectedWorld===w.world_id ? "rgba(176,92,8,0.08)" : "transparent",
+                color: selectedWorld===w.world_id ? "#b05c08" : "#6b6760" }}>
+              {w.world_name || w.world_id?.slice(0,8)}
+            </button>
+          ))}
+          <button
+            onClick={() => setSelectedWorld(null)}
+            style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, padding:"5px 14px", borderRadius:20, border:"1px solid", cursor:"pointer",
+              borderColor: selectedWorld===null ? "#b05c08" : "rgba(0,0,0,0.12)",
+              background: selectedWorld===null ? "rgba(176,92,8,0.08)" : "transparent",
+              color: selectedWorld===null ? "#b05c08" : "#6b6760" }}>
+            Canonical
+          </button>
+        </div>
+      )}
 
       {/* Portrait photo slots */}
       <div>
@@ -629,7 +676,7 @@ function MediaPanel({ actorId }) {
       </div>
 
       {/* ── State animations ── */}
-      <StateAnimationsSection actorId={actorId} animations={animations}
+      <StateAnimationsSection actorId={actorId} animations={animations} selectedWorld={selectedWorld}
         onUploaded={m => setMedia(prev => [...prev, m])}
         onDeleted={id => setMedia(prev => prev.filter(x => x.id !== id))} />
 
@@ -643,18 +690,22 @@ function VideoThumb({ url, onClick }) {
   const [thumb, setThumb] = useState(null);
   useEffect(() => {
     const v = document.createElement("video");
-    v.src = url; v.crossOrigin = "anonymous"; v.preload = "metadata";
-    v.onloadeddata = () => { v.currentTime = 0.5; };
+    v.src = url; v.crossOrigin = "anonymous"; v.preload = "auto"; v.muted = true;
+    v.onloadedmetadata = () => { v.currentTime = Math.min(0.5, v.duration * 0.1 || 0.1); };
     v.onseeked = () => {
-      const c = document.createElement("canvas");
-      c.width = 240; c.height = 180;
-      const ctx = c.getContext("2d");
-      const vw = v.videoWidth||240, vh = v.videoHeight||180;
-      const scale = Math.max(c.width/vw, c.height/vh);
-      const sw = c.width/scale, sh = c.height/scale;
-      ctx.drawImage(v, (vw-sw)/2, (vh-sh)/2, sw, sh, 0, 0, c.width, c.height);
-      setThumb(c.toDataURL("image/jpeg", 0.8));
+      try {
+        const c = document.createElement("canvas");
+        c.width = 240; c.height = 180;
+        const ctx = c.getContext("2d");
+        const vw = v.videoWidth||240, vh = v.videoHeight||180;
+        const scale = Math.max(c.width/vw, c.height/vh);
+        const sw = c.width/scale, sh = c.height/scale;
+        ctx.drawImage(v, (vw-sw)/2, (vh-sh)/2, sw, sh, 0, 0, c.width, c.height);
+        setThumb(c.toDataURL("image/jpeg", 0.8));
+      } catch(e) {}
     };
+    v.onerror = () => {};
+    v.load();
   }, [url]);
   return (
     <div onClick={onClick} style={{ width:"100%", height:"100%", position:"relative", cursor:"pointer" }}>
@@ -700,7 +751,7 @@ function AnimSlot({ stateName, type, bySlug, uploading, uploadTarget, idleFileRe
   );
 }
 
-function StateAnimationsSection({ actorId, animations, onUploaded, onDeleted }) {
+function StateAnimationsSection({ actorId, animations, onUploaded, onDeleted, selectedWorld }) {
   const [playing, setPlaying]     = useState(null);
   const [uploading, setUploading] = useState(null);
   const idleFileRef   = useRef(null);
@@ -718,6 +769,7 @@ function StateAnimationsSection({ actorId, animations, onUploaded, onDeleted }) 
     fd.append("state_slug", slug);
     fd.append("media_type", "animation");
     fd.append("filename", `${slug}.mp4`);
+    if (selectedWorld) fd.append("world_id", selectedWorld);
     const r = await fetch(`/api/actors/${actorId}/media`, { method:"POST", body:fd });
     const d = await r.json();
     onUploaded({ id:d.id, media_type:"animation", state_slug:slug, url:d.url, filename:d.filename });
@@ -1056,6 +1108,7 @@ export default function ActorsEditorPage() {
   const [editing, setEditing]   = useState(false);
   const [saving, setSaving]     = useState(false);
   const [editData, setEditData] = useState(null);
+  const [showDeploy, setShowDeploy] = useState(false);
 
   useEffect(() => {
     if (!id) return;
@@ -1156,11 +1209,19 @@ export default function ActorsEditorPage() {
 
           {/* Actions */}
           <div style={{ padding:"14px 16px", borderTop:"1px solid rgba(0,0,0,.06)", display:"flex", flexDirection:"column", gap:8 }}>
-            <button style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, letterSpacing:".06em", textTransform:"uppercase", padding:"10px 16px", borderRadius:10, background:"none", border:"1px solid rgba(0,0,0,.1)", color:"#6b6760", cursor:"pointer" }}>
+            <button onClick={() => setShowDeploy(true)} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, letterSpacing:".06em", textTransform:"uppercase", padding:"10px 16px", borderRadius:10, background:"#1a1814", border:"none", color:"#fff", cursor:"pointer" }}>
               Deploy to world
             </button>
           </div>
         </div>
+
+        {showDeploy && data?.actor && (
+          <DeployWizardModal
+            actor={data.actor}
+            onClose={() => setShowDeploy(false)}
+            onDeployed={() => { setShowDeploy(false); }}
+          />
+        )}
 
         {/* ── Main content ───────────────────────────────────────────────── */}
         <div style={{ display:"flex", flexDirection:"column" }}>

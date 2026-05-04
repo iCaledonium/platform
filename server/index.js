@@ -112,6 +112,20 @@ app.get("/api/users", (req, res) => {
   res.json(users);
 });
 
+// ── GET /api/worlds/:id/members — users who are members of this world ─────────
+app.get("/api/worlds/:id/members", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const members = db.prepare(`
+    SELECT u.id, u.name, u.email, u.photo_url, m.actor_id, m.role
+    FROM world_memberships m
+    JOIN users u ON u.id = m.user_id
+    WHERE m.world_id = ?
+    ORDER BY u.name
+  `).all(req.params.id);
+  res.json(members);
+});
+
 // ── POST /api/users/me/photo — upload profile photo for current user ──────────
 app.post("/api/users/me/photo", upload.single("photo"), async (req, res) => {
   const user = authUser(req);
@@ -177,16 +191,155 @@ app.get("/api/worlds", async (req, res) => {
       headers: { "X-Service-Token": SERVICE_TOKEN },
     });
     const worlds = await simRes.json();
-    // Merge simulator metadata with platform role/actor
     const membershipMap = Object.fromEntries(memberships.map(m => [m.world_id, m]));
-    const enriched = worlds.map(w => ({
-      ...w,
-      role:     membershipMap[w.id]?.role,
-      actor_id: membershipMap[w.id]?.actor_id,
-    }));
+    const enriched = worlds.map(w => {
+      const member_count = db.prepare(`SELECT count(*) as n FROM world_memberships WHERE world_id = ?`).get(w.id)?.n || 0;
+      return {
+        ...w,
+        role:         membershipMap[w.id]?.role,
+        actor_id:     membershipMap[w.id]?.actor_id,
+        member_count,
+      };
+    });
     res.json(enriched);
   } catch {
     res.status(502).json({ error: "simulator unreachable" });
+  }
+});
+
+// ── POST /api/worlds/:world_id/actors/:actor_id/portrait ─────────────────────
+app.post("/api/worlds/:world_id/actors/:actor_id/portrait", upload.single("photo"), async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const { world_id, actor_id } = req.params;
+  const { user_id, use_default } = req.body;
+
+  try {
+    let srcBuffer, ext;
+
+    if (req.file) {
+      srcBuffer = req.file.buffer;
+      ext = path.extname(req.file.originalname || "photo.jpg") || ".jpg";
+    } else if (use_default === "true" && user_id) {
+      // Copy from platform user photo
+      const userDir = path.join(__dirname, "../public/media/users", user_id);
+      const candidates = ["photo.png","photo.jpg","photo.jpeg","photo.webp"];
+      let found = null;
+      for (const c of candidates) {
+        const p2 = path.join(userDir, c);
+        if (fs.existsSync(p2)) { found = p2; ext = path.extname(c); break; }
+      }
+      if (found) srcBuffer = await fs.promises.readFile(found);
+    }
+
+    if (!srcBuffer) return res.json({ ok: true, skipped: true });
+
+    const destDir = path.join(__dirname, "../public/media/worlds", world_id, "actors", actor_id, "images");
+    await fs.promises.mkdir(destDir, { recursive: true });
+    const filename = `profile${ext}`;
+    await fs.promises.writeFile(path.join(destDir, filename), srcBuffer);
+    const relativePath = `/media/worlds/${world_id}/actors/${actor_id}/images/${filename}`;
+    const baseUrl = process.env.PLATFORM_PUBLIC_URL || `https://${req.headers["x-forwarded-host"] || req.headers.host}`;
+    const mediaPath = `${baseUrl}${relativePath}`;
+
+    // Tell simulator to write actor_media row
+    await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/actors/${actor_id}/portrait`, {
+      method: "POST",
+      headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({ path: mediaPath }),
+    }).catch(() => {});
+
+    res.json({ ok: true, path: mediaPath });
+  } catch (e) {
+    console.error("[portrait]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+app.delete("/api/worlds/:id", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const { id } = req.params;
+  const membership = db.prepare(`SELECT role FROM world_memberships WHERE user_id = ? AND world_id = ?`).get(user.id, id);
+  if (!membership || membership.role !== "owner") return res.status(403).json({ error: "forbidden" });
+  try {
+    await fetch(`${SIMULATOR_URL}/internal/worlds/${id}`, {
+      method: "DELETE", headers: { "X-Service-Token": SERVICE_TOKEN },
+      signal: AbortSignal.timeout(10000)
+    });
+  } catch {}
+  db.prepare(`DELETE FROM world_memberships WHERE world_id = ?`).run(id);
+  db.prepare(`DELETE FROM actor_deployments WHERE world_id = ?`).run(id);
+  // Clean up world media on platform disk
+  const worldMediaDir = path.join(__dirname, "../public/media/worlds", id);
+  fs.rm(worldMediaDir, { recursive: true, force: true }).catch(() => {});
+  res.json({ ok: true });
+});
+
+// ── POST /api/worlds ──────────────────────────────────────────────────────────
+app.post("/api/worlds", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+
+  const {
+    name, city, lat, lng, timezone,
+    news_feed_url, modules = [], scenario_seed, visibility = "private",
+    invitees = []
+  } = req.body;
+
+  if (!name) return res.status(400).json({ error: "name required" });
+  if (!city || !lat || !lng || !timezone) return res.status(400).json({ error: "city, lat, lng, timezone required" });
+
+  const world_id = randomUUID();
+  const now = new Date().toISOString();
+
+  // Resolve invitee names from users table
+  const inviteeUsers = invitees.map(id => {
+    const u = db.prepare(`SELECT id, name FROM users WHERE id = ?`).get(id);
+    return u || null;
+  }).filter(Boolean);
+
+  // Full members list: creator + invitees
+  const members = [
+    { id: user.id, name: user.name },
+    ...inviteeUsers
+  ];
+
+  try {
+    const simRes = await fetch(`${SIMULATOR_URL}/internal/worlds`, {
+      method: "POST",
+      headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: world_id, name, city, lat, lng, timezone,
+        news_feed_url, modules, scenario_seed,
+        members
+      }),
+      signal: AbortSignal.timeout(15000)
+    });
+
+    if (!simRes.ok) {
+      const err = await simRes.json().catch(() => ({}));
+      return res.status(502).json({ error: "simulator failed to create world", detail: err });
+    }
+
+    const simWorld = await simRes.json();
+    const actorMap = simWorld.actor_ids || {};
+
+    // Insert world_memberships for creator + all invitees
+    const insertMembership = db.prepare(`
+      INSERT INTO world_memberships (id, user_id, world_id, actor_id, role, inserted_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertMembership.run(randomUUID(), user.id, world_id, actorMap[user.id] || `${user.id}-actor`, "owner", now, now);
+    for (const invitee of inviteeUsers) {
+      insertMembership.run(randomUUID(), invitee.id, world_id, actorMap[invitee.id] || `${invitee.id}-actor`, "member", now, now);
+    }
+
+    res.json({ world_id, name, status: "running", ...simWorld });
+  } catch (e) {
+    console.error("[POST /api/worlds]", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -339,6 +492,42 @@ app.delete("/api/apps/:id", (req, res) => {
   if (!user) return res.status(401).json({ error: "not authenticated" });
   db.prepare(`DELETE FROM registered_tools WHERE id = ? AND user_id = ?`).run(req.params.id, user.id);
   res.json({ ok: true });
+});
+
+// ── POST /api/worlds/:world_id/issue-key ──────────────────────────────────────
+// One key per user per world. Revokes all existing keys for this user+world,
+// generates one fresh key, updates ALL registered_tools for this world to use it.
+// Returns { key: raw } — client stores in localStorage as anima_world_key_${worldId}.
+app.post("/api/worlds/:world_id/issue-key", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+
+  const worldId = req.params.world_id;
+
+  // Verify membership
+  const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`).get(user.id, worldId);
+  if (!membership) return res.status(403).json({ error: "not a member of this world" });
+
+  // Revoke all existing active keys for this user+world
+  db.prepare(`UPDATE api_keys SET revoked_at = datetime('now'), updated_at = datetime('now') WHERE user_id = ? AND world_id = ? AND revoked_at IS NULL`).run(user.id, worldId);
+
+  // Generate one new world key
+  const raw      = `sk-an-${crypto.randomBytes(32).toString("hex")}`;
+  const keyHash  = crypto.createHash("sha256").update(raw).digest("hex");
+  const prefix   = raw.slice(0, 12) + "••••••••" + raw.slice(-4);
+  const newKeyId = randomUUID();
+
+  db.prepare(`INSERT INTO api_keys (id, user_id, world_id, name, key_hash, key_prefix, scopes, inserted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`).run(
+    newKeyId, user.id, worldId,
+    `World key — ${worldId.slice(0, 8)}`,
+    keyHash, prefix,
+    JSON.stringify(["messages:read", "messages:write", "contacts:read", "calendar:read"])
+  );
+
+  // Wire all apps in this world to the new key
+  db.prepare(`UPDATE registered_tools SET api_key_id = ?, updated_at = datetime('now') WHERE user_id = ? AND world_id = ?`).run(newKeyId, user.id, worldId);
+
+  res.json({ key: raw, key_id: newKeyId });
 });
 
 // ── GET /api/worlds/:world_id/actors/:actor_id/contacts ───────────────────────
@@ -699,13 +888,17 @@ app.post("/api/actors/:id/media", upload.fields([{name:"photo",maxCount:1},{name
     if (!a?.name) return req.params.id;
     return a.name.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"") + "-" + req.params.id.slice(0,8);
   })();
-  const actorDir   = path.join(__dirname, "../public/media/actors", actorSlug, "images");
+  const world_id   = req.body.world_id || null;
+  const mediaBase  = world_id
+    ? path.join(__dirname, `../public/media/worlds/${world_id}/actors`, actorSlug)
+    : path.join(__dirname, "../public/media/actors", actorSlug);
+  const actorDir   = path.join(mediaBase, "images");
 
   const isVideo = req_file.mimetype.startsWith("video/") || filename.endsWith(".mp4");
 
   const { mkdirSync, writeFileSync } = await import("fs");
   mkdirSync(actorDir, { recursive: true });
-  const fileDir = isAudio ? path.join(__dirname, "../public/media/actors", actorSlug, "voice") : actorDir;
+  const fileDir = isAudio ? path.join(mediaBase, "voice") : actorDir;
   mkdirSync(fileDir, { recursive: true });
   writeFileSync(path.join(fileDir, filename), req_file.buffer);
 
@@ -718,14 +911,17 @@ app.post("/api/actors/:id/media", upload.fields([{name:"photo",maxCount:1},{name
     } catch {}
   }
 
-  const url = isAudio ? `/media/actors/${actorSlug}/voice/${filename}` : `/media/actors/${actorSlug}/images/${filename}`;
+  const urlBase = world_id ? `/media/worlds/${world_id}/actors/${actorSlug}` : `/media/actors/${actorSlug}`;
+  const relUrl = isAudio ? `${urlBase}/voice/${filename}` : `${urlBase}/images/${filename}`;
+  const platformBase = process.env.PLATFORM_PUBLIC_URL || `https://${req.headers["x-forwarded-host"] || req.headers.host}`;
+  const url = `${platformBase}${relUrl}`;
   const now = new Date().toISOString();
   const id  = randomUUID();
 
-  db.prepare(`DELETE FROM actor_media WHERE actor_id = ? AND state_slug = ? AND media_type = ?`)
-    .run(req.params.id, state_slug, media_type);
-  db.prepare(`INSERT INTO actor_media (id, actor_id, media_type, filename, url, state_slug, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?)`)
-    .run(id, req.params.id, media_type, filename, url, state_slug, now, now);
+  db.prepare(`DELETE FROM actor_media WHERE actor_id = ? AND state_slug = ? AND media_type = ? AND (world_id = ? OR (world_id IS NULL AND ? IS NULL))`)
+    .run(req.params.id, state_slug, media_type, world_id, world_id);
+  db.prepare(`INSERT INTO actor_media (id, actor_id, world_id, media_type, filename, url, state_slug, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)`)
+    .run(id, req.params.id, world_id, media_type, filename, url, state_slug, now, now);
 
   res.json({ id, url, state_slug, media_type, filename });
 });
@@ -766,7 +962,10 @@ app.get("/api/actors/:id/media", (req, res) => {
   if (!user) return res.status(401).json({ error: "unauthorized" });
   const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
   if (!actor) return res.status(404).json({ error: "not found" });
-  const media = db.prepare(`SELECT * FROM actor_media WHERE actor_id = ? ORDER BY media_type, inserted_at`).all(req.params.id);
+  const world_id = req.query.world_id || null;
+  const media = world_id
+    ? db.prepare(`SELECT * FROM actor_media WHERE actor_id = ? AND world_id = ? ORDER BY media_type, inserted_at`).all(req.params.id, world_id)
+    : db.prepare(`SELECT * FROM actor_media WHERE actor_id = ? ORDER BY media_type, inserted_at`).all(req.params.id);
   res.json(media);
 });
 
@@ -869,17 +1068,15 @@ app.post("/api/actors/:id/deploy", async (req, res) => {
     return { ...rel, target_simulator_actor_id: dep.simulator_actor_id };
   }).filter(Boolean);
 
-  // Base64-encode all media files into payload — self-contained, no SSH/rsync needed
-  const { readFileSync: readFS } = await import("fs");
-  const mediaRows = db.prepare(`SELECT media_type, filename, url, state_slug FROM actor_media WHERE actor_id = ?`).all(actorId);
+  // Send media as URLs — simulator fetches them if needed. No base64 embedding.
+  let mediaRows = db.prepare(`SELECT media_type, filename, url, state_slug FROM actor_media WHERE actor_id = ? AND media_type != 'animation'`).all(actorId);
+  const platformBase = process.env.PLATFORM_PUBLIC_URL || "";
   const mediaWithData = mediaRows.map(m => {
-    try {
-      const ext  = path.extname(m.filename).toLowerCase();
-      const mime = ext === ".mp3" ? "audio/mpeg" : ext === ".mp4" ? "video/mp4" : ext === ".png" ? "image/png" : "image/jpeg";
-      const data = readFS(path.join(__dirname, "../public", m.url)).toString("base64");
-      return { media_type: m.media_type, filename: m.filename, state_slug: m.state_slug, mime, data };
-    } catch(e) { console.warn("[deploy] skipping media", m.filename, e.message); return null; }
-  }).filter(Boolean);
+    const ext  = path.extname(m.filename || "").toLowerCase();
+    const mime = ext === ".mp3" ? "audio/mpeg" : ext === ".mp4" ? "video/mp4" : ext === ".png" ? "image/png" : "image/jpeg";
+    const url  = m.url.startsWith("http") ? m.url : `${platformBase}${m.url}`;
+    return { media_type: m.media_type, filename: m.filename, state_slug: m.state_slug, mime, url };
+  });
 
   const payload = {
     platform_actor_id: actorId,
@@ -931,6 +1128,15 @@ app.post("/api/actors/:id/suggest-home", async (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
 
+  const { world_id } = req.body || {};
+  let city = "Stockholm";
+  if (world_id) {
+    try {
+      const ww = await simFetch(`/internal/worlds?ids=${world_id}`);
+      city = ww?.[0]?.city || "Stockholm";
+    } catch {}
+  }
+
   let actor;
   try {
     actor = db.prepare(`
@@ -958,7 +1164,7 @@ Big5: O:${b5[0]} C:${b5[1]} E:${b5[2]} N:${b5[3]}
 Economic: ${[actor.income_level, actor.financial_situation, actor.lifestyle_tier].filter(Boolean).join(", ") || "unknown"}
 Housing preference: ${[actor.neighbourhood_pref, actor.housing_type].filter(Boolean).join(", ") || "unknown"}
 
-Suggest 3 Stockholm neighbourhoods where this person would realistically live given their occupation, psychology, income and lifestyle. Be specific and grounded.
+Suggest 3 ${city} neighbourhoods where this person would realistically live given their occupation, psychology, income and lifestyle. Be specific and grounded.
 
 Respond with JSON only — no preamble:
 [{"neighbourhood":"...","reason":"..."},{"neighbourhood":"...","reason":"..."},{"neighbourhood":"...","reason":"..."}]`;
@@ -967,7 +1173,7 @@ Respond with JSON only — no preamble:
     const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type":"application/json", "x-api-key":process.env.CLAUDE_API_KEY, "anthropic-version":"2023-06-01" },
-      body: JSON.stringify({ model:"claude-haiku-4-5-20251001", max_tokens:300, system:"You suggest Stockholm neighbourhoods. Respond in JSON only.", messages:[{ role:"user", content:prompt }] })
+      body: JSON.stringify({ model:"claude-haiku-4-5-20251001", max_tokens:300, system:`You suggest ${city} neighbourhoods. Respond in JSON only.`, messages:[{ role:"user", content:prompt }] })
     });
     const data = await apiRes.json();
     const text = data.content?.find(b => b.type === "text")?.text || "";
@@ -984,12 +1190,16 @@ app.get("/api/places/autocomplete", async (req, res) => {
 
   const q = req.query.q;
   if (!q) return res.status(400).json({ error: "q required" });
+  const countryRaw = req.query.country || "";
+  const countryMap = {"Sweden":"se","Norway":"no","Denmark":"dk","Finland":"fi","United Kingdom":"gb","United States":"us","Germany":"de","France":"fr","Spain":"es","Italy":"it","Netherlands":"nl","Belgium":"be","Switzerland":"ch","Austria":"at","Poland":"pl","Portugal":"pt","Japan":"jp","Australia":"au","Canada":"ca","Brazil":"br","Mexico":"mx","India":"in","China":"cn","South Korea":"kr","Singapore":"sg","Thailand":"th","Indonesia":"id","Malaysia":"my","Philippines":"ph","Vietnam":"vn","New Zealand":"nz","South Africa":"za","Argentina":"ar","Chile":"cl","Colombia":"co","Peru":"pe","Czech Republic":"cz","Hungary":"hu","Romania":"ro","Greece":"gr","Turkey":"tr","Israel":"il","UAE":"ae","Saudi Arabia":"sa"};
+  const country = countryMap[countryRaw] || (countryRaw.length === 2 ? countryRaw.toLowerCase() : "");
+  const components = country ? `&components=country:${country}` : "";
 
   const MAPS_KEY = "AIzaSyDy45Dov_WkN9FcxdVNYQEx23PjexI-Fxc";
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
-    const r = await fetch(`https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(q)}&types=address&components=country:se&language=en&key=${MAPS_KEY}`, { signal: controller.signal });
+    const r = await fetch(`https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(q)}&types=address${components}&language=en&key=${MAPS_KEY}`, { signal: controller.signal });
     clearTimeout(timeout);
     const data = await r.json();
     const results = (data.predictions || []).slice(0, 5).map(p => ({
@@ -1110,6 +1320,15 @@ app.post("/api/actors/:id/suggest-workplace", async (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
 
+  const { world_id } = req.body || {};
+  let city = "Stockholm";
+  if (world_id) {
+    try {
+      const ww = await simFetch(`/internal/worlds?ids=${world_id}`);
+      city = ww?.[0]?.city || "Stockholm";
+    } catch {}
+  }
+
   let actor;
   try {
     actor = db.prepare(`SELECT a.first_name, a.name, a.occupation, a.age, e.income_level, e.lifestyle_tier FROM actors a LEFT JOIN actor_economic e ON e.actor_id = a.id WHERE a.id = ?`).get(req.params.id);
@@ -1120,7 +1339,7 @@ app.post("/api/actors/:id/suggest-workplace", async (req, res) => {
   const prompt = `Character: ${name}, ${actor.age||"unknown age"}, ${actor.occupation||"unknown occupation"}
 ${actor.income_level ? `Income: ${actor.income_level}` : ""}
 
-Suggest 3 realistic Stockholm workplaces for this person. Be specific — name real hospitals, clinics, offices, studios etc. that fit their occupation and seniority.
+Suggest 3 realistic ${city} workplaces for this person. Be specific — name real hospitals, clinics, offices, studios etc. that fit their occupation and seniority.
 
 Respond with JSON only:
 [{"name":"...","reason":"..."},{"name":"...","reason":"..."},{"name":"...","reason":"..."}]`;
@@ -1129,7 +1348,7 @@ Respond with JSON only:
     const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
       method:"POST",
       headers:{ "Content-Type":"application/json", "x-api-key":process.env.CLAUDE_API_KEY, "anthropic-version":"2023-06-01" },
-      body: JSON.stringify({ model:"claude-haiku-4-5-20251001", max_tokens:300, system:"You suggest Stockholm workplaces. Respond in JSON only.", messages:[{ role:"user", content:prompt }] })
+      body: JSON.stringify({ model:"claude-haiku-4-5-20251001", max_tokens:300, system:`You suggest ${city} workplaces. Respond in JSON only.`, messages:[{ role:"user", content:prompt }] })
     });
     const data = await apiRes.json();
     const text = data.content?.find(b=>b.type==="text")?.text||"";
@@ -1161,9 +1380,23 @@ app.post("/api/actors/:id/generate-schedule", async (req, res) => {
 
   if (!actor) return res.status(404).json({ error: "not found" });
 
-  const { home_address } = req.body;
+  const { home_address, employment_type, career_level, world_id } = req.body;
   const name = actor.first_name || actor.name;
   const b5 = [actor.openness, actor.conscientiousness, actor.extraversion, actor.agreeableness, actor.neuroticism].map(v => v != null ? Math.round(v) : "?");
+
+  // Get city for schedule context
+  let city = "Stockholm";
+  if (world_id) {
+    try {
+      const ww = await simFetch(`/internal/worlds?ids=${world_id}`);
+      city = ww?.[0]?.city || "Stockholm";
+    } catch {}
+  }
+
+  const isFreelance = employment_type === "freelance";
+  const employmentNote = isFreelance
+    ? `Employment: freelance / self-employed — no fixed office, variable hours, works from home/cafes/client sites. Work activities include: pitching, negotiating, work_deep, admin, networking, script_reading, rehearsing, filming, editing, recording, composing.`
+    : `Employment: employed — regular office hours, commute to workplace.`;
 
   const SLUGS = "sleeping, morning_routine, waking, bath, skincare, grooming, eating, cooking, meal_prep, brunch, coffee, drinking_coffee, snacking, exercise, running, cycling, yoga, stretching, foam_rolling, swimming, hiking, sport, work_deep, work_admin, work_meetings, work_audition, work_casting, work_onset, work_reviewing, work_mainstream_audition, script_reading, rehearsing, filming, editing, recording, composing, mixing, storyboarding, admin, planning, errands, laundry, cleaning, childcare, shopping, medical, therapy, coaching, studying, reading, writing, journaling, sketching, painting, creative, reflection, daydreaming, meditating, praying, decompressing, relaxing, napping, watching_tv, scrolling, gaming, listening, social_dinner, social_bar, social_cafe, social_drinks, social_late_night, party, networking, exhibition, gallery, cinema, concert, ceremony, volunteering, walking, transit, taxi, travel, waiting, withdrawing, philosophical, pitching, negotiating, dining, drinking_wine, drinking_alcohol, sunbathing, sauna, spa, massage, people_watching, window_watching, flirting, hooking_up";
 
@@ -1173,7 +1406,9 @@ Big5: O:${b5[0]} C:${b5[1]} E:${b5[2]} A:${b5[3]} N:${b5[4]}
 ${actor.income_level ? `Economic: ${actor.income_level} income` : ""}
 ${actor.morning_person ? `Morning person: ${actor.morning_person}` : ""}
 ${actor.social_frequency ? `Social frequency: ${actor.social_frequency}` : ""}
-Home: ${home_address || "Stockholm"}
+Home: ${home_address || city}
+City: ${city}
+${employmentNote}
 
 Generate a realistic weekly schedule that reflects this person's psychology, occupation and lifestyle.
 Rules:
@@ -1379,16 +1614,8 @@ app.get("/api/actors/:id/worlds", async (req, res) => {
   const { id } = req.params;
   const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND (owner_id = ? OR id IN (SELECT actor_id FROM actor_shares WHERE shared_with_id = ?))`).get(id, user.id, user.id);
   if (!actor) return res.status(404).json({ error: "not found" });
-  try {
-    const simRes = await fetch(`${SIMULATOR_URL}/internal/actor-worlds/${id}`, {
-      headers: { "X-Service-Token": SERVICE_TOKEN }
-    });
-    if (!simRes.ok) return res.json([]);
-    const data = await simRes.json();
-    res.json(data);
-  } catch {
-    res.json([]);
-  }
+  const worlds = db.prepare(`SELECT world_id, world_name, deployed_at FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL ORDER BY deployed_at DESC`).all(id);
+  res.json(worlds);
 });
 
 // ── Static media ─────────────────────────────────────────────────────────────
@@ -1436,7 +1663,124 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Platform API running on :${PORT}`));
+server.listen(PORT, () => {
+  console.log(`Platform API running on :${PORT}`);
+  connectSimulatorEvents();
+});
+
+// ── SSE: browser clients registry ────────────────────────────────────────────
+const sseClients = new Map(); // user_id → Set of res objects
+
+function broadcastToUser(userId, event) {
+  const clients = sseClients.get(userId);
+  if (!clients) return;
+  const msg = `data: ${JSON.stringify(event)}\n\n`;
+  for (const res of clients) {
+    try { res.write(msg); } catch {}
+  }
+}
+
+function broadcastWorldEvent(event) {
+  // world_created/deleted fires before membership is written — broadcast to all
+  if (event.type === "world_created" || event.type === "world_deleted") {
+    const msg = `data: ${JSON.stringify(event)}\n\n`;
+    for (const [, clients] of sseClients) {
+      for (const res of clients) { try { res.write(msg); } catch {} }
+    }
+    return;
+  }
+  // Broadcast to all users who are members of the affected world
+  if (event.world_id) {
+    const members = db.prepare(`SELECT user_id FROM world_memberships WHERE world_id = ?`).all(event.world_id);
+    for (const { user_id } of members) broadcastToUser(user_id, event);
+  } else {
+    // Broadcast to all connected users (e.g. connected event)
+    for (const [, clients] of sseClients) {
+      const msg = `data: ${JSON.stringify(event)}\n\n`;
+      for (const res of clients) { try { res.write(msg); } catch {} }
+    }
+  }
+}
+
+// ── GET /api/events — browser SSE subscription ───────────────────────────────
+app.get("/api/events", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).end();
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+  res.write(`data: ${JSON.stringify({ type: "connected" })}\n\n`);
+
+  if (!sseClients.has(user.id)) sseClients.set(user.id, new Set());
+  sseClients.get(user.id).add(res);
+
+  const heartbeat = setInterval(() => {
+    try { res.write(": heartbeat\n\n"); } catch {}
+  }, 25000);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    sseClients.get(user.id)?.delete(res);
+  });
+});
+
+// ── Simulator SSE subscriber ──────────────────────────────────────────────────
+async function connectSimulatorEvents() {
+  const url = `${SIMULATOR_URL}/internal/events`;
+  const headers = { "X-Service-Token": SERVICE_TOKEN };
+
+  async function connect() {
+    try {
+      const res = await fetch(url, { headers });
+      if (!res.ok) { throw new Error(`SSE connect failed: ${res.status}`); }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      console.log("[Events] Connected to simulator SSE");
+
+      // On reconnect, fetch all world statuses and sync to browsers
+      try {
+        const worldIds = db.prepare(`SELECT DISTINCT world_id FROM world_memberships`).all().map(r => r.world_id);
+        if (worldIds.length > 0) {
+          const simRes = await fetch(`${SIMULATOR_URL}/internal/worlds?ids=${worldIds.join(",")}`, {
+            headers: { "X-Service-Token": SERVICE_TOKEN }
+          });
+          if (simRes.ok) {
+            const worlds = await simRes.json();
+            for (const w of worlds) {
+              broadcastWorldEvent({ type: w.status === "running" ? "world_started" : "world_stopped", world_id: w.id });
+            }
+          }
+        }
+      } catch {}
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop();
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            try {
+              const event = JSON.parse(line.slice(6));
+              if (event.type !== "connected") broadcastWorldEvent(event);
+            } catch {}
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("[Events] Simulator SSE disconnected, retrying in 5s:", e.message);
+    }
+    setTimeout(connect, 5000);
+  }
+
+  connect();
+}
+
+
 
 // ── GET /api/actors — list canonical actors owned by or shared with the user ─
 app.get("/api/actors", (req, res) => {
@@ -1555,11 +1899,25 @@ app.put("/api/actors/:id", (req, res) => {
 
 // ── Helper: auth from cookie ──────────────────────────────────────────────────
 function authUser(req) {
+  // 1. Cookie auth (platform UI)
   const cookieHeader = req.headers["cookie"] || "";
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
-  if (!match) return null;
-  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
-  return db.prepare(`SELECT u.id, u.name FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  if (match) {
+    const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+    const row = db.prepare(`SELECT u.id, u.name FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+    if (row) return row;
+  }
+  // 2. API key auth (installed apps)
+  const apiKey = req.headers["x-api-key"] || "";
+  if (apiKey.startsWith("sk-an-")) {
+    const keyHash = crypto.createHash("sha256").update(apiKey).digest("hex");
+    const keyRow = db.prepare(`SELECT user_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL`).get(keyHash);
+    if (keyRow) {
+      db.prepare(`UPDATE api_keys SET last_used_at = datetime('now') WHERE key_hash = ?`).run(keyHash);
+      return db.prepare(`SELECT id, name FROM users WHERE id = ?`).get(keyRow.user_id);
+    }
+  }
+  return null;
 }
 
 
@@ -1602,6 +1960,41 @@ app.get("/api/worlds/:world_id/actors/:actor_id/calendar", async (req, res) => {
     const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/calendar`);
     res.json(data);
   } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/worlds/:world_id/actors/:actor_id/voicemail ─────────────────────
+// Returns voice messages received by actor, marks as read.
+app.get("/api/worlds/:world_id/actors/:actor_id/voicemail", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  try {
+    const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/voicemail`);
+    res.json(data);
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── POST /api/tts — proxy to XTTS, fallback gracefully if down ───────────────
+const XTTS_URL = "http://212.147.242.29:8005/tts";
+app.post("/api/tts", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const { text, actor_id } = req.body;
+  if (!text || !actor_id) return res.status(400).json({ error: "text and actor_id required" });
+  try {
+    const response = await fetch(XTTS_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, reference_audio_filename: `${actor_id}.mp3`, language: "en" }),
+      signal: AbortSignal.timeout(15_000)
+    });
+    if (!response.ok) return res.json({ fallback: true });
+    const buf = await response.arrayBuffer();
+    res.set("Content-Type", "audio/wav");
+    res.send(Buffer.from(buf));
+  } catch {
+    // XTTS down or timeout — client falls back to text display
+    res.json({ fallback: true });
+  }
 });
 
 

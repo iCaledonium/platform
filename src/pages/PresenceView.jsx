@@ -1,9 +1,9 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import styles from "./PresenceView.module.css";
 
 const SIMULATOR_URL = "https://anima.simulator.ngrok.dev";
 
-export default function PresenceView({ world, user, sceneData, actorName, actorPhoto, encounter_id, onLeave }) {
+export default function PresenceView({ world, user, sceneData, actorName, actorPhoto, actorId: actorIdProp, encounter_id, onLeave }) {
   const { location } = sceneData;
   const playerActorId = user?.worlds?.find(w => w.world_id === world.id)?.actor_id;
 
@@ -20,10 +20,44 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
   const [arcSignal,   setArcSignal]   = useState(null);
   const [statusFlash, setStatusFlash] = useState(null);
   const [relShift,    setRelShift]    = useState(null);
-  const [modelName,   setModelName]   = useState("…");
+  const [modelName,   setModelName]   = useState("");
   const [vitalToasts, setVitalToasts] = useState([]);
-  const [ttsMode,     setTtsMode]     = useState("narrative"); // "conversational" | "narrative"
+  const [ttsMode,     setTtsMode]     = useState("conversational"); // "conversational" | "narrative"
   const [tsMuted,     setTsMuted]     = useState(false);
+  const [audioReady,  setAudioReady]  = useState(false);
+  const [currentAction,   setCurrentAction]   = useState("idle");
+  const [currentLocation, setCurrentLocation] = useState("hall");
+  const [currentPosition, setCurrentPosition] = useState("standing");
+  const [currentOutfit,   setCurrentOutfit]   = useState("casual");
+  const [videoFading,     setVideoFading]     = useState(false);
+
+  // ── Green screen compositor ───────────────────────────────────────────────
+  const canvasRef   = useRef(null);
+  const idleRef     = useRef(null);
+  const talkRef     = useRef(null);
+  const activeRef   = useRef(null);
+  const bgImgRef    = useRef(null);
+  const animFrameRef = useRef(null);
+  const offRef      = useRef(null);
+
+  const KEY_R = 0, KEY_G = 177, KEY_B = 64;
+  const TOLERANCE = 120, SOFTNESS = 30, SPILL = 60;
+
+  function chromaKeyPixels(pixels) {
+    const d = pixels.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const r = d[i], g = d[i+1], b = d[i+2];
+      const dist = Math.sqrt((r-KEY_R)**2 + (g-KEY_G)**2 + (b-KEY_B)**2);
+      if (dist < TOLERANCE) { d[i+3] = 0; }
+      else if (dist < TOLERANCE + SOFTNESS) {
+        const a = (dist - TOLERANCE) / SOFTNESS; d[i+3] = Math.round(255 * a);
+        if (KEY_G > KEY_R && KEY_G > KEY_B) { const sf = SPILL/100; d[i+1] = Math.round(g-(g-Math.max(r,b))*sf*(1-a)); }
+      } else if (SPILL > 0 && KEY_G > KEY_R && KEY_G > KEY_B) {
+        const sf = (SPILL/100)*Math.max(0,1-(dist-TOLERANCE-SOFTNESS)/60);
+        if (sf > 0) d[i+1] = Math.round(g-(g-Math.max(r,b))*sf*0.3);
+      }
+    }
+  }
   const [firstWordsDone, setFirstWordsDone] = useState(false);
   const tsMutedRef    = useRef(false);
   const ttsModeRef    = useRef("narrative");
@@ -33,7 +67,7 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
     fetch("/api/encounter/model-status")
       .then(r => r.ok ? r.json() : null)
       .then(d => { if (d?.model) setModelName(d.model); })
-      .catch(() => setModelName("Haiku"));
+      .catch(() => setModelName(""));
   }, []);
 
   const esRef        = useRef(null);
@@ -156,52 +190,60 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
         setSending(false);
         setFirstWordsDone(true);
         if (payload.text) {
-          setGlow("speaking");
-          setOstText("Speaking");
-          startWave();
           currentSpeakerRef.current = actorName;
-          startTypewriter(displayText(payload.text), () => {
-            finaliseResponse(displayText(payload.text));
-            stopWave();
-            setGlow("idle");
-            setOstText("Idle");
-          });
+          finaliseResponse(displayText(payload.text), payload.text);
         }
         break;
 
       case "encounter_response":
+        // Ignore streaming tokens — show full text only when response is complete
+        streamingTextRef.current = "";
         setLiveText("");
         setSending(false);
-        // Start wave if tokens didn't already start it
-        if (streamingTextRef.current === "") {
-          setGlow("speaking");
-          setOstText("Speaking");
-          startWave();
-          if (waveTimeoutRef.current) clearTimeout(waveTimeoutRef.current);
-          waveTimeoutRef.current = setTimeout(() => {
-            setGlow("idle");
-            setOstText("Idle");
-            stopWave();
-          }, 30000);
-        }
         if (payload.model)        setModelName(payload.model);
         if (payload.vitals)       updateVitals(payload.vitals);
         if (payload.need)         setNeed(payload.need);
         if (payload.relationship) updateRelationship(payload.relationship);
+        if (payload.action)   { setCurrentAction(payload.action); playActionClip(payload.action); }
+        if (payload.location) {
+          const newLoc = payload.location;
+          setCurrentLocation(prev => {
+            if (prev !== newLoc) {
+              // Pre-load the new background
+              if (bgBase) {
+                const preload = new Image();
+                preload.crossOrigin = "anonymous";
+                preload.src = `${bgBase}/location_home_${newLoc}_${currentPosition}.png`;
+                preload.onload = () => {
+                  // Play beckons first, swap background when clip ends
+                  playActionClip("beckons");
+                  setTimeout(() => {
+                    bgImgRef.current = preload;
+                    setCurrentLocation(newLoc);
+                  }, 1200);
+                };
+                preload.onerror = () => {
+                  playActionClip("beckons");
+                  setTimeout(() => setCurrentLocation(newLoc), 1200);
+                };
+              } else {
+                playActionClip("beckons");
+                setTimeout(() => setCurrentLocation(newLoc), 1200);
+              }
+              return prev;
+            }
+            return newLoc;
+          });
+        }
+        if (payload.position) { setCurrentPosition(payload.position); }
+        if (payload.outfit)   { setCurrentOutfit(payload.outfit); }
         if (payload.arc_signal && payload.arc_signal !== "neutral") {
           setArcSignal(payload.arc_signal);
           setTimeout(() => setArcSignal(null), 6000);
         }
         currentSpeakerRef.current = actorName;
-        { // Finalise using streamed tokens, fall back to payload.text
-          const streamedRaw = streamingTextRef.current.split("DELTAS:")[0].trim();
-          const finalRaw = streamedRaw || payload.text;
-          finaliseResponse(displayText(finalRaw), finalRaw);
-          streamingTextRef.current = "";
-          setLiveText("");
-          // Count expected TTS sentences
-          const sentenceCount = (finalRaw.match(/[^.!?…]+[.!?…]+/g) || [finalRaw]).length;
-          ttsExpectedRef.current = sentenceCount;
+        if (payload.text) {
+          finaliseResponse(displayText(payload.text), payload.text);
         }
         break;
 
@@ -362,6 +404,10 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
       .replace(/\[laugh\]|\[chuckle\]|\[sigh\]|\[gasp\]|\[groan\]|\[moan\]|\[whisper\]/gi, "")
       .replace(/\nDELTAS:[\s\S]*/g, "")
       .replace(/DELTAS:[\s\S]*/g, "")
+      .replace(/\nACTION:\s*\w+/g, "")
+      .replace(/\nLOCATION:\s*\w+/g, "")
+      .replace(/\nPOSITION:\s*\w+/g, "")
+      .replace(/\nOUTFIT:\s*\w+/g, "")
       .replace(/\s+/g, " ").trim();
     return ttsModeRef.current === "conversational" ? stripActions(noTags) : noTags;
   }
@@ -373,6 +419,143 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
     ttsPlaying.current   = false;
     ttsExpectedRef.current = -1;
     if (waveTimeoutRef.current) clearTimeout(waveTimeoutRef.current);
+  }
+
+  // ── Unlock audio on first interaction (browser autoplay policy) ─────────────
+  const audioUnlocked = useRef(false);
+  function unlockAudio() {
+    if (audioUnlocked.current) return;
+    audioUnlocked.current = true;
+    setAudioReady(true);
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    ctx.resume().then(() => ctx.close()).catch(() => {});
+    const silent = new Audio("data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA");
+    silent.play().catch(() => {});
+  }
+
+  // ── Load green screen videos ─────────────────────────────────────────────
+  const worldId = world?.id;
+  // Extract actorId from photo URL as fallback: .../actors/{id}/images/...
+  const actorIdFromPhoto = actorPhoto?.match(/\/actors\/([^/]+)\//)?.[1];
+  const actorId = actorIdProp || sceneData?.location?.actors?.find(a => a.actor_id !== user?.worlds?.find(w => w.world_id === worldId)?.actor_id)?.actor_id || actorIdFromPhoto;
+  const videoBase = actorId ? `https://anima.simulator.ngrok.dev/media/worlds/${worldId}/actors/${actorId}/videos` : null;
+  const bgBase    = actorId ? `https://anima.simulator.ngrok.dev/media/worlds/${worldId}/actors/${actorId}/backgrounds` : null;
+
+  // Load background image
+  useEffect(() => {
+    console.log("[BG] actorId=", actorId, "bgBase=", bgBase);
+    if (!bgBase) return;
+    const url = `${bgBase}/location_home_${currentLocation}_${currentPosition}.png`;
+    console.log("[BG] loading:", url);
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.src = url;
+    img.onload = () => { console.log("[BG] loaded ok"); bgImgRef.current = img; };
+    img.onerror = (e) => { console.log("[BG] error loading bg:", e); /* keep previous background */ };
+  }, [bgBase, currentLocation, currentPosition]);
+
+  useEffect(() => {
+    if (!videoBase) return;
+    offRef.current = document.createElement("canvas");
+
+    const idle = document.createElement("video");
+    idle.crossOrigin = "anonymous";
+    idle.src = `${videoBase}/frida_${currentPosition}_${currentOutfit}_idle_loop.mp4`;
+    idle.loop = true; idle.muted = true; idle.playsInline = true;
+    idle.addEventListener("loadeddata", () => { idle.play().catch(()=>{}); startRenderLoop(); });
+    idleRef.current = idle; activeRef.current = idle;
+
+    const talk = document.createElement("video");
+    talk.crossOrigin = "anonymous";
+    talk.src = `${videoBase}/frida_${currentPosition}_${currentOutfit}_talking_loop.mp4`;
+    talk.loop = true; talk.muted = true; talk.playsInline = true;
+    talk.load();
+    talkRef.current = talk;
+
+    return () => {
+      idle.pause(); idle.src = "";
+      talk.pause(); talk.src = "";
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    };
+  }, [videoBase]);
+
+  function startRenderLoop() {
+    if (animFrameRef.current) return;
+    function render() {
+      const canvas = canvasRef.current;
+      const video = activeRef.current;
+      if (!canvas || !video || video.readyState < 2) { animFrameRef.current = requestAnimationFrame(render); return; }
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      const W = canvas.width, H = canvas.height;
+      if (bgImgRef.current && bgImgRef.current.complete && bgImgRef.current.naturalWidth) {
+        ctx.drawImage(bgImgRef.current, 0, 0, W, H);
+      } else {
+        ctx.fillStyle = "#0d0c0a";
+        ctx.fillRect(0,0,W,H);
+      }
+      const off = offRef.current;
+      const vW = video.videoWidth||W, vH = video.videoHeight||H;
+      off.width = vW; off.height = vH;
+      const offCtx = off.getContext("2d", { willReadFrequently: true });
+      offCtx.clearRect(0,0,vW,vH); offCtx.drawImage(video,0,0,vW,vH);
+      const px = offCtx.getImageData(0,0,vW,vH);
+      chromaKeyPixels(px); offCtx.putImageData(px,0,0);
+      const aspect = vW/vH, fitH = H, fitW = fitH*aspect, dX = (W-fitW)/2;
+      ctx.drawImage(off,0,0,vW,vH,dX,0,fitW,fitH);
+      animFrameRef.current = requestAnimationFrame(render);
+    }
+    animFrameRef.current = requestAnimationFrame(render);
+  }
+
+  function switchToVideo(action) {
+    if (!idleRef.current || !talkRef.current) return;
+    const target = action === "talking" ? talkRef.current : idleRef.current;
+    if (activeRef.current === target) return;
+    activeRef.current.pause();
+    target.currentTime = 0;
+    target.play().catch(()=>{});
+    activeRef.current = target;
+  }
+
+
+
+  function playActionClip(action) {
+    if (!action || action === "idle" || action === "talking") return;
+    if (!videoBase) return;
+
+    const clipSrc = `${videoBase}/frida_${currentPosition}_${currentOutfit}_${action}_clip.mp4`;
+    const clip = document.createElement("video");
+    clip.crossOrigin = "anonymous";
+    clip.src = clipSrc;
+    clip.muted = true; clip.playsInline = true;
+    clip.preload = "auto";
+
+    const doSwitch = () => {
+      setVideoFading(true);
+      setTimeout(() => {
+        if (activeRef.current) activeRef.current.pause();
+        activeRef.current = clip;
+        clip.play().catch(()=>{});
+        setVideoFading(false);
+        clip.onended = () => {
+          setVideoFading(true);
+          setTimeout(() => {
+            activeRef.current = idleRef.current;
+            idleRef.current.currentTime = 0;
+            idleRef.current.play().catch(()=>{});
+            setVideoFading(false);
+          }, 600);
+        };
+      }, 600);
+    };
+
+    clip.addEventListener("canplaythrough", doSwitch, { once: true });
+    clip.addEventListener("loadeddata", doSwitch, { once: true });
+    // Fallback — try after short delay
+    setTimeout(() => {
+      if (activeRef.current !== clip) doSwitch();
+    }, 1500);
+    clip.load();
   }
 
   function playNextTtsChunk() {
@@ -401,6 +584,7 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
       delete ttsQueueRef.current[ttsNextIdx.current];
       ttsNextIdx.current++;
       ttsPlaying.current = false;
+      if (Object.keys(ttsQueueRef.current).length === 0) switchToVideo("idle");
       // All expected sentences done — stop wave
       if (ttsExpectedRef.current >= 0 && ttsNextIdx.current >= ttsExpectedRef.current) {
         ttsExpectedRef.current = -1;
@@ -414,6 +598,8 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
       }
       playNextTtsChunk();
     };
+    unlockAudio();
+    switchToVideo("talking");
     audio.play().catch(() => {
       ttsPlaying.current = false;
       stopWave();
@@ -422,13 +608,16 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
 
   // ── Send message ──────────────────────────────────────────────────────────
   async function sendMessage() {
-    if (!chatInput.trim() || sending || !encounter_id) return;
+    if (!chatInput.trim() || !encounter_id) return;
     const content = chatInput.trim();
     setChatInput("");
+
+    // Interrupt TTS immediately — user is speaking
     resetTtsQueue();
-    setSending(true);
+    switchToVideo("idle");
     setGlow("listening");
     setOstText("Listening");
+
     setMessages(prev => [...prev, { from: "me", text: content }]);
     scrollLog();
 
@@ -436,13 +625,12 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
       await fetch(`/api/worlds/${world.id}/encounter/${encounter_id}/message`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ content })
+        body:    JSON.stringify({ content, interrupted: true })
       });
       setGlow("thinking");
       setOstText("Thinking");
       scrollLog();
     } catch {
-      setSending(false);
       setGlow("idle");
       setOstText("Idle");
     }
@@ -460,7 +648,8 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
   const glowClass = `${styles.fglow} ${styles["fglow_" + glow] || ""}`;
 
   return (
-    <div className={styles.scene}>
+    <div className={styles.scene} onClick={!audioReady ? unlockAudio : undefined}>
+
       {/* Header */}
       <div className={styles.header}>
         <span className={styles.logo}>Anima</span>
@@ -475,18 +664,45 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
         color: modelName === "Hermes-3-70B" ? "rgba(0,220,130,0.85)" : "rgba(220,220,220,0.6)",
         letterSpacing: "0.06em", pointerEvents: "none",
         textShadow: "0 1px 4px rgba(0,0,0,0.9)"
-      }}>◈ {modelName}</div>
+      }}>◈ {modelName === "Hermes-3-70B" ? "Hermes" : modelName === "…" ? "" : modelName}</div>
 
       <div className={styles.body}>
         {/* Photo + vitals overlay */}
         <div className={styles.compCol}>
           <div className={styles.wrap}>
-            {actorPhoto
-              ? <img src={actorPhoto} className={styles.photo} alt={actorName} />
-              : <div className={styles.photoPlaceholder}><span className={styles.initials}>{actorName[0]}</span></div>
+            {videoBase
+              ? <canvas ref={canvasRef}
+                  className={`${styles.photoCanvas} ${videoFading ? styles.photoFading : ""}`}
+                  width={360} height={540} />
+              : actorPhoto
+                ? <img src={actorPhoto} className={styles.photo} alt={actorName} />
+                : <div className={styles.photoPlaceholder}><span className={styles.initials}>{actorName[0]}</span></div>
             }
-
             {/* Frame */}
+            {/* Vital change toasts */}
+            {vitalToasts.map((t, i) => (
+              <div key={t.id}
+                   className={`${styles.vitalToast} ${t.up ? styles.vitalToastUp : styles.vitalToastDown}`}
+                   style={{ top: 130 + i * 30 }}>
+                {t.label} {t.dir} {t.from} → {t.to}
+              </div>
+            ))}
+            {/* DEBUG overlay — yellow, over canvas */}
+            {videoBase && (
+              <div style={{
+                position:"absolute", bottom:14, left:14, zIndex:25,
+                fontFamily:"'DM Sans',system-ui,sans-serif",
+                fontSize:12, letterSpacing:".08em", textTransform:"uppercase",
+                color:"rgba(255,220,0,0.95)", pointerEvents:"none",
+                display:"flex", flexDirection:"column", gap:4,
+                textShadow:"0 1px 6px rgba(0,0,0,0.95)"
+              }}>
+                <span>ACTION: {currentAction}</span>
+                <span>LOCATION: {currentLocation}</span>
+                <span>POSITION: {currentPosition}</span>
+                <span>OUTFIT: {currentOutfit}</span>
+              </div>
+            )}
             <div className={`${styles.fglow} ${styles["fglow_" + glow]}`} />
             <div className={`${styles.fc} ${styles.tl}`} />
             <div className={`${styles.fc} ${styles.tr}`} />
@@ -565,14 +781,9 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
             )}
           </div>
 
-          {/* Vital change toasts */}
-          {vitalToasts.map((t, i) => (
-            <div key={t.id}
-                 className={`${styles.vitalToast} ${t.up ? styles.vitalToastUp : styles.vitalToastDown}`}
-                 style={{ top: 130 + i * 30 }}>
-              {t.label} {t.dir} {t.from} → {t.to}
-            </div>
-          ))}
+
+
+
         </div>
 
         {/* Chat */}
@@ -612,7 +823,7 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
                 className={styles.ci}
                 placeholder="Say something…"
                 value={chatInput}
-                disabled={sending || !firstWordsDone}
+                disabled={false}
                 rows={1}
                 onChange={e => {
                   setChatInput(e.target.value);
@@ -648,7 +859,7 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
                   onClick={() => { const next = !tsMuted; setTsMuted(next); tsMutedRef.current = next; }}
                   title={tsMuted ? "Unmute" : "Mute"}
                 >{tsMuted ? "🔇" : "🔊"}</button>
-                <button className={styles.sendBtn} onClick={sendMessage} disabled={sending || !firstWordsDone}>↑</button>
+                <button className={styles.sendBtn} onClick={sendMessage}>↑</button>
               </div>
             </div>
           </div>
