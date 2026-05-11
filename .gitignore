@@ -7,3 +7,4 @@ server/node_modules/
 .env
 public/media/
 public/media/
+deploy-logs/
