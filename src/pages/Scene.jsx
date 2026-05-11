@@ -141,11 +141,13 @@ export default function Scene({ world, user, sceneData, onLeave }) {
 
   // ── Load videos ─────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!videoBase) return;
+    const loading = phase === "loading" || phase === "perceiving";
+    if (!videoBase || loading) return;
 
+    const actorFirst = primaryActor?.name?.toLowerCase().split(" ")[0] || "frida";
     const idle = document.createElement("video");
     idle.crossOrigin = 'anonymous';
-    idle.src         = `${videoBase}/frida_standing_casual_idle_loop.mp4`;
+    idle.src         = `${videoBase}/${actorFirst}_standing_casual_idle_loop_gs.mp4`;
     idle.loop        = true;
     idle.muted       = true;
     idle.playsInline = true;
@@ -159,19 +161,18 @@ export default function Scene({ world, user, sceneData, onLeave }) {
 
     const talk = document.createElement("video");
     talk.crossOrigin = 'anonymous';
-    talk.src         = `${videoBase}/frida_standing_casual_talking_loop.mp4`;
+    talk.src         = `${videoBase}/${actorFirst}_standing_casual_talking_loop_gs.mp4`;
     talk.loop        = true;
     talk.muted       = true;
     talk.playsInline = true;
     talkRef.current  = talk;
-    // Preload
     talk.load();
 
     return () => {
       idle.pause(); idle.src = "";
       talk.pause(); talk.src = "";
     };
-  }, [videoBase]);
+  }, [videoBase, phase]);
 
   // ── Switch between idle and talking ─────────────────────────────────────────
   useEffect(() => {
@@ -220,6 +221,8 @@ export default function Scene({ world, user, sceneData, onLeave }) {
   }, []);
 
   // ── Poll on mount ────────────────────────────────────────────────────────────
+  const narrativeReceivedRef = useRef(false);
+
   useEffect(() => {
     if (!encounter_id) return;
     let stopped = false;
@@ -228,7 +231,8 @@ export default function Scene({ world, user, sceneData, onLeave }) {
       try {
         const r = await fetch(`/api/worlds/${world.id}/encounter/${encounter_id}`);
         const data = await r.json();
-        if (data.decision && data.narrative && !displayed && !narrative) {
+        if (data.decision && data.narrative && !narrativeReceivedRef.current) {
+          narrativeReceivedRef.current = true;
           stopped = true;
           setPhase(data.phase || data.decision);
           setDecision(data.decision);
@@ -298,7 +302,8 @@ export default function Scene({ world, user, sceneData, onLeave }) {
       case "encounter_narrative":
         setPhase(payload.decision || "narrative");
         setDecision(payload.decision);
-        if (payload.text && !narrative) {
+        if (payload.text && !narrativeReceivedRef.current) {
+          narrativeReceivedRef.current = true;
           setNarrative(payload.text);
           const onDone = payload.decision === "open_door" ? () => setShowEnterBtn(true) : null;
           startTypewriter(payload.text, onDone);
@@ -427,21 +432,33 @@ export default function Scene({ world, user, sceneData, onLeave }) {
       <div className={styles.stage}>
 
         {/* Portrait — canvas compositor if videos available, else static photo */}
-        {(hasVideos || actorPhoto) && (
-          <div className={`${styles.portrait} ${isLoading ? styles.portraitMuted : ""}`}>
-            {hasVideos ? (
+        {!isLoading && (hasVideos || actorPhoto) && (
+          <div className={styles.portrait}>
+            {hasVideos && !decision ? (
               <canvas ref={canvasRef} className={styles.portraitCanvas} />
-            ) : (
+            ) : actorPhoto ? (
               <img src={actorPhoto} alt={actorName} className={styles.portraitImg} />
-            )}
+            ) : null}
             {actorName && <span className={styles.actorName}>{actorName}</span>}
           </div>
         )}
 
-        {/* Loading spinner */}
+        {/* Loading — single circle with profile photo and name */}
         {isLoading && (
           <div className={styles.spinnerWrap}>
-            <div className={styles.spinner} />
+            <div style={{ position: "relative", width: 120, height: 120, marginBottom: 16 }}>
+              <img src={actorPhoto} alt={actorName} style={{
+                width: 120, height: 120, borderRadius: "50%",
+                objectFit: "cover", display: "block",
+                border: "1.5px solid rgba(255,255,255,0.12)",
+              }} />
+              <div className={styles.spinner} style={{
+                position: "absolute", inset: -4,
+                width: "calc(100% + 8px)", height: "calc(100% + 8px)",
+                borderRadius: "50%",
+              }} />
+            </div>
+            {actorName && <p style={{ fontFamily: "'Cormorant Garamond',serif", fontSize: 18, color: "rgba(255,255,255,0.75)", margin: "0 0 8px", letterSpacing: ".12em", textTransform: "uppercase" }}>{actorName}</p>}
             <p className={styles.spinnerText}>{statusText}</p>
           </div>
         )}
@@ -484,7 +501,7 @@ export default function Scene({ world, user, sceneData, onLeave }) {
         )}
 
         {/* Outcome actions */}
-        {decision && (hasNarrative || narrative) && (
+        {decision && (
           <div className={styles.actions}>
             {isOpen && showEnterBtn && (
               <div className={styles.enterWrap}>
@@ -508,8 +525,19 @@ export default function Scene({ world, user, sceneData, onLeave }) {
         {/* Error */}
         {phase === "error" && (
           <div className={styles.errorWrap}>
+            {actorPhoto && (
+              <img src={actorPhoto} alt={actorName} style={{
+                width: 120, height: 120, borderRadius: "50%",
+                objectFit: "cover", display: "block", margin: "0 auto 16px",
+                border: "1.5px solid rgba(255,255,255,0.12)",
+              }} />
+            )}
+            {actorName && <p style={{ fontFamily: "'Cormorant Garamond',serif", fontSize: 18, color: "rgba(255,255,255,0.75)", margin: "0 0 8px", letterSpacing: ".12em", textTransform: "uppercase", textAlign: "center" }}>{actorName}</p>}
             <p className={styles.errorText}>{statusText}</p>
-            <button className={styles.leaveSceneBtn} onClick={leave}>Leave</button>
+            <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 16 }}>
+              <button className={styles.enterBtn} onClick={() => window.location.reload()}>Try again</button>
+              <button className={styles.leaveSceneBtn} onClick={leave}>Leave</button>
+            </div>
           </div>
         )}
 

@@ -2381,6 +2381,24 @@ app.get("/api/actors/:id/assessments", (req, res) => {
 });
 
 
+// ── /media/* — pipe directly to simulator over LAN ──────────────────────────
+import http from "http";
+app.use("/media", (req, res) => {
+  const options = {
+    hostname: "192.168.1.58",
+    port: 4000,
+    path: `/media${req.path}${req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : ""}`,
+    method: req.method,
+    headers: { ...req.headers, host: "192.168.1.58:4000" }
+  };
+  const proxy = http.request(options, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
+  proxy.on("error", () => res.status(502).end());
+  req.pipe(proxy);
+});
+
 const distPath = path.join(__dirname, "../dist");
 if (fs.existsSync(distPath)) {
   app.use(express.static(distPath));
