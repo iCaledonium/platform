@@ -5,3 +5,5 @@ server/node_modules/
 *.db-shm
 *.db-wal
 .env
+public/media/
+public/media/
