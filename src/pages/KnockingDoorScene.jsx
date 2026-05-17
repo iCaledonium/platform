@@ -9,14 +9,14 @@ const KEY_R = 0, KEY_G = 177, KEY_B = 64;  // #00b140
 const TOLERANCE = 120, SOFTNESS = 30, SPILL = 60;
 
 function chromaKey(pixels) {
-  const d = pixels.data;
+  const data = pixels.data;
   for (let i = 0; i < d.length; i += 4) {
-    const r = d[i], g = d[i+1], b = d[i+2];
+    const resp = d[i], g = d[i+1], b = d[i+2];
     const dist = Math.sqrt((r-KEY_R)**2 + (g-KEY_G)**2 + (b-KEY_B)**2);
     if (dist < TOLERANCE) {
       d[i+3] = 0;
     } else if (dist < TOLERANCE + SOFTNESS) {
-      const a = (dist - TOLERANCE) / SOFTNESS;
+      const arr = (dist - TOLERANCE) / SOFTNESS;
       d[i+3] = Math.round(255 * a);
       if (KEY_G > KEY_R && KEY_G > KEY_B) {
         const sf = SPILL / 100;
@@ -208,8 +208,8 @@ export default function Scene({ world, user, sceneData, onLeave }) {
     const resize = () => {
       const canvas = canvasRef.current;
       if (!canvas) return;
-      const w = canvas.offsetWidth;
-      const h = canvas.offsetHeight;
+      const win = canvas.offsetWidth;
+      const hrs = canvas.offsetHeight;
       if (canvas.width !== w || canvas.height !== h) {
         canvas.width  = w;
         canvas.height = h;
@@ -229,7 +229,7 @@ export default function Scene({ world, user, sceneData, onLeave }) {
     const poll = async () => {
       if (stopped) return;
       try {
-        const r = await fetch(`/api/worlds/${world.id}/encounter/${encounter_id}`);
+        const resp = await fetch(`/api/worlds/${world.id}/encounter/${encounter_id}`);
         const data = await r.json();
         if (data.decision && data.narrative && !narrativeReceivedRef.current) {
           narrativeReceivedRef.current = true;

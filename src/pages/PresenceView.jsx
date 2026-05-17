@@ -27,17 +27,21 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
   const [tsMuted,     setTsMuted]     = useState(false);
   const [audioReady,  setAudioReady]  = useState(false);
   const [currentAction,   setCurrentAction]   = useState("idle");
+  const LOOP_ACTIONS = new Set(["idle","talking","thinking","sitting","standing","waiting","listening","watching","resting","sleeping","breathing","riding","enjoying","keep_going","fucking"]);
   const [currentLocation, setCurrentLocation] = useState("hall");
   const [currentPosition, setCurrentPosition] = useState("standing");
   const [currentOutfit,   setCurrentOutfit]   = useState("casual");
   const [noBg,            setNoBg]            = useState(false);
   const noBgRef = useRef(false);
   const [videoReady,      setVideoReady]      = useState(false);
-  const currentOutfitRef  = useRef("casual");
+  const currentOutfitRef   = useRef("casual");
+  const currentPositionRef  = useRef("standing");
+  const currentLocationRef  = useRef("hall");
   const [rawAction,       setRawAction]       = useState("idle");
   const [videoFading,     setVideoFading]     = useState(false);
   const [mediaList,      setMediaList]        = useState([]);
   const [mediaPanelOpen, setMediaPanelOpen]   = useState(true);
+  const [mediaPreview,   setMediaPreview]    = useState(null); // {src, filename}
   const [outfitOpen,     setOutfitOpen]       = useState({});
   const [posOpen,        setPosOpen]          = useState({});
   const [locOpen,        setLocOpen]          = useState({});
@@ -82,13 +86,13 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
   const TOLERANCE = 80, SOFTNESS = 20, SPILL = 40;
 
   function chromaKeyPixels(pixels) {
-    const d = pixels.data;
+    const data = pixels.data;
     for (let i = 0; i < d.length; i += 4) {
-      const r = d[i], g = d[i+1], b = d[i+2];
+      const resp = d[i], g = d[i+1], b = d[i+2];
       const dist = Math.sqrt((r-KEY_R)**2 + (g-KEY_G)**2 + (b-KEY_B)**2);
       if (dist < TOLERANCE) { d[i+3] = 0; }
       else if (dist < TOLERANCE + SOFTNESS) {
-        const a = (dist - TOLERANCE) / SOFTNESS; d[i+3] = Math.round(255 * a);
+        const arr = (dist - TOLERANCE) / SOFTNESS; d[i+3] = Math.round(255 * a);
         if (KEY_G > KEY_R && KEY_G > KEY_B) { const sf = SPILL/100; d[i+1] = Math.round(g-(g-Math.max(r,b))*sf*(1-a)); }
       } else if (SPILL > 0 && KEY_G > KEY_R && KEY_G > KEY_B) {
         const sf = (SPILL/100)*Math.max(0,1-(dist-TOLERANCE-SOFTNESS)/60);
@@ -244,8 +248,22 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
         if (payload.need)         setNeed(payload.need);
         if (payload.relationship) updateRelationship(payload.relationship);
         if (payload.outfit)   { setCurrentOutfit(payload.outfit); currentOutfitRef.current = payload.outfit; }
-        if (payload.position) { setCurrentPosition(payload.position); }
-        if (payload.action)   { setCurrentAction(payload.action); setRawAction(payload.action); playActionClip(payload.action); }
+        if (payload.position) { setCurrentPosition(payload.position); currentPositionRef.current = payload.position; }
+        if (payload.action) {
+          setCurrentAction(payload.action);
+          setRawAction(payload.action);
+          if (LOOP_ACTIONS.has(payload.action) && payload.action !== "idle" && payload.action !== "talking") {
+            const loc = currentLocationRef.current;
+            const pos = currentPositionRef.current;
+            const out = currentOutfitRef.current;
+            const sfx = pos === "standing" ? "gs" : "bg";
+            const lp  = pos !== "standing" ? `${loc}_` : "";
+            const loopSrc = `${videoBase}/frida_${lp}${pos}_${out}_${payload.action}_loop_${sfx}.mp4`;
+            if (idleRef.current) { idleRef.current.src = loopSrc; idleRef.current.load(); idleRef.current.play().catch(()=>{}); }
+          } else {
+            playActionClip(payload.action);
+          }
+        }
         if (payload.location) {
           const newLoc = payload.location;
           setCurrentLocation(prev => {
@@ -255,10 +273,10 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
                   const preload = new Image();
                   preload.crossOrigin = "anonymous";
                   preload.src = `${bgBase}/location_home_${newLoc}_${currentPosition}.png`;
-                  preload.onload = () => { bgImgRef.current = preload; setCurrentLocation(newLoc); };
-                  preload.onerror = () => setCurrentLocation(newLoc);
+                  preload.onload = () => { bgImgRef.current = preload; currentLocationRef.current = newLoc; setCurrentLocation(newLoc); };
+                  preload.onerror = () => { currentLocationRef.current = newLoc; setCurrentLocation(newLoc); };
                 } else {
-                  setCurrentLocation(newLoc);
+                  currentLocationRef.current = newLoc; setCurrentLocation(newLoc);
                 }
               };
               // Play beckon clip first, then switch location after clip ends
@@ -562,7 +580,8 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
     const buildSrc = (action, type) =>
       `${videoBase}/${actorPrefix}_${locPart}${currentPosition}_${currentOutfit}_${action}_${type}_${suffix}.mp4`;
 
-    const idleSrc = buildSrc("idle", "loop");
+    const activeLoopAction = (currentAction && currentAction !== "idle" && currentAction !== "talking" && LOOP_ACTIONS.has(currentAction)) ? currentAction : "idle";
+    const idleSrc = buildSrc(activeLoopAction, "loop");
     const talkSrc = buildSrc("talking", "loop");
     console.log("[VIDEO] loading idle:", idleSrc);
 
@@ -673,8 +692,9 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
       "kiss_me":      "kiss",
     }[a] || a);
     const normalizedAction = normalizeAct(action);
-    const m = mediaList.find(x =>
-      x.position === currentPosition &&
+    const pos = currentPositionRef.current;
+    const msg = mediaList.find(x =>
+      x.position === pos &&
       x.outfit   === currentOutfitRef.current &&
       x.action   === normalizedAction &&
       String(x.type) === "clip"
@@ -682,9 +702,10 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
     const clipSrc = m
       ? `${videoBase}/${m.filename}`
       : (() => {
-          const fallbackSuffix = currentPosition === "standing" ? "gs" : "bg";
-          const fallbackLocation = currentPosition !== "standing" ? `${currentLocation}_` : "";
-          return `${videoBase}/${actorPrefix}_${fallbackLocation}${currentPosition}_${currentOutfitRef.current}_${normalizedAction}_clip_${fallbackSuffix}.mp4`;
+          const fallbackSuffix = pos === "standing" ? "gs" : "bg";
+          const loc = currentLocationRef.current;
+          const fallbackLocation = pos !== "standing" ? `${loc}_` : "";
+          return `${videoBase}/${actorPrefix}_${fallbackLocation}${pos}_${currentOutfitRef.current}_${normalizedAction}_clip_${fallbackSuffix}.mp4`;
         })();
     const clip = document.createElement("video");
     clip.crossOrigin = "anonymous";
@@ -692,7 +713,22 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
     clip.muted = true; clip.playsInline = true;
     clip.preload = "auto";
 
+    let switched = false;
+    const returnToIdle = () => {
+      clipPlayingRef.current = false;
+      setVideoFading(true);
+      setTimeout(() => {
+        if (idleRef.current) {
+          activeRef.current = idleRef.current;
+          idleRef.current.currentTime = 0;
+          idleRef.current.play().catch(()=>{});
+        }
+        setVideoFading(false);
+      }, 600);
+    };
     const doSwitch = () => {
+      if (switched) return;
+      switched = true;
       setVideoFading(true);
       setTimeout(() => {
         if (activeRef.current) activeRef.current.pause();
@@ -700,24 +736,16 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
         clipPlayingRef.current = true;
         clip.play().catch(()=>{});
         setVideoFading(false);
-        clip.onended = () => {
-          clipPlayingRef.current = false;
-          setVideoFading(true);
-          setTimeout(() => {
-            activeRef.current = idleRef.current;
-            idleRef.current.currentTime = 0;
-            idleRef.current.play().catch(()=>{});
-            setVideoFading(false);
-          }, 600);
-        };
+        clip.onended = returnToIdle;
+        clip.onerror = returnToIdle;
       }, 600);
     };
 
+    clip.onerror = returnToIdle; // early error before canplaythrough
     clip.addEventListener("canplaythrough", doSwitch, { once: true });
-    clip.addEventListener("loadeddata", doSwitch, { once: true });
     // Fallback — try after short delay
     setTimeout(() => {
-      if (activeRef.current !== clip) doSwitch();
+      if (!switched) doSwitch();
     }, 1500);
     clip.load();
   }
@@ -1001,6 +1029,28 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
             )}
           </div>
 
+          {/* Context action buttons */}
+          <div style={{display:"flex",gap:6,padding:"0 12px 6px",flexWrap:"wrap"}}>
+            <button onClick={async () => {
+              try {
+                const resp = await fetch(`/api/worlds/${world.id}/player/home`);
+                const data = await r.ok ? r.json() : null;
+                if (d?.home_address) {
+                  setChatInput(prev => (prev ? prev + " " : "") + `[📍 ${d.home_address}]`);
+                } else {
+                  setChatInput(prev => (prev ? prev + " " : "") + "[📍 No home address set]");
+                }
+              } catch(e) { console.error(e); }
+            }} style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,padding:"4px 10px",borderRadius:20,border:"1px solid rgba(255,255,255,.12)",background:"rgba(255,255,255,.06)",color:"rgba(255,255,255,.6)",cursor:"pointer"}}>
+              📍 Share home address
+            </button>
+            <button onClick={() => {
+              setChatInput(prev => (prev ? prev + " " : "") + "Would you like to stay over tonight?");
+            }} style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,padding:"4px 10px",borderRadius:20,border:"1px solid rgba(255,255,255,.12)",background:"rgba(255,255,255,.06)",color:"rgba(255,255,255,.6)",cursor:"pointer"}}>
+              🌙 Ask to stay over
+            </button>
+          </div>
+
           <div className={styles.inputRow}>
             <div className={styles.inputShell}>
               <textarea
@@ -1079,6 +1129,24 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
                 color: "rgba(255,255,255,0.4)",
               }}>Media</span>
             )}
+            {mediaPanelOpen && encounter_id && (
+              <button
+                onClick={() => {
+                  fetch(`${SIMULATOR_URL}/internal/worlds/${worldId}/encounter/${encounter_id}/rescan_media`, {
+                    method: "POST",
+                    headers: { "x-service-token": "d1ea19ea6e778fb309358333b7a74d72378cbd076e3a47f6489db003e6a454b7" }
+                  }).then(r => r.ok ? r.json() : null).then(d => {
+                    if (d?.count !== undefined) {
+                      fetch(`${SIMULATOR_URL}/internal/worlds/${worldId}/encounter/${encounter_id}/media`, {
+                        headers: { "x-service-token": "d1ea19ea6e778fb309358333b7a74d72378cbd076e3a47f6489db003e6a454b7" }
+                      }).then(r => r.ok ? r.json() : null).then(d => { if (d?.media) setMediaList(d.media); }).catch(() => {});
+                    }
+                  }).catch(() => {});
+                }}
+                style={{ background: "none", border: "none", cursor: "pointer", color: "rgba(255,255,255,0.3)", fontSize: 13, padding: "0 4px", lineHeight: 1 }}
+                title="Rescan media"
+              >↻</button>
+            )}
             <button
               onClick={() => setMediaPanelOpen(p => !p)}
               style={{
@@ -1102,7 +1170,7 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
                   textAlign: "center",
                 }}>No media</div>
               ) : Object.entries(mediaTree).map(([outfit, positions]) => {
-                const oOpen = outfitOpen[outfit] !== false;
+                const oOpen = outfitOpen[outfit] === true;
                 return (
                   <div key={outfit}>
                     {/* Outfit node */}
@@ -1120,7 +1188,7 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
 
                     {oOpen && Object.entries(positions).map(([position, locations]) => {
                       const pKey  = `${outfit}·${position}`;
-                      const pOpen = posOpen[pKey] !== false;
+                      const pOpen = posOpen[pKey] === true;
                       return (
                         <div key={pKey}>
                           {/* Position node */}
@@ -1136,7 +1204,7 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
 
                           {pOpen && Object.entries(locations).map(([location, items]) => {
                             const lKey   = `${pKey}·${location}`;
-                            const lOpen  = locOpen[lKey] !== false;
+                            const lOpen  = locOpen[lKey] === true;
                             const isAny  = location === "any location";
                             return (
                               <div key={lKey}>
@@ -1156,24 +1224,38 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
                                   }}>{isAny ? "gs" : "bg"}</span>
                                 </div>
 
-                                {lOpen && items.map((m, i) => (
-                                  <div key={i} style={{
-                                    display: "flex", alignItems: "center",
-                                    justifyContent: "space-between",
-                                    padding: "2px 10px 2px 40px",
-                                    fontFamily: "'DM Sans',system-ui,sans-serif",
-                                    fontSize: 11, color: "rgba(255,255,255,0.4)",
-                                  }}>
-                                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                {lOpen && items.map((m, i) => {
+                                  const src = videoBase ? `${videoBase}/${m.filename}` : null;
+                                  return (
+                                  <div key={i}
+                                    onClick={() => src && setMediaPreview({ src, filename: m.filename })}
+                                    style={{
+                                      display: "flex", alignItems: "center",
+                                      justifyContent: "space-between",
+                                      padding: "3px 10px 3px 40px", cursor: "pointer",
+                                      fontFamily: "'DM Sans',system-ui,sans-serif",
+                                      fontSize: 11, color: "rgba(255,255,255,0.4)",
+                                      gap: 6,
+                                    }}>
+                                    {src && (
+                                      <video
+                                        src={src}
+                                        muted playsInline preload="metadata"
+                                        style={{ width: 36, height: 64, objectFit: "cover", borderRadius: 3, flexShrink: 0, background: "#111" }}
+                                        onLoadedMetadata={e => { e.target.currentTime = 0.5; }}
+                                      />
+                                    )}
+                                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
                                       {m.action.replace(/_/g, " ")}
                                     </span>
                                     <span style={{
                                       fontSize: 9, letterSpacing: ".05em", textTransform: "uppercase",
                                       color: m.type === "loop" ? "rgba(0,200,120,0.55)" : "rgba(180,140,255,0.55)",
-                                      marginLeft: 5, flexShrink: 0,
+                                      flexShrink: 0,
                                     }}>{m.type}</span>
                                   </div>
-                                ))}
+                                  );
+                                })}
                               </div>
                             );
                           })}
@@ -1188,6 +1270,34 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
         </div>
       </div>
     </div>
+
+    {/* ── Media preview modal ─────────────────────────────────────────── */}
+    {mediaPreview && (
+      <div
+        onClick={() => setMediaPreview(null)}
+        style={{
+          position: "fixed", inset: 0, zIndex: 9999,
+          background: "rgba(0,0,0,0.85)",
+          display: "flex", flexDirection: "column",
+          alignItems: "center", justifyContent: "center", gap: 12,
+        }}>
+        <video
+          src={mediaPreview.src}
+          autoPlay loop muted={false} playsInline controls
+          onClick={e => e.stopPropagation()}
+          style={{ maxHeight: "80vh", maxWidth: "90vw", borderRadius: 8, background: "#000" }}
+        />
+        <div style={{
+          fontFamily: "'DM Sans',system-ui,sans-serif",
+          fontSize: 11, color: "rgba(255,255,255,0.4)",
+          letterSpacing: ".04em",
+        }}>{mediaPreview.filename}</div>
+        <div style={{
+          fontSize: 11, color: "rgba(255,255,255,0.25)",
+          fontFamily: "'DM Sans',system-ui,sans-serif",
+        }}>click outside to close</div>
+      </div>
+    )}
 
     {/* ── Missing media modal ────────────────────────────────────────────── */}
     {missingMedia && (
@@ -1273,8 +1383,9 @@ function MissingMediaModal({ missingMedia, actorId, worldId, encounter_id, SIMUL
     })
       .then(r => r.ok ? r.json() : null)
       .then(d => {
-        if (d?.start_url) { setStartUrl(d.start_url); setStartPath(d.start_path); }
-        if (d?.end_url)   { setEndUrl(d.end_url);     setEndPath(d.end_path); }
+        const fixUrl = u => u ? u.replace(/https?:\/\/localhost:\d+/, SIMULATOR_URL) : u;
+        if (d?.start_url) { setStartUrl(fixUrl(d.start_url)); setStartPath(d.start_path); }
+        if (d?.end_url)   { setEndUrl(fixUrl(d.end_url));     setEndPath(d.end_path); }
         setFramesLoaded(true);
       })
       .catch(() => setFramesLoaded(true));
@@ -1303,7 +1414,8 @@ function MissingMediaModal({ missingMedia, actorId, worldId, encounter_id, SIMUL
     try {
       const form = new FormData();
       form.append("file", file, finalFilename);
-      const res = await fetch(`${SIMULATOR_URL}/internal/actors/${actorId}/media`, {
+      form.append("world_id", worldId);
+      const res = await fetch(`${SIMULATOR_URL}/internal/worlds/${worldId}/actors/${actorId}/upload_video`, {
         method: "POST",
         headers: { "x-service-token": SERVICE_TOKEN },
         body: form,
@@ -1366,7 +1478,7 @@ function MissingMediaModal({ missingMedia, actorId, worldId, encounter_id, SIMUL
         }}>Click to replace</div>
       </div>
       <input ref={fileRef} type="file" accept="image/jpeg,image/png" style={{ display: "none" }}
-        onChange={e => { const f = e.target.files[0]; if (f) uploadFrame(f, role); }} />
+        onChange={e => { const file = e.target.files[0]; if (f) uploadFrame(f, role); }} />
     </div>
   );
 
@@ -1484,7 +1596,7 @@ function MissingMediaModal({ missingMedia, actorId, worldId, encounter_id, SIMUL
             {uploading ? "Uploading…" : "Or drop .mp4 here to upload manually"}
           </div>
           <input ref={fileRef} type="file" accept=".mp4,video/mp4" style={{ display: "none" }}
-            onChange={e => { const f = e.target.files[0]; if (f) upload(f); }} />
+            onChange={e => { const file = e.target.files[0]; if (f) upload(f); }} />
         </div>
 
         {error && <div style={{ fontSize: 11, color: "rgba(255,80,80,0.8)", marginBottom: 10 }}>{error}</div>}

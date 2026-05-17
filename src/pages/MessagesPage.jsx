@@ -594,7 +594,7 @@ export default function MessagesPage() {
                   <div key={m.id} className={`${styles.bubble} ${m.from_me ? styles.bubbleMe : styles.bubbleThem}`}>
                     {m.attachment
                       ? <DocBubble attachment={m.attachment} fromMe={m.from_me} />
-                      : (!m.from_me && m.payload && (() => { try { const p = JSON.parse(m.payload); return p.locationname || p.location_name; } catch { return false; } })())
+                      : (!m.from_me && m.payload && (() => { try { const parsedPayload = JSON.parse(m.payload); return parsedPayload.locationname || parsedPayload.location_name; } catch { return false; } })())
                         ? <ProposalBubble message={m} onAccept={acceptProposal} onDecline={declineProposal} hasCalendar={hasCalendar} />
                         : <p className={styles.bubbleText}>{m.content}</p>
                     }

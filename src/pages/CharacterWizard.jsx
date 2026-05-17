@@ -53,7 +53,7 @@ async function callAI(prompt) {
     method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify({ prompt }),
   });
-  const d = await res.json();
+  const data = await res.json();
   return d.text || "";
 }
 
@@ -65,14 +65,7 @@ export default function CharacterWizard({ user, worlds, onClose, onCreated }) {
   const [error, setError]     = useState(null);
   useEffect(() => { if (step === 6) setError(null); }, [step]);
   const PHOTO_SLOTS = [
-    { slug:"profile",        label:"Profile" },
-    { slug:"photo_close",    label:"Close-up" },
-    { slug:"photo_halfbody", label:"Half Body" },
-    { slug:"photo_full_body",label:"Full Body" },
-    { slug:"photo_side",     label:"Side" },
-    { slug:"photo_behind",   label:"Behind" },
-    { slug:"photo_bikini",   label:"Bikini" },
-    { slug:"photo_intimate", label:"Intimate" },
+    { slug:"profile", label:"Profile" },
   ];
   const [photos, setPhotos] = useState({}); // { slug: File }
   const activeSlotRef = useRef(null);
@@ -140,7 +133,7 @@ export default function CharacterWizard({ user, worlds, onClose, onCreated }) {
     return JSON.parse(cleaned);
   }
   function updAF(key, val) {
-    setSkippedFields(s => { const n = new Set(s); n.delete(key); return n; });
+    setSkippedFields(s => { const next = new Set(s); n.delete(key); return n; });
     setAppearanceFields(p => {
       const next = {...p, [key]: val};
       // Serialise to appearance text
@@ -167,7 +160,7 @@ Existing psychology: ${JSON.stringify(psychology)}
 Write a compelling "${label}" for this character. Return only the text — no labels, no JSON, 2-3 sentences max.`);
       // Strip JSON/markdown if Haiku accidentally wraps plain text
       let val = text.trim().replace(/```json|```/gi,"").trim();
-      try { const j = JSON.parse(val); val = j[key] || j.text || j.value || val; } catch {}
+      try { const json = JSON.parse(val); val = j[key] || j.text || j.value || val; } catch {}
       setPsychology(p=>({...p,[key]:val}));
     } catch { setError("Generation failed"); }
     setGenerating(null);
@@ -180,7 +173,7 @@ Write a compelling "${label}" for this character. Return only the text — no la
       const text = await callAI(`${charCtx()}
 Return ONLY valid JSON (no markdown):
 {"backstory":"2-3 sentences","wound":"core wound","what_they_want":"private desire","blindspot":"pattern they repeat","defenses":"emotional defenses","contradiction":"tension they live with","coping_mechanisms":"how they cope","view_on_sex":"their relationship with sex and intimacy","marital_status":"single|casually_dating|in_relationship|married|divorced"}`);
-      const j = parseJSON(text);
+      const json = parseJSON(text);
       setPsychology(p=>({...p,...j}));
     } catch { setError("Generation failed"); }
     setGenerating(null);
@@ -327,7 +320,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
   async function generateLifestyle() {
     setGenerating("lifestyle"); setError(null);
     try {
-      const t = await callAI(`${charCtx()} Attachment: ${personality.attachment_style}. N=${personality.big5.neuroticism} E=${personality.big5.extraversion}.\nReturn ONLY valid JSON:\n{"alcohol_relationship":"non_drinker|rare|moderate|regular|heavy","drug_use":"none|cannabis_occasional|cannabis_regular|mixed_recreational|cocaine_occasional","substance_context":"","sleep_pattern":"early_riser|normal|night_owl|irregular","sleep_quality":"good|variable|poor","exercise_habit":"sedentary|occasional|regular|athlete","exercise_type":"","social_frequency":"rarely|monthly|weekly|daily","diet":"","lifestyle_note":""}`);
+      const aiResult = await callAI(`${charCtx()} Attachment: ${personality.attachment_style}. N=${personality.big5.neuroticism} E=${personality.big5.extraversion}.\nReturn ONLY valid JSON:\n{"alcohol_relationship":"non_drinker|rare|moderate|regular|heavy","drug_use":"none|cannabis_occasional|cannabis_regular|mixed_recreational|cocaine_occasional","substance_context":"","sleep_pattern":"early_riser|normal|night_owl|irregular","sleep_quality":"good|variable|poor","exercise_habit":"sedentary|occasional|regular|athlete","exercise_type":"","social_frequency":"rarely|monthly|weekly|daily","diet":"","lifestyle_note":""}`);
       setLifestyle(p=>({...p,...parseJSON(t)}));
     } catch { setError("Generation failed"); }
     setGenerating(null);
@@ -336,7 +329,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
   async function generateEconomy() {
     setGenerating("economy"); setError(null);
     try {
-      const t = await callAI(`Occupation: ${identity.occupation}, Age: ${identity.age}. C=${personality.big5.conscientiousness}.\nReturn ONLY valid JSON:\n{"financial_situation":"stable|struggling|comfortable|wealthy|precarious","income_stability":"stable|variable|freelance|unemployed","monthly_income_sek":35000,"spending_style":"frugal|balanced|spender|impulsive","savings_habit":"none|minimal|moderate|disciplined","attitude_to_wealth":"practical|aspirational|anxious|indifferent","financial_anxiety":0.3,"behavior_note":""}`);
+      const aiResult = await callAI(`Occupation: ${identity.occupation}, Age: ${identity.age}. C=${personality.big5.conscientiousness}.\nReturn ONLY valid JSON:\n{"financial_situation":"stable|struggling|comfortable|wealthy|precarious","income_stability":"stable|variable|freelance|unemployed","monthly_income_sek":35000,"spending_style":"frugal|balanced|spender|impulsive","savings_habit":"none|minimal|moderate|disciplined","attitude_to_wealth":"practical|aspirational|anxious|indifferent","financial_anxiety":0.3,"behavior_note":""}`);
       setEconomy(p=>({...p,...parseJSON(t)}));
     } catch { setError("Generation failed"); }
     setGenerating(null);
@@ -360,7 +353,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({ identity, psychology:{...psychology, attachment_style:personality.attachment_style}, personality, lifestyle, economy }),
       });
-      const d = await res.json();
+      const data = await res.json();
       if (!res.ok || d.error) throw new Error(d.error || "Save failed");
       actorId = d.id;
 
@@ -503,7 +496,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
               <input style={S.input} value={identity.occupation} onChange={e=>updI("occupation",e.target.value)} placeholder="Photographer, nurse, architect…" />
             </Field>
 
-            <Field label="Photos" hint="Click a slot to upload. Used for appearance profile and identity recognition.">
+            <Field label="Photos" hint="Upload a profile photo. Used for appearance generation and displayed throughout the platform.">
               <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8}}>
                 {PHOTO_SLOTS.map(slot=>(
                   <div key={slot.slug}
@@ -555,10 +548,10 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
                         img.onerror = rej;
                         img.src = url;
                       });
-                      const APPEARANCE_PRIORITY = ["photo_halfbody","photo_full_body","photo_bikini","profile","photo_close","photo_side","photo_behind","photo_intimate"];
+                      const APPEARANCE_PRIORITY = ["profile"];
                       const photoFiles = APPEARANCE_PRIORITY.map(s=>photos[s]).filter(Boolean).slice(0,1);
                       console.log("[appearance] photoFiles:", photoFiles.length, "priority slots checked");
-                      if(photoFiles.length===0) throw new Error("No suitable photo found — upload a half body or full body photo first.");
+                      if(photoFiles.length===0) throw new Error("Upload a profile photo first.");
                       const imgs = await Promise.all(photoFiles.map(toBase64));
                       console.log("[appearance] imgs encoded:", imgs.length, "sizes:", imgs.map(i=>i.length));
                       const resp = await fetch("/api/generate/appearance",{
@@ -566,7 +559,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
                         body:JSON.stringify({images:imgs,name:(identity.first_name+" "+identity.last_name).trim(),gender:identity.gender,age:identity.age}),
                       });
                       console.log("[appearance] response status:", resp.status);
-                      const d = await resp.json();
+                      const data = await resp.json();
                       console.log("[appearance] response body:", JSON.stringify(d).slice(0,200));
                       if(d.error) throw new Error(d.error);
                       if(d.fields) {

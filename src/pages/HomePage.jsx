@@ -5,9 +5,9 @@ import AppConfig from "./AppConfig.jsx";
 import WorldEnterOverlay from "./WorldEnterOverlay.jsx";
 
 function greeting() {
-  const h = new Date().getHours();
-  if (h < 12) return "Good morning";
-  if (h < 18) return "Good afternoon";
+  const currentHour = new Date().getHours();
+  if (currentHour < 12) return "Good morning";
+  if (currentHour < 18) return "Good afternoon";
   return "Good evening";
 }
 

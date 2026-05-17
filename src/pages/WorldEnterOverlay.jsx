@@ -1,9 +1,101 @@
 import { useState, useEffect, useRef } from "react";
 import styles from "./WorldEnterOverlay.module.css";
 import VenueScene from "./VenueScene.jsx";
-import Scene from "./Scene.jsx";
+import KnockingDoorScene from "./KnockingDoorScene.jsx";
+import PlayerHomeScene from "./PlayerHomeScene.jsx";
 
 const SIMULATOR_URL = "https://anima.simulator.ngrok.dev";
+
+function resizedPhoto(photoSrc, size = 64) {
+  if (!photoSrc) return null;
+  const photoPath = photoSrc.startsWith(SIMULATOR_URL) ? photoSrc.replace(SIMULATOR_URL, "") : (photoSrc.startsWith("http") ? null : photoSrc);
+  if (!photoPath) return photoSrc;
+  return `/api/media/resize?url=${encodeURIComponent(photoPath)}&w=${size}&h=${size}`;
+}
+
+function parseHours(operating_hours) {
+  // operating_hours format: "09:00-17:00" or null
+  if (!operating_hours) return null;
+  const parts = operating_hours.split("-");
+  if (parts.length !== 2) return null;
+  const toMins = t => { const [h,m] = t.split(":").map(Number); return h*60+(m||0); };
+  return { open: toMins(parts[0]), close: toMins(parts[1]) };
+}
+
+function isVenueOpen(operating_hours) {
+  const h = parseHours(operating_hours);
+  if (!h) return null; // unknown
+  const now = new Date();
+  const mins = now.getHours()*60 + now.getMinutes();
+  // Handle overnight (e.g. 22:00-04:00)
+  if (h.close < h.open) return mins >= h.open || mins < h.close;
+  return mins >= h.open && mins < h.close;
+}
+
+function formatHours(operating_hours) {
+  if (!operating_hours) return null;
+  return operating_hours;
+}
+
+function decodePolyline(encoded) {
+  if (!encoded) return [];
+  let index = 0, lat = 0, lng = 0;
+  const coords = [];
+  const decodeNext = () => {
+    let shift = 0, result = 0, byte = 0;
+    while (true) {
+      byte = encoded.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+      if (byte < 0x20) break;
+    }
+    return (result & 1) ? ~(result >> 1) : (result >> 1);
+  };
+  while (index < encoded.length) {
+    lat += decodeNext();
+    lng += decodeNext();
+    coords.push({ lat: lat / 1e5, lng: lng / 1e5 });
+  }
+  return coords;
+}
+
+function interpolatePosition(coords, fraction) {
+  if (!coords || coords.length === 0) return null;
+  if (fraction <= 0) return coords[0];
+  if (fraction >= 1) return coords[coords.length - 1];
+  // Calculate total distance
+  let totalDist = 0;
+  const dists = [];
+  for (let i = 1; i < coords.length; i++) {
+    const d = Math.hypot(coords[i].lat - coords[i-1].lat, coords[i].lng - coords[i-1].lng);
+    dists.push(d);
+    totalDist += d;
+  }
+  let target = fraction * totalDist;
+  for (let i = 0; i < dists.length; i++) {
+    if (target <= dists[i]) {
+      const t = dists[i] > 0 ? target / dists[i] : 0;
+      return {
+        lat: coords[i].lat + t * (coords[i+1].lat - coords[i].lat),
+        lng: coords[i].lng + t * (coords[i+1].lng - coords[i].lng)
+      };
+    }
+    target -= dists[i];
+  }
+  return coords[coords.length - 1];
+}
+
+function getActorPosition(actor, placesCoords) {
+  if (!actor.in_transit || !actor.transit_polyline) return null;
+  const coords = decodePolyline(actor.transit_polyline);
+  if (coords.length === 0) return null;
+  const started = actor.transit_started_at ? new Date(actor.transit_started_at.endsWith('Z') ? actor.transit_started_at : actor.transit_started_at + 'Z').getTime() : null;
+  const duration = actor.transit_duration_minutes ? actor.transit_duration_minutes * 60000 : null;
+  if (!started || !duration) return null;
+  const elapsed = Date.now() - started;
+  const fraction = Math.min(1, Math.max(0, elapsed / duration));
+  return interpolatePosition(coords, fraction);
+}
 const MAPS_KEY = "AIzaSyDy45Dov_WkN9FcxdVNYQEx23PjexI-Fxc";
 
 const PIN_STYLES = `
@@ -59,20 +151,25 @@ function injectPinStyles() {
 export default function WorldEnterOverlay({ world, user, onClose }) {
   const mapRef        = useRef(null);
   const mapInstance   = useRef(null);
-  const markers       = useRef([]);
+  const markers        = useRef([]);
+  const transitMarkers = useRef([]);
+  const transitTimer   = useRef(null);
   const selectedRef   = useRef(null);
 
   const spawnLock = useRef(false);
 
   const [locations, setLocations] = useState([]);
+  const locationsRef   = useRef([]);
   const [selected,  setSelected]  = useState(null);
   const [mapReady,  setMapReady]  = useState(false);
   const [spawning,  setSpawning]  = useState(false);
   const [loading,   setLoading]   = useState(true);
   const [sceneData, setSceneData] = useState(null);
+  const [selectedActor, setSelectedActor] = useState(null); // for transit panel
   const [mapKey,    setMapKey]    = useState(0);
 
   // Fetch presence + refresh every 30s
+  const loadPresenceRef = useRef(null);
   useEffect(() => {
     const load = () => {
       fetch(`/api/worlds/${world.id}/presence`)
@@ -89,6 +186,7 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
         })
         .catch(() => setLoading(false));
     };
+    loadPresenceRef.current = load;
     load();
     const t = setInterval(load, 30000);
     return () => clearInterval(t);
@@ -155,16 +253,20 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
         const hasActors = loc.actors && loc.actors.length > 0;
         const div = document.createElement("div");
         div.style.cssText = "position:absolute;cursor:pointer;";
-        const first    = hasActors ? loc.actors[0] : null;
-        const photoUrl = first?.photo_url ? (first.photo_url.startsWith('http') ? first.photo_url : `${SIMULATOR_URL}${first.photo_url}`) : null;
-        const extra    = hasActors && loc.actors.length > 1 ? loc.actors.length - 1 : 0;
-        const label    = loc.name.length > 18 ? loc.name.slice(0, 17) + "…" : loc.name;
+        const label = loc.name.length > 18 ? loc.name.slice(0, 17) + "…" : loc.name;
+        const actors = (loc.actors || []).filter(a => !a.in_transit);
+        const shown = actors.slice(0, 3);
+        const stackedPhotos = shown.map((a, i) => {
+          const pinPhoto = a.photo_url ? resizedPhoto(a.photo_url, 48) : null;
+          return pinPhoto
+            ? `<img src="${pinPhoto}" style="width:22px;height:22px;border-radius:50%;object-fit:cover;border:1.5px solid rgba(255,255,255,.8);margin-left:${i===0?0:-8}px;z-index:${shown.length-i};position:relative;" onerror="this.style.display='none'" />`
+            : `<div style="width:22px;height:22px;border-radius:50%;background:rgba(181,148,90,.3);border:1.5px solid rgba(255,255,255,.8);display:inline-flex;align-items:center;justify-content:center;font-size:9px;color:#1a1814;margin-left:${i===0?0:-8}px;z-index:${shown.length-i};position:relative;">${a.name[0]}</div>`;
+        }).join("");
         div.innerHTML = `
           <div class="anima-pin" style="transform:translate(-50%,-100%);display:flex;flex-direction:column;align-items:center;">
-            <div class="anima-pin-bubble">
-              ${photoUrl ? `<img src="${photoUrl}" class="anima-pin-photo" onerror="this.style.display='none'" />` : hasActors ? `<div class="anima-pin-initial">${first.name[0]}</div>` : ""}
+            <div class="anima-pin-bubble" style="display:flex;flex-direction:row;align-items:center;gap:5px;">
+              ${hasActors ? `<div style="display:flex;align-items:center;">${stackedPhotos}</div>` : ""}
               <span class="anima-pin-label">${label}</span>
-              ${extra > 0 ? `<span class="anima-pin-extra">+${extra}</span>` : ""}
             </div>
             <div class="anima-pin-stem"></div>
           </div>`;
@@ -200,6 +302,111 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
     });
   }, [mapReady, locations, mapKey]);
 
+  // Transit actor dots — interpolate position every 5s
+  useEffect(() => {
+    if (!mapReady || !mapInstance.current) return;
+    if (transitTimer.current) clearInterval(transitTimer.current);
+
+    const getLocations = () => locationsRef.current;
+    const placesCoords = {};
+    getLocations().forEach(l => {
+      if (l.lat && l.lng) {
+        placesCoords[l.place_id] = { lat: Number(l.lat), lng: Number(l.lng) };
+        placesCoords[l.id] = { lat: Number(l.lat), lng: Number(l.lng) };
+      }
+    });
+
+    const transitActors = getLocations().flatMap(l => l.actors || []).filter(a => a.in_transit && a.transit_polyline);
+
+    // Create route lines and dots once, then just update dot positions
+    const routeLines = [];
+    const dots = [];
+
+    transitActors.forEach(actor => {
+      // Route line — static, created once
+      const coords = decodePolyline(actor.transit_polyline);
+      if (coords.length >= 2) {
+        const polylinePath = coords.map(c => new window.google.maps.LatLng(c.lat, c.lng));
+        const routeLine = new window.google.maps.Polyline({
+          path: polylinePath, geodesic: false,
+          strokeColor: "#6B9FD4", strokeOpacity: 0.7, strokeWeight: 2,
+          map: mapInstance.current,
+          icons: [{ icon: { path: window.google.maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 2, fillColor: "#6B9FD4", fillOpacity: 1, strokeWeight: 0 }, offset: "100%" }]
+        });
+        routeLines.push(routeLine);
+        transitMarkers.current.push({ setMap: (m) => routeLine.setMap(m) });
+      }
+
+      // Transit dot — created once, position updated in-place
+      const photoUrl = actor.photo_url ? resizedPhoto(actor.photo_url, 48) : null;
+
+      // Use factory instead of class to avoid esbuild hoisting issues
+      const createTransitDot = () => {
+        const overlay = new window.google.maps.OverlayView();
+        overlay._pos = null;
+        overlay._div = null;
+        overlay.onAdd = function() {
+          const div = document.createElement("div");
+          div.style.cssText = "position:absolute;pointer-events:auto;cursor:pointer;";
+          div.innerHTML = `<div style="transform:translate(-50%,-50%);width:32px;height:32px;border-radius:50%;overflow:hidden;border:2px solid rgba(181,148,90,.8);box-shadow:0 0 8px rgba(181,148,90,.4);">
+            ${photoUrl
+              ? `<img src="${photoUrl}" style="width:100%;height:100%;object-fit:cover;" onerror="this.style.display='none'" />`
+              : `<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:rgba(181,148,90,.3);font-size:12px;color:white;">${actor.name[0]}</div>`
+            }
+          </div>`;
+          div.addEventListener("click", (e) => {
+            e.stopPropagation();
+            window.__selectTransitActor && window.__selectTransitActor(actor);
+          });
+          this._div = div;
+          this.getPanes().overlayMouseTarget.appendChild(div);
+        };
+        overlay.draw = function() {
+          const proj = this.getProjection();
+          if (!proj || !this._div || !this._pos) return;
+          const pt = proj.fromLatLngToDivPixel(new window.google.maps.LatLng(this._pos.lat, this._pos.lng));
+          if (pt) { this._div.style.left = pt.x + "px"; this._div.style.top = pt.y + "px"; }
+        };
+        overlay.updatePos = function(pos) { this._pos = pos; this.draw(); };
+        overlay.onRemove = function() { if (this._div?.parentNode) this._div.parentNode.removeChild(this._div); this._div = null; };
+        return overlay;
+      };
+
+      const dot = createTransitDot();
+      const initialPos = getActorPosition(actor, placesCoords);
+      if (initialPos) { dot._pos = initialPos; }
+      dot.setMap(mapInstance.current);
+      dots.push({ dot, actor });
+      transitMarkers.current.push(dot);
+    });
+
+    const updatePositions = () => {
+      dots.forEach(({ dot, actor }) => {
+        const pos = getActorPosition(actor, placesCoords);
+        if (pos) dot.updatePos(pos);
+      });
+    };
+
+    if (transitActors.length > 0) {
+      transitTimer.current = setInterval(updatePositions, 5000);
+    }
+
+    return () => {
+      if (transitTimer.current) { clearInterval(transitTimer.current); transitTimer.current = null; }
+      transitMarkers.current.forEach(m => { try { m.setMap(null); } catch(e) {} });
+      transitMarkers.current = [];
+    };
+  }, [mapReady, locations, mapKey]);
+
+  // Keep locationsRef current so transit effect can read latest without re-running
+  locationsRef.current = locations;
+
+  // Wire transit actor click to React state
+  useEffect(() => {
+    window.__selectTransitActor = (actor) => setSelectedActor(actor);
+    return () => { delete window.__selectTransitActor; };
+  }, []);
+
   function selectLocation(loc) {
     if (selectedRef.current) {
       markers.current.find(m => m._locId === selectedRef.current.id)?.setSelected(false);
@@ -222,6 +429,18 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify({ location_id: selected.place_id || selected.id }),
       });
+
+      // Check if this is the player's own home
+      // Route to PlayerHomeScene if residential_home and player is present (or no one is — it's their home)
+      console.log("[home check] category:", selected.category, "actors:", selected.actors?.map(a=>a.actor_id), "playerActorId:", playerActorId);
+      const isPlayerHome = selected.category === "residential_home" &&
+        (selected.actors?.length === 0 || selected.actors?.some(a => a.actor_id === playerActorId));
+      if (isPlayerHome) {
+        setSceneData({ location: selected, mode: "player_home" });
+        setSpawning(false);
+        spawnLock.current = false;
+        return;
+      }
 
       if (selected.category === "residential") {
         await new Promise(r => setTimeout(r, 1200));
@@ -266,10 +485,22 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
       mapInstance.current = null;
       setSceneData(null);
       setMapKey(k => k + 1);
+      // Refresh presence to reflect updated state
+      if (loadPresenceRef.current) loadPresenceRef.current();
     };
+    if (sceneData.mode === "player_home") {
+      return (
+        <PlayerHomeScene
+          world={world}
+          user={user}
+          location={sceneData.location}
+          onLeave={onLeave}
+        />
+      );
+    }
     if (sceneData.mode === "scene") {
       return (
-        <Scene
+        <KnockingDoorScene
           world={world}
           user={user}
           sceneData={sceneData}
@@ -288,7 +519,7 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
   }
 
   const worldTime = new Date().toLocaleTimeString("sv-SE", {
-    hour: "2-digit", minute: "2-digit", timeZone: "Europe/Stockholm",
+    hour: "2-digit", minute: "2-digit", timeZone: world?.timezone || "Europe/Stockholm",
   });
 
   return (
@@ -319,8 +550,38 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
           <div ref={mapRef} className={styles.map} />
         </div>
 
-        <div className={`${styles.panel} ${selected ? styles.panelVisible : ""}`}>
-          {selected && (
+        <div className={`${styles.panel} ${selected || selectedActor ? styles.panelVisible : ""}`}>
+          {selectedActor && (
+            <div className={styles.panelInner}>
+              <button className={styles.panelClose} onClick={() => setSelectedActor(null)}>✕</button>
+              <div className={styles.panelMeta}>
+                <span className={styles.panelType}>In transit</span>
+              </div>
+              <h2 className={styles.panelName}>{selectedActor.name}</h2>
+              <p className={styles.panelAddress}>{selectedActor.occupation}</p>
+              <div className={styles.divider} />
+              <p className={styles.sectionLabel}>Heading to</p>
+              <p className={styles.actorName}>
+                {(() => {
+                  const dest = locationsRef.current.find(l => l.place_id === selectedActor.transit_destination || l.id === selectedActor.transit_destination);
+                  return dest ? dest.name : selectedActor.transit_destination || "—";
+                })()}
+              </p>
+              <p className={styles.sectionLabel}>Vehicle</p>
+              <p className={styles.actorName}>
+                {selectedActor.vehicle
+                  ? `${selectedActor.vehicle.color || ""} ${selectedActor.vehicle.make || ""} ${selectedActor.vehicle.model || ""}`.trim()
+                  : "No vehicle data"}
+              </p>
+              {selectedActor.transit_duration_minutes && selectedActor.transit_started_at && (() => {
+                const started = new Date((selectedActor.transit_started_at.endsWith("Z") ? selectedActor.transit_started_at : selectedActor.transit_started_at + "Z")).getTime();
+                const elapsed = Math.floor((Date.now() - started) / 60000);
+                const remaining = Math.max(0, selectedActor.transit_duration_minutes - elapsed);
+                return <p className={styles.actorStatus}>{remaining} min remaining</p>;
+              })()}
+            </div>
+          )}
+          {!selectedActor && selected && (
             <>
               <div className={styles.panelInner}>
                 <div className={styles.panelMeta}>
@@ -328,45 +589,100 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
                   {selected.area && <span className={styles.panelArea}>{selected.area}</span>}
                 </div>
                 <h2 className={styles.panelName}>{selected.name}</h2>
+
+                {/* Open/closed + hours — server-filtered ambient staff = open */}
+                {!["residential","residential_home"].includes(selected.category) && (() => {
+                  const hasStaff = selected.actors.some(a => a.is_ambient && a.is_staff); // staff specifically
+                  const venueOpen = selected.actors.some(a => a.is_ambient) || !selected.operating_hours;
+                  const hours = formatHours(selected.operating_hours);
+                  const showBadge = selected.operating_hours != null;
+                  return (
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+                      {showBadge && (
+                        <span style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,fontWeight:500,
+                          color: venueOpen ? "#4caf87" : "#e07070",
+                          background: venueOpen ? "rgba(76,175,135,.12)" : "rgba(224,112,112,.12)",
+                          padding:"2px 8px",borderRadius:20}}>
+                          {venueOpen ? "Open" : "Closed"}
+                        </span>
+                      )}
+                      {hours && <span style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"rgba(255,255,255,.35)"}}>{hours}</span>}
+                    </div>
+                  );
+                })()}
+
                 {selected.formatted_address && (
                   <p className={styles.panelAddress}>{selected.formatted_address}</p>
                 )}
 
                 <div className={styles.divider} />
 
-                <p className={styles.sectionLabel}>Here now</p>
-                {selected.actors.filter(a => a.actor_id !== user?.worlds?.find(w => w.world_id === world.id)?.actor_id).length === 0 ? (
-                  <p className={styles.emptyState}>Nobody here right now</p>
-                ) : (
-                  <div className={styles.actorList}>
-                    {selected.actors.filter(a => a.actor_id !== user?.worlds?.find(w => w.world_id === world.id)?.actor_id).map(a => (
-                      <div key={a.actor_id} className={styles.actorRow}>
-                        <div className={styles.actorAvWrap}>
-                          {a.photo_url
-                            ? <img
-                                src={a.photo_url.startsWith('http') ? a.photo_url : `${SIMULATOR_URL}${a.photo_url}`}
-                                className={styles.actorPhoto}
-                                onError={e => { e.target.style.display = "none"; e.target.nextSibling.style.display = "flex"; }}
-                              />
-                            : null}
-                          <div className={styles.actorInitial} style={{ display: a.photo_url ? "none" : "flex" }}>
-                            {a.name[0]}
+                {/* Staff section — ambient actors at this venue */}
+                {(() => {
+                  const venueOpen2 = selected.actors.some(a => a.is_ambient) || !selected.operating_hours;
+                  const staff = selected.actors.filter(a => a.is_ambient && a.is_staff);
+                  // Only show ambient visitors when open — real actors always shown
+                  const visitors = selected.actors.filter(a => {
+                    if (!a.is_ambient) return true;
+                    if (a.is_staff) return false;
+                    return venueOpen2;
+                  });
+                  const isResidential = ["residential","residential_home"].includes(selected.category);
+
+                  return (<>
+                    {!isResidential && staff.length > 0 && venueOpen2 && (
+                      <>
+                        <p className={styles.sectionLabel}>Staff</p>
+                        <div className={styles.actorList}>
+                          {staff.map(a => (
+                            <div key={a.actor_id} className={styles.actorRow}>
+                              <div className={styles.actorAvWrap}>
+                                <div className={styles.actorInitial}>{a.name[0]}</div>
+                              </div>
+                              <div className={styles.actorInfo}>
+                                <p className={styles.actorName}>{a.name}</p>
+                                <p className={styles.actorStatus}>{a.occupation || "—"}</p>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                        {visitors.length > 0 && <div className={styles.divider} />}
+                      </>
+                    )}
+
+                    <p className={styles.sectionLabel}>Here now</p>
+                    {visitors.length === 0 ? (
+                      <p className={styles.emptyState}>
+                        {!venueOpen2 && selected.operating_hours ? "Closed right now" : "Nobody here right now"}
+                      </p>
+                    ) : (
+                      <div className={styles.actorList}>
+                        {visitors.map(a => (
+                          <div key={a.actor_id} className={styles.actorRow}>
+                            <div className={styles.actorAvWrap}>
+                              {a.photo_url
+                                ? <img
+                                    src={resizedPhoto(a.photo_url, 64)}
+                                    className={styles.actorPhoto}
+                                    onError={e => { e.target.style.display = "none"; e.target.nextSibling.style.display = "flex"; }}
+                                  />
+                                : null}
+                              <div className={styles.actorInitial} style={{ display: a.photo_url ? "none" : "flex" }}>
+                                {a.name[0]}
+                              </div>
+                            </div>
+                            <div className={styles.actorInfo}>
+                              <p className={styles.actorName}>{a.actor_id === user?.worlds?.find(w => w.world_id === world.id)?.actor_id ? "You" : a.name}</p>
+                              <p className={styles.actorStatus}>
+                                {a.in_transit ? "In transit" : a.activity_slug ? a.activity_slug.replace(/_/g, " ") : a.occupation || "—"}
+                              </p>
+                            </div>
                           </div>
-                        </div>
-                        <div className={styles.actorInfo}>
-                          <p className={styles.actorName}>{a.name}</p>
-                          <p className={styles.actorStatus}>
-                            {a.in_transit
-                              ? "In transit"
-                              : a.activity_slug
-                                ? a.activity_slug.replace(/_/g, " ")
-                                : a.occupation || "—"}
-                          </p>
-                        </div>
+                        ))}
                       </div>
-                    ))}
-                  </div>
-                )}
+                    )}
+                  </>);
+                })()}
               </div>
 
               <div className={styles.panelFooter}>
@@ -379,8 +695,8 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
                     disabled={spawning}
                   >
                     {spawning
-                      ? (selected.category === "residential" ? "Knocking…" : "Entering…")
-                      : (selected.category === "residential" ? "Knock on door →" : "Enter this location →")}
+                      ? (selected.category === "residential_home" ? "Entering…" : selected.category === "residential" ? "Knocking…" : "Entering…")
+                      : (selected.category === "residential_home" ? "Enter your home →" : selected.category === "residential" ? "Knock on door →" : "Enter this location →")}
                   </button>
                 )}
               </div>

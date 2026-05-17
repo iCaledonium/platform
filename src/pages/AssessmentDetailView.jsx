@@ -35,19 +35,19 @@ function answerColor(rtype, answer) {
       : { bg:"rgba(192,57,43,0.1)", color:"#c0392b" };
   }
   if (rtype === "likert4") {
-    const n = Number(answer);
+    const next = Number(answer);
     if (n <= 2) return { bg:"rgba(192,57,43,0.1)", color:"#c0392b" };
     if (n === 3) return { bg:"rgba(201,151,58,0.12)", color:"#8a5a00" };
     return { bg:"rgba(52,199,89,0.12)", color:"#1a7a35" };
   }
   if (rtype === "likert5") {
-    const n = Number(answer);
+    const next = Number(answer);
     if (n <= 2) return { bg:"rgba(192,57,43,0.1)", color:"#c0392b" };
     if (n === 3) return { bg:"rgba(201,151,58,0.12)", color:"#8a5a00" };
     return { bg:"rgba(52,199,89,0.12)", color:"#1a7a35" };
   }
   if (rtype === "likert7") {
-    const n = Number(answer);
+    const next = Number(answer);
     if (n <= 2) return { bg:"rgba(52,199,89,0.12)", color:"#1a7a35" };
     if (n <= 4) return { bg:"rgba(201,151,58,0.12)", color:"#8a5a00" };
     return { bg:"rgba(192,57,43,0.1)", color:"#c0392b" };

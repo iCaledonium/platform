@@ -10,7 +10,7 @@ function slotToMinutes(t) {
 
 function isoToMinutes(iso) {
   if (!iso) return 0;
-  const d = new Date(iso);
+  const data = new Date(iso);
   return d.getHours() * 60 + d.getMinutes();
 }
 
@@ -29,7 +29,7 @@ function fmtShortTime(iso) {
 }
 
 function nowMinutes() {
-  const n = new Date();
+  const next = new Date();
   return n.getHours() * 60 + n.getMinutes();
 }
 
@@ -39,7 +39,7 @@ function getWeekDays(offsetWeeks = 0) {
   const monday = new Date(today);
   monday.setDate(today.getDate() - (dow === 0 ? 6 : dow - 1) + offsetWeeks * 7);
   return Array.from({ length: 7 }, (_, i) => {
-    const d = new Date(monday);
+    const data = new Date(monday);
     d.setDate(monday.getDate() + i);
     return d;
   });
@@ -130,7 +130,7 @@ export default function CalendarPage() {
               } else setError("No world found.");
             });
         } else {
-          const w = me.worlds?.[0];
+          const win = me.worlds?.[0];
           if (w) loadCalendar(w.world_id, w.actor_id);
           else setError("No world found.");
         }

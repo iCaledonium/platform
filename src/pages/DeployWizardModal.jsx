@@ -16,7 +16,7 @@ function StepBar({ current }) {
   return (
     <div style={{ display:"flex", alignItems:"center", padding:"1rem 1.5rem 0" }}>
       {STEPS.map((label, i) => {
-        const n = i + 1;
+        const next = i + 1;
         const done   = n < current;
         const active = n === current;
         return (
@@ -69,10 +69,10 @@ function StepWorld({ actor, state, setState }) {
   useEffect(() => {
     if (window.google?.maps) { setMapReady(true); return; }
     if (document.getElementById("gmaps-script")) {
-      const t = setInterval(() => { if (window.google?.maps) { setMapReady(true); clearInterval(t); } }, 200);
+      const timer = setInterval(() => { if (window.google?.maps) { setMapReady(true); clearInterval(t); } }, 200);
       return;
     }
-    const s = document.createElement("script");
+    const state = document.createElement("script");
     s.id  = "gmaps-script";
     s.src = `https://maps.googleapis.com/maps/api/js?key=${MAPS_KEY}`;
     s.onload = () => setMapReady(true);
@@ -97,9 +97,9 @@ function StepWorld({ actor, state, setState }) {
       const lng = e.latLng.lng();
       placeMarker(lat, lng);
       try {
-        const r = await fetch(`/api/places/reverse?lat=${lat}&lng=${lng}`);
+        const resp = await fetch(`/api/places/reverse?lat=${lat}&lng=${lng}`);
         if (r.ok) {
-          const d = await r.json();
+          const data = await r.json();
           setState(prev => ({...prev, home: { ...d, home_type: prev.home?.home_type }}));
           setSearchQuery(d.address);
         }
@@ -136,7 +136,7 @@ function StepWorld({ actor, state, setState }) {
   async function suggestNeighbourhood() {
     setSuggesting(true); setSuggestions([]);
     try {
-      const r = await fetch(`/api/actors/${actor.id}/suggest-home`, { method:"POST", headers:{"Content-Type":"application/json"} });
+      const resp = await fetch(`/api/actors/${actor.id}/suggest-home`, { method:"POST", headers:{"Content-Type":"application/json"} });
       if (r.ok) setSuggestions(await r.json());
     } catch {}
     setSuggesting(false);
@@ -145,9 +145,9 @@ function StepWorld({ actor, state, setState }) {
   async function suggestCareer() {
     setCareerSuggesting(true);
     try {
-      const r = await fetch(`/api/actors/${actor.id}/suggest-career`, { method:"POST", headers:{"Content-Type":"application/json"} });
+      const resp = await fetch(`/api/actors/${actor.id}/suggest-career`, { method:"POST", headers:{"Content-Type":"application/json"} });
       if (r.ok) {
-        const d = await r.json();
+        const data = await r.json();
         setState(prev => ({...prev, career: { career_level: d.career_level, career_ladder: d.career_ladder, employment_type: d.employment_type, reputation_score: d.reputation_score ?? 0.5 }}));
       }
     } catch {}
@@ -157,7 +157,7 @@ function StepWorld({ actor, state, setState }) {
   async function suggestWorkplace() {
     setWorkSuggesting(true); setWorkSuggestions([]);
     try {
-      const r = await fetch(`/api/actors/${actor.id}/suggest-workplace`, { method:"POST", headers:{"Content-Type":"application/json"} });
+      const resp = await fetch(`/api/actors/${actor.id}/suggest-workplace`, { method:"POST", headers:{"Content-Type":"application/json"} });
       if (r.ok) setWorkSuggestions(await r.json());
     } catch {}
     setWorkSuggesting(false);
@@ -171,8 +171,8 @@ function StepWorld({ actor, state, setState }) {
       setWorkSearching(true);
       try {
         const country = state.world?.country || '';
-        const r = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(q)}${country ? '&country='+country : ''}`, { credentials: 'include' });
-        if (r.ok) { const d = await r.json(); setWorkResults(Array.isArray(d) ? d : []); }
+        const resp = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(q)}${country ? '&country='+country : ''}`, { credentials: 'include' });
+        if (r.ok) { const data = await r.json(); setWorkResults(Array.isArray(d) ? d : []); }
       } catch {}
       setWorkSearching(false);
     }, 400);
@@ -185,9 +185,9 @@ function StepWorld({ actor, state, setState }) {
     try {
       const controller = new AbortController();
       setTimeout(() => controller.abort(), 5000);
-      const r = await fetch(`/api/places/details?place_id=${p.place_id}`, { signal: controller.signal });
+      const resp = await fetch(`/api/places/details?place_id=${p.place_id}`, { signal: controller.signal });
       if (r.ok) {
-        const d = await r.json();
+        const data = await r.json();
         setState(prev => ({...prev, workplace: { ...prev.workplace, ...d }}));
         setWorkQuery(d.name + " — " + d.address);
       }
@@ -211,9 +211,9 @@ function StepWorld({ actor, state, setState }) {
         const lat = e.latLng.lat();
         const lng = e.latLng.lng();
         try {
-          const r = await fetch(`/api/places/reverse?lat=${lat}&lng=${lng}`);
+          const resp = await fetch(`/api/places/reverse?lat=${lat}&lng=${lng}`);
           if (r.ok) {
-            const d = await r.json();
+            const data = await r.json();
             setState(prev => ({...prev, workplace: { ...d }}));
             setWorkQuery(d.address);
           }
@@ -246,9 +246,9 @@ function StepWorld({ actor, state, setState }) {
         const country = state.world?.country || '';
         const url = `/api/places/autocomplete?q=${encodeURIComponent(q)}${country ? '&country='+country : ''}`;
         console.log('[searchPlaces] fetching', url);
-        const r = await fetch(url, { credentials: 'include' });
+        const resp = await fetch(url, { credentials: 'include' });
         console.log('[searchPlaces] status', r.status);
-        if (r.ok) { const d = await r.json(); console.log('[searchPlaces] results', d.length); setSearchResults(Array.isArray(d) ? d : []); }
+        if (r.ok) { const data = await r.json(); console.log('[searchPlaces] results', d.length); setSearchResults(Array.isArray(d) ? d : []); }
       } catch(e) { console.error('[searchPlaces] error', e); }
       setSearching(false);
     }, 400);
@@ -256,7 +256,7 @@ function StepWorld({ actor, state, setState }) {
 
   function pickSuggestion(s) {
     const city = state.world?.city || "Stockholm";
-    const q = s.neighbourhood + " " + city;
+    const query = s.neighbourhood + " " + city;
     setSearchQuery(q); searchPlaces(q);
   }
 
@@ -267,9 +267,9 @@ function StepWorld({ actor, state, setState }) {
     try {
       const controller = new AbortController();
       setTimeout(() => controller.abort(), 5000);
-      const r = await fetch(`/api/places/details?place_id=${p.place_id}`, { signal: controller.signal });
+      const resp = await fetch(`/api/places/details?place_id=${p.place_id}`, { signal: controller.signal });
       if (r.ok) {
-        const d = await r.json();
+        const data = await r.json();
         setState(prev => ({...prev, home: { ...prev.home, ...d }}));
         setSearchQuery(d.address);
       }
@@ -284,10 +284,10 @@ function StepWorld({ actor, state, setState }) {
       {worlds.map(w => {
         const running = w.status === "running";
         return (
-          <div key={w.id} onClick={() => running && setState(p => ({...p, world:w}))}
-            style={{ padding:"10px 14px", borderRadius:12, border:`1.5px solid ${state.world?.id===w.id?"#1a1814":"rgba(0,0,0,.08)"}`, background:state.world?.id===w.id?"rgba(26,24,20,.04)":running?"rgba(255,255,255,.5)":"rgba(0,0,0,.02)", cursor:running?"pointer":"not-allowed", marginBottom:8, display:"flex", justifyContent:"space-between", alignItems:"center", opacity:running?1:0.5 }}>
+          <div key={w.id} onClick={() => setState(p => ({...p, world:w}))}
+            style={{ padding:"10px 14px", borderRadius:12, border:`1.5px solid ${state.world?.id===w.id?"#1a1814":"rgba(0,0,0,.08)"}`, background:state.world?.id===w.id?"rgba(26,24,20,.04)":"rgba(255,255,255,.5)", cursor:"pointer", marginBottom:8, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
             <div>
-              <div style={{ ...S.sans, fontSize:13, fontWeight:500, color:running?"#1a1814":"#a8a5a0" }}>{w.name}</div>
+              <div style={{ ...S.sans, fontSize:13, fontWeight:500, color:"#1a1814" }}>{w.name}</div>
               <div style={{ ...S.sans, fontSize:11, color:running?"#5CA87A":"#c0392b", marginTop:1 }}>{running ? "● running" : "● stopped"}</div>
             </div>
             {state.world?.id===w.id && <span style={{ color:"#1a1814" }}>✓</span>}
@@ -410,7 +410,23 @@ function StepWorld({ actor, state, setState }) {
         {/* Workplace section */}
         <div style={{ marginTop:20 }}>
           <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
-            <div style={{ ...S.label }}>Workplace</div>
+            <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+              <div style={{ ...S.label }}>Workplace</div>
+              <label style={{ display:"flex", alignItems:"center", gap:5, cursor:"pointer" }}>
+                <input type="checkbox" checked={state.workFromHome||false}
+                  onChange={e => {
+                    const wfh = e.target.checked;
+                    setState(p => {
+                      const home = p.home || {};
+                      return { ...p, workFromHome: wfh, workplace: wfh && home.address
+                        ? { place_id: home.place_id, address: home.address, name: home.address, lat: home.lat, lng: home.lng }
+                        : wfh ? {} : p.workplace };
+                    });
+                  }}
+                  style={{ accentColor:"#1a1814" }} />
+                <span style={{ ...S.sans, fontSize:11, color:"#6b6760" }}>Work from home</span>
+              </label>
+            </div>
             <button onClick={suggestWorkplace} disabled={workSuggesting} style={{ ...S.sans, fontSize:11, padding:"3px 10px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"none", color:"#6b6760", cursor:workSuggesting?"default":"pointer", opacity:workSuggesting?0.5:1 }}>
               {workSuggesting ? "Thinking…" : "✨ Suggest"}
             </button>
@@ -519,7 +535,7 @@ function StepRelationships({ actor, state, setState }) {
   function addCustomType(dim) {
     const val = customInputs[dim].trim();
     if (!val) return;
-    const t = { id:`custom-${dim}-${val.replace(/\s+/g,"-").toLowerCase()}`, name:val.replace(/\s+/g,"_"), dimension_id:dim, dimension_name:dimConfig[dim]?.label?.toLowerCase()||dim.replace("dim-",""), _custom:true };
+    const timer = { id:`custom-${dim}-${val.replace(/\s+/g,"-").toLowerCase()}`, name:val.replace(/\s+/g,"_"), dimension_id:dim, dimension_name:dimConfig[dim]?.label?.toLowerCase()||dim.replace("dim-",""), _custom:true };
     setCustomTypes(p => ({...p, [dim]:[...p[dim], t]}));
     setCustomInputs(p => ({...p, [dim]:""}));
     selectType(t);
@@ -529,7 +545,7 @@ function StepRelationships({ actor, state, setState }) {
     if (!picked || !selType) return;
     setInspiring(true);
     try {
-      const r = await fetch(`/api/actors/${actor.id}/inspire-relationship`, {
+      const resp = await fetch(`/api/actors/${actor.id}/inspire-relationship`, {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({
           rel_type_id:   selType.id,
@@ -568,7 +584,7 @@ function StepRelationships({ actor, state, setState }) {
   }
 
   function editRel(i) {
-    const r = (state.relationships||[])[i];
+    const resp = (state.relationships||[])[i];
     setPicked(r.character);
     setSelType({ id:r.rel_type_id, name:r.rel_type_name, dimension_id:r.dimension_id, dimension_name:r.dimension_name });
     setDescription(r.description||"");
@@ -747,7 +763,7 @@ function StepSchedule({ actor, state, setState }) {
   async function generate() {
     setGenerating(true); setError("");
     try {
-      const r = await fetch(`/api/actors/${actor.id}/generate-schedule`, {
+      const resp = await fetch(`/api/actors/${actor.id}/generate-schedule`, {
         method: "POST",
         headers: { "Content-Type":"application/json" },
         body: JSON.stringify({
@@ -849,37 +865,55 @@ function StepSchedule({ actor, state, setState }) {
 
 // ── Step 4: Media ─────────────────────────────────────────────────────────────
 function StepMedia({ actor, state, setState }) {
-  const [photos,    setPhotos]    = useState([]);
-  const [slots,     setSlots]     = useState([]);
-  const [voiceFile, setVoiceFile] = useState(null);
+  const [profilePhoto, setProfilePhoto] = useState(null); // {url} existing
+  const [archives,     setArchives]     = useState([]);
+  const [uploading,    setUploading]    = useState(false);
+  const [voiceFile,    setVoiceFile]    = useState(null);
   const [voiceUploading, setVoiceUploading] = useState(false);
-  const [voiceDone, setVoiceDone] = useState(false);
+  const [voiceDone,    setVoiceDone]    = useState(false);
+  const fileRef = useRef(null);
+  const videoRef = useRef(null);
 
   useEffect(() => {
     fetch(`/api/actors/${actor.id}/media`).then(r=>r.ok?r.json():[]).then(d => {
-      setPhotos(d.filter(m=>m.media_type==="photo"));
-    }).catch(()=>{});
-  }, [actor.id]);
-
-  useEffect(() => {
-    if (!state.schedule?.length) return;
-    const SKIP = new Set(["sleeping","napping","morning_routine","waking","transit","taxi","waiting","errands","laundry","cleaning"]);
-    const seen = new Set();
-    const unique = [];
-    for (const s of state.schedule) {
-      const slug = s.activity_slug;
-      if (!slug || SKIP.has(slug) || seen.has(slug)) continue;
-      seen.add(slug);
-      unique.push({ slug, label: slug.replace(/_/g," ") });
-    }
-    setSlots(unique);
-  }, [state.schedule]);
-
-  useEffect(() => {
-    fetch(`/api/actors/${actor.id}/media`).then(r=>r.ok?r.json():[]).then(d => {
+      const photo = d.find(m => m.media_type==="photo" && m.state_slug==="profile");
+      if (photo) setProfilePhoto(photo);
       if (d.some(m=>m.media_type==="voice_reference")) setVoiceDone(true);
     }).catch(()=>{});
   }, [actor.id]);
+
+  useEffect(() => {
+    fetch(`/api/actors/${actor.id}/archived-media`).then(r=>r.ok?r.json():[]).then(d => {
+      const groups = {};
+      (Array.isArray(d)?d:[]).forEach(m => {
+        if (!groups[m.world_id]) groups[m.world_id] = { world_name: m.world_name, world_id: m.world_id, count: 0 };
+        groups[m.world_id].count++;
+      });
+      setArchives(Object.values(groups));
+    }).catch(()=>{});
+  }, [actor.id]);
+
+  async function uploadPhoto(file) {
+    setUploading(true);
+    const fd = new FormData();
+    fd.append("photo", file);
+    fd.append("state_slug", "profile");
+    fd.append("media_type", "photo");
+    if (state.world?.id) fd.append("world_id", state.world.id);
+    const resp = await fetch(`/api/actors/${actor.id}/media`, { method:"POST", body:fd });
+    if (r.ok) { const data = await r.json(); setProfilePhoto(d); }
+    setUploading(false);
+  }
+
+  async function uploadVideo(file) {
+    setUploading(true);
+    const fd = new FormData();
+    fd.append("video", file);
+    fd.append("world_id", state.world?.id);
+    fd.append("actor_id", actor.id);
+    await fetch(`/api/actors/${actor.id}/upload-video`, { method:"POST", body:fd }).catch(()=>{});
+    setUploading(false);
+  }
 
   async function uploadVoice(file) {
     setVoiceUploading(true);
@@ -887,85 +921,94 @@ function StepMedia({ actor, state, setState }) {
     fd.append("audio", file);
     fd.append("media_type", "voice_reference");
     fd.append("state_slug", "voice_reference");
-    try {
-      const r = await fetch(`/api/actors/${actor.id}/media`, { method:"POST", body:fd });
-      if (r.ok) setVoiceDone(true);
-    } catch {}
+    const resp = await fetch(`/api/actors/${actor.id}/media`, { method:"POST", body:fd });
+    if (r.ok) setVoiceDone(true);
     setVoiceUploading(false);
   }
 
   return (
-    <div>
-      <p style={{ ...S.sans, fontSize:13, color:"#a8a5a0", marginBottom:16 }}>Transfer portraits and generate state images + animations</p>
+    <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
+      <p style={{ ...S.sans, fontSize:13, color:"#a8a5a0", margin:0 }}>All sections are optional — you can manage media later from the character editor.</p>
+
+      {/* Profile photo */}
+      <div>
+        <div style={{ ...S.label, marginBottom:8 }}>Profile photo</div>
+        <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+          <div style={{ width:64, height:64, borderRadius:"50%", overflow:"hidden", border:"1px solid rgba(0,0,0,.1)", background:"#e0d8cf", flexShrink:0 }}>
+            {profilePhoto ? <img src={profilePhoto.url} style={{ width:"100%", height:"100%", objectFit:"cover" }} /> : <div style={{ width:"100%", height:"100%", display:"flex", alignItems:"center", justifyContent:"center", color:"#a8a5a0", fontSize:20 }}>+</div>}
+          </div>
+          <div>
+            <label style={{ ...S.sans, fontSize:12, padding:"6px 14px", borderRadius:8, border:"1px solid rgba(0,0,0,.12)", background:"#1a1814", color:"#faf8f4", cursor:"pointer", opacity:uploading?0.6:1 }}>
+              {uploading ? "Uploading…" : profilePhoto ? "Replace" : "Upload photo"}
+              <input ref={fileRef} type="file" accept="image/*" style={{ display:"none" }} onChange={e=>{ if(e.target.files[0]) uploadPhoto(e.target.files[0]); }} />
+            </label>
+            <div style={{ ...S.sans, fontSize:11, color:"#a8a5a0", marginTop:4 }}>World-specific profile image</div>
+          </div>
+        </div>
+      </div>
 
       {/* Voice reference */}
-      <div style={{ ...S.label, marginBottom:8 }}>Voice reference</div>
-      <div style={{ padding:"12px 14px", borderRadius:10, border:`1px ${voiceDone?"solid":"dashed"} ${voiceDone?"rgba(29,158,117,.3)":"rgba(0,0,0,.1)"}`, background:voiceDone?"rgba(29,158,117,.05)":"rgba(0,0,0,.02)", marginBottom:20, display:"flex", alignItems:"center", gap:12 }}>
-        {voiceDone ? (
-          <>
-            <span style={{ fontSize:18 }}>🎙️</span>
-            <div style={{ flex:1 }}>
-              <div style={{ ...S.sans, fontSize:13, fontWeight:500, color:"#0f6e56" }}>Voice reference uploaded</div>
-              <div style={{ ...S.sans, fontSize:11, color:"#a8a5a0" }}>Used by XTTS/COCQIA for voice synthesis</div>
-            </div>
-            <label style={{ ...S.sans, fontSize:11, padding:"4px 10px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"none", color:"#6b6760", cursor:"pointer" }}>
-              Replace <input type="file" accept="audio/mp3,audio/mpeg,.mp3" style={{ display:"none" }} onChange={e=>{ if(e.target.files[0]) { setVoiceFile(e.target.files[0]); uploadVoice(e.target.files[0]); }}} />
-            </label>
-          </>
-        ) : (
-          <>
-            <span style={{ fontSize:18 }}>🎙️</span>
-            <div style={{ flex:1 }}>
-              <div style={{ ...S.sans, fontSize:13, color:"#1a1814" }}>Upload a voice reference MP3</div>
-              <div style={{ ...S.sans, fontSize:11, color:"#a8a5a0" }}>10–30 seconds of clear speech, no background noise</div>
-            </div>
-            <label style={{ ...S.sans, fontSize:11, padding:"4px 10px", borderRadius:7, border:"1px solid rgba(0,0,0,.12)", background:"#1a1814", color:"#faf8f4", cursor:"pointer", opacity:voiceUploading?0.6:1 }}>
-              {voiceUploading ? "Uploading…" : "Upload MP3"}
-              <input type="file" accept="audio/mp3,audio/mpeg,.mp3" style={{ display:"none" }} onChange={e=>{ if(e.target.files[0]) { setVoiceFile(e.target.files[0]); uploadVoice(e.target.files[0]); }}} disabled={voiceUploading} />
-            </label>
-          </>
-        )}
-      </div>
-
-      <div style={{ ...S.label, marginBottom:8 }}>Portraits · {photos.length} / 8</div>
-      <div style={{ display:"grid", gridTemplateColumns:"repeat(8,1fr)", gap:5, marginBottom:20 }}>
-        {Array.from({length:8}).map((_,i) => {
-          const p = photos[i];
-          return (
-            <div key={i} style={{ aspectRatio:"1", borderRadius:7, border:`1px ${p?"solid":"dashed"} ${p?"rgba(29,158,117,.3)":"rgba(0,0,0,.1)"}`, background:p?"rgba(29,158,117,.08)":"rgba(0,0,0,.03)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:10, color:p?"#0f6e56":"#c8c5c0", overflow:"hidden", position:"relative" }}>
-              {p ? <img src={p.url} style={{ width:"100%", height:"100%", objectFit:"cover", borderRadius:7 }} /> : "+"}
-            </div>
-          );
-        })}
-      </div>
-
-      <div style={{ ...S.label, marginBottom:8 }}>State images & animations</div>
-      <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
-        {slots.map(si => (
-          <div key={si.slug} style={{ border:"1px solid rgba(0,0,0,.07)", borderRadius:10, overflow:"hidden" }}>
-            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"8px 12px", background:"rgba(0,0,0,.02)" }}>
-              <span style={{ ...S.sans, fontSize:13, fontWeight:500, color:"#1a1814" }}>{si.label}</span>
-              <div style={{ display:"flex", gap:5 }}>
-                <button style={{ ...S.sans, fontSize:11, padding:"3px 9px", borderRadius:6, border:"1px solid rgba(55,138,221,.3)", background:"rgba(55,138,221,.07)", color:"#185FA5", cursor:"pointer" }}>Generate</button>
-                <button style={{ ...S.sans, fontSize:11, padding:"3px 9px", borderRadius:6, border:"1px solid rgba(0,0,0,.1)", background:"none", color:"#6b6760", cursor:"pointer" }}>Upload</button>
-              </div>
-            </div>
-            {["Idle","Active"].map(anim => (
-              <div key={anim} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"6px 12px 6px 22px", borderTop:"1px solid rgba(0,0,0,.04)" }}>
-                <span style={{ ...S.sans, fontSize:11, color:"#a8a5a0" }}>↳ {anim} animation</span>
-                <div style={{ display:"flex", gap:5 }}>
-                  <button style={{ ...S.sans, fontSize:11, padding:"3px 9px", borderRadius:6, border:"1px solid rgba(55,138,221,.3)", background:"rgba(55,138,221,.07)", color:"#185FA5", cursor:"pointer" }}>Generate from image</button>
-                  <button style={{ ...S.sans, fontSize:11, padding:"3px 9px", borderRadius:6, border:"1px solid rgba(0,0,0,.1)", background:"none", color:"#6b6760", cursor:"pointer" }}>Upload</button>
-                </div>
-              </div>
-            ))}
+      <div>
+        <div style={{ ...S.label, marginBottom:8 }}>Voice reference</div>
+        <div style={{ padding:"12px 14px", borderRadius:10, border:`1px ${voiceDone?"solid":"dashed"} ${voiceDone?"rgba(29,158,117,.3)":"rgba(0,0,0,.1)"}`, background:voiceDone?"rgba(29,158,117,.05)":"rgba(0,0,0,.02)", display:"flex", alignItems:"center", gap:12 }}>
+          <span style={{ fontSize:18 }}>🎙️</span>
+          <div style={{ flex:1 }}>
+            <div style={{ ...S.sans, fontSize:13, fontWeight:500, color:voiceDone?"#0f6e56":"#1a1814" }}>{voiceDone?"Voice reference uploaded":"Upload a voice reference MP3"}</div>
+            <div style={{ ...S.sans, fontSize:11, color:"#a8a5a0" }}>10–30 seconds of clear speech, no background noise</div>
           </div>
-        ))}
-        {slots.length===0 && <p style={{ ...S.sans, fontSize:13, color:"#a8a5a0" }}>Complete the schedule step first.</p>}
+          <label style={{ ...S.sans, fontSize:11, padding:"4px 10px", borderRadius:7, border:"1px solid rgba(0,0,0,.12)", background: voiceDone?"none":"#1a1814", color:voiceDone?"#6b6760":"#faf8f4", cursor:"pointer", opacity:voiceUploading?0.6:1 }}>
+            {voiceUploading?"Uploading…":voiceDone?"Replace":"Upload MP3"}
+            <input type="file" accept="audio/mp3,audio/mpeg,.mp3" style={{ display:"none" }} onChange={e=>{ if(e.target.files[0]) uploadVoice(e.target.files[0]); }} disabled={voiceUploading} />
+          </label>
+        </div>
+      </div>
+
+      {/* Archive transfer */}
+      <div>
+        <div style={{ ...S.label, marginBottom:8 }}>Transfer animations from archive</div>
+        <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+          <div onClick={() => setState(s => ({ ...s, archiveWorldId: null }))}
+            style={{ padding:"10px 14px", borderRadius:9, cursor:"pointer",
+              border:`1px solid ${!state.archiveWorldId?"rgba(29,158,117,.4)":"rgba(0,0,0,.1)"}`,
+              background:!state.archiveWorldId?"rgba(29,158,117,.06)":"rgba(0,0,0,.02)",
+              display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+            <span style={{ ...S.sans, fontSize:13, color:"#1a1814" }}>No transfer — start fresh</span>
+            {!state.archiveWorldId && <span style={{ color:"#1D9E75" }}>✓</span>}
+          </div>
+          {archives.map(a => (
+            <div key={a.world_id} onClick={() => setState(s => ({ ...s, archiveWorldId: a.world_id }))}
+              style={{ padding:"10px 14px", borderRadius:9, cursor:"pointer",
+                border:`1px solid ${state.archiveWorldId===a.world_id?"rgba(29,158,117,.4)":"rgba(0,0,0,.1)"}`,
+                background:state.archiveWorldId===a.world_id?"rgba(29,158,117,.06)":"rgba(0,0,0,.02)",
+                display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+              <div>
+                <div style={{ ...S.sans, fontSize:13, color:"#1a1814", fontWeight:500 }}>{a.world_name || a.world_id.slice(0,8)}</div>
+                <div style={{ ...S.sans, fontSize:11, color:"#a8a5a0" }}>{a.count} animations</div>
+              </div>
+              {state.archiveWorldId===a.world_id && <span style={{ color:"#1D9E75" }}>✓</span>}
+            </div>
+          ))}
+          {archives.length === 0 && <p style={{ ...S.sans, fontSize:12, color:"#a8a5a0" }}>No archived animation sets found.</p>}
+        </div>
+      </div>
+
+      {/* Upload animations */}
+      <div>
+        <div style={{ ...S.label, marginBottom:4 }}>Upload animations</div>
+        <div style={{ ...S.sans, fontSize:11, color:"#a8a5a0", marginBottom:8 }}>Green screen standing clips recommended as a starting point. Multiple files accepted.</div>
+        <label style={{ ...S.sans, fontSize:12, padding:"8px 16px", borderRadius:8, border:"1px dashed rgba(0,0,0,.15)", background:"rgba(0,0,0,.02)", color:"#6b6760", cursor:"pointer", display:"inline-block" }}>
+          + Add video files (.mp4)
+          <input ref={videoRef} type="file" accept="video/mp4,.mp4" multiple style={{ display:"none" }}
+            onChange={async e => {
+              for (const f of Array.from(e.target.files)) { await uploadVideo(f); }
+              e.target.value = "";
+            }} />
+        </label>
       </div>
     </div>
   );
 }
+
 
 // ── Step 5: Review ────────────────────────────────────────────────────────────
 function StepDeploy({ actor, state }) {

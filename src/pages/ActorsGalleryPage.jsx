@@ -157,7 +157,7 @@ function ShareModal({ actor, onClose }) {
 }
 
 function ActorCard({ actor, shared, owned, onShare, onDelete, onDeploy, onUndeploy, deployed, onClick }) {
-  const c = sc(actor.attachment_style);
+  const ctx = sc(actor.attachment_style);
   const dots = COMPLETION.map(s => s.check(actor));
 
   return (
@@ -267,7 +267,7 @@ export default function ActorsGalleryPage() {
 
   const undeployActor = async (id) => {
     await fetch(`/api/actors/${id}/undeploy`, { method: "POST" });
-    setDeployedIds(p => { const n = new Set(p); n.delete(id); return n; });
+    setDeployedIds(p => { const next = new Set(p); n.delete(id); return n; });
     setDeployments(p => p.filter(d => d.platform_actor_id !== id));
   };
 
@@ -279,6 +279,15 @@ export default function ActorsGalleryPage() {
     const key = d.world_name || d.world_id;
     if (!acc[key]) acc[key] = new Set();
     acc[key].add(d.platform_actor_id);
+    return acc;
+  }, {});
+
+  // world-specific photo lookup: "worldName|actorId" -> url
+  const worldPhotoMap = deployments.reduce((acc, d) => {
+    if (d.world_photo_url) {
+      const key = `${d.world_name || d.world_id}|${d.platform_actor_id}`;
+      acc[key] = d.world_photo_url;
+    }
     return acc;
   }, {});
 
@@ -304,7 +313,11 @@ export default function ActorsGalleryPage() {
           return (
             <SectionLabel key={worldName} label={`In Play · ${worldName}`} count={worldActors.length}>
               <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(170px,1fr))", gap:12, marginBottom:"2.5rem" }}>
-                {worldActors.map(a => <ActorCard key={a.id} actor={a} owned deployed onShare={setShareActor} onDelete={deleteActor} onUndeploy={undeployActor} onClick={() => navigate(`/actors/${a.id}`)} />)}
+                {worldActors.map(a => {
+            const worldPhoto = worldPhotoMap[`${worldName}|${a.id}`];
+            const actorWithPhoto = worldPhoto ? { ...a, photo_url: worldPhoto } : a;
+            return <ActorCard key={a.id} actor={actorWithPhoto} owned deployed onShare={setShareActor} onDelete={deleteActor} onUndeploy={undeployActor} onClick={() => navigate(`/actors/${a.id}`)} />;
+          })}
               </div>
             </SectionLabel>
           );

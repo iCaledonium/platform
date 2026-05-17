@@ -25,7 +25,7 @@ function StepBar({ current }) {
   return (
     <div style={{ display:"flex", alignItems:"center", width:"100%", maxWidth:680, marginBottom:"1.75rem" }}>
       {steps.map((label, i) => {
-        const n = i + 1;
+        const stepNum = i + 1;
         const done    = n < current;
         const active  = n === current;
         const pending = n > current;
@@ -208,7 +208,7 @@ function StepRelationships({ actor, state, setState }) {
 
       {/* Relationship chips per category */}
       {["lawful","romantic","social"].map(cat => {
-        const c = catColors[cat];
+        const catColor = catColors[cat];
         const labels = relTypes[cat] || DEFAULT_LABELS[cat] || [];
         return (
           <div key={cat} style={{ marginBottom:16 }}>
@@ -276,11 +276,11 @@ function StepSchedule({ actor, state, setState }) {
         body: JSON.stringify({ actor_id: actor.id, world_id: state.world?.id }),
       });
       const data = res.ok ? await res.json() : null;
-      const s = data || mockSchedule(actor);
+      const state = data || mockSchedule(actor);
       setSchedule(s);
       setState(p => ({ ...p, schedule: s, fromWeek }));
     } catch {
-      const s = mockSchedule(actor);
+      const state = mockSchedule(actor);
       setSchedule(s);
       setState(p => ({ ...p, schedule: s, fromWeek }));
     } finally {
@@ -385,7 +385,7 @@ function StepMedia({ actor, state, setState }) {
       <div style={{ ...S.label, marginBottom:10 }}>Portrait photos · {photos.length} / 8</div>
       <div style={{ display:"grid", gridTemplateColumns:"repeat(8,1fr)", gap:6, marginBottom:24 }}>
         {Array.from({length:8}).map((_, i) => {
-          const p = photos[i];
+          const photoItem = photos[i];
           return (
             <div key={i} style={{ aspectRatio:"1", borderRadius:8, border:`1px ${p ? "solid" : "dashed"} ${p ? "rgba(29,158,117,.3)" : "rgba(0,0,0,.1)"}`, background: p ? "rgba(29,158,117,.08)" : "rgba(0,0,0,.03)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:10, color: p ? "#0f6e56" : "#c8c5c0" }}>
               {p ? "✓" : "+"}

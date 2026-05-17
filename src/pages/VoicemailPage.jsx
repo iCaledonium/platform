@@ -44,14 +44,14 @@ function avatarColor(id) {
 }
 
 function formatTime(secs) {
-  const m = Math.floor(secs / 60);
-  const s = Math.floor(secs % 60);
+  const msg = Math.floor(secs / 60);
+  const state = Math.floor(secs % 60);
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
 function formatDate(iso) {
   if (!iso) return "";
-  const d = new Date(iso);
+  const data = new Date(iso);
   const now = new Date();
   const diff = (now - d) / 1000;
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;

@@ -99,13 +99,13 @@ function BellSlot({ unread, onClick, notifications }) {
 
 function formatTime(isoStr) {
   if (!isoStr) return "";
-  const d = new Date(isoStr);
+  const data = new Date(isoStr);
   return d.toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit" });
 }
 
 function formatSection(isoStr) {
   if (!isoStr) return "Earlier";
-  const d = new Date(isoStr);
+  const data = new Date(isoStr);
   const now = new Date();
   const diff = Math.floor((now - d) / 86400000);
   if (diff === 0) return "Today";
@@ -133,6 +133,7 @@ function initials(name) {
 
 export default function App() {
   const [notifications, setNotifications] = useState([]);
+  const [homeKnock, setHomeKnock] = useState(null); // {actor_id, actor_name, photo_url, address, world_id, home_place_id}
   const [toasts, setToasts]               = useState([]);
   const [showCentre, setShowCentre]       = useState(false);
   const esRef                              = useRef(null);
@@ -153,6 +154,8 @@ export default function App() {
       .catch(() => {});
   }
 
+  const clearedIdsRef = useRef(new Set());
+
   function connectSSE() {
     if (esRef.current) esRef.current.close();
     const es = new EventSource("/api/stream");
@@ -160,17 +163,25 @@ export default function App() {
     es.onmessage = (e) => {
       try {
         const payload = JSON.parse(e.data);
+        if (payload.type === "home_knock") {
+          setHomeKnock(payload);
+          return;
+        }
         if (payload.type === "new_message") {
-          // Add to notifications list immediately
+          const notifId = payload.notif_id;
+          // No server-assigned ID = can't track → skip
+          if (!notifId) return;
+          // Already cleared this session → don't re-add
+          if (clearedIdsRef.current.has(notifId)) return;
           const notif = {
-            id:                payload.notif_id || crypto.randomUUID(),
+            id:                notifId,
             sender_actor_id:   payload.sender_id,
             sender_name:       payload.sender_name,
             sender_actor_type: payload.sender_actor_type,
             content:           payload.content,
             app_id:            payload.app_id || null,
-            conv_type:         payload.conv_type || "text_thread",
-            has_app:           payload.has_app !== false,
+            conversation_type: payload.conv_type || "text_thread",
+            // has_app intentionally NOT set from SSE — computed server-side on GET
             read_at:           null,
             inserted_at:       payload.sent_at || new Date().toISOString(),
           };
@@ -178,12 +189,9 @@ export default function App() {
             if (prev.find(n => n.id === notif.id)) return prev;
             return [notif, ...prev];
           });
-          // Suppress toast if this conversation is already open
           const currentUrl = window.location.href;
           const alreadyOpen = currentUrl.includes(`contact=${payload.sender_id}`);
-          if (!alreadyOpen) {
-            showToast(notif);
-          }
+          if (!alreadyOpen) showToast(notif);
         }
       } catch {}
     };
@@ -203,39 +211,37 @@ export default function App() {
 
   async function clearNotif(id) {
     await fetch(`/api/notifications/${id}`, { method: "DELETE" }).catch(() => {});
+    clearedIdsRef.current.add(id);
     setNotifications(prev => prev.filter(n => n.id !== id));
   }
 
   async function clearAll() {
     await fetch("/api/notifications", { method: "DELETE" }).catch(() => {});
+    notifications.forEach(n => clearedIdsRef.current.add(n.id));
     setNotifications([]);
   }
 
   function openFromNotif(notif) {
     markRead(notif.id);
     setShowCentre(false);
-
-    // No app installed — open wizard pre-selecting the right tool type
-    if (!notif.has_app) {
-      const toolType = CONV_TO_TOOL[notif.conversation_type] || "messages";
-      if (toolType === 'messages') { window.location.href = `/home?install=${toolType}`; } else { alert(toolType.charAt(0).toUpperCase() + toolType.slice(1) + ' app coming soon.'); }
+    const convType = notif.conversation_type || notif.conv_type || "text_thread";
+    const toolType = CONV_TO_TOOL[convType] || "messages";
+    const contactParam = notif.sender_actor_id ? `&contact=${notif.sender_actor_id}` : "";
+    // Always do fresh app lookup — never rely on stale has_app from notification
+    if (notif.app_id) {
+      window.open(`/messages?app=${notif.app_id}${contactParam}`, "_blank");
       return;
     }
-
-    const appId = notif.app_id;
-    const contactParam = notif.sender_actor_id ? `&contact=${notif.sender_actor_id}` : "";
-    if (appId) {
-      window.open(`/messages?app=${appId}${contactParam}`, "_blank");
-    } else {
-      fetch("/api/apps")
-        .then(r => r.ok ? r.json() : [])
-        .then(apps => {
-          const toolType = CONV_TO_TOOL[notif.conversation_type] || "messages";
-          const app = apps.find(a => a.tool_type === toolType);
-          if (app) window.open(`/messages?app=${app.id}${contactParam}`, "_blank");
-          else if (toolType === 'messages') { window.location.href = `/home?install=${toolType}`; } else { alert(toolType.charAt(0).toUpperCase() + toolType.slice(1) + ' app coming soon.'); }
-        });
-    }
+    fetch("/api/apps")
+      .then(r => r.ok ? r.json() : [])
+      .then(apps => {
+        const app = apps.find(a => a.tool_type === toolType);
+        if (app) {
+          window.open(`/messages?app=${app.id}${contactParam}`, "_blank");
+        } else {
+          window.location.href = `/home?install=${toolType}`;
+        }
+      });
   }
 
   function openFromToast(toast) {
@@ -346,6 +352,52 @@ export default function App() {
         ))}
       </div>
 
+      {/* Home knock overlay */}
+      {homeKnock && (
+        <div style={{position:"fixed",inset:0,zIndex:10000,background:"rgba(0,0,0,.7)",display:"flex",alignItems:"center",justifyContent:"center",padding:24}}>
+          <div style={{background:"#1a1814",borderRadius:20,padding:32,maxWidth:380,width:"100%",display:"flex",flexDirection:"column",alignItems:"center",gap:18,boxShadow:"0 24px 64px rgba(0,0,0,.5)"}}>
+            {homeKnock.photo_url && (
+              <div style={{width:72,height:72,borderRadius:"50%",overflow:"hidden",border:"2px solid rgba(255,255,255,.15)"}}>
+                <img src={homeKnock.photo_url} style={{width:"100%",height:"100%",objectFit:"cover"}} alt="" />
+              </div>
+            )}
+            <div style={{textAlign:"center"}}>
+              <p style={{fontFamily:"'Cormorant Garamond',Georgia,serif",fontSize:22,color:"rgba(255,255,255,.9)",margin:"0 0 8px",fontWeight:500}}>
+                {homeKnock.actor_name} is at your door
+              </p>
+              <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:12,color:"rgba(255,255,255,.4)",margin:0}}>
+                {homeKnock.address}
+              </p>
+            </div>
+            <div style={{display:"flex",gap:10,width:"100%"}}>
+              <button onClick={async () => {
+                try {
+                  const resp = await fetch(`/api/worlds/${homeKnock.world_id}/encounter/start`, {
+                    method:"POST", headers:{"Content-Type":"application/json"},
+                    body: JSON.stringify({ target_actor_id: homeKnock.actor_id, location_id: homeKnock.home_place_id, trigger: "home_knock" })
+                  });
+                  const data = await r.json();
+                  setHomeKnock(null);
+                  // Navigate to encounter
+                  window.location.href = `/home`;
+                } catch(e) { console.error("Failed to open door", e); }
+              }} style={{flex:1,fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:13,fontWeight:500,padding:"11px 0",borderRadius:12,border:"none",background:"rgba(255,255,255,.92)",color:"#1a1814",cursor:"pointer"}}>
+                Open the door →
+              </button>
+              <button onClick={() => {
+                fetch(`/api/worlds/${homeKnock.world_id}/home-knock/decline`, {
+                  method:"POST", headers:{"Content-Type":"application/json"},
+                  body: JSON.stringify({ actor_id: homeKnock.actor_id })
+                }).catch(()=>{});
+                setHomeKnock(null);
+              }} style={{flex:1,fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:13,padding:"11px 0",borderRadius:12,border:"1px solid rgba(255,255,255,.15)",background:"rgba(255,255,255,.06)",color:"rgba(255,255,255,.5)",cursor:"pointer"}}>
+                Ignore
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <style>{`
         @keyframes ncSlide { from { transform: translateX(100%); } to { transform: translateX(0); } }
         @keyframes toastIn { from { transform: translateX(120%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
@@ -357,9 +409,8 @@ export default function App() {
 
 function NotifItem({ notif, onOpen, onClear }) {
   const [hover, setHover] = useState(false);
-  const hasApp = notif.has_app !== false;
-  const toolType = CONV_TO_TOOL[notif.conversation_type] || "messages";
-  const toolMeta = TOOL_LABELS[toolType] || TOOL_LABELS.messages;
+  const convType = notif.conversation_type || notif.conv_type || "text_thread";
+  const toolType = CONV_TO_TOOL[convType] || "messages";
 
   return (
     <div
@@ -381,24 +432,12 @@ function NotifItem({ notif, onOpen, onClear }) {
       <div style={{flex:1,minWidth:0}}>
         <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:2}}>
           <span style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:13,fontWeight:500,color:"#1a1814"}}>{notif.sender_name}</span>
-          <TypeBadge convType={notif.conversation_type} />
+          <TypeBadge convType={convType} />
           <span style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:10,color:"#a8a5a0",marginLeft:"auto"}}>{formatTime(notif.inserted_at)}</span>
         </div>
-        {hasApp ? (
-          <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#6b6760",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",margin:0}}>{notif.content}</p>
-        ) : notif.conversation_type === "call_request" ? (
-          <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:toolMeta.color,margin:0}}>
-            Missed call — Install Voice Call app to answer calls →
-          </p>
-        ) : toolType === "voice" ? (
-          <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:toolMeta.color,margin:0}}>
-            Install Voice app to listen →
-          </p>
-        ) : (
-          <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:toolMeta.color,margin:0}}>
-            Install {toolMeta.label} app to {toolType === "email" ? "read" : "view"} →
-          </p>
-        )}
+        <p style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#6b6760",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",margin:0}}>
+          {notif.content || "Tap to open →"}
+        </p>
       </div>
       {!notif.read_at && (
         <div style={{width:6,height:6,borderRadius:"50%",background:"#378add",flexShrink:0,marginTop:5}} />

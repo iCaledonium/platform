@@ -16,11 +16,10 @@ function sc(s) { return STYLE_COLOR[s] || STYLE_COLOR.default; }
 function ini(name) { return name?.split(" ").map(n=>n[0]).join("").slice(0,2).toUpperCase()||"?"; }
 
 function Field({ label, value, tall, full }) {
-  if (!value && value !== 0) return null;
   return (
     <div style={{ marginBottom:14 }}>
       <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".16em", textTransform:"uppercase", color:"#a8a5a0", marginBottom:5 }}>{label}</div>
-      <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, color:"#1a1814", background:"rgba(255,255,255,.55)", border:"1px solid rgba(0,0,0,.07)", borderRadius:8, padding: tall ? "10px 12px" : "8px 12px", lineHeight:1.6, whiteSpace: tall ? "pre-wrap" : "normal", maxWidth: full ? "100%" : 480 }}>{value}</div>
+      <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, color: value ? "#1a1814" : "#c8c5c0", background:"rgba(255,255,255,.55)", border:"1px solid rgba(0,0,0,.07)", borderRadius:8, padding: tall ? "10px 12px" : "8px 12px", lineHeight:1.6, whiteSpace: tall ? "pre-wrap" : "normal", maxWidth: full ? "100%" : 480 }}>{value || "—"}</div>
     </div>
   );
 }
@@ -67,7 +66,7 @@ function InspireBtn({ fieldKey, label, context, onResult, disabled }) {
   async function go() {
     setLoading(true);
     try {
-      const r = await fetch("/api/generate/profile", {
+      const resp = await fetch("/api/generate/profile", {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({ prompt:`${context}\n\nWrite a compelling "${label}" for this character. Return only the text — no labels, no JSON, 2-3 sentences max.` }),
       });
@@ -101,7 +100,7 @@ function EFieldInspire({ label, fieldKey, value, onChange, tall, context }) {
 
 function ScoreBar({ label, value, danger }) {
   const raw = value ?? 0;
-  const v = Math.round(raw <= 1.0 && raw > 0 ? raw * 100 : raw);
+  const val = Math.round(raw <= 1.0 && raw > 0 ? raw * 100 : raw);
   const color = danger && v > 70 ? "#c0392b" : danger && v > 50 ? "#b05c08" : "#6b6760";
   return (
     <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:8 }}>
@@ -140,7 +139,7 @@ function NavItem({ label, active, done, onClick }) {
 function IdentityPanel({ d, editing, setEditData }) {
   const { actor: a, psychology: p } = d;
   const upd = (path, val) => setEditData(prev => {
-    const n = {...prev};
+    const next = {...prev};
     const parts = path.split(".");
     let obj = n;
     for (let i=0; i<parts.length-1; i++) obj = obj[parts[i]] = {...obj[parts[i]]};
@@ -455,18 +454,12 @@ function EconomicPanel({ d, editing, setEditData }) {
 
 // ── Panel: Media ──────────────────────────────────────────────────────────────
 const PHOTO_SLOTS = [
-  { slug:"profile",        label:"Profile" },
-  { slug:"photo_close",    label:"Close-up" },
-  { slug:"photo_halfbody", label:"Half Body" },
-  { slug:"photo_full_body",label:"Full Body" },
-  { slug:"photo_side",     label:"Side" },
-  { slug:"photo_behind",   label:"Behind" },
-  { slug:"photo_bikini",   label:"Bikini" },
-  { slug:"photo_intimate", label:"Intimate" },
+  { slug:"profile", label:"Profile" },
 ];
 
 function MediaPanel({ actorId }) {
   const [media, setMedia]           = useState([]);
+  const [videos, setVideos]         = useState([]);
   const [loading, setLoading]       = useState(true);
   const [uploading, setUploading]   = useState(null);
   const [worlds, setWorlds]         = useState([]);
@@ -488,18 +481,35 @@ function MediaPanel({ actorId }) {
       .catch(() => {});
   }, [actorId]);
 
-  // Fetch media whenever actorId or selectedWorld changes
+  // Fetch profile photo whenever actorId changes
   useEffect(() => {
     if (!actorId) return;
     setLoading(true);
-    const url = selectedWorld
-      ? `/api/actors/${actorId}/media?world_id=${selectedWorld}`
-      : `/api/actors/${actorId}/media`;
-    fetch(url)
+    fetch(`/api/actors/${actorId}/media`)
       .then(r => r.ok ? r.json() : [])
       .then(d => { setMedia(d); setLoading(false); })
       .catch(() => setLoading(false));
+  }, [actorId]);
+
+  const [archivedMedia, setArchivedMedia] = useState([]);
+
+  // Fetch videos from simulator filesystem whenever world tab changes
+  useEffect(() => {
+    if (!actorId || !selectedWorld) { setVideos([]); return; }
+    fetch(`/api/worlds/${selectedWorld}/actors/${actorId}/videos`)
+      .then(r => r.ok ? r.json() : { videos: [] })
+      .then(d => setVideos(d.videos || []))
+      .catch(() => setVideos([]));
   }, [actorId, selectedWorld]);
+
+  // Fetch archived media for this actor
+  useEffect(() => {
+    if (!actorId) return;
+    fetch(`/api/actors/${actorId}/archived-media`)
+      .then(r => r.ok ? r.json() : [])
+      .then(d => setArchivedMedia(Array.isArray(d) ? d : []))
+      .catch(() => {});
+  }, [actorId]);
 
   async function resizeFile(file, maxPx) {
     return new Promise(res => {
@@ -507,7 +517,7 @@ function MediaPanel({ actorId }) {
       const url = URL.createObjectURL(file);
       img.onload = () => {
         const scale = Math.min(1, maxPx / Math.max(img.width, img.height));
-        const c = document.createElement("canvas");
+        const ctx = document.createElement("canvas");
         c.width = Math.round(img.width*scale); c.height = Math.round(img.height*scale);
         c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
         URL.revokeObjectURL(url);
@@ -529,8 +539,8 @@ function MediaPanel({ actorId }) {
     fd.append("media_type", "state_image");
     fd.append("filename", slug+".jpg");
     if (selectedWorld) fd.append("world_id", selectedWorld);
-    const r = await fetch(`/api/actors/${actorId}/media`, { method:"POST", body:fd });
-    const d = await r.json();
+    const resp = await fetch(`/api/actors/${actorId}/media`, { method:"POST", body:fd });
+    const data = await r.json();
     setMedia(prev => [...prev, { id:d.id, media_type:"state_image", state_slug:slug, url:d.url, filename:d.filename }]);
     setUploading(null);
   }
@@ -544,7 +554,7 @@ function MediaPanel({ actorId }) {
       const url = URL.createObjectURL(file);
       img.onload = () => {
         const MAX = 1200, scale = Math.min(1, MAX / Math.max(img.width, img.height));
-        const c = document.createElement("canvas");
+        const ctx = document.createElement("canvas");
         c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
         c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
         URL.revokeObjectURL(url);
@@ -559,8 +569,8 @@ function MediaPanel({ actorId }) {
     fd.append("media_type", "photo");
     fd.append("filename", slug+".jpg");
     if (selectedWorld) fd.append("world_id", selectedWorld);
-    const r = await fetch(`/api/actors/${actorId}/media`, { method:"POST", body:fd });
-    const d = await r.json();
+    const resp = await fetch(`/api/actors/${actorId}/media`, { method:"POST", body:fd });
+    const data = await r.json();
     setMedia(prev => {
       const filtered = prev.filter(m => !(m.media_type==="photo" && m.state_slug===slug));
       return [...filtered, { id:d.id, media_type:"photo", state_slug:slug, url:d.url, filename:d.filename }];
@@ -577,7 +587,11 @@ function MediaPanel({ actorId }) {
   const photos = media.filter(m => m.media_type === "photo");
   const states = media.filter(m => m.media_type === "state_image");
   const animations = media.filter(m => m.media_type === "animation");
-  const photoBySlug = Object.fromEntries(photos.map(m => [m.state_slug, m]));
+  const photoBySlug = (() => {
+    const canonical = Object.fromEntries(photos.filter(m => !m.world_id).map(m => [m.state_slug, m]));
+    const worldSpecific = Object.fromEntries(photos.filter(m => m.world_id === selectedWorld).map(m => [m.state_slug, m]));
+    return { ...canonical, ...worldSpecific };
+  })();
 
   if (loading) return <p style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, color:"#a8a5a0" }}>Loading media...</p>;
 
@@ -597,27 +611,20 @@ function MediaPanel({ actorId }) {
               {w.world_name || w.world_id?.slice(0,8)}
             </button>
           ))}
-          <button
-            onClick={() => setSelectedWorld(null)}
-            style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, padding:"5px 14px", borderRadius:20, border:"1px solid", cursor:"pointer",
-              borderColor: selectedWorld===null ? "#b05c08" : "rgba(0,0,0,0.12)",
-              background: selectedWorld===null ? "rgba(176,92,8,0.08)" : "transparent",
-              color: selectedWorld===null ? "#b05c08" : "#6b6760" }}>
-            Canonical
-          </button>
+
         </div>
       )}
 
-      {/* Portrait photo slots */}
+      {/* Profile image */}
       <div>
-        <div style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", fontSize:18, fontWeight:500, color:"#1a1814", marginBottom:14 }}>Portrait photos</div>
-        <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:8, maxWidth:480 }}>
+        <div style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", fontSize:18, fontWeight:500, color:"#1a1814", marginBottom:14 }}>Profile image</div>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(1,1fr)", gap:8, maxWidth:120 }}>
           {PHOTO_SLOTS.map(slot => {
             const existing = photoBySlug[slot.slug];
             return (
               <div key={slot.slug}
                 onDragOver={e => e.preventDefault()}
-                onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) uploadSlot(slot.slug, f); }}
+                onDrop={e => { e.preventDefault(); const file = e.dataTransfer.files[0]; if (f) uploadSlot(slot.slug, f); }}
                 onClick={() => { if (!existing) { activeSlotRef.current = slot.slug; fileRef.current?.click(); }}}
                 style={{ border:`1px dashed ${existing?"rgba(176,92,8,0.4)":"rgba(0,0,0,0.12)"}`, borderRadius:10, overflow:"hidden", aspectRatio:"3/4", position:"relative", cursor:existing?"default":"pointer", background:"rgba(255,255,255,0.5)" }}>
                 {uploading===slot.slug && (
@@ -645,41 +652,230 @@ function MediaPanel({ actorId }) {
           })}
         </div>
         <input ref={fileRef} type="file" accept="image/*" style={{ display:"none" }}
-          onChange={e => { const f = e.target.files[0]; if (f && activeSlotRef.current) uploadSlot(activeSlotRef.current, f); e.target.value=""; }} />
+          onChange={e => { const file = e.target.files[0]; if (f && activeSlotRef.current) uploadSlot(activeSlotRef.current, f); e.target.value=""; }} />
       </div>
 
-      {/* State images — editable */}
-      <div>
-        <div style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", fontSize:18, fontWeight:500, color:"#1a1814", marginBottom:6 }}>State images</div>
-        <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#a8a5a0", marginBottom:14 }}>Activity images used by the simulator. Names must match simulator activity slugs.</div>
+      {/* Animations — grouped by scene, playable */}
+      <AnimationsPanel
+        videos={videos}
+        archivedVideos={archivedMedia.filter(m => m.world_id === selectedWorld)}
+        worldName={worlds.find(w=>w.world_id===selectedWorld)?.world_name}
+        selectedWorld={selectedWorld}
+        actorId={actorId}
+        onArchived={() => fetch(`/api/actors/${actorId}/archived-media`).then(r=>r.ok?r.json():[]).then(d=>setArchivedMedia(Array.isArray(d)?d:[]))}
+      />
 
-        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(130px,1fr))", gap:10, marginBottom:12 }}>
-          {states.map(m => (
-            <StateImageCard key={m.id} m={m} actorId={actorId}
-              onDeleted={id => setMedia(prev => prev.filter(x => x.id !== id))}
-              onRenamed={(id, newSlug) => setMedia(prev => prev.map(x => x.id===id ? {...x, state_slug:newSlug} : x))}
-            />
-          ))}
+    </div>
+  );
+}
 
-          {/* Upload new state image */}
-          <div
-            onClick={() => { stateFileRef.current?.click(); }}
-            onDragOver={e => e.preventDefault()}
-            onDrop={async e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) uploadStateImage(f); }}
-            style={{ border:"1px dashed rgba(0,0,0,0.12)", borderRadius:10, aspectRatio:"1/1", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:4, cursor:"pointer", background:"rgba(255,255,255,0.5)" }}>
-            <div style={{ fontSize:20, opacity:.2 }}>+</div>
-            <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:9, color:"#a8a5a0", letterSpacing:"0.1em", textTransform:"uppercase" }}>Add state</div>
+// ── AnimationsPanel ───────────────────────────────────────────────────────────
+function parseVideoGroup(filename) {
+  // frida_bedroom_kneeling_topless_kiss_clip_bg.mp4
+  // Strip .mp4, strip _gs/_bg/_no_bg suffix
+  let name = filename.replace(/\.mp4$/, "");
+  let suffix = "";
+  if (name.endsWith("_gs"))     { suffix = "gs"; name = name.slice(0, -3); }
+  else if (name.endsWith("_bg")) { suffix = "bg"; name = name.slice(0, -3); }
+  else if (name.endsWith("_no_bg")) { suffix = "bg"; name = name.slice(0, -6); }
+
+  const parts = name.split("_");
+  const knownLocations = ["bedroom", "hall", "living", "kitchen"];
+  const knownPositions = ["standing", "sitting", "kneeling", "lying", "missionary", "straddles", "riding", "doggy"];
+
+  // Drop actor prefix
+  let rest = parts.slice(1);
+
+  // Try to find location (may be 2 words e.g. living_room)
+  let location = null;
+  if (rest.length >= 2 && knownLocations.some(l => rest[0] + "_" + rest[1] === l + "_room")) {
+    location = rest[0] + " " + rest[1]; rest = rest.slice(2);
+  } else if (knownLocations.includes(rest[0])) {
+    location = rest[0]; rest = rest.slice(1);
+  }
+
+  // Position
+  let position = rest[0] || ""; rest = rest.slice(1);
+  // Handle "lying_on_back", "lying_on_stomach"
+  if (position === "lying" && rest[0] === "on") {
+    position = "lying " + rest[0] + " " + rest[1]; rest = rest.slice(2);
+  }
+
+  // Outfit
+  let outfit = rest[0] || ""; rest = rest.slice(1);
+
+  // Remaining = action + type (clip/loop)
+  const type = rest[rest.length - 1] || "";
+  const action = rest.slice(0, -1).join(" ");
+
+  const group = [location, position, outfit].filter(Boolean).join(" · ");
+  return { group, action, type, suffix, label: action || type };
+}
+
+function AnimationsPanel({ videos, archivedVideos = [], worldName, selectedWorld, actorId, onArchived }) {
+  const [playing, setPlaying]       = useState(null);
+  const [archiving, setArchiving]   = useState(false);
+
+  async function manualArchive() {
+    setArchiving(true);
+    try {
+      const resp = await fetch(`/api/worlds/${selectedWorld}/actors/${actorId}/archive-media`, { method:"POST" });
+      const data = await r.json();
+      if (onArchived) onArchived();
+      alert(`Archived ${d.archived || 0} videos.`);
+    } catch { alert("Archive failed."); }
+    setArchiving(false);
+  }
+
+  const [expanded, setExpanded] = useState({});
+
+  if (!selectedWorld) return (
+    <div>
+      <div style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", fontSize:18, fontWeight:500, color:"#1a1814", marginBottom:6 }}>Animations</div>
+      <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#a8a5a0" }}>Select a world tab to see animations.</div>
+    </div>
+  );
+
+  // Group videos
+  const groups = {};
+  videos.forEach(v => {
+    const { group, label } = parseVideoGroup(v.filename);
+    if (!groups[group]) groups[group] = [];
+    groups[group].push({ ...v, label });
+  });
+  const sortedGroups = Object.keys(groups).sort();
+
+  function toggleGroup(group) {
+    setExpanded(prev => ({ ...prev, [group]: !prev[group] }));
+  }
+
+  return (
+    <div>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:4 }}>
+        <div style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", fontSize:18, fontWeight:500, color:"#1a1814" }}>Animations</div>
+        <button onClick={manualArchive} disabled={archiving}
+          style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:"0.06em", textTransform:"uppercase",
+            padding:"5px 12px", borderRadius:6, border:"1px solid rgba(0,0,0,0.12)",
+            background:"transparent", color:"#6b6760", cursor:"pointer" }}>
+          {archiving ? "Archiving…" : "↓ Archive now"}
+        </button>
+      </div>
+      <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#a8a5a0", marginBottom:18 }}>
+        {worldName || "This world"} · {videos.length} live
+      </div>
+
+      {videos.length === 0 && (
+        <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, color:"#a8a5a0", marginBottom:16 }}>Not currently deployed in this world.</div>
+      )}
+
+      {sortedGroups.map(group => {
+        const isOpen = expanded[group] === true;
+        return (
+          <div key={group} style={{ marginBottom:8 }}>
+            <div onClick={() => toggleGroup(group)}
+              style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
+                fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, color:"#6b6760",
+                letterSpacing:"0.1em", textTransform:"uppercase", padding:"8px 10px",
+                background:"rgba(0,0,0,0.03)", borderRadius:6, cursor:"pointer",
+                userSelect:"none", marginBottom: isOpen ? 8 : 0 }}>
+              <span>{group || "General"} <span style={{ color:"#a8a5a0", fontWeight:400 }}>· {groups[group].length}</span></span>
+              <span style={{ fontSize:10, color:"#a8a5a0" }}>{isOpen ? "▲" : "▼"}</span>
+            </div>
+            {isOpen && (
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))", gap:8, marginBottom:16 }}>
+                {groups[group].map(v => (
+                  <div key={v.filename} onClick={() => setPlaying(v)}
+                    style={{ borderRadius:8, overflow:"hidden", cursor:"pointer", background:"#000", position:"relative", aspectRatio:"9/16" }}>
+                    <video
+                      src={v.url} muted preload="metadata"
+                      style={{ width:"100%", height:"100%", objectFit:"cover", display:"block", opacity:0.85 }}
+                      onMouseEnter={e => e.target.play().catch(()=>{})}
+                      onMouseLeave={e => { e.target.pause(); e.target.currentTime = 0; }}
+                    />
+                    <div style={{ position:"absolute", bottom:0, left:0, right:0, padding:"4px 6px",
+                      background:"linear-gradient(transparent, rgba(0,0,0,0.7))" }}>
+                      <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:8, color:"rgba(255,255,255,0.85)", letterSpacing:"0.06em" }}>
+                        {v.label || v.filename.replace(/\.mp4$/,"")}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
+        );
+      })}
+
+      {/* Archived animations for this world — grouped same as live */}
+      {archivedVideos.length > 0 && (() => {
+        const aGroups = {};
+        archivedVideos.forEach(v => {
+          const { group, label } = parseVideoGroup(v.filename);
+          if (!aGroups[group]) aGroups[group] = [];
+          aGroups[group].push({ ...v, label });
+        });
+        const aSortedGroups = Object.keys(aGroups).sort();
+        return (
+          <div style={{ marginTop:32 }}>
+            <div style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", fontSize:16, fontWeight:500, color:"#1a1814", marginBottom:4 }}>Archived</div>
+            <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#a8a5a0", marginBottom:14 }}>
+              {archivedVideos[0]?.world_name} · {archivedVideos.length} files
+            </div>
+            {aSortedGroups.map(group => {
+              const key = "a_" + group;
+              const isOpen = expanded[key] === true;
+              return (
+                <div key={group} style={{ marginBottom:8 }}>
+                  <div onClick={() => toggleGroup(key)}
+                    style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
+                      fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, color:"#6b6760",
+                      letterSpacing:"0.1em", textTransform:"uppercase", padding:"8px 10px",
+                      background:"rgba(176,92,8,0.05)", borderRadius:6, cursor:"pointer",
+                      userSelect:"none", marginBottom: isOpen ? 8 : 0 }}>
+                    <span>{group || "General"} <span style={{ color:"#a8a5a0", fontWeight:400 }}>· {aGroups[group].length}</span></span>
+                    <span style={{ fontSize:10, color:"#a8a5a0" }}>{isOpen ? "▲" : "▼"}</span>
+                  </div>
+                  {isOpen && (
+                    <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))", gap:8, marginBottom:16 }}>
+                      {aGroups[group].map(v => (
+                        <div key={v.id} onClick={() => setPlaying({ filename: v.filename, url: v.url })}
+                          style={{ borderRadius:8, overflow:"hidden", cursor:"pointer", background:"#111", position:"relative", aspectRatio:"9/16", border:"1px solid rgba(176,92,8,0.2)" }}>
+                          <video src={v.url} muted preload="metadata"
+                            style={{ width:"100%", height:"100%", objectFit:"cover", display:"block", opacity:0.75 }}
+                            onMouseEnter={e => e.target.play().catch(()=>{})}
+                            onMouseLeave={e => { e.target.pause(); e.target.currentTime = 0; }}
+                          />
+                          <div style={{ position:"absolute", top:4, right:4, background:"rgba(176,92,8,0.8)", borderRadius:4, padding:"2px 5px", fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:7, color:"#fff", letterSpacing:"0.06em" }}>ARCHIVED</div>
+                          <div style={{ position:"absolute", bottom:0, left:0, right:0, padding:"4px 6px", background:"linear-gradient(transparent, rgba(0,0,0,0.7))" }}>
+                            <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:8, color:"rgba(255,255,255,0.85)", letterSpacing:"0.06em" }}>{v.label || v.action || v.filename.replace(/\.mp4$/,"")}</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })()}
+
+      {playing && (
+        <div onClick={() => setPlaying(null)}
+          style={{ position:"fixed", inset:0, zIndex:2000, background:"rgba(0,0,0,0.9)",
+            display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:12 }}>
+          <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"rgba(255,255,255,0.5)", letterSpacing:"0.1em", textTransform:"uppercase" }}>
+            {playing.filename}
+          </div>
+          <video src={playing.url} controls autoPlay loop onClick={e => e.stopPropagation()}
+            style={{ maxHeight:"80vh", maxWidth:"min(400px,90vw)", borderRadius:10 }} />
+          <button onClick={() => setPlaying(null)}
+            style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"rgba(255,255,255,0.4)",
+              background:"none", border:"1px solid rgba(255,255,255,0.15)", borderRadius:8, padding:"6px 18px", cursor:"pointer" }}>
+            Close
+          </button>
         </div>
-        <input ref={stateFileRef} type="file" accept="image/*" style={{ display:"none" }}
-          onChange={e => { const f = e.target.files[0]; if (f) uploadStateImage(f); e.target.value=""; }} />
-      </div>
-
-      {/* ── State animations ── */}
-      <StateAnimationsSection actorId={actorId} animations={animations} selectedWorld={selectedWorld}
-        onUploaded={m => setMedia(prev => [...prev, m])}
-        onDeleted={id => setMedia(prev => prev.filter(x => x.id !== id))} />
-
+      )}
     </div>
   );
 }
@@ -689,14 +885,14 @@ function MediaPanel({ actorId }) {
 function VideoThumb({ url, onClick }) {
   const [thumb, setThumb] = useState(null);
   useEffect(() => {
-    const v = document.createElement("video");
+    const val = document.createElement("video");
     v.src = url; v.crossOrigin = "anonymous"; v.preload = "auto"; v.muted = true;
     v.onloadedmetadata = () => { v.currentTime = Math.min(0.5, v.duration * 0.1 || 0.1); };
     v.onseeked = () => {
       try {
-        const c = document.createElement("canvas");
-        c.width = 240; c.height = 180;
-        const ctx = c.getContext("2d");
+        const canvasEl = document.createElement("canvas");
+        canvasEl.width = 240; canvasEl.height = 180;
+        const ctx = canvasEl.getContext("2d");
         const vw = v.videoWidth||240, vh = v.videoHeight||180;
         const scale = Math.max(c.width/vw, c.height/vh);
         const sw = c.width/scale, sh = c.height/scale;
@@ -770,8 +966,8 @@ function StateAnimationsSection({ actorId, animations, onUploaded, onDeleted, se
     fd.append("media_type", "animation");
     fd.append("filename", `${slug}.mp4`);
     if (selectedWorld) fd.append("world_id", selectedWorld);
-    const r = await fetch(`/api/actors/${actorId}/media`, { method:"POST", body:fd });
-    const d = await r.json();
+    const resp = await fetch(`/api/actors/${actorId}/media`, { method:"POST", body:fd });
+    const data = await r.json();
     onUploaded({ id:d.id, media_type:"animation", state_slug:slug, url:d.url, filename:d.filename });
     setUploading(null);
   }
@@ -1128,7 +1324,7 @@ export default function ActorsEditorPage() {
   );
 
   const { actor: a } = data;
-  const c = sc(a?.attachment_style);
+  const ctx = sc(a?.attachment_style);
 
   function startEdit() {
     setEditData(JSON.parse(JSON.stringify(data)));
@@ -1155,7 +1351,7 @@ export default function ActorsEditorPage() {
     setSaving(false);
   }
 
-  const d = editing ? editData : data;
+  const viewData = editing ? editData : data;
 
   const panels = {
     identity:    <IdentityPanel    d={d} editing={editing} setEditData={setEditData} />,
@@ -1203,7 +1399,7 @@ export default function ActorsEditorPage() {
             {NAV.map((item, i) =>
               item.section
                 ? <NavSection key={i} label={item.section} />
-                : <NavItem key={item.id} label={item.label} active={tab===item.id} done={item.doneKey(data)} onClick={() => setTab(item.id)} />
+                : <NavItem key={item.id} label={item.label} active={tab===item.id} done={item.doneKey(viewData)} onClick={() => setTab(item.id)} />
             )}
           </div>
 
@@ -1215,9 +1411,9 @@ export default function ActorsEditorPage() {
           </div>
         </div>
 
-        {showDeploy && data?.actor && (
+        {showDeploy && viewData?.actor && (
           <DeployWizardModal
-            actor={data.actor}
+            actor={viewData.actor}
             onClose={() => setShowDeploy(false)}
             onDeployed={() => { setShowDeploy(false); }}
           />

@@ -34,7 +34,7 @@ export default function AppConfig({ app, user, onClose, onSaved }) {
   }
 
   function getPrivacy(id) {
-    const c = contactIds.find(c => c.id === id);
+    const ctx = contactIds.find(c => c.id === id);
     return c?.privacy || "private";
   }
 

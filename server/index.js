@@ -152,7 +152,7 @@ app.post("/api/users/me/photo", upload.single("photo"), async (req, res) => {
   res.json({ url });
 });
 
-app.get("/api/me", (req, res) => {
+app.get("/api/me", async (req, res) => {
   const cookieHeader = req.headers["cookie"] || "";
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (!match) return res.status(401).json({ error: "not authenticated" });
@@ -285,7 +285,7 @@ app.post("/api/worlds", async (req, res) => {
   const {
     name, city, lat, lng, timezone,
     news_feed_url, modules = [], scenario_seed, visibility = "private",
-    invitees = []
+    invitees = [], home_address
   } = req.body;
 
   if (!name) return res.status(400).json({ error: "name required" });
@@ -313,7 +313,8 @@ app.post("/api/worlds", async (req, res) => {
       body: JSON.stringify({
         id: world_id, name, city, lat, lng, timezone,
         news_feed_url, modules, scenario_seed,
-        members
+        members: members.map((m, i) => ({ ...m, role: i === 0 ? "owner" : "member" })),
+        home_address: home_address || undefined
       }),
       signal: AbortSignal.timeout(15000)
     });
@@ -388,6 +389,47 @@ app.post("/api/worlds/:id/start", async (req, res) => {
 app.post("/api/worlds/:id/stop", async (req, res) => {
   try { res.json(await simFetch(`/internal/worlds/${req.params.id}/stop`, "POST")); }
   catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/worlds/:world_id/actors/:actor_id/videos ────────────────────────
+app.get("/api/worlds/:world_id/actors/:actor_id/videos", async (req, res) => {
+  try {
+    const { world_id, actor_id } = req.params;
+    const deployment = db.prepare("SELECT simulator_actor_id FROM actor_deployments WHERE world_id = ? AND platform_actor_id = ?").get(world_id, actor_id);
+    const sim_actor_id = deployment?.simulator_actor_id || actor_id;
+    const simRes = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/actors/${sim_actor_id}/videos`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN },
+    });
+    const data = await simRes.json();
+    const base = (req.get("x-forwarded-proto") || req.protocol) + "://" + (req.get("x-forwarded-host") || req.get("host"));
+    const videos = (data.videos || []).map(v => ({
+      filename: v.filename,
+      url: `${base}/media/worlds/${world_id}/actors/${sim_actor_id}/videos/${v.filename}`
+    }));
+    res.json({ videos });
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/worlds/:id/modules ─────────────────────────────────────────────
+app.get("/api/worlds/:id/modules", async (req, res) => {
+  try {
+    const simRes = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.id}/modules`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN },
+    });
+    res.json(await simRes.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── PATCH /api/worlds/:id/modules ────────────────────────────────────────────
+app.patch("/api/worlds/:id/modules", async (req, res) => {
+  try {
+    const simRes = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.id}/modules`, {
+      method: "PATCH",
+      headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify(req.body),
+    });
+    res.json(await simRes.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
 });
 
 // ── GET /api/keys ─────────────────────────────────────────────────────────────
@@ -869,9 +911,11 @@ app.get("/api/actors/shared", (req, res) => {
 // ── POST /api/actors/:id/media — upload tagged photo ─────────────────────────
 app.post("/api/actors/:id/media", upload.fields([{name:"photo",maxCount:1},{name:"audio",maxCount:1}]), async (req, res) => {
   const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  console.log("[media upload] actor:", req.params.id, "user:", user?.id, "files:", Object.keys(req.files||{}), "body:", req.body);
+  if (!user) { console.error("[media upload] unauthorized"); return res.status(401).json({ error: "unauthorized" }); }
 
   const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
+  console.log("[media upload] actor lookup:", actor ? "found" : "NOT FOUND", "owner check:", req.params.id, user.id);
   if (!actor) return res.status(404).json({ error: "not found" });
 
   const req_file = req.files?.photo?.[0] || req.files?.audio?.[0] || req.file;
@@ -889,12 +933,17 @@ app.post("/api/actors/:id/media", upload.fields([{name:"photo",maxCount:1},{name
     return a.name.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"") + "-" + req.params.id.slice(0,8);
   })();
   const world_id   = req.body.world_id || null;
-  const mediaBase  = world_id
-    ? path.join(__dirname, `../public/media/worlds/${world_id}/actors`, actorSlug)
-    : path.join(__dirname, "../public/media/actors", actorSlug);
-  const actorDir   = path.join(mediaBase, "images");
-
   const isVideo = req_file.mimetype.startsWith("video/") || filename.endsWith(".mp4");
+
+  // Photos/audio: stored under /media/actors/{slug}/worlds/{world_id}/ when world-specific
+  // This avoids the nginx proxy rule which intercepts /media/worlds/ and sends to simulator
+  // Videos: stored at /media/worlds/{world_id}/actors/{slug}/ (nginx proxies missing ones to simulator)
+  const mediaBase = isVideo && world_id
+    ? path.join(__dirname, `../public/media/worlds/${world_id}/actors`, actorSlug)
+    : world_id
+      ? path.join(__dirname, "../public/media/actors", actorSlug, "worlds", world_id)
+      : path.join(__dirname, "../public/media/actors", actorSlug);
+  const actorDir = path.join(mediaBase, "images");
 
   const { mkdirSync, writeFileSync } = await import("fs");
   mkdirSync(actorDir, { recursive: true });
@@ -911,10 +960,13 @@ app.post("/api/actors/:id/media", upload.fields([{name:"photo",maxCount:1},{name
     } catch {}
   }
 
-  const urlBase = world_id ? `/media/worlds/${world_id}/actors/${actorSlug}` : `/media/actors/${actorSlug}`;
+  const urlBase = (isVideo && world_id)
+    ? `/media/worlds/${world_id}/actors/${actorSlug}`
+    : world_id
+      ? `/media/actors/${actorSlug}/worlds/${world_id}`
+      : `/media/actors/${actorSlug}`;
   const relUrl = isAudio ? `${urlBase}/voice/${filename}` : `${urlBase}/images/${filename}`;
-  const platformBase = process.env.PLATFORM_PUBLIC_URL || `https://${req.headers["x-forwarded-host"] || req.headers.host}`;
-  const url = `${platformBase}${relUrl}`;
+  const url = relUrl;
   const now = new Date().toISOString();
   const id  = randomUUID();
 
@@ -1000,6 +1052,109 @@ app.get("/api/relationship-types", async (req, res) => {
   }
 });
 
+
+// ── Archive world media helper ────────────────────────────────────────────────
+function parseVideoMeta(filename) {
+  // frida_bedroom_kneeling_topless_kiss_clip_bg.mp4
+  let name = filename.replace(/\.mp4$/, "");
+  let suffix = "gs";
+  if (name.endsWith("_bg"))    { suffix = "bg";  name = name.slice(0, -3); }
+  else if (name.endsWith("_gs")) { suffix = "gs"; name = name.slice(0, -3); }
+  else if (name.endsWith("_no_bg")) { suffix = "bg"; name = name.slice(0, -6); }
+
+  const parts = name.split("_");
+  const knownLocations = ["bedroom", "hall", "living", "kitchen", "bathroom", "office"];
+  const knownPositions = ["standing", "sitting", "kneeling", "lying", "missionary", "straddles", "riding", "doggy", "bent"];
+
+  let rest = parts.slice(1); // drop actor prefix
+
+  // Detect location (may be 2 parts e.g. living_room)
+  let location = null;
+  if (rest.length >= 2 && knownLocations.some(l => rest[0] + "_" + rest[1] === l + "_room")) {
+    location = rest[0] + "_" + rest[1]; rest = rest.slice(2);
+  } else if (knownLocations.includes(rest[0])) {
+    location = rest[0]; rest = rest.slice(1);
+  }
+
+  // Position (may be multi-word: lying_on_back)
+  let position = rest[0] || "standing"; rest = rest.slice(1);
+  if (position === "lying" && rest[0] === "on") {
+    position = "lying_on_" + rest[1]; rest = rest.slice(2);
+  }
+
+  // Outfit
+  const outfit = rest[0] || "casual"; rest = rest.slice(1);
+
+  // Type is last part (clip/loop)
+  const clip_type = rest[rest.length - 1] || "loop";
+  const action = rest.slice(0, -1).join("_") || "idle";
+
+  return { location, position, outfit, action, clip_type, suffix };
+}
+
+async function archiveWorldMedia(platformActorId, worldId, worldName, mediaFolder, simActorId) {
+  console.log(`[archive] Starting archive for actor ${platformActorId} world ${worldId}`);
+
+  // List videos from simulator
+  let videos = [];
+  try {
+    const simRes = await fetch(`${SIMULATOR_URL}/internal/worlds/${worldId}/actors/${simActorId}/videos`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN }
+    });
+    const data = await simRes.json();
+    videos = data.videos || [];
+  } catch (e) {
+    console.warn("[archive] Failed to list videos:", e.message);
+    return 0;
+  }
+
+  if (videos.length === 0) {
+    console.log("[archive] No videos to archive");
+    return 0;
+  }
+
+  // Store archives under /media/actors/ path — avoids nginx proxy rule for /media/worlds/
+  const destDir = path.join(__dirname, "../public/media/actors", mediaFolder, "archives", worldId, "videos");
+  await fs.promises.mkdir(destDir, { recursive: true });
+
+  const now = new Date().toISOString();
+  let archived = 0;
+
+  for (const video of videos) {
+    try {
+      // Download from simulator nginx (internal LAN)
+      const videoUrl = `http://192.168.1.58:4001/media/worlds/${worldId}/actors/${simActorId}/videos/${video.filename}`;
+      const videoRes = await fetch(videoUrl);
+      if (!videoRes.ok) { console.warn("[archive] Failed to fetch:", video.filename); continue; }
+
+      const buffer = Buffer.from(await videoRes.arrayBuffer());
+      const destPath = path.join(destDir, video.filename);
+      await fs.promises.writeFile(destPath, buffer);
+
+      const meta = parseVideoMeta(video.filename);
+      const platformUrl = `/media/actors/${mediaFolder}/archives/${worldId}/videos/${video.filename}`;
+
+      // Upsert into actor_media
+      const existing = db.prepare(`SELECT id FROM actor_media WHERE actor_id = ? AND world_id = ? AND filename = ?`).get(platformActorId, worldId, video.filename);
+      if (!existing) {
+        db.prepare(`INSERT INTO actor_media (id, actor_id, world_id, world_name, media_type, filename, url, position, outfit, action, clip_type, suffix, file_size, archived_at, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+          .run(randomUUID(), platformActorId, worldId, worldName, "video", video.filename, platformUrl,
+               meta.position, meta.outfit, meta.action, meta.clip_type, meta.suffix,
+               buffer.length, now, now, now);
+      } else {
+        db.prepare(`UPDATE actor_media SET archived_at = ?, file_size = ?, url = ?, updated_at = ? WHERE id = ?`)
+          .run(now, buffer.length, platformUrl, now, existing.id);
+      }
+      archived++;
+    } catch (e) {
+      console.warn("[archive] Error archiving", video.filename, e.message);
+    }
+  }
+
+  console.log(`[archive] Archived ${archived}/${videos.length} videos for actor ${platformActorId} world ${worldId}`);
+  return archived;
+}
+
 // ── POST /api/actors/:id/undeploy ────────────────────────────────────────────
 app.post("/api/actors/:id/undeploy", async (req, res) => {
   const user = authUser(req);
@@ -1011,6 +1166,13 @@ app.post("/api/actors/:id/undeploy", async (req, res) => {
   const deployment = db.prepare(`SELECT * FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL ORDER BY deployed_at DESC LIMIT 1`).get(req.params.id);
   if (!deployment) return res.status(400).json({ error: "not deployed" });
 
+  // Archive media before undeploying
+  try {
+    await archiveWorldMedia(req.params.id, deployment.world_id, deployment.world_name, actor.media_folder, deployment.simulator_actor_id);
+  } catch (e) {
+    console.warn("[undeploy] archive failed:", e.message);
+  }
+
   try {
     await fetch(`${SIMULATOR_URL}/internal/actors/${deployment.simulator_actor_id}/undeploy`, { method:"POST", headers:{"X-Service-Token": SERVICE_TOKEN} });
   } catch (e) {
@@ -1021,6 +1183,36 @@ app.post("/api/actors/:id/undeploy", async (req, res) => {
   db.prepare(`UPDATE actor_deployments SET undeployed_at = ? WHERE id = ?`).run(now, deployment.id);
 
   res.json({ ok: true });
+});
+
+// ── POST /api/worlds/:world_id/actors/:actor_id/archive-media — manual backup ─
+app.post("/api/worlds/:world_id/actors/:actor_id/archive-media", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+
+  const { world_id, actor_id } = req.params;
+  const actor = db.prepare(`SELECT * FROM actors WHERE id = ?`).get(actor_id);
+  if (!actor) return res.status(404).json({ error: "actor not found" });
+
+  const deployment = db.prepare(`SELECT * FROM actor_deployments WHERE platform_actor_id = ? AND world_id = ? ORDER BY deployed_at DESC LIMIT 1`).get(actor_id, world_id);
+  if (!deployment) return res.status(404).json({ error: "no deployment found" });
+
+  try {
+    const count = await archiveWorldMedia(actor_id, world_id, deployment.world_name, actor.media_folder, deployment.simulator_actor_id);
+    res.json({ ok: true, archived: count });
+  } catch (e) {
+    console.error("[archive-media]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /api/actors/:id/archived-media — list archived videos ─────────────────
+app.get("/api/actors/:id/archived-media", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+
+  const rows = db.prepare(`SELECT * FROM actor_media WHERE actor_id = ? AND media_type = 'video' AND archived_at IS NOT NULL ORDER BY world_name, filename`).all(req.params.id);
+  res.json(rows);
 });
 
 // ── POST /api/actors/:id/deploy ───────────────────────────────────────────────
@@ -1181,6 +1373,188 @@ Respond with JSON only — no preamble:
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── POST /api/worlds/:world_id/actors/:actor_id/home — set player home ─────────
+app.post("/api/worlds/:world_id/actors/:actor_id/home", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const { home_place_id } = req.body;
+  if (!home_place_id) return res.status(400).json({ error: "home_place_id required" });
+  try {
+    const { home_place_id, description, lat, lng } = req.body;
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/home`, {
+      method:"POST", headers:{ "X-Service-Token": SERVICE_TOKEN, "Content-Type":"application/json" },
+      body: JSON.stringify({ home_place_id, description, lat, lng }),
+    });
+    const d = await r.json();
+    res.json(d);
+  } catch(e) { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+
+
+
+
+
+// ── GET /api/media/resize?url=...&w=...&h=... ────────────────────────────────
+// Fetches a media file from simulator and resizes it on the fly
+app.get("/api/media/resize", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).end();
+  const { url, w = "128", h = "128" } = req.query;
+  if (!url) return res.status(400).end();
+  try {
+    const sharp = (await import("sharp")).default;
+    // url is a relative path like /media/worlds/.../profile.png
+    // fetch from simulator
+    const fullUrl = url.startsWith("http") ? url : `${SIMULATOR_URL}${url}`;
+    const r = await fetch(fullUrl, { headers: { "X-Service-Token": SERVICE_TOKEN } });
+    if (!r.ok) return res.status(404).end();
+    const buf = Buffer.from(await r.arrayBuffer());
+    const resized = await sharp(buf)
+      .resize(parseInt(w), parseInt(h), { fit: "cover", position: "center" })
+      .png({ compressionLevel: 8 })
+      .toBuffer();
+    res.set("Content-Type", "image/png");
+    res.set("Cache-Control", "public, max-age=86400");
+    res.send(resized);
+  } catch (e) {
+    console.error("[resize]", e.message);
+    res.status(500).end();
+  }
+});
+
+// ── GET /api/states/home-activities ──────────────────────────────────────────
+app.get("/api/states/home-activities", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/states/home-activities`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN }
+    });
+    const d = r.ok ? await r.json() : [];
+    res.json(d);
+  } catch (e) { res.json([]); }
+});
+
+// ── GET /api/worlds/:world_id/player/state ────────────────────────────────────
+app.get("/api/worlds/:world_id/player/state", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const m = db.prepare("SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?").get(user.id, req.params.world_id);
+  if (!m) return res.json({});
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/actors/${m.actor_id}/state`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN }
+    });
+    const d = r.ok ? await r.json() : {};
+    res.json(d);
+  } catch (e) { res.json({}); }
+});
+
+// ── POST /api/worlds/:world_id/player/state ───────────────────────────────────
+app.post("/api/worlds/:world_id/player/state", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const m = db.prepare("SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?").get(user.id, req.params.world_id);
+  if (!m) return res.json({});
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/actors/${m.actor_id}/state`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Service-Token": SERVICE_TOKEN },
+      body: JSON.stringify(req.body)
+    });
+    const d = r.ok ? await r.json() : {};
+    res.json(d);
+  } catch (e) { res.json({}); }
+});
+
+// ── GET /api/worlds/:world_id/player/home ─────────────────────────────────────
+app.get("/api/worlds/:world_id/player/home", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/actors/${user.id}/home`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN }
+    });
+    const d = r.ok ? await r.json() : {};
+    res.json(d);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /api/worlds/:world_id/home-knock/decline ────────────────────────────
+app.post("/api/worlds/:world_id/home-knock/decline", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const { actor_id } = req.body;
+  if (!actor_id) return res.status(400).json({ error: "actor_id required" });
+  try {
+    await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/home-knock/decline`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Service-Token": SERVICE_TOKEN },
+      body: JSON.stringify({ actor_id })
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    res.json({ ok: true }); // best-effort — don't fail client if simulator unreachable
+  }
+});
+
+// ── GET /api/worlds/:id/actors/residences — actors with home data ─────────────
+app.get("/api/worlds/:id/actors/residences", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const world_id = req.params.id;
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/actors/residences`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN }
+    });
+    const d = await r.json();
+
+    // Build sim_actor_id → platform photo map via actor_deployments
+    const deployments = db.prepare("SELECT simulator_actor_id, platform_actor_id FROM actor_deployments WHERE world_id = ? AND undeployed_at IS NULL").all(world_id);
+    const photoMap = {};
+    for (const dep of deployments) {
+      // Prefer world-specific photo, fall back to canonical (world_id IS NULL)
+      const photo = db.prepare(
+        "SELECT url FROM actor_media WHERE actor_id = ? AND state_slug = 'profile' AND media_type = 'photo' ORDER BY CASE WHEN world_id = ? THEN 0 WHEN world_id IS NULL THEN 1 ELSE 2 END LIMIT 1"
+      ).get(dep.platform_actor_id, world_id);
+      if (photo) photoMap[dep.simulator_actor_id] = photo.url;
+    }
+
+    // For user/player actors — use simulator portrait URL (served via nginx proxy)
+    const memberships = db.prepare("SELECT actor_id, user_id FROM world_memberships WHERE world_id = ?").all(world_id);
+    const userPhotoMap = {};
+    for (const m of memberships) {
+      // Check platform actor_media first, then fall back to simulator portrait path
+      const photo = db.prepare("SELECT url FROM actor_media WHERE actor_id = ? AND state_slug = 'profile' AND media_type = 'photo' LIMIT 1").get(m.user_id);
+      userPhotoMap[m.actor_id] = photo?.url || `/media/worlds/${world_id}/actors/${m.actor_id}/images/profile.png`;
+    }
+
+    const actors = (d.actors || []).map(a => ({
+      ...a,
+      photo_url: photoMap[a.id] || userPhotoMap[a.id] || null
+    }));
+    res.json(actors);
+  } catch(e) { console.error("[residences]", e); res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/worlds/:id/places — list places for a world ────────────────────────
+app.get("/api/worlds/:id/places", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const { category } = req.query;
+  const qs = category ? `?category=${encodeURIComponent(category)}` : "";
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.id}/places${qs}`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN }
+    });
+    const d = await r.json();
+    res.json(d);
+  } catch(e) { res.status(502).json({ error: "simulator unreachable" }); }
 });
 
 // ── GET /api/places/autocomplete — address autocomplete proxy ────────────────
@@ -1567,7 +1941,17 @@ app.get("/api/actors/deployments", (req, res) => {
     JOIN actor_shares s ON s.actor_id = d.platform_actor_id
     WHERE s.shared_with_id = ?
   `).all(user.id, user.id);
-  res.json(deps);
+
+  // Enrich each deployment with the world-specific profile photo
+  const enriched = deps.map(d => {
+    try {
+      const worldPhoto = db.prepare(
+        "SELECT url FROM actor_media WHERE actor_id = ? AND state_slug = ? AND media_type = ? AND world_id = ? LIMIT 1"
+      ).get(d.platform_actor_id, "profile", "photo", d.world_id);
+      return { ...d, world_photo_url: worldPhoto?.url || null };
+    } catch { return { ...d, world_photo_url: null }; }
+  });
+  res.json(enriched);
 });
 
 // ── GET /api/actors/:id/in-play — worlds, relationships, memories ────────────────
@@ -1887,12 +2271,27 @@ app.put("/api/actors/:id", (req, res) => {
   const target = TABLES[section];
   if (!target) return res.status(400).json({ error: "unknown section" });
 
-  const fields = Object.keys(data).filter(k => k !== target.pk && k !== "inserted_at");
-  const sets   = fields.map(f => `${f} = ?`).join(", ");
-  const values = fields.map(f => data[f]);
+  // photo_url lives in actor_media, not actors table — handle separately
+  const photoUrl = (section === "actor") ? data.photo_url : undefined;
+  const fields = Object.keys(data).filter(k => k !== target.pk && k !== "inserted_at" && k !== "photo_url");
 
-  db.prepare(`UPDATE ${target.table} SET ${sets}, updated_at = ? WHERE ${target.pk} = ?`)
-    .run(...values, now, id);
+  if (fields.length > 0) {
+    const sets   = fields.map(f => `${f} = ?`).join(", ");
+    const values = fields.map(f => data[f]);
+    db.prepare(`UPDATE ${target.table} SET ${sets}, updated_at = ? WHERE ${target.pk} = ?`)
+      .run(...values, now, id);
+  }
+
+  // Upsert canonical profile photo into actor_media if provided
+  if (photoUrl) {
+    const existing = db.prepare("SELECT id FROM actor_media WHERE actor_id = ? AND state_slug = 'profile' AND media_type = 'photo' AND world_id IS NULL").get(id);
+    if (existing) {
+      db.prepare("UPDATE actor_media SET url = ?, updated_at = ? WHERE id = ?").run(photoUrl, now, existing.id);
+    } else {
+      db.prepare("INSERT INTO actor_media (id, actor_id, media_type, state_slug, url, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?)")
+        .run(randomUUID(), id, "photo", "profile", photoUrl, now, now);
+    }
+  }
 
   res.json({ ok: true });
 });
@@ -2273,9 +2672,11 @@ app.post("/api/generate/appearance", async (req, res) => {
       : isMale
       ? `,"physique":"slim|average|toned|muscular|heavy","shoulders":"narrow|average|broad|very broad","height_dominance":"average|tall|very tall"`
       : "";
-    const lastMsg = `You are a creative writing assistant helping build a detailed fictional character profile. Describe the physical characteristics of the person in this photo for use in a character description. Name: ${name||"character"}, Age: ${age||"unknown"}, Gender: ${gender||"unknown"}.
+    const lastMsg = `You are a creative writing assistant for a fiction platform. A creator has uploaded a visual reference image to inspire the look of a fictional character they are designing — do not attempt to identify who is in the image. Use it only as a style and aesthetic reference.
 
-Return ONLY valid JSON, short descriptive values:
+Fictional character details: Name: ${name||"character"}, Age: ${age||"unknown"}, Gender: ${gender||"unknown"}.
+
+Based on the visual reference, describe the fictional character's appearance. Return ONLY valid JSON with short descriptive values:
 {"gender":"${gender||"unknown"}","height":"tall|above average|average|petite|short","build":"slim|lean|athletic|curvy|full-figured|stocky|muscular","body_shape":"hourglass|pear|apple|rectangle|inverted triangle","hair":"[colour, length, texture, style]","eyes":"[colour and notable quality]","face":"[shape, skin tone, jaw, cheekbones, notable features]","style":"[inferred clothing style]","notable":"[any distinctive features or none]","presence":"commanding|warm|understated|magnetic|reserved","body_confidence":"high|moderate|low","grooming":"meticulous|natural|minimal|casual","tension_markers":"none|[visible physical tension signals]"${genderSpecific}}`;
     const contentWithText = [...content.slice(0,-1), { type: "text", text: lastMsg }];
     const r = await fetch("https://api.anthropic.com/v1/messages", {

@@ -15,7 +15,7 @@ function styleColor(s) { return STYLE_COLOR[s] || STYLE_COLOR.default; }
 
 function Initials({ name, size = 44, style: attachment }) {
   const ini = name?.split(" ").map(n => n[0]).join("").slice(0,2).toUpperCase() || "?";
-  const c = styleColor(attachment);
+  const ctx = styleColor(attachment);
   return (
     <div style={{
       width: size, height: size, borderRadius: "50%",
@@ -59,7 +59,7 @@ function Dots({ actor }) {
 
 // ── Actor gallery card ────────────────────────────────────────────────────
 function ActorCard({ actor, selected, onClick }) {
-  const c = styleColor(actor.attachment_style);
+  const ctx = styleColor(actor.attachment_style);
   return (
     <div onClick={onClick} style={{
       background: selected ? "var(--color-background-info)" : "var(--color-background-secondary)",
@@ -135,7 +135,7 @@ function Field({ label, value, tall, full }) {
 }
 
 function ScoreBar({ label, value, color }) {
-  const v = Math.round(value || 0);
+  const val = Math.round(value || 0);
   const barColor = color || (v > 70 ? "#E24B4A" : v > 50 ? "#378ADD" : "#888780");
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
@@ -410,7 +410,7 @@ export default function ActorsPage() {
     expenses:    <EconomicPanel    data={detail || {}} />,
   };
 
-  const c = selected ? styleColor(selected.attachment_style) : styleColor("default");
+  const ctx = selected ? styleColor(selected.attachment_style) : styleColor("default");
 
   return (
     <div style={{ padding: "24px 20px", maxWidth: 1100, margin: "0 auto" }}>

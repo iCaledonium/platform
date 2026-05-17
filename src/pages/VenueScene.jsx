@@ -59,16 +59,16 @@ export default function VenueScene({ world, user, location, onLeave }) {
 
   // Clock
   useEffect(() => {
-    const t = setInterval(() => setClock(stockholmTime()), 10000);
+    const timer = setInterval(() => setClock(stockholmTime()), 10000);
     return () => clearInterval(t);
   }, []);
 
   // Dwell
   useEffect(() => {
-    const t = setInterval(() => {
+    const timer = setInterval(() => {
       dwellRef.current++;
-      const m = Math.floor(dwellRef.current / 60);
-      const s = dwellRef.current % 60;
+      const mins = Math.floor(dwellRef.current / 60);
+      const secs = dwellRef.current % 60;
       setDwell(`${m}:${String(s).padStart(2, "0")}`);
     }, 1000);
     return () => clearInterval(t);
@@ -112,7 +112,7 @@ export default function VenueScene({ world, user, location, onLeave }) {
     };
     // First poll immediately on mount to set baseline
     poll();
-    const t = setInterval(poll, 15000);
+    const timer = setInterval(poll, 15000);
     return () => clearInterval(t);
   }, [world.id, location.id, location.place_id]);
 

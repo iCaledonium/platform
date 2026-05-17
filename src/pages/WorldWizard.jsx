@@ -76,10 +76,12 @@ const DEFAULT_FEED = "https://feeds.skynews.com/feeds/rss/world.xml";
 
 const MODULES_DEF = [
   { key:"encounters",   label:"Encounters",      desc:"In-person real-time scenes via Hermes 70B",    on:true  },
-  { key:"sms",          label:"SMS & messaging", desc:"Actor-to-actor and player text threads",       on:true  },
+  { key:"sms_messaging",          label:"SMS & messaging", desc:"Actor-to-actor and player text threads",       on:true  },
   { key:"meetings",     label:"Meetings",        desc:"Actor↔actor conversations via MeetingRunner", on:true  },
   { key:"work_economy", label:"Work economy",    desc:"WorkOfferGenerator, salaries, freelance jobs", on:false },
-  { key:"news",         label:"News feed",       desc:"Local RSS news injected into actor context",   on:false },
+  { key:"news_feed",     label:"News feed",       desc:"Local RSS news injected into actor context",           on:false },
+  { key:"weather",       label:"Weather",         desc:"Real-time weather fetched and injected into context",  on:true  },
+  { key:"schedule",      label:"Schedule",        desc:"Actors follow daily schedules for activities and locations", on:true  },
 ];
 
 function WorldMap({ selected, onSelect }) {
@@ -150,6 +152,8 @@ function WorldMap({ selected, onSelect }) {
 
 export default function WorldWizard({ onClose, onCreated }) {
   const [step, setStep]       = useState(0);
+  const [residences,   setResidences]   = useState([]);
+  const [createdWorld, setCreatedWorld] = useState(null); // triggers residence picker after creation
   const [saving, setSaving]   = useState(false);
   const [error, setError]     = useState(null);
   const [name, setName]       = useState("");
@@ -159,10 +163,15 @@ export default function WorldWizard({ onClose, onCreated }) {
   const [users, setUsers]     = useState([]);
   const [portraits, setPortraits] = useState({}); // userId → { file, preview } | null
   const [city, setCity]       = useState(null);
+  const [homeAddress, setHomeAddress] = useState(null); // {description, place_id, lat, lng}
+  const [homeQuery, setHomeQuery]   = useState("");
+  const [homeSuggestions, setHomeSuggestions] = useState([]);
   const [modules, setModules] = useState(() => Object.fromEntries(MODULES_DEF.map(m => [m.key, m.on])));
 
-  const canNext = [name.trim().length > 0, city !== null, true];
+  const canNext = [name.trim().length > 0, city !== null, true  ];
   const TITLES = ["Identity","Location","Modules"];
+
+
 
   useEffect(() => {
     Promise.all([
@@ -178,7 +187,7 @@ export default function WorldWizard({ onClose, onCreated }) {
     try {
       const enabledModules = Object.entries(modules).filter(([,v])=>v).map(([k])=>k);
       const allMembers = [{ id: null, ...users.find(u => u.id === null) }, ...invitees]; // creator resolved server-side
-      const r = await fetch("/api/worlds", {
+      const resp = await fetch("/api/worlds", {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({
           name: name.trim(), tagline: tagline.trim() || undefined, visibility,
@@ -186,9 +195,10 @@ export default function WorldWizard({ onClose, onCreated }) {
           news_feed_url: FEED_MAP[city.n] || DEFAULT_FEED,
           modules: enabledModules,
           invitees: invitees.map(u => u.id),
+          home_address: homeAddress || undefined,
         }),
       });
-      const d = await r.json();
+      const data = await r.json();
       if (!r.ok) { setError(d.error || "Failed to create world"); setSaving(false); return; }
 
       // Upload portraits — custom overrides or signal to use platform default
@@ -217,6 +227,7 @@ export default function WorldWizard({ onClose, onCreated }) {
   const serif = { fontFamily:"'Cormorant Garamond',Georgia,serif" };
 
   return (
+    <>
     <div style={{position:"fixed",inset:0,zIndex:1000,background:"rgba(0,0,0,0.55)",
       display:"flex",alignItems:"center",justifyContent:"center",padding:"1rem"}}>
       <div style={{background:"#faf8f4",borderRadius:16,width:"100%",maxWidth:800,
@@ -358,6 +369,48 @@ export default function WorldWizard({ onClose, onCreated }) {
               ) : (
                 <p style={{fontSize:12,color:"#a8a5a0",margin:0}}>Click a city to select it</p>
               )}
+              {city && (
+                <div style={{marginTop:14}}>
+                  <p style={{fontSize:11,color:"#a8a5a0",letterSpacing:".1em",textTransform:"uppercase",marginBottom:6}}>Your home address</p>
+                  <div style={{position:"relative"}}>
+                    <input
+                      value={homeQuery}
+                      onChange={async e => {
+                        const query = e.target.value;
+                        setHomeQuery(q);
+                        setHomeAddress(null);
+                        if (q.length < 3) { setHomeSuggestions([]); return; }
+                        const resp = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(q)}`).then(r=>r.ok?r.json():[]);
+                        setHomeSuggestions(Array.isArray(r)?r:[]);
+                      }}
+                      placeholder={`Search your address in ${city.n}…`}
+                      style={{width:"100%",boxSizing:"border-box",padding:"9px 12px",borderRadius:9,border:"1px solid rgba(0,0,0,.12)",fontSize:13,fontFamily:"'DM Sans',system-ui,sans-serif",background:"#fff",outline:"none"}}
+                    />
+                    {homeSuggestions.length > 0 && (
+                      <div style={{position:"absolute",top:"100%",left:0,right:0,background:"#fff",border:"1px solid rgba(0,0,0,.1)",borderRadius:9,zIndex:100,boxShadow:"0 8px 24px rgba(0,0,0,.1)",overflow:"hidden",marginTop:4}}>
+                        {homeSuggestions.map(s => (
+                          <div key={s.place_id} onClick={async () => {
+                            setHomeQuery(s.description);
+                            setHomeSuggestions([]);
+                            const det = await fetch(`/api/places/details?place_id=${s.place_id}`).then(r=>r.ok?r.json():null);
+                            const loc = det?.result?.geometry?.location;
+                            setHomeAddress({ description: s.description, place_id: s.place_id, lat: loc?.lat, lng: loc?.lng });
+                          }} style={{padding:"10px 14px",fontSize:13,fontFamily:"'DM Sans',system-ui,sans-serif",cursor:"pointer",borderBottom:"1px solid rgba(0,0,0,.05)",color:"#1a1814"}}
+                            onMouseEnter={e=>e.currentTarget.style.background="rgba(0,0,0,.03)"}
+                            onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                            {s.description}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {homeAddress && (
+                    <div style={{marginTop:8,padding:"8px 12px",background:"rgba(29,158,117,.06)",border:"1px solid rgba(29,158,117,.3)",borderRadius:8,fontSize:12,color:"#1D9E75",fontFamily:"'DM Sans',system-ui,sans-serif"}}>
+                      ✓ {homeAddress.description}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -417,5 +470,55 @@ export default function WorldWizard({ onClose, onCreated }) {
         </div>
       </div>
     </div>
+
+    {/* ── Post-creation residence picker ── */}
+    {createdWorld && (
+      <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1001 }}>
+        <div style={{ background:"#faf8f4", borderRadius:18, padding:36, width:520, maxWidth:"92vw", maxHeight:"80vh", display:"flex", flexDirection:"column" }}>
+          <div style={{...serif, fontSize:24, fontWeight:500, color:"#1a1814", marginBottom:6}}>Pick your home</div>
+          <p style={{...sans, fontSize:13, color:"#6b6760", marginBottom:20}}>
+            Choose your address in {city?.n}. Actors who know your address can visit you here.
+          </p>
+          <div style={{ flex:1, overflowY:"auto", display:"flex", flexDirection:"column", gap:8, marginBottom:20 }}>
+            {residences.length === 0 && <p style={{...sans, fontSize:13, color:"#a8a5a0"}}>No residential places found.</p>}
+            {residences.map(r => (
+              <div key={r.id} onClick={() => setHomePlaceId(r.id)}
+                style={{ padding:"12px 14px", borderRadius:9, cursor:"pointer",
+                  border:`1px solid ${homePlaceId===r.id ? "rgba(29,158,117,.5)" : "rgba(0,0,0,.1)"}`,
+                  background: homePlaceId===r.id ? "rgba(29,158,117,.06)" : "rgba(0,0,0,.02)",
+                  display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                <div>
+                  <div style={{...sans, fontSize:13, fontWeight:500, color:"#1a1814"}}>{r.name}</div>
+                  <div style={{...sans, fontSize:11, color:"#a8a5a0"}}>{r.formatted_address}</div>
+                </div>
+                {homePlaceId===r.id && <span style={{color:"#1D9E75", fontSize:16}}>✓</span>}
+              </div>
+            ))}
+          </div>
+          <div style={{ display:"flex", gap:10, justifyContent:"flex-end" }}>
+            <button onClick={() => { setCreatedWorld(null); onCreated && onCreated(createdWorld); }}
+              style={{...sans, fontSize:13, padding:"8px 18px", borderRadius:9, border:"1px solid rgba(0,0,0,.12)", background:"transparent", color:"#6b6760", cursor:"pointer"}}>
+              Skip for now
+            </button>
+            <button disabled={!homePlaceId} onClick={async () => {
+              const ownerActorId = createdWorld.actor_ids?.[null] || Object.values(createdWorld.actor_ids || {})[0];
+              if (ownerActorId && homePlaceId) {
+                await fetch(`/api/worlds/${createdWorld.world_id}/actors/${ownerActorId}/home`, {
+                  method:"POST", headers:{"Content-Type":"application/json"},
+                  body: JSON.stringify({ home_place_id: homePlaceId }),
+                }).catch(() => {});
+              }
+              setCreatedWorld(null);
+              onCreated && onCreated(createdWorld);
+            }} style={{...sans, fontSize:13, padding:"8px 24px", borderRadius:9, border:"none",
+              background: homePlaceId ? "#1a1814" : "rgba(0,0,0,.15)",
+              color: homePlaceId ? "#faf8f4" : "#a8a5a0", cursor: homePlaceId ? "pointer" : "not-allowed"}}>
+              Set as home →
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+    </>
   );
 }
