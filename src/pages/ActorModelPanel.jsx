@@ -352,6 +352,99 @@ function normaliseToFloor(root) {
   return { rawHeight, scale };
 }
 
+// Every vertex, every measurement pass. 30k verts at 2Hz costs under 2ms and
+// buys an exact scalp — a stride would miss the apex by up to a vertex spacing,
+// which is the same order as the error being measured.
+const POSE_SAMPLE_STRIDE = 1;
+const _poseVertex = new THREE.Vector3();
+
+/**
+ * True bounding height of a posed skinned character.
+ *
+ * Box3.setFromObject transforms geometry.boundingBox by matrixWorld. That box
+ * is baked at bind pose and skinning runs on the GPU, so it is blind to the
+ * current pose: a clip that straightens the legs makes the character visibly
+ * taller while the box does not move. applyBoneTransform runs the same skinning
+ * maths on the CPU for one vertex, against bones[].matrixWorld — current for the
+ * frame as long as this is called after the renderer has updated the graph.
+ *
+ * Returns null when there is nothing to measure, so the caller shows nothing
+ * rather than a confident zero.
+ */
+function measurePosedBounds(root, stride = POSE_SAMPLE_STRIDE) {
+  let minY = Infinity;
+  let maxY = -Infinity;
+  let sampled = 0;
+  let skinnedMeshes = 0;
+
+  root.traverse((o) => {
+    if (!o.isMesh || !o.geometry) return;
+    const pos = o.geometry.attributes.position;
+    if (!pos) return;
+
+    // r151 renamed boneTransform -> applyBoneTransform. Support both rather
+    // than silently measuring a skinned mesh as if it were static, which would
+    // reproduce exactly the bug this function exists to find.
+    let apply = null;
+    if (o.isSkinnedMesh && o.skeleton) {
+      skinnedMeshes += 1;
+      const fn = o.applyBoneTransform || o.boneTransform;
+      if (!fn) {
+        throw new Error(
+          "ActorModelPanel: SkinnedMesh has neither applyBoneTransform nor " +
+          "boneTransform — three.js version is outside the supported range " +
+          "and posed height cannot be measured."
+        );
+      }
+      apply = fn.bind(o);
+    }
+
+    for (let i = 0; i < pos.count; i += stride) {
+      _poseVertex.fromBufferAttribute(pos, i);
+      if (apply) apply(i, _poseVertex);
+      _poseVertex.applyMatrix4(o.matrixWorld);
+      if (_poseVertex.y < minY) minY = _poseVertex.y;
+      if (_poseVertex.y > maxY) maxY = _poseVertex.y;
+      sampled += 1;
+    }
+  });
+
+  if (!sampled) return null;
+  return { minY, maxY, height: maxY - minY, sampled, skinnedMeshes };
+}
+
+// Meshy generates each clip in a separate job and none of them agree on where
+// the floor is: measured on Frida, Walking sits 1.6cm below it and
+// Walking_Woman 14.2cm above, a 15.8cm spread on one character. Her *height* is
+// constant across all of them, so this is not scale — each clip simply writes an
+// absolute Hips Y of its own choosing.
+//
+// So grounding is a property of the clip, not of the character. Measured once
+// per clip from the lowest foot across the whole duration, never per frame:
+// per-frame would clamp Running to the floor and delete its airborne phase.
+const CLIP_GROUND_SAMPLES = 24;
+const CLIP_GROUND_STRIDE = 8;
+
+/**
+ * Lowest world Y the character reaches anywhere in a clip, with the holder at
+ * its base height. Leaves the mixer wound to the end of the sweep — the caller
+ * is responsible for resetting it.
+ */
+function measureClipLowestY(holder, mixer, action) {
+  const duration = action.getClip()?.duration ?? 0;
+  if (duration <= 0) return null;
+
+  let lowest = Infinity;
+  for (let i = 0; i < CLIP_GROUND_SAMPLES; i += 1) {
+    mixer.setTime((duration * i) / CLIP_GROUND_SAMPLES);
+    holder.updateMatrixWorld(true);
+    const bounds = measurePosedBounds(holder, CLIP_GROUND_STRIDE);
+    if (bounds && bounds.minY < lowest) lowest = bounds.minY;
+  }
+
+  return Number.isFinite(lowest) ? lowest : null;
+}
+
 // Clip names come from whoever authored them ("Idle_11", "Walking_Woman").
 // Match on substring and show the result in the UI so a wrong guess is visible.
 /**
@@ -470,12 +563,23 @@ export default function ActorModelPanel({ actorId }) {
   const boundsRef = useRef({ minX: -ROOM / 2, maxX: ROOM / 2, minZ: -ROOM / 2, maxZ: ROOM / 2 });
   const keysRef = useRef(new Set());
   const walkRef = useRef({ on: false, speed: 1.35, roles: null, current: null, flip: false });
+  // Live inputs to the clip state machine, so a wrong clip can be read off the
+  // panel instead of reasoned about.
+  const walkDebugRef = useRef(null);
+  // Per-clip floor correction, held as an offset from floorY rather than an
+  // absolute height so nothing else that writes holder.position can clobber it.
+  // `target` is where the current clip wants her, `applied` is where she has
+  // eased to. Snapping target straight onto the holder puts her at the incoming
+  // clip's height while she is still wearing the outgoing clip's pose, which
+  // shows up as a 7.3cm grow-then-shrink across the crossfade.
+  const groundRef = useRef({ target: 0, applied: 0 });
   const matBackupRef = useRef(new Map());
   const skinBackupRef = useRef(new Map());
   const skeletonHelperRef = useRef(null);
   const showSkeletonRef = useRef(false);
   const mixerRef = useRef(null);
   const actionsRef = useRef(new Map());
+  const clipGroundRef = useRef(new Map());
   const currentActionRef = useRef(null);
   const frameRef = useRef(null);
   const clockRef = useRef(new THREE.Clock());
@@ -495,6 +599,9 @@ export default function ActorModelPanel({ actorId }) {
   const [flipFacing, setFlipFacing] = useState(false);
   const [roles, setRoles] = useState(null);
   const [fitInfo, setFitInfo] = useState(null);
+  const [posedInfo, setPosedInfo] = useState(null);
+  const [clipGround, setClipGround] = useState(new Map());
+  const [walkDebug, setWalkDebug] = useState(null);
   const [matInfo, setMatInfo] = useState(null);
   const [shading, setShading] = useState("source");
   const [exposure, setExposure] = useState(1.0);
@@ -588,12 +695,24 @@ export default function ActorModelPanel({ actorId }) {
     // Switching tabs mid-keypress means the keyup never arrives and shift stays
     // held — which reads as her running when nothing is pressed.
     const onBlur = () => keysRef.current.clear();
+    // Window blur only catches leaving the page. Clicking a select or a slider
+    // inside the panel keeps the window focused while onKeyDown starts ignoring
+    // keys, so anything held at that moment is latched with no way to release
+    // it. Clearing on focus change covers the case window blur cannot see.
+    const onFocusIn = (e) => {
+      const tag = e.target?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
+        keysRef.current.clear();
+      }
+    };
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
     window.addEventListener("blur", onBlur);
+    document.addEventListener("focusin", onFocusIn);
 
     let frames = 0;
     let acc = 0;
+    let poseAcc = 0;
 
     const animate = () => {
       frameRef.current = requestAnimationFrame(animate);
@@ -612,8 +731,48 @@ export default function ActorModelPanel({ actorId }) {
 
       if (mixerRef.current) mixerRef.current.update(delta);
       if (vrmRef.current) vrmRef.current.update(delta);
-      controls.update();
+
+      // Ease the feet on roughly the same curve as the crossfade blends the
+      // pose, and write it every frame so a room load or a holder.position.set
+      // elsewhere cannot silently drop the correction.
+      if (holderRef.current) {
+        const g = groundRef.current;
+        const diff = g.target - g.applied;
+        if (Math.abs(diff) > 1e-5) {
+          g.applied += diff * (1 - Math.exp(-delta / 0.06));
+        } else {
+          g.applied = g.target;
+        }
+        holderRef.current.position.y = floorYRef.current + g.applied;
+      }
+
+      // OrbitControls.enabled only gates input. update() still runs, and it
+      // ends with object.lookAt(target) — which in first person overwrites the
+      // pointer-lock orientation every frame and pins the view to the room
+      // centre. Mouse look cannot survive it, so it does not run in FPV.
+      if (!fpvRef.current) controls.update();
+
       renderer.render(scene, camera);
+
+      // After render, so bones[].matrixWorld is current for this frame. Twice a
+      // second is enough to read while a clip plays and cheap enough to leave on.
+      poseAcc += delta;
+      if (poseAcc >= 0.5) {
+        poseAcc = 0;
+        setWalkDebug(walkDebugRef.current);
+        if (holderRef.current) {
+          const posed = measurePosedBounds(holderRef.current);
+          if (posed) {
+            setPosedInfo({
+              height: posed.height,
+              topY: posed.maxY,
+              feetY: posed.minY,
+              sampled: posed.sampled,
+              skinnedMeshes: posed.skinnedMeshes,
+            });
+          }
+        }
+      }
 
       frames += 1;
       acc += delta;
@@ -641,6 +800,7 @@ export default function ActorModelPanel({ actorId }) {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", onBlur);
+      document.removeEventListener("focusin", onFocusIn);
       cancelAnimationFrame(frameRef.current);
       if (mixerRef.current) mixerRef.current.stopAllAction();
       if (rootRef.current) VRMUtils.deepDispose(rootRef.current);
@@ -829,6 +989,10 @@ export default function ActorModelPanel({ actorId }) {
     if (!action) return;
     const previous = currentActionRef.current;
     if (previous === action) return;
+    // Same per-clip floor correction as play(). Without it the state machine
+    // reintroduces the float every time it crosses between idle and walk,
+    // which on Frida's clips is a 7.3cm step.
+    groundForClip(name, action);
     action.reset().setLoop(THREE.LoopRepeat, Infinity);
     if (previous) action.crossFadeFrom(previous, 0.18, false).play();
     else action.fadeIn(0.18).play();
@@ -941,6 +1105,7 @@ export default function ActorModelPanel({ actorId }) {
     if (fpvRef.current) {
       const moving = stepWander(delta, holder, st, performance.now());
       const want = moving ? st.roles.walk ?? st.roles.idle : st.roles.idle;
+      walkDebugRef.current = { moving, running: false, want, current: st.current };
       if (want && want !== st.current) {
         st.current = want;
         switchClip(want);
@@ -997,6 +1162,8 @@ export default function ActorModelPanel({ actorId }) {
     const want = moving
       ? (running && st.roles.run ? st.roles.run : st.roles.walk) ?? st.roles.idle
       : st.roles.idle ?? st.roles.walk;
+
+    walkDebugRef.current = { moving, running, want, current: st.current };
 
     if (want && want !== st.current) {
       st.current = want;
@@ -1333,6 +1500,10 @@ export default function ActorModelPanel({ actorId }) {
       mixerRef.current = null;
     }
     actionsRef.current.clear();
+    clipGroundRef.current.clear();
+    setClipGround(new Map());
+    groundRef.current.target = 0;
+    groundRef.current.applied = 0;
     currentActionRef.current = null;
 
     if (holderRef.current) {
@@ -1344,6 +1515,7 @@ export default function ActorModelPanel({ actorId }) {
     }
     setRoles(null);
     setFitInfo(null);
+    setPosedInfo(null);
     setMatInfo(null);
     setSkinInfo(null);
     matBackupRef.current.clear();
@@ -1550,6 +1722,8 @@ export default function ActorModelPanel({ actorId }) {
     const action = actionsRef.current.get(name);
     if (!action) return;
 
+    groundForClip(name, action);
+
     action.reset();
     action.setLoop(loop ? THREE.LoopRepeat : THREE.LoopOnce, Infinity);
     action.clampWhenFinished = !loop;
@@ -1565,6 +1739,45 @@ export default function ActorModelPanel({ actorId }) {
     setPlaying(name);
   }
 
+  /**
+   * Put the holder at the height that makes this clip's lowest foot touch the
+   * floor. Measured on first play and cached — the sweep costs about 5ms and
+   * stopping the mixer to run it is only safe before the crossfade starts.
+   */
+  function groundForClip(name, action) {
+    const holder = holderRef.current;
+    const mixer = mixerRef.current;
+    if (!holder || !mixer) return;
+
+    const baseY = floorYRef.current;
+    let offset = clipGroundRef.current.get(name);
+
+    if (offset === undefined) {
+      const restore = currentActionRef.current;
+      mixer.stopAllAction();
+      holder.position.y = baseY;
+
+      action.reset();
+      action.setEffectiveWeight(1);
+      action.play();
+
+      const lowest = measureClipLowestY(holder, mixer, action);
+      offset = lowest === null ? 0 : baseY - lowest;
+      clipGroundRef.current.set(name, offset);
+
+      mixer.stopAllAction();
+      mixer.setTime(0);
+      if (restore) restore.play();
+
+      setClipGround(new Map(clipGroundRef.current));
+    }
+
+    // First clip after a load has no outgoing pose to blend against, so it
+    // snaps; every later switch eases and arrives with the crossfade.
+    groundRef.current.target = offset;
+    if (!currentActionRef.current) groundRef.current.applied = offset;
+  }
+
   function stop() {
     const action = currentActionRef.current;
     if (!action) return;
@@ -1572,6 +1785,10 @@ export default function ActorModelPanel({ actorId }) {
     window.setTimeout(() => {
       action.stop();
       vrmRef.current?.humanoid?.resetNormalizedPose();
+      // Bind pose is what normaliseToFloor grounded against, so the clip's
+      // correction has to come back off or Stop lands her wherever the last
+      // clip wanted her. Eased, for the same reason the switch is.
+      groundRef.current.target = 0;
     }, 320);
     currentActionRef.current = null;
     setPlaying(null);
@@ -1813,7 +2030,15 @@ export default function ActorModelPanel({ actorId }) {
               )}
               <Row label="Spring bones" value={report.springBones} />
               <Row label="Triangles" value={report.triangles.toLocaleString()} />
-              {fitInfo && (
+              {walkDebug && (
+                <Row
+                  label="Walk state"
+                  value={`${walkDebug.moving ? "moving" : "still"}${
+                    walkDebug.running ? " + SHIFT" : ""
+                  } → ${walkDebug.want ?? "none"}`}
+                  warn={walkDebug.running && !walkDebug.moving}
+                />
+              )}              {fitInfo && (
                 <>
                   <Row
                     label="Scaled to 1.7m"
@@ -1822,15 +2047,37 @@ export default function ActorModelPanel({ actorId }) {
                   {fitInfo.standHeight !== undefined && (
                     <>
                       <Row
-                        label="Measured height"
+                        label="Bind height"
                         value={`${fitInfo.standHeight.toFixed(3)} m`}
                         warn={Math.abs(fitInfo.standHeight - TARGET_HEIGHT) > 0.02}
                       />
+                      {posedInfo && (
+                        <Row
+                          label="Posed height"
+                          value={`${posedInfo.height.toFixed(3)} m · top ${posedInfo.topY.toFixed(3)}`}
+                          warn={Math.abs(posedInfo.height - TARGET_HEIGHT) > 0.02}
+                        />
+                      )}
                       <Row
                         label="Feet vs floor"
-                        value={`${fitInfo.feetY.toFixed(3)} vs ${fitInfo.floorY.toFixed(3)} m`}
-                        warn={Math.abs(fitInfo.feetY - fitInfo.floorY) > 0.01}
+                        value={
+                          posedInfo
+                            ? `${posedInfo.feetY.toFixed(3)} vs ${fitInfo.floorY.toFixed(3)} m`
+                            : `${fitInfo.feetY.toFixed(3)} vs ${fitInfo.floorY.toFixed(3)} m (bind)`
+                        }
+                        warn={
+                          Math.abs(
+                            (posedInfo ? posedInfo.feetY : fitInfo.feetY) - fitInfo.floorY
+                          ) > 0.01
+                        }
                       />
+                      {posedInfo && (
+                        <Row
+                          label="Off floor"
+                          value={`${((posedInfo.feetY - fitInfo.floorY) * 100).toFixed(1)} cm`}
+                          warn={Math.abs(posedInfo.feetY - fitInfo.floorY) > 0.01}
+                        />
+                      )}
                     </>
                   )}
                 </>
@@ -1930,6 +2177,9 @@ export default function ActorModelPanel({ actorId }) {
                       >
                         {c.mapped}/{c.sourceTracks} tracks · {c.duration.toFixed(1)}s
                         {c.droppedScale > 0 && ` · ${c.droppedScale} scale dropped`}
+                        {clipGround.has(c.name) &&
+                          Math.abs(clipGround.get(c.name)) > 0.005 &&
+                          ` · ground ${(clipGround.get(c.name) * 100 > 0 ? "+" : "")}${(clipGround.get(c.name) * 100).toFixed(1)}cm`}
                       </span>
                     </div>
                   ))}
