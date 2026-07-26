@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { useNavigate } from "react-router-dom";
 
 const font    = "'DM Sans', system-ui, sans-serif";
 const serif   = "'Cormorant Garamond', Georgia, serif";
@@ -9,19 +10,23 @@ function worldLocalTime(tz) {
   return new Date().toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit", timeZone: tz || "UTC" });
 }
 
-export default function PlayerHomeScene({ world, user, location, onLeave }) {
+export default function PlayerHomeScene({ world, user, location, onLeave, onEncounterStart }) {
+  const navigate = useNavigate();
   const [activities,    setActivities]    = useState([]);
   const [currentState,  setCurrentState]  = useState(null); // active slug
   const [saving,        setSaving]        = useState(false);
   const [actors,        setActors]        = useState(location.actors || []);
   const [clock,         setClock]         = useState(worldLocalTime(world?.timezone));
   const [leaving,       setLeaving]       = useState(false);
+  const [approaching,   setApproaching]   = useState(null);
+  const [worldApps,     setWorldApps]     = useState([]);
+  const [activeApp,     setActiveApp]     = useState(null);
   const esRef = useRef(null);
 
   // Clock
   useEffect(() => {
     const timer = setInterval(() => setClock(worldLocalTime(world?.timezone)), 30000);
-    return () => clearInterval(t);
+    return () => clearInterval(timer);
   }, []);
 
   // Fetch home activities
@@ -37,6 +42,14 @@ export default function PlayerHomeScene({ world, user, location, onLeave }) {
     fetch(`/api/worlds/${world.id}/player/state`)
       .then(r => r.ok ? r.json() : null)
       .then(d => { if (d?.activity_slug) setCurrentState(d.activity_slug); })
+      .catch(() => {});
+  }, [world.id]);
+
+  // Fetch installed apps for this world
+  useEffect(() => {
+    fetch("/api/apps")
+      .then(r => r.ok ? r.json() : [])
+      .then(apps => setWorldApps(apps.filter(a => a.world_id === world.id)))
       .catch(() => {});
   }, [world.id]);
 
@@ -83,12 +96,44 @@ export default function PlayerHomeScene({ world, user, location, onLeave }) {
     onLeave();
   }
 
+  async function handleApproach(actor) {
+    setApproaching(actor.actor_id);
+    try {
+      const resp = await fetch(`/api/worlds/${world.id}/encounter/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          target_actor_id: actor.actor_id,
+          player_actor_id: playerActorId,
+          location_id: location.place_id || location.id,
+          trigger: "actor_approach"
+        })
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data.encounter_id) throw new Error("No encounter_id in response");
+
+      sessionStorage.setItem("encounterContext", JSON.stringify({
+        world, user,
+        sceneData: {
+          location,
+          encounter_id: data.encounter_id,
+          trigger: "actor_approach"
+        }
+      }));
+      navigate(`/encounter/knock/${data.encounter_id}`);
+    } catch(e) {
+      console.error("Failed to start encounter", e);
+      setApproaching(null);
+    }
+  }
+
   const playerActorId = user?.worlds?.find(w => w.world_id === world.id)?.actor_id;
   // Include player in HERE NOW — they are home
   const playerEntry = { actor_id: playerActorId, name: "You", photo_url: user?.photo_url || null, activity_slug: currentState };
   const hereNow = [playerEntry, ...actors.filter(a => a.actor_id !== playerActorId)];
 
   return (
+    <>
     <div style={{ position:"fixed", inset:0, display:"flex", background:"#0e0d0b", color:"rgba(255,255,255,.85)", fontFamily:font, overflow:"hidden", zIndex:100 }}>
 
       {/* Left — home content */}
@@ -141,6 +186,28 @@ export default function PlayerHomeScene({ world, user, location, onLeave }) {
           </div>
         </div>
 
+        {/* Apps */}
+        {worldApps.length > 0 && (
+          <div style={{ borderTop:"1px solid rgba(255,255,255,.06)", paddingTop:24, marginBottom:24 }}>
+            <div style={{ fontSize:11, letterSpacing:".08em", textTransform:"uppercase", color:dim, marginBottom:14 }}>
+              Your apps
+            </div>
+            <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+              {worldApps.map(app => (
+                <button key={app.id} onClick={() => setActiveApp(app)} style={{
+                  fontFamily:font, fontSize:12, padding:"8px 16px", borderRadius:20,
+                  border:"1px solid rgba(255,255,255,.12)", background:"rgba(255,255,255,.05)",
+                  color:"rgba(255,255,255,.7)", cursor:"pointer", display:"flex", alignItems:"center", gap:7,
+                  transition:"all .15s"
+                }}>
+                  <span style={{ fontSize:14 }}>{APP_ICON[app.tool_type] || "□"}</span>
+                  {app.name}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Future: home images */}
         <div style={{ borderTop:"1px solid rgba(255,255,255,.06)", paddingTop:24 }}>
           <div style={{ fontSize:11, letterSpacing:".08em", textTransform:"uppercase", color:dim, marginBottom:12 }}>
@@ -162,7 +229,9 @@ export default function PlayerHomeScene({ world, user, location, onLeave }) {
         <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
             {hereNow.map(a => {
               const photoUrl = a.photo_url
-                ? (a.photo_url.startsWith("/media/users") ? `/api/media/resize?url=${encodeURIComponent(a.photo_url)}&w=64&h=64` : (a.photo_url.startsWith(SIMULATOR_URL) ? `/api/media/resize?url=${encodeURIComponent(a.photo_url.replace(SIMULATOR_URL,""))}&w=64&h=64` : a.photo_url))
+                ? (a.photo_url.startsWith("/media/users") ? a.photo_url
+                  : a.photo_url.startsWith(SIMULATOR_URL) ? `/api/media/resize?url=${encodeURIComponent(a.photo_url.replace(SIMULATOR_URL,""))}&w=64&h=64`
+                  : a.photo_url)
                 : null;
               return (
                 <div key={a.actor_id} style={{ display:"flex", alignItems:"center", gap:10 }}>
@@ -172,15 +241,58 @@ export default function PlayerHomeScene({ world, user, location, onLeave }) {
                       : <div style={{ width:"100%", height:"100%", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13, color:"rgba(181,148,90,.8)" }}>{a.name?.[0]}</div>
                     }
                   </div>
-                  <div>
+                  <div style={{ flex:1 }}>
                     <div style={{ fontSize:13, fontWeight:500, color:"rgba(255,255,255,.8)" }}>{a.name}</div>
                     <div style={{ fontSize:11, color:dim }}>{a.activity_slug?.replace(/_/g," ") || a.occupation || "—"}</div>
                   </div>
+                  {a.actor_id !== playerActorId && (
+                    <button
+                      onClick={() => handleApproach(a)}
+                      disabled={approaching === a.actor_id}
+                      style={{
+                        fontFamily:font, fontSize:11, padding:"5px 10px", borderRadius:8,
+                        border:"1px solid rgba(181,148,90,.3)", background:"rgba(181,148,90,.08)",
+                        color:"rgba(181,148,90,.8)", cursor:"pointer", flexShrink:0,
+                        opacity: approaching === a.actor_id ? 0.5 : 1
+                      }}
+                    >{approaching === a.actor_id ? "…" : "Approach"}</button>
+                  )}
                 </div>
               );
             })}
         </div>
       </div>
     </div>
+
+      {/* App modal overlay */}
+      {activeApp && (
+        <div style={{ position:"fixed", inset:0, zIndex:200, background:"rgba(0,0,0,.7)", display:"flex", alignItems:"center", justifyContent:"center", padding:24 }}>
+          <div style={{ width:"100%", maxWidth:480, height:"80vh", background:"#faf8f5", borderRadius:16, overflow:"hidden", display:"flex", flexDirection:"column", boxShadow:"0 32px 80px rgba(0,0,0,.5)" }}>
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"12px 16px", borderBottom:"1px solid #ede9e3", background:"#fff" }}>
+              <span style={{ fontFamily:font, fontSize:13, fontWeight:500, color:"#1a1814" }}>{activeApp.name}</span>
+              <button onClick={() => setActiveApp(null)} style={{ fontFamily:font, fontSize:12, padding:"5px 12px", borderRadius:8, border:"1px solid #ede9e3", background:"none", color:"#a8a5a0", cursor:"pointer" }}>✕ Close</button>
+            </div>
+            <iframe
+              src={`${APP_URL[activeApp.tool_type] || "/"}?app=${activeApp.id}`}
+              style={{ flex:1, border:"none", width:"100%" }}
+              title={activeApp.name}
+            />
+          </div>
+        </div>
+      )}
+    </>
   );
 }
+
+const APP_ICON = {
+  messages:  "💬",
+  calendar:  "📅",
+  voicemail: "📩",
+  custom:    "⚙️",
+};
+
+const APP_URL = {
+  messages:  "/apps/messages",
+  calendar:  "/apps/calendar",
+  voicemail: "/apps/voicemail",
+};

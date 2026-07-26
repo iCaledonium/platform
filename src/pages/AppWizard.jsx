@@ -17,13 +17,21 @@ const AVATARS = {
   "tommy-norberg-actor":    { bg: "#2a1e2e", col: "#9e5cbe" },
   "johan-molin-actor":      { bg: "#1e2818", col: "#6ea86e" },
   "david-norberg-actor":    { bg: "#1e1e2e", col: "#7a7abe" },
+  "3516d51c-4a6f-4f36-b4d5-8b284397cc9c": { bg: "#2e1a1a", col: "#be5c5c" },
 };
 
 function initials(name) {
   return name?.split(" ").map(n => n[0]).join("").slice(0,2).toUpperCase() || "?";
 }
 
-export default function AppWizard({ user, worlds, directTool, onClose, onCreated }) {
+// toolType → world module that must be enabled
+const TOOL_MODULE = {
+  messages:  "sms_messaging",
+  voicemail: "sms_messaging",
+  calendar:  "meetings",
+};
+
+export default function AppWizard({ user, worlds, directTool, lockedWorldId, apps, onClose, onCreated }) {
   const [path, setPath]             = useState(directTool ? "prebuilt" : null);
   const [step, setStep]             = useState(directTool ? 2 : 1);
   const [toolType, setToolType]     = useState(directTool || "messages");
@@ -33,11 +41,12 @@ export default function AppWizard({ user, worlds, directTool, onClose, onCreated
   const [keys, setKeys]             = useState([]);
   const [contacts, setContacts]     = useState([]);
   const [selected, setSelected]     = useState(new Set());
-  const [privacy, setPrivacy]       = useState({});  // contactId → "private" | "visible"
+  const [privacy, setPrivacy]       = useState({});
   const [loadingContacts, setLoadingContacts] = useState(false);
   const [creating, setCreating]     = useState(false);
-  const [worldId, setWorldId]       = useState(() => worlds?.[0]?.id || null);
+  const [worldId, setWorldId]       = useState(lockedWorldId || null);
   const [rawKey, setRawKey]         = useState("");
+  const [worldModules, setWorldModules] = useState({});  // worldId → {module: bool}
 
   const world    = worlds?.find(w => w.id === worldId);
   const actorId  = user?.worlds?.find(m => m.world_id === worldId)?.actor_id || null;
@@ -55,6 +64,19 @@ export default function AppWizard({ user, worlds, directTool, onClose, onCreated
       .then(r => r.ok ? r.json() : [])
       .then(data => setKeys(data.filter(k => !k.revoked_at)));
   }, []);
+
+  // Fetch modules for all worlds so we can show enabled/disabled status
+  useEffect(() => {
+    if (!worlds?.length) return;
+    Promise.all(worlds.map(w =>
+      fetch(`/api/worlds/${w.id}/modules`)
+        .then(r => r.ok ? r.json() : {})
+        .then(m => [w.id, m])
+        .catch(() => [w.id, {}])
+    )).then(results => {
+      setWorldModules(Object.fromEntries(results));
+    });
+  }, [worlds]);
 
   function loadContacts() {
     if (contacts.length > 0) return;
@@ -185,11 +207,14 @@ export default function AppWizard({ user, worlds, directTool, onClose, onCreated
                 </div>
                 <div className={styles.field}>
                   <label>World</label>
-                  <input type="text" value={world?.name || worldId || ""} disabled style={{opacity:.5}} />
+                  {lockedWorldId
+                    ? <input type="text" value={world?.name || ""} disabled style={{opacity:.5}} />
+                    : <WorldPicker worlds={worlds} worldId={worldId} setWorldId={setWorldId} toolType={toolType} apps={apps} worldModules={worldModules} />
+                  }
                 </div>
                 <div className={styles.footer}>
                   <button className={styles.btnCancel} onClick={() => directTool ? onClose() : setStep(1)}>← Back</button>
-                  <button className={styles.btnNext} disabled={!name} onClick={() => { if (NO_CONTACTS_TOOLS.includes(toolType)) { setStep(4); } else { loadContacts(); setStep(3); } }}>Next →</button>
+                  <button className={styles.btnNext} disabled={!name || !worldId} onClick={() => { if (NO_CONTACTS_TOOLS.includes(toolType)) { setStep(4); } else { loadContacts(); setStep(3); } }}>Next →</button>
                 </div>
               </div>
             )}
@@ -294,11 +319,14 @@ export default function AppWizard({ user, worlds, directTool, onClose, onCreated
                 </div>
                 <div className={styles.field}>
                   <label>World</label>
-                  <input type="text" value={world?.name || worldId || ""} disabled style={{opacity:.5}} />
+                  {lockedWorldId
+                    ? <input type="text" value={world?.name || ""} disabled style={{opacity:.5}} />
+                    : <WorldPicker worlds={worlds} worldId={worldId} setWorldId={setWorldId} toolType={toolType} apps={apps} worldModules={worldModules} />
+                  }
                 </div>
                 <div className={styles.footer}>
                   <button className={styles.btnCancel} onClick={() => setPath(null)}>← Back</button>
-                  <button className={styles.btnNext} disabled={!name || !url} onClick={() => setStep(2)}>Next →</button>
+                  <button className={styles.btnNext} disabled={!name || !url || !worldId} onClick={() => setStep(2)}>Next →</button>
                 </div>
               </div>
             )}
@@ -307,6 +335,69 @@ export default function AppWizard({ user, worlds, directTool, onClose, onCreated
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+function WorldPicker({ worlds, worldId, setWorldId, toolType, apps, worldModules }) {
+  const font = "'DM Sans', system-ui, sans-serif";
+  const serif = "'Cormorant Garamond', Georgia, serif";
+  const reqModule = TOOL_MODULE[toolType];
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:6, marginTop:4 }}>
+      {(worlds || []).map(w => {
+        const modules = worldModules[w.id] || {};
+        const moduleEnabled = !reqModule || modules[reqModule] === true;
+        const alreadyInstalled = (apps || []).some(a => a.world_id === w.id && a.tool_type === toolType);
+        const isDisabled = alreadyInstalled || !moduleEnabled;
+        const isSelected = worldId === w.id;
+
+        return (
+          <div key={w.id}
+            onClick={() => !isDisabled && setWorldId(w.id)}
+            style={{
+              display:"flex", alignItems:"center", gap:12,
+              padding:"10px 14px", borderRadius:10,
+              border:`1px solid ${isSelected ? "rgba(181,148,90,.5)" : "rgba(0,0,0,.08)"}`,
+              background: isSelected ? "rgba(181,148,90,.07)" : isDisabled ? "rgba(0,0,0,.02)" : "white",
+              cursor: isDisabled ? "default" : "pointer",
+              transition:"all .12s",
+              opacity: isDisabled ? 0.7 : 1
+            }}>
+            {/* Status dot */}
+            <div style={{
+              width:7, height:7, borderRadius:"50%", flexShrink:0,
+              background: w.status === "running" ? "#4caf50" : "#ccc"
+            }} />
+            {/* World info */}
+            <div style={{ flex:1 }}>
+              <div style={{ fontFamily:font, fontSize:13, fontWeight:500, color: isDisabled ? "#aaa" : "#1a1a1a" }}>
+                {w.name}
+              </div>
+              {w.city && (
+                <div style={{ fontFamily:font, fontSize:11, color:"#aaa", marginTop:1 }}>{w.city}</div>
+              )}
+            </div>
+            {/* Status badge */}
+            {alreadyInstalled && (
+              <div style={{ fontFamily:font, fontSize:11, color:"#d94f4f", display:"flex", alignItems:"center", gap:4, flexShrink:0 }}>
+                <span style={{ fontSize:10, fontWeight:700 }}>✕</span> Already installed
+              </div>
+            )}
+            {!alreadyInstalled && !moduleEnabled && (
+              <div style={{ fontFamily:font, fontSize:11, color:"#d94f4f", display:"flex", alignItems:"center", gap:4, flexShrink:0 }}>
+                <span style={{ fontSize:10, fontWeight:700 }}>✕</span> Not enabled
+              </div>
+            )}
+            {!isDisabled && isSelected && (
+              <div style={{ fontFamily:font, fontSize:11, color:"rgba(181,148,90,.9)", fontWeight:500, flexShrink:0 }}>
+                Selected ✓
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

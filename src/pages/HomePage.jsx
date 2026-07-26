@@ -24,6 +24,7 @@ export default function HomePage() {
   const [showWizard, setShowWizard]         = useState(false);
   const [configApp, setConfigApp]           = useState(null);
   const [directTool, setDirectTool]         = useState(null);
+  const [lockedInstallWorldId, setLockedInstallWorldId] = useState(null);
   const [showEnterOverlay, setShowEnterOverlay] = useState(false);
   const [selectedWorld,    setSelectedWorld]    = useState(null);
 
@@ -37,6 +38,22 @@ export default function HomePage() {
   }
 
   useEffect(() => {
+    // If VisitorPresenceView/KnockEncounterPage left a pendingHomeScene signal
+    // on exit, mount WorldEnterOverlay immediately rather than waiting for the
+    // user to click into a world manually — WorldEnterOverlay itself already
+    // knows how to consume this signal and jump straight to PlayerHomeScene,
+    // but it never gets that chance unless something here actually mounts it.
+    const pendingRaw = sessionStorage.getItem("pendingHomeScene");
+    if (pendingRaw) {
+      try {
+        const pending = JSON.parse(pendingRaw);
+        if (pending.world) {
+          setSelectedWorld(pending.world);
+          setShowEnterOverlay(true);
+        }
+      } catch {}
+    }
+
     fetch("/api/me")
       .then(r => { if (r.status === 401) { window.location.href = "/login"; return null; } return r.ok ? r.json() : null; })
       .then(data => {
@@ -60,17 +77,24 @@ export default function HomePage() {
           setWorlds(p => p.map(w => w.id === event.world_id ? {...w, status: "stopped"} : w));
         } else if (event.type === "world_created" || event.type === "world_deleted") {
           fetchWorlds();
+        } else if (event.type === "new_message") {
+          setPendingCount(n => n + 1);
         }
       } catch {}
     };
-    es.onerror = () => {}; // auto-reconnects
+    es.onerror = () => {};
 
-    return () => es.close();
+    const params = new URLSearchParams(window.location.search);
+    const installTool = params.get("install");
+    const installWorldId = params.get("world_id");
     if (installTool) {
       setDirectTool(installTool);
+      if (installWorldId) setLockedInstallWorldId(installWorldId);
       setShowWizard(true);
       window.history.replaceState({}, "", "/home");
     }
+
+    return () => es.close();
   }, []);
 
   function checkPendingMessages() {
@@ -128,8 +152,10 @@ export default function HomePage() {
           <AppWizard
             user={user}
             worlds={worlds}
+            apps={apps}
             directTool={directTool}
-            onClose={() => { setShowWizard(false); setDirectTool(null); }}
+            lockedWorldId={lockedInstallWorldId || selectedWorld?.id || null}
+            onClose={() => { setShowWizard(false); setDirectTool(null); setSelectedWorld(null); setLockedInstallWorldId(null); }}
             onCreated={onAppCreated}
           />
         )}
@@ -231,7 +257,7 @@ export default function HomePage() {
                       </div>
                     </div>
                   ))}
-                  <div className={homeStyles.appCardNew} style={{flex:"0 0 auto", width:180}} onClick={() => { setDirectTool(null); setShowWizard(true); }}>
+                  <div className={homeStyles.appCardNew} style={{flex:"0 0 auto", width:180}} onClick={() => { setSelectedWorld(w); setDirectTool(null); setShowWizard(true); }}>
                     <div className={homeStyles.newPlus}>+</div>
                     <p className={homeStyles.newLabel}>New app</p>
                   </div>
@@ -240,7 +266,7 @@ export default function HomePage() {
               {worldApps.length === 0 && (
                 <div style={{borderTop:"1px solid rgba(0,0,0,.06)", padding:"10px 20px 14px"}}>
                   <span style={{fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, color:"#c0bdb8", cursor:"pointer"}}
-                    onClick={() => { setDirectTool(null); setShowWizard(true); }}>+ Install app</span>
+                    onClick={() => { setSelectedWorld(w); setDirectTool(null); setShowWizard(true); }}>+ Install app</span>
                 </div>
               )}
             </div>
@@ -254,7 +280,7 @@ export default function HomePage() {
         <div className={homeStyles.toolsGrid} style={{marginBottom: "2.5rem"}}>
           {COMM_TOOLS.map(t => (
             <div key={t.name} className={`${homeStyles.toolCard} ${t.live ? homeStyles.toolCardLive : ""}`}
-              onClick={t.live ? () => { setDirectTool(t.toolType); setShowWizard(true); } : undefined}
+              onClick={t.live ? () => { setSelectedWorld(null); setDirectTool(t.toolType); setShowWizard(true); } : undefined}
               style={t.live ? {cursor:"pointer"} : {}}>
               <span className={t.live ? homeStyles.liveBadge : homeStyles.soonBadge}>{t.live ? "live" : "soon"}</span>
               <div className={homeStyles.toolIcon} style={{background: t.iconBg, border: `1px solid ${t.iconBd}`}} dangerouslySetInnerHTML={{__html: t.svg}} />

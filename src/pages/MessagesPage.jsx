@@ -186,10 +186,13 @@ export default function MessagesPage() {
   const [dragging, setDragging]           = useState(false);
   const [context, setContext]             = useState(null); // { memories, conflicts }
   const [hasCalendar, setHasCalendar]     = useState(false);
+  const [unreadIds, setUnreadIds]         = useState(new Set());
   const pollRef     = useRef(null);
   const bottomRef   = useRef(null);
   const fileInputRef = useRef(null);
   const dragCounter = useRef(0);
+  const sseRef      = useRef(null);
+  const selectedRef = useRef(null);
 
   useEffect(() => {
     if (autoContact && contacts.length > 0 && me && !autoOpened) {
@@ -243,6 +246,31 @@ export default function MessagesPage() {
       .then(apps => setHasCalendar(apps.some(a => a.tool_type === "calendar")));
   }, []);
 
+  // Keep selectedRef in sync so SSE handler can read current selection
+  useEffect(() => { selectedRef.current = selected; }, [selected]);
+
+  // SSE — live push from simulator via /api/stream
+  useEffect(() => {
+    if (!world) return;
+    const es = new EventSource(`/api/stream?world_id=${world.world_id}`);
+    sseRef.current = es;
+    es.onmessage = (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+        if (payload.type === "new_message") {
+          const cur = selectedRef.current;
+          if (cur && (payload.sender_id === cur.id || payload.receiver_id === cur.id)) {
+            loadMessages(world.world_id, world.actor_id, cur.id);
+          } else if (payload.sender_id) {
+            setUnreadIds(prev => new Set([...prev, payload.sender_id]));
+          }
+          loadContacts(world.world_id, world.actor_id);
+        }
+      } catch {}
+    };
+    return () => es.close();
+  }, [world]);
+
   function loadContacts(worldId, actorId, contactIds) {
     apiFetch(`/api/worlds/${worldId}/actors/${actorId}/contacts`)
       .then(r => r.ok ? r.json() : [])
@@ -261,6 +289,7 @@ export default function MessagesPage() {
     setMessages([]);
     setPendingAttachment(null);
     setContext(null);
+    setUnreadIds(prev => { const n = new Set(prev); n.delete(contact.id); return n; });
     if (pollRef.current) clearInterval(pollRef.current);
     const _world = world || me?.worlds?.[0];
     if (!world) return;
@@ -467,6 +496,7 @@ export default function MessagesPage() {
                       : c.occupation}
                   </p>
                 </div>
+                {unreadIds.has(c.id) && <span className={styles.unreadDot} />}
               </div>
             );
           })}

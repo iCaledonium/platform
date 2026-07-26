@@ -44,8 +44,8 @@ function avatarColor(id) {
 }
 
 function formatTime(secs) {
-  const msg = Math.floor(secs / 60);
-  const state = Math.floor(secs % 60);
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
@@ -53,10 +53,10 @@ function formatDate(iso) {
   if (!iso) return "";
   const data = new Date(iso);
   const now = new Date();
-  const diff = (now - d) / 1000;
+  const diff = (now - data) / 1000;
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  return d.toLocaleDateString("en-SE", { month: "short", day: "numeric" });
+  return data.toLocaleDateString("en-SE", { month: "short", day: "numeric" });
 }
 
 function VoicemailCard({ msg, worldId, actorId, apiFetch }) {

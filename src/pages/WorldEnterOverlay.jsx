@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef } from "react";
+import { useNavigate } from "react-router-dom";
 import styles from "./WorldEnterOverlay.module.css";
-import VenueScene from "./VenueScene.jsx";
-import KnockingDoorScene from "./KnockingDoorScene.jsx";
 import PlayerHomeScene from "./PlayerHomeScene.jsx";
+import SneakScene from "./SneakScene.jsx";
 
 const SIMULATOR_URL = "https://anima.simulator.ngrok.dev";
 
@@ -149,6 +149,7 @@ function injectPinStyles() {
 }
 
 export default function WorldEnterOverlay({ world, user, onClose }) {
+  const navigate = useNavigate();
   const mapRef        = useRef(null);
   const mapInstance   = useRef(null);
   const markers        = useRef([]);
@@ -160,27 +161,50 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
 
   const [locations, setLocations] = useState([]);
   const locationsRef   = useRef([]);
+  const [weather,   setWeather]   = useState(null);
   const [selected,  setSelected]  = useState(null);
   const [mapReady,  setMapReady]  = useState(false);
   const [spawning,  setSpawning]  = useState(false);
   const [loading,   setLoading]   = useState(true);
   const [sceneData, setSceneData] = useState(null);
+  const [sneakData, setSneakData] = useState(null); // {sessionId, location, participants}
   const [selectedActor, setSelectedActor] = useState(null); // for transit panel
+  const [selectedAmbient, setSelectedAmbient] = useState(null); // ambient NPC bubble
   const [mapKey,    setMapKey]    = useState(0);
+
+  // ── Auto-enter player home — set by VisitorPresenceView on exit, since
+  // for knock_user_door the player never actually left home to begin with.
+  // Skips the map selection view entirely and drops straight into the
+  // same PlayerHomeScene render path used when clicking "Enter your home".
+  useEffect(() => {
+    const raw = sessionStorage.getItem("pendingHomeScene");
+    if (!raw) return;
+    sessionStorage.removeItem("pendingHomeScene");
+    try {
+      const { location } = JSON.parse(raw);
+      if (location) setSceneData({ location, mode: "player_home" });
+    } catch {}
+  }, []);
 
   // Fetch presence + refresh every 30s
   const loadPresenceRef = useRef(null);
   useEffect(() => {
     const load = () => {
       fetch(`/api/worlds/${world.id}/presence`)
-        .then(r => r.json())
+        .then(r => {
+          if (!r.ok) throw new Error(`presence ${r.status}`);
+          return r.json();
+        })
         .then(data => {
-          setLocations(data);
+          const locs = data.locations || data;
+          if (!Array.isArray(locs)) return; // guard against unexpected response shape
+          if (data.weather) setWeather(data.weather);
+          setLocations(locs);
           setLoading(false);
           // Keep selected panel in sync
           setSelected(prev => {
             if (!prev) return prev;
-            const updated = data.find(l => l.id === prev.id);
+            const updated = locs.find(l => l.id === prev.id);
             return updated || prev;
           });
         })
@@ -191,6 +215,47 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
     const t = setInterval(load, 30000);
     return () => clearInterval(t);
   }, [world.id]);
+
+  // SSE — thought bubbles and transit arrivals
+  const [thoughtBubbles, setThoughtBubbles] = useState({});
+  useEffect(() => {
+    const playerActorId = user?.worlds?.find(w => w.world_id === world.id)?.actor_id;
+    if (!playerActorId) return;
+    const es = new EventSource(`/api/actors/${playerActorId}/stream`);
+    es.onmessage = (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+        if (payload.type === "thought_bubble") {
+          const { actor_id, reason, emotion, intensity, actor_name, target_actor_id, target_name } = payload.data;
+          const resolvedName = actor_name ||
+            locationsRef.current.flatMap(l => l.actors || []).find(a => a.actor_id === actor_id)?.name ||
+            null;
+          setThoughtBubbles(prev => {
+            const existing = prev[actor_id];
+            // Don't replace if current bubble is less than 12 seconds old
+            // BUT allow replacement if new intensity is higher (more meaningful action)
+            if (existing && Date.now() - existing.ts < 12000 && intensity <= (existing.intensity || 0)) return prev;
+            return { ...prev, [actor_id]: { reason, emotion, intensity, ts: Date.now(), actor_name: resolvedName, target_actor_id, target_name } };
+          });
+          // Auto-clear after 20 seconds
+          setTimeout(() => setThoughtBubbles(prev => {
+            const next = { ...prev };
+            if (next[actor_id]?.ts === prev[actor_id]?.ts) delete next[actor_id];
+            return next;
+          }), 20000);
+        }
+        if (payload.type === "transit_arrived") {
+          // Force immediate presence reload to snap marker
+          if (loadPresenceRef.current) loadPresenceRef.current();
+        }
+      } catch {}
+    };
+    es.onerror = () => {};
+    return () => es.close();
+  }, [world.id, user]);
+
+  const thoughtBubblesRef = useRef({});
+  thoughtBubblesRef.current = thoughtBubbles;
 
   // Load Google Maps
   useEffect(() => {
@@ -257,7 +322,7 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
         const actors = (loc.actors || []).filter(a => !a.in_transit);
         const shown = actors.slice(0, 3);
         const stackedPhotos = shown.map((a, i) => {
-          const pinPhoto = a.photo_url ? resizedPhoto(a.photo_url, 48) : null;
+          const pinPhoto = a.generated_portrait_url || (a.photo_url ? resizedPhoto(a.photo_url, 48) : null);
           return pinPhoto
             ? `<img src="${pinPhoto}" style="width:22px;height:22px;border-radius:50%;object-fit:cover;border:1.5px solid rgba(255,255,255,.8);margin-left:${i===0?0:-8}px;z-index:${shown.length-i};position:relative;" onerror="this.style.display='none'" />`
             : `<div style="width:22px;height:22px;border-radius:50%;background:rgba(181,148,90,.3);border:1.5px solid rgba(255,255,255,.8);display:inline-flex;align-items:center;justify-content:center;font-size:9px;color:#1a1814;margin-left:${i===0?0:-8}px;z-index:${shown.length-i};position:relative;">${a.name[0]}</div>`;
@@ -302,7 +367,8 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
     });
   }, [mapReady, locations, mapKey]);
 
-  // Transit actor dots — interpolate position every 5s
+  // Keep locationsRef current so transit effect can read latest without re-running
+  locationsRef.current = locations;
   useEffect(() => {
     if (!mapReady || !mapInstance.current) return;
     if (transitTimer.current) clearInterval(transitTimer.current);
@@ -329,16 +395,16 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
         const polylinePath = coords.map(c => new window.google.maps.LatLng(c.lat, c.lng));
         const routeLine = new window.google.maps.Polyline({
           path: polylinePath, geodesic: false,
-          strokeColor: "#6B9FD4", strokeOpacity: 0.7, strokeWeight: 2,
+          strokeColor: "#E05252", strokeOpacity: 0.85, strokeWeight: 2.5,
           map: mapInstance.current,
-          icons: [{ icon: { path: window.google.maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 2, fillColor: "#6B9FD4", fillOpacity: 1, strokeWeight: 0 }, offset: "100%" }]
+          icons: [{ icon: { path: window.google.maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 2, fillColor: "#E05252", fillOpacity: 1, strokeWeight: 0 }, offset: "100%" }]
         });
         routeLines.push(routeLine);
         transitMarkers.current.push({ setMap: (m) => routeLine.setMap(m) });
       }
 
       // Transit dot — created once, position updated in-place
-      const photoUrl = actor.photo_url ? resizedPhoto(actor.photo_url, 48) : null;
+      const photoUrl = actor.generated_portrait_url || (actor.photo_url ? resizedPhoto(actor.photo_url, 48) : null);
 
       // Use factory instead of class to avoid esbuild hoisting issues
       const createTransitDot = () => {
@@ -368,6 +434,43 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
           if (pt) { this._div.style.left = pt.x + "px"; this._div.style.top = pt.y + "px"; }
         };
         overlay.updatePos = function(pos) { this._pos = pos; this.draw(); };
+        overlay.updateBubble = function(bubble) {
+          if (!this._div) return;
+          let bub = this._div.querySelector(".thought-bub");
+          if (!bubble) { if (bub) bub.remove(); this._lastBubbleTs = null; return; }
+          const age = Date.now() - bubble.ts;
+          const opacity = age < 16000 ? 1 : Math.max(0, 1 - (age - 16000) / 4000);
+          // Only rebuild innerHTML when bubble content changes
+          if (!bub || this._lastBubbleTs !== bubble.ts) {
+            if (!bub) {
+              bub = document.createElement("div");
+              bub.className = "thought-bub";
+              bub.style.cssText = "position:absolute;bottom:38px;left:50%;transform:translateX(-50%);pointer-events:none;transition:opacity 0.5s;";
+              this._div.appendChild(bub);
+            }
+            this._lastBubbleTs = bubble.ts;
+            const isA2A       = !!bubble.target_name;
+            const headerLabel = isA2A
+              ? `${(bubble.actor_name || '').toUpperCase()} → ${bubble.target_name.toUpperCase()}`
+              : bubble.actor_name ? bubble.actor_name.toUpperCase() : null;
+            const bg     = isA2A ? 'rgba(8,18,30,0.94)'   : 'rgba(15,12,8,0.92)';
+            const border = isA2A ? 'rgba(74,127,165,0.6)'  : 'rgba(181,148,90,0.4)';
+            const dot    = isA2A ? 'rgba(74,127,165,0.4)'  : 'rgba(181,148,90,0.3)';
+            const emCol  = isA2A ? 'rgba(74,127,165,0.9)'  : 'rgba(181,148,90,0.8)';
+            const maxW   = isA2A ? '340px' : '220px';
+            bub.innerHTML = `
+              <div style="position:relative;background:${bg};border:1px solid ${border};border-radius:12px;padding:6px 10px;max-width:${maxW};min-width:120px;font-family:'DM Sans',sans-serif;font-size:10px;color:rgba(255,255,255,0.9);line-height:1.4;white-space:normal;text-align:left;box-shadow:0 2px 12px rgba(0,0,0,0.4);">
+                ${headerLabel ? `<div style="color:#fff;font-size:9px;font-weight:600;margin-bottom:3px;letter-spacing:0.8px;">${headerLabel}</div>` : ''}
+                ${!isA2A ? `<div style="color:${emCol};font-size:9px;margin-bottom:2px;text-transform:capitalize;letter-spacing:0.5px;">${bubble.emotion}</div>` : ''}
+                <div style="color:rgba(255,255,255,${isA2A ? '0.88' : '0.9'});">${bubble.reason}</div>
+                <div style="position:absolute;bottom:-10px;left:50%;transform:translateX(-50%);display:flex;gap:2px;">
+                  <div style="width:5px;height:5px;border-radius:50%;background:${bg};border:1px solid ${dot};"></div>
+                  <div style="width:3px;height:3px;border-radius:50%;background:${bg};border:1px solid ${dot};margin-top:3px;"></div>
+                </div>
+              </div>`;
+          }
+          bub.style.opacity = opacity;
+        };
         overlay.onRemove = function() { if (this._div?.parentNode) this._div.parentNode.removeChild(this._div); this._div = null; };
         return overlay;
       };
@@ -384,11 +487,13 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
       dots.forEach(({ dot, actor }) => {
         const pos = getActorPosition(actor, placesCoords);
         if (pos) dot.updatePos(pos);
+        const bubble = thoughtBubblesRef.current[actor.actor_id] || null;
+        dot.updateBubble(bubble);
       });
     };
 
     if (transitActors.length > 0) {
-      transitTimer.current = setInterval(updatePositions, 5000);
+      transitTimer.current = setInterval(updatePositions, 1000);
     }
 
     return () => {
@@ -398,8 +503,48 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
     };
   }, [mapReady, locations, mapKey]);
 
-  // Keep locationsRef current so transit effect can read latest without re-running
-  locationsRef.current = locations;
+  // Update thought bubbles on static markers whenever thoughtBubbles state changes
+  useEffect(() => {
+    markers.current.forEach(pin => {
+      if (!pin.div || !pin.loc) return;
+      const actors = (pin.loc.actors || []).filter(a => !a.in_transit);
+      const bubble = actors.reduce((found, a) => found || thoughtBubbles[a.actor_id] || null, null);
+      let bub = pin.div.querySelector(".thought-bub-static");
+      if (!bubble) { if (bub) bub.remove(); pin._lastBubbleTs = null; return; }
+      const age = Date.now() - bubble.ts;
+      const opacity = age < 16000 ? 1 : Math.max(0, 1 - (age - 16000) / 4000);
+      // Only rebuild when content changes
+      if (!bub || pin._lastBubbleTs !== bubble.ts) {
+        if (!bub) {
+          bub = document.createElement("div");
+          bub.className = "thought-bub-static";
+          bub.style.cssText = "position:absolute;bottom:calc(100% + 4px);left:50%;transform:translateX(-50%);pointer-events:none;z-index:10;transition:opacity 0.5s;";
+          pin.div.querySelector(".anima-pin")?.appendChild(bub);
+        }
+        pin._lastBubbleTs = bubble.ts;
+        const isA2A       = !!bubble.target_name;
+        const headerLabel = isA2A
+          ? `${(bubble.actor_name || '').toUpperCase()} → ${bubble.target_name.toUpperCase()}`
+          : bubble.actor_name ? bubble.actor_name.toUpperCase() : null;
+        const bg     = isA2A ? 'rgba(8,18,30,0.94)'   : 'rgba(15,12,8,0.92)';
+        const border = isA2A ? 'rgba(74,127,165,0.6)'  : 'rgba(181,148,90,0.4)';
+        const dot    = isA2A ? 'rgba(74,127,165,0.4)'  : 'rgba(181,148,90,0.3)';
+        const emCol  = isA2A ? 'rgba(74,127,165,0.9)'  : 'rgba(181,148,90,0.8)';
+        const maxW   = isA2A ? '340px' : '220px';
+        bub.innerHTML = `
+          <div style="position:relative;background:${bg};border:1px solid ${border};border-radius:12px;padding:6px 10px;max-width:${maxW};min-width:120px;font-family:'DM Sans',sans-serif;font-size:10px;color:rgba(255,255,255,0.9);line-height:1.4;white-space:normal;text-align:left;box-shadow:0 2px 12px rgba(0,0,0,0.4);">
+            ${headerLabel ? `<div style="color:#fff;font-size:9px;font-weight:600;margin-bottom:3px;letter-spacing:0.8px;">${headerLabel}</div>` : ''}
+            ${!isA2A ? `<div style="color:${emCol};font-size:9px;margin-bottom:2px;text-transform:capitalize;letter-spacing:0.5px;">${bubble.emotion}</div>` : ''}
+            <div style="color:rgba(255,255,255,${isA2A ? '0.88' : '0.9'});">${bubble.reason}</div>
+            <div style="position:absolute;bottom:-10px;left:50%;transform:translateX(-50%);display:flex;gap:2px;">
+              <div style="width:5px;height:5px;border-radius:50%;background:${bg};border:1px solid ${dot};"></div>
+              <div style="width:3px;height:3px;border-radius:50%;background:${bg};border:1px solid ${dot};margin-top:3px;"></div>
+            </div>
+          </div>`;
+      }
+      bub.style.opacity = opacity;
+    });
+  }, [thoughtBubbles]);
 
   // Wire transit actor click to React state
   useEffect(() => {
@@ -467,9 +612,22 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
           const encData = await encResp.json();
           encounter_id = encData.encounter_id;
         }
-        setSceneData({ location: selected, encounter_id, trigger: "knock", mode: "scene" });
+        // Store everything in sessionStorage — no API needed in encounter page
+        sessionStorage.setItem("encounterContext", JSON.stringify({
+          world:      world,
+          user:       user,
+          sceneData:  { location: selected, encounter_id, trigger: "knock", mode: "scene" }
+        }));
+        navigate(`/encounter/knock/${encounter_id || "pending"}`);
+        onClose();
       } else {
-        setSceneData({ location: selected, mode: "venue" });
+        sessionStorage.setItem("venueContext", JSON.stringify({
+          world:    world,
+          user:     user,
+          location: selected
+        }));
+        navigate(`/encounter/venue/${world.id}/${selected.place_id || selected.id}`);
+        onClose();
       }
     } catch (e) {
       console.error("Spawn failed", e);
@@ -479,37 +637,36 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
     }
   }
 
-  // If scene is active render it instead of map
-  if (sceneData) {
+  // Sneak mode — observing an actor↔actor meeting
+  if (sneakData) {
+    return (
+      <SneakScene
+        world={world}
+        user={user}
+        location={sneakData.location}
+        sessionId={sneakData.sessionId}
+        participants={sneakData.participants}
+        onLeave={() => {
+          setSneakData(null);
+          mapInstance.current = null;
+          setMapKey(k => k + 1);
+          if (loadPresenceRef.current) loadPresenceRef.current();
+        }}
+      />
+    );
+  }
+
+  // If scene is active render it instead of map (player_home only)
+  // knock and venue scenes now have their own routes → /encounter/knock/:id and /encounter/venue/:wid/:lid
+  if (sceneData && sceneData.mode === "player_home") {
     const onLeave = () => {
       mapInstance.current = null;
       setSceneData(null);
       setMapKey(k => k + 1);
-      // Refresh presence to reflect updated state
       if (loadPresenceRef.current) loadPresenceRef.current();
     };
-    if (sceneData.mode === "player_home") {
-      return (
-        <PlayerHomeScene
-          world={world}
-          user={user}
-          location={sceneData.location}
-          onLeave={onLeave}
-        />
-      );
-    }
-    if (sceneData.mode === "scene") {
-      return (
-        <KnockingDoorScene
-          world={world}
-          user={user}
-          sceneData={sceneData}
-          onLeave={onLeave}
-        />
-      );
-    }
     return (
-      <VenueScene
+      <PlayerHomeScene
         world={world}
         user={user}
         location={sceneData.location}
@@ -523,6 +680,7 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
   });
 
   return (
+    <>
     <div className={styles.overlay}>
 
       <div className={styles.header}>
@@ -541,13 +699,36 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
 
       <div className={styles.body}>
 
-        <div key={mapKey} className={styles.mapWrap}>
+        <div key={mapKey} className={styles.mapWrap} style={{position:"relative"}}>
           {loading && (
             <div className={styles.mapLoading}>
               <span className={styles.mapLoadingText}>Loading world…</span>
             </div>
           )}
           <div ref={mapRef} className={styles.map} />
+          {weather && weather !== "weather disabled" && (
+            <div style={{
+              position:"absolute", top:12, left:12, zIndex:10,
+              background:"rgba(255,255,255,0.92)", backdropFilter:"blur(8px)",
+              borderRadius:10, padding:"6px 12px",
+              fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12,
+              color:"#4a4744", boxShadow:"0 2px 8px rgba(0,0,0,.12)",
+              display:"flex", alignItems:"center", gap:6
+            }}>
+              {weather !== "fetching…" && (
+                <span style={{fontSize:14}}>
+                  {weather.includes("Rain") || weather.includes("Drizzle") ? "🌧" :
+                   weather.includes("Cloud") ? "☁️" :
+                   weather.includes("Snow") ? "❄️" :
+                   weather.includes("Thunder") ? "⛈" : "☀️"}
+                </span>
+              )}
+              <span style={{
+                color: weather === "fetching…" ? "#a8a5a0" : "#4a4744",
+                fontStyle: weather === "fetching…" ? "italic" : "normal"
+              }}>{weather}</span>
+            </div>
+          )}
         </div>
 
         <div className={`${styles.panel} ${selected || selectedActor ? styles.panelVisible : ""}`}>
@@ -634,10 +815,16 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
                       <>
                         <p className={styles.sectionLabel}>Staff</p>
                         <div className={styles.actorList}>
-                          {staff.map(a => (
-                            <div key={a.actor_id} className={styles.actorRow}>
+                        {staff.map(a => (
+                            <div key={a.actor_id} className={styles.actorRow}
+                              onClick={() => a.is_ambient ? setSelectedAmbient(a) : null}
+                              style={a.is_ambient ? {cursor:"pointer"} : {}}>
                               <div className={styles.actorAvWrap}>
-                                <div className={styles.actorInitial}>{a.name[0]}</div>
+                                {a.generated_portrait_url
+                                  ? <img src={a.generated_portrait_url} className={styles.actorPhoto} alt={a.name}
+                                      onError={e => { e.target.style.display = "none"; e.target.nextSibling.style.display = "flex"; }} />
+                                  : null}
+                                <div className={styles.actorInitial} style={{ display: a.generated_portrait_url ? "none" : "flex" }}>{a.name[0]}</div>
                               </div>
                               <div className={styles.actorInfo}>
                                 <p className={styles.actorName}>{a.name}</p>
@@ -658,16 +845,18 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
                     ) : (
                       <div className={styles.actorList}>
                         {visitors.map(a => (
-                          <div key={a.actor_id} className={styles.actorRow}>
+                          <div key={a.actor_id} className={styles.actorRow}
+                            onClick={() => a.is_ambient ? setSelectedAmbient(a) : null}
+                            style={a.is_ambient ? {cursor:"pointer"} : {}}>
                             <div className={styles.actorAvWrap}>
-                              {a.photo_url
+                              {(a.generated_portrait_url || a.photo_url)
                                 ? <img
-                                    src={resizedPhoto(a.photo_url, 64)}
+                                    src={a.generated_portrait_url || resizedPhoto(a.photo_url, 64)}
                                     className={styles.actorPhoto}
                                     onError={e => { e.target.style.display = "none"; e.target.nextSibling.style.display = "flex"; }}
                                   />
                                 : null}
-                              <div className={styles.actorInitial} style={{ display: a.photo_url ? "none" : "flex" }}>
+                              <div className={styles.actorInitial} style={{ display: (a.generated_portrait_url || a.photo_url) ? "none" : "flex" }}>
                                 {a.name[0]}
                               </div>
                             </div>
@@ -677,6 +866,9 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
                                 {a.in_transit ? "In transit" : a.activity_slug ? a.activity_slug.replace(/_/g, " ") : a.occupation || "—"}
                               </p>
                             </div>
+                            {a.is_ambient && (
+                              <span style={{fontSize:10, color:"#bbb", marginLeft:"auto", paddingLeft:6, flexShrink:0}}>ℹ</span>
+                            )}
                           </div>
                         ))}
                       </div>
@@ -686,6 +878,30 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
               </div>
 
               <div className={styles.panelFooter}>
+                {selected.meeting_session_id && (
+                  <button
+                    className={styles.spawnBtn}
+                    style={{ marginBottom: 8, background: "rgba(255,255,255,0.06)", color: "rgba(255,255,255,0.6)", border: "0.5px solid rgba(255,255,255,0.15)" }}
+                    onClick={() => {
+                      const ACTOR_COLORS = ["#c98a74", "#7aa4cc", "#8fbb8f", "#b89acc", "#c4b97a"];
+                      const participants = (selected.actors || [])
+                        .filter(a => !a.is_ambient)
+                        .map((a, i) => ({
+                          name:      a.name,
+                          initials:  a.name.split(" ").map(n => n[0]).join("").slice(0, 2).toUpperCase(),
+                          color:     ACTOR_COLORS[i % ACTOR_COLORS.length],
+                          photo_url: a.generated_portrait_url || (a.photo_url ? resizedPhoto(a.photo_url, 64) : null),
+                        }));
+                      setSneakData({
+                        sessionId:    selected.meeting_session_id,
+                        location:     selected,
+                        participants,
+                      });
+                    }}
+                  >
+                    Observe →
+                  </button>
+                )}
                 {selected.category === "residential" && selected.actors.length > 0 && !selected.actors.some(a => a.knows_player) ? (
                   <p className={styles.emptyState}>You don't know anyone here</p>
                 ) : (
@@ -706,5 +922,51 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
 
       </div>
     </div>
+
+    {/* Ambient NPC info bubble */}
+    {selectedAmbient && (
+      <div onClick={() => setSelectedAmbient(null)}
+        style={{position:"fixed",inset:0,zIndex:1100,display:"flex",alignItems:"center",justifyContent:"center",padding:24,background:"rgba(0,0,0,.4)"}}>
+        <div onClick={e => e.stopPropagation()}
+          style={{background:"#fff",borderRadius:16,padding:24,maxWidth:320,width:"100%",boxShadow:"0 16px 48px rgba(0,0,0,.18)",fontFamily:"'DM Sans',system-ui,sans-serif"}}>
+
+          {/* Header */}
+          <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16}}>
+            <div style={{width:44,height:44,borderRadius:"50%",background:"#f0ece4",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:600,color:"#8a7a60",flexShrink:0}}>
+              {selectedAmbient.name[0]}
+            </div>
+            <div style={{flex:1}}>
+              <div style={{fontSize:15,fontWeight:500,color:"#1a1814"}}>{selectedAmbient.name}{selectedAmbient.age ? `, ${selectedAmbient.age}` : ""}</div>
+              <div style={{fontSize:12,color:"#a8a5a0",marginTop:2}}>{selectedAmbient.occupation}</div>
+            </div>
+            <span style={{fontSize:10,padding:"3px 8px",borderRadius:20,background: selectedAmbient.is_staff ? "#f0ece4" : "#f5f5f5",color: selectedAmbient.is_staff ? "#8a7a60" : "#aaa",fontWeight:500}}>
+              {selectedAmbient.is_staff ? "Works here" : "Regular"}
+            </span>
+          </div>
+
+          {/* Psychology */}
+          {selectedAmbient.psychology && (
+            <div style={{borderTop:"1px solid #f0ece4",paddingTop:14,display:"flex",flexDirection:"column",gap:8}}>
+              {selectedAmbient.psychology.social_style && (
+                <p style={{margin:0,fontSize:13,color:"#4a4744",lineHeight:1.5}}>
+                  {selectedAmbient.psychology.social_style}
+                </p>
+              )}
+              {selectedAmbient.psychology.note && (
+                <p style={{margin:0,fontSize:12,color:"#a8a5a0",lineHeight:1.5,fontStyle:"italic"}}>
+                  {selectedAmbient.psychology.note}
+                </p>
+              )}
+            </div>
+          )}
+
+          <button onClick={() => setSelectedAmbient(null)}
+            style={{marginTop:18,width:"100%",padding:"9px 0",borderRadius:10,border:"1px solid #ede9e3",background:"none",fontSize:12,color:"#a8a5a0",cursor:"pointer",fontFamily:"'DM Sans',system-ui,sans-serif"}}>
+            Close
+          </button>
+        </div>
+      </div>
+    )}
+    </>
   );
 }

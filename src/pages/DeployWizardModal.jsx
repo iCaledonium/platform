@@ -17,13 +17,13 @@ function StepBar({ current }) {
     <div style={{ display:"flex", alignItems:"center", padding:"1rem 1.5rem 0" }}>
       {STEPS.map((label, i) => {
         const next = i + 1;
-        const done   = n < current;
-        const active = n === current;
+        const done   = next < current;
+        const active = next === current;
         return (
           <div key={label} style={{ display:"flex", alignItems:"center", flex: i < STEPS.length-1 ? 1 : "none" }}>
             <div style={{ display:"flex", alignItems:"center", gap:6, flexShrink:0 }}>
               <div style={{ width:24, height:24, borderRadius:"50%", display:"flex", alignItems:"center", justifyContent:"center", fontSize:11, fontWeight:500, flexShrink:0, background: done?"rgba(29,158,117,.12)":active?"#1a1814":"rgba(0,0,0,.06)", color: done?"#0f6e56":active?"#faf8f4":"#a8a5a0" }}>
-                {done ? "✓" : n}
+                {done ? "✓" : next}
               </div>
               <span style={{ ...S.sans, fontSize:11, color: active?"#1a1814":"#a8a5a0", fontWeight: active?500:400 }}>{label}</span>
             </div>
@@ -72,11 +72,11 @@ function StepWorld({ actor, state, setState }) {
       const timer = setInterval(() => { if (window.google?.maps) { setMapReady(true); clearInterval(t); } }, 200);
       return;
     }
-    const state = document.createElement("script");
-    s.id  = "gmaps-script";
-    s.src = `https://maps.googleapis.com/maps/api/js?key=${MAPS_KEY}`;
-    s.onload = () => setMapReady(true);
-    document.head.appendChild(s);
+    const script = document.createElement("script");
+    script.id  = "gmaps-script";
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${MAPS_KEY}`;
+    script.onload = () => setMapReady(true);
+    document.head.appendChild(script);
   }, []);
 
   // Init map
@@ -97,11 +97,11 @@ function StepWorld({ actor, state, setState }) {
       const lng = e.latLng.lng();
       placeMarker(lat, lng);
       try {
-        const resp = await fetch(`/api/places/reverse?lat=${lat}&lng=${lng}`);
+        const r = await fetch(`/api/places/reverse?lat=${lat}&lng=${lng}`);
         if (r.ok) {
           const data = await r.json();
-          setState(prev => ({...prev, home: { ...d, home_type: prev.home?.home_type }}));
-          setSearchQuery(d.address);
+          setState(prev => ({...prev, home: { ...data, home_type: prev.home?.home_type }}));
+          setSearchQuery(data.address);
         }
       } catch {}
     });
@@ -136,7 +136,7 @@ function StepWorld({ actor, state, setState }) {
   async function suggestNeighbourhood() {
     setSuggesting(true); setSuggestions([]);
     try {
-      const resp = await fetch(`/api/actors/${actor.id}/suggest-home`, { method:"POST", headers:{"Content-Type":"application/json"} });
+      const r = await fetch(`/api/actors/${actor.id}/suggest-home`, { method:"POST", headers:{"Content-Type":"application/json"} });
       if (r.ok) setSuggestions(await r.json());
     } catch {}
     setSuggesting(false);
@@ -145,10 +145,10 @@ function StepWorld({ actor, state, setState }) {
   async function suggestCareer() {
     setCareerSuggesting(true);
     try {
-      const resp = await fetch(`/api/actors/${actor.id}/suggest-career`, { method:"POST", headers:{"Content-Type":"application/json"} });
+      const r = await fetch(`/api/actors/${actor.id}/suggest-career`, { method:"POST", headers:{"Content-Type":"application/json"} });
       if (r.ok) {
         const data = await r.json();
-        setState(prev => ({...prev, career: { career_level: d.career_level, career_ladder: d.career_ladder, employment_type: d.employment_type, reputation_score: d.reputation_score ?? 0.5 }}));
+        setState(prev => ({...prev, career: { career_level: data.career_level, career_ladder: data.career_ladder, employment_type: data.employment_type, reputation_score: data.reputation_score ?? 0.5 }}));
       }
     } catch {}
     setCareerSuggesting(false);
@@ -157,7 +157,7 @@ function StepWorld({ actor, state, setState }) {
   async function suggestWorkplace() {
     setWorkSuggesting(true); setWorkSuggestions([]);
     try {
-      const resp = await fetch(`/api/actors/${actor.id}/suggest-workplace`, { method:"POST", headers:{"Content-Type":"application/json"} });
+      const r = await fetch(`/api/actors/${actor.id}/suggest-workplace`, { method:"POST", headers:{"Content-Type":"application/json"} });
       if (r.ok) setWorkSuggestions(await r.json());
     } catch {}
     setWorkSuggesting(false);
@@ -171,8 +171,8 @@ function StepWorld({ actor, state, setState }) {
       setWorkSearching(true);
       try {
         const country = state.world?.country || '';
-        const resp = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(q)}${country ? '&country='+country : ''}`, { credentials: 'include' });
-        if (r.ok) { const data = await r.json(); setWorkResults(Array.isArray(d) ? d : []); }
+        const r = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(q)}${country ? '&country='+country : ''}`, { credentials: 'include' });
+        if (r.ok) { const data = await r.json(); setWorkResults(Array.isArray(data) ? data : []); }
       } catch {}
       setWorkSearching(false);
     }, 400);
@@ -185,11 +185,11 @@ function StepWorld({ actor, state, setState }) {
     try {
       const controller = new AbortController();
       setTimeout(() => controller.abort(), 5000);
-      const resp = await fetch(`/api/places/details?place_id=${p.place_id}`, { signal: controller.signal });
+      const r = await fetch(`/api/places/details?place_id=${p.place_id}`, { signal: controller.signal });
       if (r.ok) {
         const data = await r.json();
-        setState(prev => ({...prev, workplace: { ...prev.workplace, ...d }}));
-        setWorkQuery(d.name + " — " + d.address);
+        setState(prev => ({...prev, workplace: { ...prev.workplace, ...data }}));
+        setWorkQuery(data.name + " — " + data.address);
       }
     } catch {}
   }
@@ -211,11 +211,11 @@ function StepWorld({ actor, state, setState }) {
         const lat = e.latLng.lat();
         const lng = e.latLng.lng();
         try {
-          const resp = await fetch(`/api/places/reverse?lat=${lat}&lng=${lng}`);
+          const r = await fetch(`/api/places/reverse?lat=${lat}&lng=${lng}`);
           if (r.ok) {
             const data = await r.json();
-            setState(prev => ({...prev, workplace: { ...d }}));
-            setWorkQuery(d.address);
+            setState(prev => ({...prev, workplace: { ...data }}));
+            setWorkQuery(data.address);
           }
         } catch {}
       });
@@ -246,9 +246,9 @@ function StepWorld({ actor, state, setState }) {
         const country = state.world?.country || '';
         const url = `/api/places/autocomplete?q=${encodeURIComponent(q)}${country ? '&country='+country : ''}`;
         console.log('[searchPlaces] fetching', url);
-        const resp = await fetch(url, { credentials: 'include' });
+        const r = await fetch(url, { credentials: 'include' });
         console.log('[searchPlaces] status', r.status);
-        if (r.ok) { const data = await r.json(); console.log('[searchPlaces] results', d.length); setSearchResults(Array.isArray(d) ? d : []); }
+        if (r.ok) { const data = await r.json(); console.log('[searchPlaces] results', data.length); setSearchResults(Array.isArray(data) ? data : []); }
       } catch(e) { console.error('[searchPlaces] error', e); }
       setSearching(false);
     }, 400);
@@ -257,7 +257,7 @@ function StepWorld({ actor, state, setState }) {
   function pickSuggestion(s) {
     const city = state.world?.city || "Stockholm";
     const query = s.neighbourhood + " " + city;
-    setSearchQuery(q); searchPlaces(q);
+    setSearchQuery(query); searchPlaces(query);
   }
 
   async function pickPlace(p) {
@@ -267,11 +267,11 @@ function StepWorld({ actor, state, setState }) {
     try {
       const controller = new AbortController();
       setTimeout(() => controller.abort(), 5000);
-      const resp = await fetch(`/api/places/details?place_id=${p.place_id}`, { signal: controller.signal });
+      const r = await fetch(`/api/places/details?place_id=${p.place_id}`, { signal: controller.signal });
       if (r.ok) {
         const data = await r.json();
-        setState(prev => ({...prev, home: { ...prev.home, ...d }}));
-        setSearchQuery(d.address);
+        setState(prev => ({...prev, home: { ...prev.home, ...data }}));
+        setSearchQuery(data.address);
       }
     } catch {}
   }
@@ -545,7 +545,7 @@ function StepRelationships({ actor, state, setState }) {
     if (!picked || !selType) return;
     setInspiring(true);
     try {
-      const resp = await fetch(`/api/actors/${actor.id}/inspire-relationship`, {
+      const r = await fetch(`/api/actors/${actor.id}/inspire-relationship`, {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({
           rel_type_id:   selType.id,
@@ -584,12 +584,12 @@ function StepRelationships({ actor, state, setState }) {
   }
 
   function editRel(i) {
-    const resp = (state.relationships||[])[i];
-    setPicked(r.character);
-    setSelType({ id:r.rel_type_id, name:r.rel_type_name, dimension_id:r.dimension_id, dimension_name:r.dimension_name });
-    setDescription(r.description||"");
-    setContext(r.context||"");
-    setScores(r.scores || defaultScores[r.dimension_id] || defaultScores["dim-social"]);
+    const rel = (state.relationships||[])[i];
+    setPicked(rel.character);
+    setSelType({ id:rel.rel_type_id, name:rel.rel_type_name, dimension_id:rel.dimension_id, dimension_name:rel.dimension_name });
+    setDescription(rel.description||"");
+    setContext(rel.context||"");
+    setScores(rel.scores || defaultScores[rel.dimension_id] || defaultScores["dim-social"]);
     setEditingIdx(i);
   }
 
@@ -763,7 +763,7 @@ function StepSchedule({ actor, state, setState }) {
   async function generate() {
     setGenerating(true); setError("");
     try {
-      const resp = await fetch(`/api/actors/${actor.id}/generate-schedule`, {
+      const r = await fetch(`/api/actors/${actor.id}/generate-schedule`, {
         method: "POST",
         headers: { "Content-Type":"application/json" },
         body: JSON.stringify({
@@ -775,7 +775,8 @@ function StepSchedule({ actor, state, setState }) {
       });
       if (r.ok) {
         const slots = await r.json();
-        setState(p => ({...p, schedule: slots, fromWeek}));
+        const normalized = slots.map(s => ({...s, day_of_week: (s.day_of_week || "").toLowerCase().trim()}));
+        setState(p => ({...p, schedule: normalized, fromWeek}));
       } else {
         setError("Generation failed — try again.");
       }
@@ -900,8 +901,8 @@ function StepMedia({ actor, state, setState }) {
     fd.append("state_slug", "profile");
     fd.append("media_type", "photo");
     if (state.world?.id) fd.append("world_id", state.world.id);
-    const resp = await fetch(`/api/actors/${actor.id}/media`, { method:"POST", body:fd });
-    if (r.ok) { const data = await r.json(); setProfilePhoto(d); }
+    const r = await fetch(`/api/actors/${actor.id}/media`, { method:"POST", body:fd });
+    if (r.ok) { const data = await r.json(); setProfilePhoto(data); }
     setUploading(false);
   }
 
@@ -921,7 +922,7 @@ function StepMedia({ actor, state, setState }) {
     fd.append("audio", file);
     fd.append("media_type", "voice_reference");
     fd.append("state_slug", "voice_reference");
-    const resp = await fetch(`/api/actors/${actor.id}/media`, { method:"POST", body:fd });
+    const r = await fetch(`/api/actors/${actor.id}/media`, { method:"POST", body:fd });
     if (r.ok) setVoiceDone(true);
     setVoiceUploading(false);
   }

@@ -106,8 +106,8 @@ function ResidencesTab({ world }) {
       // Show modal immediately with coords, then update with real address
       setAssignModal({ lat, lng, address: `${lat.toFixed(4)}, ${lng.toFixed(4)}`, place_id: null, loading: true });
       const resp = await fetch(`/api/places/reverse?lat=${lat}&lng=${lng}`).then(r=>r.ok?r.json():null);
-      if (r?.address) {
-        setAssignModal({ lat, lng, address: r.address, place_id: r.place_id, loading: false });
+      if (resp?.address) {
+        setAssignModal({ lat, lng, address: resp.address, place_id: resp.place_id, loading: false });
       } else {
         setAssignModal(prev => prev ? { ...prev, loading: false } : null);
       }
@@ -263,7 +263,7 @@ function ResidencesTab({ world }) {
                 const query = e.target.value; setHomeQuery(q);
                 if (q.length < 3) { setHomeSuggs([]); return; }
                 const resp = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(q)}`).then(r=>r.ok?r.json():[]);
-                setHomeSuggs(Array.isArray(r)?r:[]);
+                setHomeSuggs(Array.isArray(resp)?resp:[]);
               }} placeholder={`Search address in ${world.city||"city"}…`}
                 style={{width:"100%",boxSizing:"border-box",padding:"9px 12px",borderRadius:9,border:"1px solid rgba(0,0,0,.12)",fontSize:13,outline:"none"}}
               />
@@ -313,6 +313,173 @@ function ResidencesTab({ world }) {
   );
 }
 
+// ── LlmTab ───────────────────────────────────────────────────────────────────
+const CAPABILITIES = [
+  { key:"encounter",          label:"Encounter",          group:"Output",   desc:"Real-time in-person scene generation" },
+  { key:"synthesis",          label:"Synthesis",          group:"Output",   desc:"ThoughtEngine full psychology synthesis" },
+  { key:"knock",              label:"Knock",              group:"Output",   desc:"Door knock decision" },
+  { key:"door_narrative",     label:"Door narrative",     group:"Output",   desc:"Knock arrival narrative" },
+  { key:"message_content",    label:"Message content",    group:"Output",   desc:"SMS content generation" },
+  { key:"ambient_chat",       label:"Ambient chat",       group:"Output",   desc:"Ambient NPC chat generation" },
+  { key:"social_process",     label:"Social process",     group:"Wave",     desc:"Wave 2 — relationship graph reasoning" },
+  { key:"memory_process",     label:"Memory process",     group:"Wave",     desc:"Wave 2 — trigger matching & summarization" },
+  { key:"affect_process",     label:"Affect process",     group:"Wave",     desc:"Wave 3 — emotion delta generation" },
+  { key:"drive_process",      label:"Drive process",      group:"Wave",     desc:"Wave 3 — impulse generation" },
+  { key:"decisions",          label:"Decisions",          group:"Planning", desc:"AgentLoop pool decisions" },
+  { key:"thoughts",           label:"Thoughts",           group:"Planning", desc:"Internal actor reflection" },
+  { key:"memory",             label:"Memory",             group:"Planning", desc:"Memory summarization" },
+  { key:"planning",           label:"Planning",           group:"Planning", desc:"Schedule & objective generation" },
+  { key:"relationship_score", label:"Rel scoring",        group:"Planning", desc:"Warmth/trust/tension scoring" },
+  { key:"media_prompt",       label:"Media prompt",       group:"Planning", desc:"Kling/Hedra prompt generation" },
+];
+
+const MODEL_OPTIONS = [
+  { value:"nevoria",    label:"Nevoria 70B (UpCloud)" },
+  { value:"dirty-muse", label:"dirty-muse 9B (M4)" },
+  { value:"haiku",      label:"Claude Haiku (API)" },
+];
+
+const PROVIDER_DEFAULTS = {
+  nevoria_url:    "http://212.147.242.70:11434",
+  dirty_muse_url: "http://192.168.1.60:11434",
+};
+
+function LlmTab({ world }) {
+  const [config, setConfig]         = useState({});
+  const [available, setAvailable]   = useState([]);
+  const [providers, setProviders]   = useState({ nevoria_url: PROVIDER_DEFAULTS.nevoria_url, dirty_muse_url: PROVIDER_DEFAULTS.dirty_muse_url });
+  const [loading, setLoading]       = useState(true);
+  const [saving, setSaving]         = useState(null); // capability being saved
+  const [savingProviders, setSavingProviders] = useState(false);
+  const [status, setStatus]         = useState(null);
+
+  useEffect(() => {
+    fetch(`/api/worlds/${world.id}/llm-config`)
+      .then(r => r.ok ? r.json() : {})
+      .then(data => {
+        // capabilities: { encounter: { llm_id, name, alias }, ... }
+        // available: [{ id, name, alias, url, model_tag, provider }, ...]
+        const caps = {};
+        Object.entries(data.capabilities || {}).forEach(([cap, v]) => {
+          caps[cap] = v.llm_id || v.alias || "dirty-muse";
+        });
+        setConfig(caps);
+        setAvailable(data.available || []);
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+  }, [world.id]);
+
+  async function setCapability(capability, llm_id) {
+    setSaving(capability);
+    setConfig(prev => ({ ...prev, [capability]: llm_id }));
+    try {
+      await fetch(`/api/worlds/${world.id}/llm-config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ world_id: world.id, capability, llm_id }),
+      });
+      const llm = available.find(l => l.id === llm_id);
+      setStatus({ ok: true, msg: `${capability} → ${llm?.name || llm_id}` });
+      setTimeout(() => setStatus(null), 2000);
+    } catch {
+      setStatus({ ok: false, msg: "Save failed" });
+    }
+    setSaving(null);
+  }
+
+  async function saveProviders() {
+    setSavingProviders(true);
+    try {
+      await fetch(`/api/worlds/${world.id}/llm-config/providers`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(providers),
+      });
+      setStatus({ ok: true, msg: "Provider URLs saved" });
+      setTimeout(() => setStatus(null), 2000);
+    } catch {
+      setStatus({ ok: false, msg: "Save failed" });
+    }
+    setSavingProviders(false);
+  }
+
+  if (loading) return <p style={{fontSize:12,color:"#a8a5a0",padding:8}}>Loading…</p>;
+
+  return (
+    <div style={{display:"flex",gap:20}}>
+      {/* Capabilities */}
+      <div style={{flex:1}}>
+        <p style={{fontSize:10,color:"#a8a5a0",letterSpacing:".1em",textTransform:"uppercase",margin:"0 0 10px"}}>Capabilities</p>
+        <div style={{display:"flex",flexDirection:"column",gap:14}}>
+          {["Output","Wave","Planning"].map(group => (
+            <div key={group}>
+              <p style={{fontSize:10,color:"#a8a5a0",letterSpacing:".1em",textTransform:"uppercase",margin:"0 0 6px"}}>{group}</p>
+              <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                {CAPABILITIES.filter(c => c.group === group).map(cap => (
+                  <div key={cap.key} style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+                    padding:"8px 12px",background:"rgba(0,0,0,0.02)",border:"1px solid rgba(0,0,0,0.06)",borderRadius:7}}>
+                    <div>
+                      <div style={{fontSize:12,fontWeight:500,color:"#1a1814"}}>{cap.label}</div>
+                      <div style={{fontSize:10,color:"#a8a5a0"}}>{cap.desc}</div>
+                    </div>
+                    <select
+                      value={config[cap.key] || ""}
+                      onChange={e => setCapability(cap.key, e.target.value)}
+                      disabled={saving === cap.key}
+                      style={{fontSize:11,padding:"4px 7px",borderRadius:6,border:"1px solid rgba(0,0,0,0.12)",
+                        background:"#fff",color:"#1a1814",cursor:"pointer",minWidth:170}}>
+                      <option value="">— default —</option>
+                      {available.map(llm => (
+                        <option key={llm.id} value={llm.id}>{llm.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Providers */}
+      <div style={{width:260,flexShrink:0}}>
+        <p style={{fontSize:10,color:"#a8a5a0",letterSpacing:".1em",textTransform:"uppercase",margin:"0 0 10px"}}>Provider URLs</p>
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          {[
+            { key:"nevoria_url", label:"Nevoria (UpCloud)" },
+            { key:"dirty_muse_url", label:"dirty-muse (M4)" },
+          ].map(p => (
+            <div key={p.key}>
+              <label style={{fontSize:11,color:"#a8a5a0",display:"block",marginBottom:4}}>{p.label}</label>
+              <input
+                value={providers[p.key] || ""}
+                onChange={e => setProviders(prev => ({ ...prev, [p.key]: e.target.value }))}
+                style={{width:"100%",boxSizing:"border-box",padding:"8px 10px",borderRadius:7,
+                  border:"1px solid rgba(0,0,0,0.12)",fontSize:12,color:"#1a1814",outline:"none"}}
+              />
+            </div>
+          ))}
+          <button onClick={saveProviders} disabled={savingProviders}
+            style={{fontSize:11,letterSpacing:".06em",textTransform:"uppercase",padding:"8px 14px",
+              borderRadius:7,background:"#1a1814",color:"#faf8f4",border:"none",cursor:"pointer",marginTop:4}}>
+            {savingProviders ? "Saving…" : "Save URLs"}
+          </button>
+        </div>
+
+        {status && (
+          <div style={{marginTop:12,padding:"8px 12px",borderRadius:7,fontSize:12,
+            background: status.ok ? "rgba(29,158,117,0.08)" : "rgba(192,57,43,0.08)",
+            border: `1px solid ${status.ok ? "rgba(29,158,117,0.3)" : "rgba(192,57,43,0.3)"}`,
+            color: status.ok ? "#1D9E75" : "#993c1d"}}>
+            {status.ok ? "✓" : "✕"} {status.msg}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── WorldConfigModal ──────────────────────────────────────────────────────────
 function WorldConfigModal({ world, onClose, onDeleted }) {
   const [activeTab, setActiveTab] = useState("modules");
@@ -352,6 +519,7 @@ function WorldConfigModal({ world, onClose, onDeleted }) {
   const TABS = [
     { key:"modules",    label:"Modules" },
     { key:"residences", label:"Residences" },
+    { key:"llm",        label:"LLM" },
     { key:"info",       label:"Info" },
   ];
 
@@ -359,7 +527,7 @@ function WorldConfigModal({ world, onClose, onDeleted }) {
     <div style={{position:"fixed",inset:0,zIndex:1000,background:"rgba(0,0,0,0.5)",
       display:"flex",alignItems:"center",justifyContent:"center",padding:"1rem"}}>
       <div style={{background:"#faf8f4",borderRadius:16,width:"100%",
-        maxWidth: activeTab==="residences" ? 920 : 520,
+        maxWidth: activeTab==="residences" || activeTab==="llm" ? 920 : 520,
         boxShadow:"0 24px 64px rgba(0,0,0,0.2)",overflow:"hidden",...F}}>
         <div style={{padding:"20px 24px 0"}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
@@ -385,6 +553,13 @@ function WorldConfigModal({ world, onClose, onDeleted }) {
         {activeTab==="residences" && (
           <div style={{height:520}}>
             <ResidencesTab world={world} />
+          </div>
+        )}
+
+        {/* LLM tab */}
+        {activeTab==="llm" && (
+          <div style={{padding:"14px 24px 20px",height:520,overflowY:"auto"}}>
+            <LlmTab world={world} />
           </div>
         )}
 

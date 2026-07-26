@@ -4,7 +4,7 @@ import styles from "./PresenceView.module.css";
 const SIMULATOR_URL = "https://anima.simulator.ngrok.dev";
 
 
-export default function PresenceView({ world, user, sceneData, actorName, actorPhoto, actorId: actorIdProp, encounter_id, onLeave }) {
+export default function VisitorPresenceView({ world, user, sceneData, actorName, actorPhoto, actorId: actorIdProp, encounter_id, onLeave }) {
   const { location } = sceneData;
   const playerActorId = user?.worlds?.find(w => w.world_id === world.id)?.actor_id;
 
@@ -256,8 +256,8 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
         if (payload.vitals) updateVitals(payload.vitals);
         setSending(false);
         setFirstWordsDone(true);
-        if (payload.text && (currentResponseId.current === null || currentResponseId.current !== lastFinalisedResponseIdRef.current)) {
-          lastFinalisedResponseIdRef.current = currentResponseId.current;
+        if (payload.text && !caughtUpRef.current) {
+          caughtUpRef.current = true;
           currentSpeakerRef.current = actorName;
           const ts = payload.fired_at ? new Date(payload.fired_at) : new Date();
           finaliseResponse(displayText(payload.text), payload.text, ts);
@@ -295,15 +295,7 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
           setCurrentLocation(prev => {
             if (prev !== newLoc) {
               const switchLocation = () => {
-                if (bgBase) {
-                  const preload = new Image();
-                  preload.crossOrigin = "anonymous";
-                  preload.src = `${bgBase}/location_home_${newLoc}_${currentPosition}.png`;
-                  preload.onload = () => { bgImgRef.current = preload; currentLocationRef.current = newLoc; setCurrentLocation(newLoc); };
-                  preload.onerror = () => { currentLocationRef.current = newLoc; setCurrentLocation(newLoc); };
-                } else {
-                  currentLocationRef.current = newLoc; setCurrentLocation(newLoc);
-                }
+                currentLocationRef.current = newLoc; setCurrentLocation(newLoc);
               };
               // Play beckon clip first, then switch location after clip ends
               playActionClip("beckons");
@@ -565,7 +557,6 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
   const actorIdFromPhoto = actorPhoto?.match(/\/actors\/([^/]+)\//)?.[1];
   const actorId = actorIdProp || sceneData?.location?.actors?.find(a => a.actor_id !== user?.worlds?.find(w => w.world_id === worldId)?.actor_id)?.actor_id || actorIdFromPhoto;
   const videoBase = actorId ? `/media/worlds/${worldId}/actors/${actorId}/videos` : null;
-  const bgBase    = actorId ? `/media/worlds/${worldId}/actors/${actorId}/backgrounds` : null;
 
   // Fetch available media for the sidebar
   useEffect(() => {
@@ -578,20 +569,13 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
       .catch(() => {});
   }, [worldId, actorId, encounter_id]);
 
-  // Load background image — only for standing position (_gs videos need a background)
-  useEffect(() => {
-    if (!bgBase || currentPosition !== "standing") {
-      if (currentPosition !== "standing") bgImgRef.current = null;
-      return;
-    }
-    const url = `${bgBase}/location_home_${currentLocation}_${currentPosition}.png`;
-    console.log("[BG] loading:", url);
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.src = url;
-    img.onload = () => { console.log("[BG] loaded ok"); bgImgRef.current = img; };
-    img.onerror = (e) => { console.log("[BG] error loading bg:", e); };
-  }, [bgBase, currentLocation, currentPosition]);
+  // Background image loading intentionally disabled here — the background
+  // media folder is keyed by actorId (her own apartment's rooms), which is
+  // wrong for this reversed flow where she's visiting the player's home.
+  // bgImgRef simply stays null; the render loop already falls back cleanly
+  // to its solid dark fill, and chroma-key compositing for standing videos
+  // is unaffected since that's gated independently of whether a background
+  // image exists.
 
   useEffect(() => {
     console.log("[VIDEO] effect triggered - videoBase:", !!videoBase, "encounter_id:", !!encounter_id);
@@ -1061,28 +1045,6 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
                 <span/><span/><span/>
               </div>
             )}
-          </div>
-
-          {/* Context action buttons */}
-          <div style={{display:"flex",gap:6,padding:"0 12px 6px",flexWrap:"wrap"}}>
-            <button onClick={async () => {
-              try {
-                const resp = await fetch(`/api/worlds/${world.id}/player/home`);
-                const data = await r.ok ? r.json() : null;
-                if (d?.home_address) {
-                  setChatInput(prev => (prev ? prev + " " : "") + `[📍 ${d.home_address}]`);
-                } else {
-                  setChatInput(prev => (prev ? prev + " " : "") + "[📍 No home address set]");
-                }
-              } catch(e) { console.error(e); }
-            }} style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,padding:"4px 10px",borderRadius:20,border:"1px solid rgba(255,255,255,.12)",background:"rgba(255,255,255,.06)",color:"rgba(255,255,255,.6)",cursor:"pointer"}}>
-              📍 Share home address
-            </button>
-            <button onClick={() => {
-              setChatInput(prev => (prev ? prev + " " : "") + "Would you like to stay over tonight?");
-            }} style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,padding:"4px 10px",borderRadius:20,border:"1px solid rgba(255,255,255,.12)",background:"rgba(255,255,255,.06)",color:"rgba(255,255,255,.6)",cursor:"pointer"}}>
-              🌙 Ask to stay over
-            </button>
           </div>
 
           <div className={styles.inputRow}>

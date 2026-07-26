@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import DeployWizardModal from "./DeployWizardModal.jsx";
+import ActorModelPanel from "./ActorModelPanel.jsx";
 
 const STYLE_COLOR = {
   fearful_avoidant:  { bg: "rgba(55,138,221,.10)",  border: "rgba(55,138,221,.2)",  text: "#185fa5", init: "rgba(55,138,221,.15)" },
@@ -70,7 +71,7 @@ function InspireBtn({ fieldKey, label, context, onResult, disabled }) {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({ prompt:`${context}\n\nWrite a compelling "${label}" for this character. Return only the text — no labels, no JSON, 2-3 sentences max.` }),
       });
-      const data = await r.json();
+      const data = await resp.json();
       let val = (data.text||"").trim().replace(/```json|```/gi,"").trim();
       try { const j=JSON.parse(val); val=j[fieldKey]||j.text||j.value||val; } catch {}
       onResult(val);
@@ -101,14 +102,14 @@ function EFieldInspire({ label, fieldKey, value, onChange, tall, context }) {
 function ScoreBar({ label, value, danger }) {
   const raw = value ?? 0;
   const val = Math.round(raw <= 1.0 && raw > 0 ? raw * 100 : raw);
-  const color = danger && v > 70 ? "#c0392b" : danger && v > 50 ? "#b05c08" : "#6b6760";
+  const color = danger && val > 70 ? "#c0392b" : danger && val > 50 ? "#b05c08" : "#6b6760";
   return (
     <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:8 }}>
       <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, color:"#6b6760", width:130, flexShrink:0 }}>{label}</div>
       <div style={{ flex:1, height:4, background:"rgba(0,0,0,.08)", borderRadius:2, overflow:"hidden" }}>
-        <div style={{ width:`${v}%`, height:"100%", background: color, borderRadius:2, transition:"width .4s" }} />
+        <div style={{ width:`${val}%`, height:"100%", background: color, borderRadius:2, transition:"width .4s" }} />
       </div>
-      <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, fontWeight:500, color:"#1a1814", width:26, textAlign:"right" }}>{v}</div>
+      <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, fontWeight:500, color:"#1a1814", width:26, textAlign:"right" }}>{val}</div>
     </div>
   );
 }
@@ -141,10 +142,10 @@ function IdentityPanel({ d, editing, setEditData }) {
   const upd = (path, val) => setEditData(prev => {
     const next = {...prev};
     const parts = path.split(".");
-    let obj = n;
+    let obj = next;
     for (let i=0; i<parts.length-1; i++) obj = obj[parts[i]] = {...obj[parts[i]]};
     obj[parts[parts.length-1]] = val;
-    return n;
+    return next;
   });
   if (!editing) return (
     <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14 }}>
@@ -517,7 +518,7 @@ function MediaPanel({ actorId }) {
       const url = URL.createObjectURL(file);
       img.onload = () => {
         const scale = Math.min(1, maxPx / Math.max(img.width, img.height));
-        const ctx = document.createElement("canvas");
+        const c = document.createElement("canvas");
         c.width = Math.round(img.width*scale); c.height = Math.round(img.height*scale);
         c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
         URL.revokeObjectURL(url);
@@ -540,8 +541,8 @@ function MediaPanel({ actorId }) {
     fd.append("filename", slug+".jpg");
     if (selectedWorld) fd.append("world_id", selectedWorld);
     const resp = await fetch(`/api/actors/${actorId}/media`, { method:"POST", body:fd });
-    const data = await r.json();
-    setMedia(prev => [...prev, { id:d.id, media_type:"state_image", state_slug:slug, url:d.url, filename:d.filename }]);
+    const data = await resp.json();
+    setMedia(prev => [...prev, { id:data.id, media_type:"state_image", state_slug:slug, url:data.url, filename:data.filename }]);
     setUploading(null);
   }
 
@@ -554,7 +555,7 @@ function MediaPanel({ actorId }) {
       const url = URL.createObjectURL(file);
       img.onload = () => {
         const MAX = 1200, scale = Math.min(1, MAX / Math.max(img.width, img.height));
-        const ctx = document.createElement("canvas");
+        const c = document.createElement("canvas");
         c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
         c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
         URL.revokeObjectURL(url);
@@ -570,10 +571,10 @@ function MediaPanel({ actorId }) {
     fd.append("filename", slug+".jpg");
     if (selectedWorld) fd.append("world_id", selectedWorld);
     const resp = await fetch(`/api/actors/${actorId}/media`, { method:"POST", body:fd });
-    const data = await r.json();
+    const data = await resp.json();
     setMedia(prev => {
       const filtered = prev.filter(m => !(m.media_type==="photo" && m.state_slug===slug));
-      return [...filtered, { id:d.id, media_type:"photo", state_slug:slug, url:d.url, filename:d.filename }];
+      return [...filtered, { id:data.id, media_type:"photo", state_slug:slug, url:data.url, filename:data.filename }];
     });
     setUploading(null);
   }
@@ -624,7 +625,7 @@ function MediaPanel({ actorId }) {
             return (
               <div key={slot.slug}
                 onDragOver={e => e.preventDefault()}
-                onDrop={e => { e.preventDefault(); const file = e.dataTransfer.files[0]; if (f) uploadSlot(slot.slug, f); }}
+                onDrop={e => { e.preventDefault(); const file = e.dataTransfer.files[0]; if (file) uploadSlot(slot.slug, file); }}
                 onClick={() => { if (!existing) { activeSlotRef.current = slot.slug; fileRef.current?.click(); }}}
                 style={{ border:`1px dashed ${existing?"rgba(176,92,8,0.4)":"rgba(0,0,0,0.12)"}`, borderRadius:10, overflow:"hidden", aspectRatio:"3/4", position:"relative", cursor:existing?"default":"pointer", background:"rgba(255,255,255,0.5)" }}>
                 {uploading===slot.slug && (
@@ -652,7 +653,7 @@ function MediaPanel({ actorId }) {
           })}
         </div>
         <input ref={fileRef} type="file" accept="image/*" style={{ display:"none" }}
-          onChange={e => { const file = e.target.files[0]; if (f && activeSlotRef.current) uploadSlot(activeSlotRef.current, f); e.target.value=""; }} />
+          onChange={e => { const file = e.target.files[0]; if (file && activeSlotRef.current) uploadSlot(activeSlotRef.current, file); e.target.value=""; }} />
       </div>
 
       {/* Animations — grouped by scene, playable */}
@@ -720,9 +721,9 @@ function AnimationsPanel({ videos, archivedVideos = [], worldName, selectedWorld
     setArchiving(true);
     try {
       const resp = await fetch(`/api/worlds/${selectedWorld}/actors/${actorId}/archive-media`, { method:"POST" });
-      const data = await r.json();
+      const data = await resp.json();
       if (onArchived) onArchived();
-      alert(`Archived ${d.archived || 0} videos.`);
+      alert(`Archived ${data.archived || 0} videos.`);
     } catch { alert("Archive failed."); }
     setArchiving(false);
   }
@@ -894,10 +895,10 @@ function VideoThumb({ url, onClick }) {
         canvasEl.width = 240; canvasEl.height = 180;
         const ctx = canvasEl.getContext("2d");
         const vw = v.videoWidth||240, vh = v.videoHeight||180;
-        const scale = Math.max(c.width/vw, c.height/vh);
-        const sw = c.width/scale, sh = c.height/scale;
-        ctx.drawImage(v, (vw-sw)/2, (vh-sh)/2, sw, sh, 0, 0, c.width, c.height);
-        setThumb(c.toDataURL("image/jpeg", 0.8));
+        const scale = Math.max(canvasEl.width/vw, canvasEl.height/vh);
+        const sw = canvasEl.width/scale, sh = canvasEl.height/scale;
+        ctx.drawImage(v, (vw-sw)/2, (vh-sh)/2, sw, sh, 0, 0, canvasEl.width, canvasEl.height);
+        setThumb(canvasEl.toDataURL("image/jpeg", 0.8));
       } catch(e) {}
     };
     v.onerror = () => {};
@@ -967,8 +968,8 @@ function StateAnimationsSection({ actorId, animations, onUploaded, onDeleted, se
     fd.append("filename", `${slug}.mp4`);
     if (selectedWorld) fd.append("world_id", selectedWorld);
     const resp = await fetch(`/api/actors/${actorId}/media`, { method:"POST", body:fd });
-    const data = await r.json();
-    onUploaded({ id:d.id, media_type:"animation", state_slug:slug, url:d.url, filename:d.filename });
+    const data = await resp.json();
+    onUploaded({ id:data.id, media_type:"animation", state_slug:slug, url:data.url, filename:data.filename });
     setUploading(null);
   }
 
@@ -1290,6 +1291,7 @@ const NAV = [
   { id: "inplay",      label: "In Play",               doneKey: () => true },
   { section: "Media" },
   { id: "media",       label: "Photos & media",        doneKey: d => !!d?.actor?.photo_url },
+  { id: "model3d",     label: "3D character",         doneKey: () => false },
   { section: "Meta" },
   { id: "diagnoses",   label: "Diagnoses",             doneKey: d => d?.diagnoses?.length > 0 },
   { id: "expenses",    label: "Expenses",              doneKey: d => d?.expenses?.length > 0 },
@@ -1324,7 +1326,7 @@ export default function ActorsEditorPage() {
   );
 
   const { actor: a } = data;
-  const ctx = sc(a?.attachment_style);
+  const c = sc(a?.attachment_style);
 
   function startEdit() {
     setEditData(JSON.parse(JSON.stringify(data)));
@@ -1354,16 +1356,17 @@ export default function ActorsEditorPage() {
   const viewData = editing ? editData : data;
 
   const panels = {
-    identity:    <IdentityPanel    d={d} editing={editing} setEditData={setEditData} />,
-    psych:       <PsychPanel       d={d} editing={editing} setEditData={setEditData} />,
-    assessments: <AssessmentsPanel d={d} editing={editing} setEditData={setEditData} actorId={id} />,
-    mental:      <MentalPanel      d={d} editing={editing} setEditData={setEditData} />,
-    lifestyle:   <LifestylePanel   d={d} editing={editing} setEditData={setEditData} />,
-    economic:    <EconomicPanel    d={d} editing={editing} setEditData={setEditData} />,
+    identity:    <IdentityPanel    d={viewData} editing={editing} setEditData={setEditData} />,
+    psych:       <PsychPanel       d={viewData} editing={editing} setEditData={setEditData} />,
+    assessments: <AssessmentsPanel d={viewData} editing={editing} setEditData={setEditData} actorId={id} />,
+    mental:      <MentalPanel      d={viewData} editing={editing} setEditData={setEditData} />,
+    lifestyle:   <LifestylePanel   d={viewData} editing={editing} setEditData={setEditData} />,
+    economic:    <EconomicPanel    d={viewData} editing={editing} setEditData={setEditData} />,
     inplay:      <InPlayPanel      actorId={id} />,
     media:       <MediaPanel       actorId={id} />,
-    diagnoses:   <MentalPanel      d={d} editing={editing} setEditData={setEditData} />,
-    expenses:    <EconomicPanel    d={d} editing={editing} setEditData={setEditData} />,
+    model3d:     <ActorModelPanel  actorId={id} />,
+    diagnoses:   <MentalPanel      d={viewData} editing={editing} setEditData={setEditData} />,
+    expenses:    <EconomicPanel    d={viewData} editing={editing} setEditData={setEditData} />,
   };
 
   const activeNav = NAV.find(n => n.id === tab);

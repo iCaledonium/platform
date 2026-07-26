@@ -54,7 +54,7 @@ function AccountPicker({ org, onSelect, onBack }) {
 
   function handleNext() {
     if (selected === null) return;
-    const msg = members[selected];
+    const m = members[selected];
     if (!m.enrolled) {
       window.location.href = `/enroll?user_id=${m.id}`;
       return;

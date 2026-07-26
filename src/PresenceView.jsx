@@ -132,7 +132,6 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
   const streamingTextRef = useRef("");   // raw token stream accumulator
   const ttsNextIdx    = useRef(0);
   const currentResponseId = useRef(null);
-  const lastFinalisedResponseIdRef = useRef(null);
   const ttsPlaying    = useRef(false);
 
   const timeStr = new Date().toLocaleTimeString("sv-SE", {
@@ -140,34 +139,12 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
   });
 
   // ── On mount: signal entry, open SSE ─────────────────────────────────────
-  const caughtUpRef = useRef(false);
-
   useEffect(() => {
     if (!playerActorId || !encounter_id) return;
 
     // Signal player has entered — triggers optional opening words + vitals broadcast
     // Fallback: unblock input after 30s even if first_words never arrives
     const firstWordsTimeout = setTimeout(() => setFirstWordsDone(true), 30000);
-
-    // Catch up on anything already generated before this view (or its SSE
-    // connection) existed — specifically knock_user_door, where first_words
-    // fires immediately when the encounter starts, likely before the
-    // frontend has finished mounting. No-op for the knock trigger, since
-    // conversation_log is legitimately still empty at this point there —
-    // first_words for that flow only starts once /enter is called below.
-    fetch(`/api/worlds/${world.id}/encounter/${encounter_id}`)
-      .then(r => r.ok ? r.json() : null)
-      .then(data => {
-        if (caughtUpRef.current) return;
-        const opening = data?.conversation_log?.find(m => m.from === "actor");
-        if (opening?.text) {
-          caughtUpRef.current = true;
-          setFirstWordsDone(true);
-          currentSpeakerRef.current = actorName;
-          finaliseResponse(displayText(opening.text), opening.text, new Date());
-        }
-      })
-      .catch(() => {});
 
     if (!enteredRef.current) {
       enteredRef.current = true;
@@ -256,10 +233,9 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
         if (payload.vitals) updateVitals(payload.vitals);
         setSending(false);
         setFirstWordsDone(true);
-        if (payload.text && (currentResponseId.current === null || currentResponseId.current !== lastFinalisedResponseIdRef.current)) {
-          lastFinalisedResponseIdRef.current = currentResponseId.current;
+        if (payload.text) {
           currentSpeakerRef.current = actorName;
-          const ts = payload.fired_at ? new Date(payload.fired_at) : new Date();
+          const ts = payload.started_at ? new Date(payload.started_at) : payload.fired_at ? new Date(payload.fired_at) : new Date();
           finaliseResponse(displayText(payload.text), payload.text, ts);
         }
         break;
@@ -326,9 +302,8 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
           setTimeout(() => setArcSignal(null), 6000);
         }
         currentSpeakerRef.current = actorName;
-        if (payload.text && (currentResponseId.current === null || currentResponseId.current !== lastFinalisedResponseIdRef.current)) {
-          lastFinalisedResponseIdRef.current = currentResponseId.current;
-          const ts = payload.fired_at ? new Date(payload.fired_at) : new Date();
+        if (payload.text) {
+          const ts = payload.started_at ? new Date(payload.started_at) : payload.fired_at ? new Date(payload.fired_at) : new Date();
           finaliseResponse(displayText(payload.text), payload.text, ts);
         }
         break;
@@ -484,9 +459,39 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
     revealTimer.current = setTimeout(() => revealWord(onDone), delay);
   }
 
+  // Messages carry a real timestamp — payload.started_at from the server
+  // for "them" messages, capturing when that turn actually BEGAN (the
+  // player message or event that triggered it), not when generation
+  // finished. fired_at (completion time) was tried first and confirmed
+  // wrong: a response that started generating early but took 60+ seconds
+  // could still finish after a message the player sent in the meantime,
+  // making it sort after that later message even though it belongs
+  // before it. started_at reflects the actual conversational position;
+  // fired_at is kept as a fallback only for encounters running on an
+  // older server build that hasn't been redeployed yet. "me" messages use
+  // send-time, which is accurate for them since there's no equivalent
+  // generation delay. Appending blindly to the end assumes events arrive
+  // in true chronological order, which breaks whenever a response takes
+  // long enough that the player sends a later message before it arrives.
+  // Inserting at the correct sorted position instead means a late-arriving
+  // response still lands where it actually happened, regardless of when
+  // the browser received it.
+  function insertByTs(list, msg) {
+    const t = (msg.ts instanceof Date ? msg.ts : new Date(msg.ts || Date.now())).getTime();
+    let i = list.length;
+    while (i > 0) {
+      const prevT = (list[i - 1].ts instanceof Date ? list[i - 1].ts : new Date(list[i - 1].ts || 0)).getTime();
+      if (prevT <= t) break;
+      i--;
+    }
+    const next = list.slice();
+    next.splice(i, 0, msg);
+    return next;
+  }
+
   function finaliseResponse(text, rawText, ts) {
     if (!text || text.trim() === "") return;
-    setMessages(prev => [...prev, { from: "them", text: rawText || text, speaker: actorName, ts: ts || new Date() }]);
+    setMessages(prev => insertByTs(prev, { from: "them", text: rawText || text, speaker: actorName, ts: ts || new Date() }));
     setLiveText("");
     liveTextRef.current = "";
     scrollLog();
@@ -860,7 +865,7 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
     setGlow("listening");
     setOstText("Listening");
 
-    setMessages(prev => [...prev, { from: "me", text: content, ts: new Date() }]);
+    setMessages(prev => insertByTs(prev, { from: "me", text: content, ts: new Date() }));
     scrollLog();
 
     try {
@@ -1035,7 +1040,7 @@ export default function PresenceView({ world, user, sceneData, actorName, actorP
         <div className={styles.chatCol}>
           <div className={styles.chatHdr}>In person</div>
           <div className={styles.tlog} ref={tlogRef}>
-            {[...messages].sort((a, b) => (a.ts || 0) - (b.ts || 0)).map((m, i) => (
+            {messages.map((m, i) => (
               <div key={i}>
                 <div className={`${styles.tlLabel} ${m.from === "me" ? styles.tlYouLabel : styles.tlCompLabel}`}>
                   {m.from === "me" ? "You" : m.speaker || actorName}

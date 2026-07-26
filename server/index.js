@@ -13,6 +13,30 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// ── Local LLM helper (dirty-muse on M4) — replaces Haiku for structured JSON tasks ──
+const DIRTY_MUSE_URL  = "http://192.168.1.60:11434/api/chat";
+const DIRTY_MUSE_MODEL = "dirty-muse-q4:latest";
+
+async function callDirtyMuse(system, userContent, maxTokens = 600) {
+  const messages = system
+    ? [{ role: "system", content: system }, { role: "user", content: userContent }]
+    : [{ role: "user", content: userContent }];
+  console.log("[callDirtyMuse] posting to", DIRTY_MUSE_URL, "content length:", userContent.length);
+  const res = await fetch(DIRTY_MUSE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: DIRTY_MUSE_MODEL, stream: false, keep_alive: -1,
+      options: { num_ctx: 2048 }, messages }),
+    signal: AbortSignal.timeout(120_000)
+  });
+  if (!res.ok) throw new Error(`dirty-muse ${res.status}`);
+  const data = await res.json();
+  const raw = data.message?.content || data.choices?.[0]?.message?.content || "";
+  // Strip any preamble before first { or [
+  const match = raw.match(/[{\[].*/s);
+  return match ? match[0] : raw;
+}
+
 const app = express();
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true, limit: "20mb" }));
@@ -256,7 +280,103 @@ app.post("/api/worlds/:world_id/actors/:actor_id/portrait", upload.single("photo
   }
 });
 
+// ── GET /api/ambient-actors/:actor_id/portrait-status ────────────────────────
+app.get("/api/ambient-actors/:actor_id/portrait-status", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const { actor_id } = req.params;
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/ambient-actors/${actor_id}/portrait-status`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN }
+    });
+    res.json(await r.json());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
+// ── POST /api/worlds/:world_id/ambient-encounter/start ───────────────────────
+app.post("/api/worlds/:world_id/ambient-encounter/start", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const { world_id } = req.params;
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/ambient-encounter/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Service-Token": SERVICE_TOKEN },
+      body: JSON.stringify(req.body)
+    });
+    res.json(await r.json());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /api/worlds/:world_id/ambient-encounter/:id/opening ─────────────────
+app.get("/api/worlds/:world_id/ambient-encounter/:encounter_id/opening", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const { world_id, encounter_id } = req.params;
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/ambient-encounter/${encounter_id}/opening`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN }
+    });
+    res.json(await r.json());
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /api/worlds/:world_id/ambient-encounter/:id/message ─────────────────
+app.post("/api/worlds/:world_id/ambient-encounter/:encounter_id/message", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const { world_id, encounter_id } = req.params;
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/ambient-encounter/${encounter_id}/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Service-Token": SERVICE_TOKEN },
+      body: JSON.stringify(req.body)
+    });
+    res.json(await r.json());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /api/worlds/:world_id/ambient-encounter/:id/end ─────────────────────
+app.post("/api/worlds/:world_id/ambient-encounter/:encounter_id/end", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const { world_id, encounter_id } = req.params;
+  try {
+    await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/ambient-encounter/${encounter_id}/end`, {
+      method: "POST",
+      headers: { "X-Service-Token": SERVICE_TOKEN }
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /api/ambient-actors/:actor_id/generate-portrait ─────────────────────
+app.post("/api/ambient-actors/:actor_id/generate-portrait", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const { actor_id } = req.params;
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/ambient-actors/${actor_id}/generate-portrait`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Service-Token": SERVICE_TOKEN }
+    });
+    const data = await r.json();
+    res.json(data);
+  } catch (e) {
+    console.error("[ambient-portrait]", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DELETE /api/worlds/:id ────────────────────────────────────────────────────
 app.delete("/api/worlds/:id", async (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
@@ -432,6 +552,47 @@ app.patch("/api/worlds/:id/modules", async (req, res) => {
   } catch { res.status(502).json({ error: "simulator unreachable" }); }
 });
 
+// ── GET /api/worlds/:id/llm-config ───────────────────────────────────────────
+app.get("/api/worlds/:id/llm-config", async (req, res) => {
+  try {
+    const simRes = await fetch(`${SIMULATOR_URL}/internal/config/llm?world_id=${req.params.id}`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN },
+    });
+    res.json(await simRes.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── POST /api/worlds/:id/llm-config ──────────────────────────────────────────
+app.post("/api/worlds/:id/llm-config", async (req, res) => {
+  try {
+    const simRes = await fetch(`${SIMULATOR_URL}/internal/config/llm`, {
+      method: "POST",
+      headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify(req.body),
+    });
+    res.json(await simRes.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── DELETE /api/worlds/:id/llm-config ─────────────────────────────────────────
+app.delete("/api/worlds/:id/llm-config", async (req, res) => {
+  try {
+    const simRes = await fetch(`${SIMULATOR_URL}/internal/config/llm`, {
+      method: "DELETE",
+      headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify(req.body),
+    });
+    res.json(await simRes.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── POST /api/worlds/:id/llm-config/providers ─────────────────────────────────
+app.post("/api/worlds/:id/llm-config/providers", async (req, res) => {
+  // Provider URLs are runtime-only for now — stored in ETS via LlmConfig
+  // Future: persist to DB. For now just acknowledge.
+  res.json({ ok: true });
+});
+
 // ── GET /api/keys ─────────────────────────────────────────────────────────────
 app.get("/api/keys", (req, res) => {
   const cookieHeader = req.headers["cookie"] || "";
@@ -502,8 +663,15 @@ app.post("/api/apps", (req, res) => {
   if (!user) return res.status(401).json({ error: "not authenticated" });
   const { name, tool_type, world_id, actor_id, api_key_id, url, built_by, contact_ids } = req.body;
   if (!name || !tool_type || !world_id || !actor_id || !api_key_id) return res.status(400).json({ error: "all fields required" });
+
+  // Verify the api_key belongs to this user
   const key = db.prepare(`SELECT id FROM api_keys WHERE id = ? AND user_id = ? AND revoked_at IS NULL`).get(api_key_id, user.id);
   if (!key) return res.status(403).json({ error: "invalid api key" });
+
+  // Verify the user is a member of this world with the claimed actor_id
+  const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`).get(user.id, world_id);
+  if (!membership) return res.status(403).json({ error: "not a member of this world" });
+  if (membership.actor_id !== actor_id) return res.status(403).json({ error: "actor mismatch" });
   const id = randomUUID();
   db.prepare(`INSERT INTO registered_tools (id, user_id, world_id, actor_id, api_key_id, tool_type, name, url, built_by, contact_ids, inserted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`).run(id, user.id, world_id, actor_id, api_key_id, tool_type, name, url || null, built_by || "anima", JSON.stringify(contact_ids || []));
   res.json({ id, name, tool_type, url, built_by: built_by || "anima" });
@@ -582,6 +750,12 @@ app.get("/api/worlds/:world_id/actors/:actor_id/contacts", async (req, res) => {
 
 // ── GET /api/worlds/:world_id/actors/:actor_id/messages/:contact_id ───────────
 app.get("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  // Verify user is a member of this world with the claimed actor_id
+  const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`).get(user.id, req.params.world_id);
+  if (!membership) return res.status(403).json({ error: "not a member of this world" });
+  if (membership.actor_id !== req.params.actor_id) return res.status(403).json({ error: "actor mismatch" });
   try {
     const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/messages/${req.params.contact_id}`);
     res.json(data);
@@ -604,20 +778,18 @@ app.get("/api/worlds/:world_id/actors/:actor_id/context/:contact_id", async (req
 
 // ── POST /api/worlds/:world_id/actors/:actor_id/messages/:contact_id ──────────
 app.post("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id", async (req, res) => {
-  const cookieHeader = req.headers["cookie"] || "";
-  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
-  let visibility = "private"; // safe default
-  if (match) {
-    const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
-    const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
-    if (user) {
-      const app = db.prepare(`SELECT contact_ids FROM registered_tools WHERE user_id = ? AND world_id = ? AND tool_type != 'custom' ORDER BY inserted_at DESC LIMIT 1`).get(user.id, req.params.world_id);
-      if (app) {
-        const contacts = JSON.parse(app.contact_ids || "[]");
-        const contact = contacts.find(c => c.id === req.params.contact_id);
-        if (contact) visibility = contact.privacy || "private";
-      }
-    }
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`).get(user.id, req.params.world_id);
+  if (!membership) return res.status(403).json({ error: "not a member of this world" });
+  if (membership.actor_id !== req.params.actor_id) return res.status(403).json({ error: "actor mismatch" });
+
+  let visibility = "private";
+  const app = db.prepare(`SELECT contact_ids FROM registered_tools WHERE user_id = ? AND world_id = ? AND tool_type != 'custom' ORDER BY inserted_at DESC LIMIT 1`).get(user.id, req.params.world_id);
+  if (app) {
+    const contacts = JSON.parse(app.contact_ids || "[]");
+    const contact = contacts.find(c => c.id === req.params.contact_id);
+    if (contact) visibility = contact.privacy || "private";
   }
   try {
     const resp = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/messages/${req.params.contact_id}`, {
@@ -752,7 +924,10 @@ app.get("/api/stream", async (req, res) => {
   const user = db.prepare(`SELECT u.id, u.name FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
   if (!user) return res.status(401).end();
 
-  const membership = db.prepare(`SELECT actor_id, world_id FROM world_memberships WHERE user_id = ? LIMIT 1`).get(user.id);
+  const requestedWorldId = req.query.world_id;
+  const membership = requestedWorldId
+    ? db.prepare(`SELECT actor_id, world_id FROM world_memberships WHERE user_id = ? AND world_id = ? LIMIT 1`).get(user.id, requestedWorldId)
+    : db.prepare(`SELECT actor_id, world_id FROM world_memberships WHERE user_id = ? LIMIT 1`).get(user.id);
   if (!membership) return res.status(403).end();
 
   const { actor_id, world_id } = membership;
@@ -797,6 +972,11 @@ app.get("/api/stream", async (req, res) => {
         try {
           const payload = JSON.parse(line.slice(6));
           if (payload.type === "new_message") {
+            // Skip actor↔actor messages — player should not be notified of private conversations
+            if (payload.sender_id !== actor_id && payload.receiver_id && payload.receiver_id !== actor_id) {
+              continue;
+            }
+
             // Conversation type → tool type mapping
             const CONV_TO_TOOL = {
               text_thread:   "messages",
@@ -1362,13 +1542,7 @@ Respond with JSON only — no preamble:
 [{"neighbourhood":"...","reason":"..."},{"neighbourhood":"...","reason":"..."},{"neighbourhood":"...","reason":"..."}]`;
 
   try {
-    const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type":"application/json", "x-api-key":process.env.CLAUDE_API_KEY, "anthropic-version":"2023-06-01" },
-      body: JSON.stringify({ model:"claude-haiku-4-5-20251001", max_tokens:300, system:`You suggest ${city} neighbourhoods. Respond in JSON only.`, messages:[{ role:"user", content:prompt }] })
-    });
-    const data = await apiRes.json();
-    const text = data.content?.find(b => b.type === "text")?.text || "";
+    const text = await callDirtyMuse(`You suggest ${city} neighbourhoods. Respond in JSON only.`, prompt, 300);
     res.json(JSON.parse(text.replace(/```json|```/g, "").trim()));
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1678,13 +1852,7 @@ Respond with JSON only:
 {"career_level":"...","career_ladder":"...","employment_type":"...","reputation_score":0.0}`;
 
   try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type":"application/json", "x-api-key":process.env.CLAUDE_API_KEY, "anthropic-version":"2023-06-01" },
-      body: JSON.stringify({ model:"claude-haiku-4-5-20251001", max_tokens:150, system:"You suggest career details. Respond in JSON only.", messages:[{ role:"user", content:prompt }] })
-    });
-    const data = await r.json();
-    const text = data.content?.find(b=>b.type==="text")?.text||"";
+    const text = await callDirtyMuse("You suggest career details. Respond in JSON only.", prompt, 150);
     res.json(JSON.parse(text.replace(/```json|```/g,"").trim()));
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
@@ -1719,13 +1887,7 @@ Respond with JSON only:
 [{"name":"...","reason":"..."},{"name":"...","reason":"..."},{"name":"...","reason":"..."}]`;
 
   try {
-    const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method:"POST",
-      headers:{ "Content-Type":"application/json", "x-api-key":process.env.CLAUDE_API_KEY, "anthropic-version":"2023-06-01" },
-      body: JSON.stringify({ model:"claude-haiku-4-5-20251001", max_tokens:300, system:`You suggest ${city} workplaces. Respond in JSON only.`, messages:[{ role:"user", content:prompt }] })
-    });
-    const data = await apiRes.json();
-    const text = data.content?.find(b=>b.type==="text")?.text||"";
+    const text = await callDirtyMuse(`You suggest ${city} workplaces. Respond in JSON only.`, prompt, 300);
     res.json(JSON.parse(text.replace(/```json|```/g,"").trim()));
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
@@ -1754,7 +1916,7 @@ app.post("/api/actors/:id/generate-schedule", async (req, res) => {
 
   if (!actor) return res.status(404).json({ error: "not found" });
 
-  const { home_address, employment_type, career_level, world_id } = req.body;
+  const { home_address, employment_type, career_level, world_id, day_only } = req.body;
   const name = actor.first_name || actor.name;
   const b5 = [actor.openness, actor.conscientiousness, actor.extraversion, actor.agreeableness, actor.neuroticism].map(v => v != null ? Math.round(v) : "?");
 
@@ -1801,24 +1963,55 @@ Rules:
 Respond with a compact JSON array only — no preamble, no markdown, no extra whitespace:
 [{"day_of_week":"monday","start_time":"00:00","end_time":"06:30","activity_slug":"sleeping","state_note":"deep sleep","location_type":"home"},...]`;
 
+  const DAYS = day_only ? [day_only] : ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"];
+
   try {
-    const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type":"application/json", "x-api-key":process.env.CLAUDE_API_KEY, "anthropic-version":"2023-06-01" },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 16000,
-        system: "You generate weekly schedules as JSON arrays. Respond with JSON only — no preamble, no markdown fences.",
-        messages: [{ role:"user", content: prompt }]
-      })
-    });
-    const data = await apiRes.json();
-    const text = data.content?.find(b => b.type === "text")?.text || "";
-    const clean = text.replace(/```json|```/g, "").trim();
-    const slots = JSON.parse(clean);
+    // Generate sequentially — Ollama NUM_PARALLEL=2, parallel would queue anyway
+    const allSlots = [];
+    for (const day of DAYS) {
+      const isWeekend = day === "saturday" || day === "sunday";
+      const dayPrompt = `Character: ${name}, ${actor.age || "unknown age"}, ${actor.occupation || "unknown occupation"}
+Attachment: ${actor.attachment_style || "unknown"}
+Big5: O:${b5[0]} C:${b5[1]} E:${b5[2]} A:${b5[3]} N:${b5[4]}
+${employmentNote}
+${isWeekend ? "This is a WEEKEND day — no regular work, more leisure and social activities." : "This is a WEEKDAY."}
+
+Generate a realistic schedule for ${day.toUpperCase()} ONLY.
+Rules:
+- Cover exactly 00:00 to 24:00 with NO gaps and NO overlaps
+- Exactly 10-11 slots — no more, no less
+- Sleep = ONE block 6-9 hours. Morning routine = ONE block 1-2 hours.
+- MINIMUM slot duration: 1 hour
+- Use ONLY these slugs: ${SLUGS}
+- location_type: home, work, gym, cafe, restaurant, bar, outdoor, transit, other
+- state_note: 2-5 words specific to this character
+
+Return a JSON array for ${day} only — no preamble, no markdown:
+[{"day_of_week":"${day}","start_time":"00:00","end_time":"HH:MM","activity_slug":"...","state_note":"...","location_type":"..."},...]`;
+
+      const r = await fetch(DIRTY_MUSE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: DIRTY_MUSE_MODEL, stream: false, keep_alive: -1,
+          options: { num_ctx: 4096, num_predict: 1024 }, messages: [
+            { role: "system", content: "You generate daily schedules as compact JSON arrays. Respond with JSON only — no preamble, no markdown." },
+            { role: "user", content: dayPrompt }
+          ]
+        }),
+        signal: AbortSignal.timeout(120_000)
+      });
+      const d = await r.json();
+      const text = d.message?.content || "";
+      const clean = text.replace(/```json|```/g, "").trim();
+      const parsed = JSON.parse(clean.match(/\[.*/s)?.[0] || clean);
+      allSlots.push(...parsed);
+    }
+
+    const slots = allSlots;
+    console.log("[generate-schedule] total slots:", slots.length);
     res.json(slots);
   } catch (e) {
-    console.error("[generate-schedule] error:", e);
+    console.error("[generate-schedule] error:", e.message);
     res.status(500).json({ error: e.message, stack: e.stack?.split("\n").slice(0,3) });
   }
 });
@@ -1846,7 +2039,8 @@ app.post("/api/actors/:id/inspire-relationship", async (req, res) => {
 
   function getPsych(actorId) {
     try {
-      return db.prepare(`
+      // First try direct platform actor ID
+      const actor = db.prepare(`
         SELECT a.first_name, a.last_name, a.name, a.occupation,
                ap.attachment_style, ap.core_wound,
                b.openness, b.conscientiousness, b.extraversion, b.agreeableness, b.neuroticism,
@@ -1854,9 +2048,26 @@ app.post("/api/actors/:id/inspire-relationship", async (req, res) => {
         FROM actors a
         LEFT JOIN actor_psychology ap ON ap.actor_id = a.id
         LEFT JOIN actor_big5 b ON b.actor_id = a.id
-        LEFT JOIN actor_personality p ON p.actor_id = a.id
+        LEFT JOIN actor_psychology p ON p.actor_id = a.id
         WHERE a.id = ?
       `).get(actorId);
+      if (actor) return actor;
+      // Fall back: look up via simulator_actor_id in deployments
+      const dep = db.prepare(`SELECT platform_actor_id FROM actor_deployments WHERE simulator_actor_id = ? LIMIT 1`).get(actorId);
+      if (dep) {
+        return db.prepare(`
+          SELECT a.first_name, a.last_name, a.name, a.occupation,
+                 ap.attachment_style, ap.core_wound,
+                 b.openness, b.conscientiousness, b.extraversion, b.agreeableness, b.neuroticism,
+                 p.blind_spot, p.coping_strategies
+          FROM actors a
+          LEFT JOIN actor_psychology ap ON ap.actor_id = a.id
+          LEFT JOIN actor_big5 b ON b.actor_id = a.id
+          LEFT JOIN actor_psychology p ON p.actor_id = a.id
+          WHERE a.id = ?
+        `).get(dep.platform_actor_id);
+      }
+      return db.prepare(`SELECT * FROM actors WHERE id = ?`).get(actorId);
     } catch { return db.prepare(`SELECT * FROM actors WHERE id = ?`).get(actorId); }
   }
 
@@ -1907,20 +2118,21 @@ Respond in JSON only — no preamble, no markdown fences.`;
   }
 
   try {
-    const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type":"application/json", "x-api-key":process.env.CLAUDE_API_KEY, "anthropic-version":"2023-06-01" },
-      body: JSON.stringify({ model:"claude-haiku-4-5-20251001", max_tokens:600, system:systemPrompt, messages })
-    });
-    const apiData = await apiRes.json();
-    const text = apiData.content?.find(b => b.type === "text")?.text || "";
+    const lastMsg = messages[messages.length - 1]?.content;
+    const userMsg = Array.isArray(lastMsg)
+      ? lastMsg.find(b => b.type === "text")?.text || ""
+      : lastMsg || "";
+    console.log("[inspire-relationship] calling dirty-muse, prompt length:", userMsg.length);
+    const t0 = Date.now();
+    const text = await callDirtyMuse(systemPrompt, userMsg, 600);
+    console.log("[inspire-relationship] dirty-muse responded in", Date.now()-t0, "ms");
     const clean = text.replace(/```json|```/g, "").trim();
-    // Extract JSON object robustly — find first { to last }
     const start = clean.indexOf("{");
     const end   = clean.lastIndexOf("}");
     const jsonStr = start >= 0 && end > start ? clean.slice(start, end + 1) : clean;
     res.json(JSON.parse(jsonStr));
   } catch (e) {
+    console.error("[inspire-relationship] error:", e.message);
     res.status(500).json({ error: "inspire failed", detail: e.message });
   }
 });
@@ -2341,6 +2553,9 @@ app.post("/api/worlds/:world_id/meetings/confirm", async (req, res) => {
 app.post("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id/respond/:msg_id", async (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "not authenticated" });
+  const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`).get(user.id, req.params.world_id);
+  if (!membership) return res.status(403).json({ error: "not a member of this world" });
+  if (membership.actor_id !== req.params.actor_id) return res.status(403).json({ error: "actor mismatch" });
   try {
     const resp = await fetch(
       `${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/messages/${req.params.contact_id}/respond/${req.params.msg_id}`,
@@ -2355,6 +2570,9 @@ app.post("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id/respond/:m
 app.get("/api/worlds/:world_id/actors/:actor_id/calendar", async (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "not authenticated" });
+  const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`).get(user.id, req.params.world_id);
+  if (!membership) return res.status(403).json({ error: "not a member of this world" });
+  if (membership.actor_id !== req.params.actor_id) return res.status(403).json({ error: "actor mismatch" });
   try {
     const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/calendar`);
     res.json(data);
@@ -2446,6 +2664,41 @@ app.get("/api/actors/:actor_id/stream", async (req, res) => {
       `${SIMULATOR_URL}/internal/actors/${actor_id}/stream`,
       { headers: { "X-Service-Token": SERVICE_TOKEN } }
     );
+    res.setHeader("Content-Type",      "text/event-stream");
+    res.setHeader("Cache-Control",     "no-cache");
+    res.setHeader("Connection",        "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+    const reader = simResp.body.getReader();
+    const pump = async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(Buffer.from(value));
+        }
+      } catch {}
+      res.end();
+    };
+    pump();
+    req.on("close", () => { try { reader.cancel(); } catch {} });
+  } catch { res.status(502).end(); }
+});
+
+// ── GET /api/meeting/:session_id/stream — SSE proxy for sneak/observe mode ───
+// Forwards actor_meeting:#{session_id} PubSub events to the browser.
+// Auth: user must be a member of any world (session_id is opaque, no world check needed —
+// the simulator only broadcasts to subscribers of that specific topic).
+app.get("/api/meeting/:session_id/stream", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).end();
+  const { session_id } = req.params;
+  try {
+    const simResp = await fetch(
+      `${SIMULATOR_URL}/internal/meeting/${session_id}/stream`,
+      { headers: { "X-Service-Token": SERVICE_TOKEN } }
+    );
+    if (!simResp.ok) return res.status(simResp.status).end();
     res.setHeader("Content-Type",      "text/event-stream");
     res.setHeader("Cache-Control",     "no-cache");
     res.setHeader("Connection",        "keep-alive");
@@ -2637,18 +2890,11 @@ app.post("/api/generate/profile", async (req, res) => {
   const key = process.env.CLAUDE_API_KEY;
   if (!key) return res.status(500).json({ error: "no API key" });
   try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 4000,
-        system: "You are a character design assistant. Return ONLY raw JSON. No markdown, no code fences, no backticks, no explanation. Start your response with { and end with }.",
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-    const d = await r.json();
-    res.json({ text: d.content?.[0]?.text || "" });
+    const text = await callDirtyMuse(
+      "You are a character design assistant. Return ONLY raw JSON. No markdown, no code fences, no backticks, no explanation. Start your response with { and end with }.",
+      prompt, 4000
+    );
+    res.json({ text });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 

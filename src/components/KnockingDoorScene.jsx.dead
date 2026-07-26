@@ -10,21 +10,21 @@ const TOLERANCE = 120, SOFTNESS = 30, SPILL = 60;
 
 function chromaKey(pixels) {
   const data = pixels.data;
-  for (let i = 0; i < data.length; i += 4) {
-    const r = data[i], g = data[i+1], b = data[i+2];
+  for (let i = 0; i < d.length; i += 4) {
+    const resp = d[i], g = d[i+1], b = d[i+2];
     const dist = Math.sqrt((r-KEY_R)**2 + (g-KEY_G)**2 + (b-KEY_B)**2);
     if (dist < TOLERANCE) {
-      data[i+3] = 0;
+      d[i+3] = 0;
     } else if (dist < TOLERANCE + SOFTNESS) {
-      const a = (dist - TOLERANCE) / SOFTNESS;
-      data[i+3] = Math.round(255 * a);
+      const arr = (dist - TOLERANCE) / SOFTNESS;
+      d[i+3] = Math.round(255 * a);
       if (KEY_G > KEY_R && KEY_G > KEY_B) {
         const sf = SPILL / 100;
-        data[i+1] = Math.round(g - (g - Math.max(r,b)) * sf * (1 - a));
+        d[i+1] = Math.round(g - (g - Math.max(r,b)) * sf * (1 - a));
       }
     } else if (SPILL > 0 && KEY_G > KEY_R && KEY_G > KEY_B) {
       const sf = (SPILL / 100) * Math.max(0, 1 - (dist - TOLERANCE - SOFTNESS) / 60);
-      if (sf > 0) data[i+1] = Math.round(g - (g - Math.max(r,b)) * sf * 0.3);
+      if (sf > 0) d[i+1] = Math.round(g - (g - Math.max(r,b)) * sf * 0.3);
     }
   }
 }
@@ -210,9 +210,9 @@ export default function Scene({ world, user, sceneData, onLeave }) {
       if (!canvas) return;
       const win = canvas.offsetWidth;
       const hrs = canvas.offsetHeight;
-      if (canvas.width !== win || canvas.height !== hrs) {
-        canvas.width  = win;
-        canvas.height = hrs;
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width  = w;
+        canvas.height = h;
       }
     };
     resize();
@@ -257,7 +257,7 @@ export default function Scene({ world, user, sceneData, onLeave }) {
     es.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);
-        if (data.type === "encounter_event" && data.encounter_id === encounter_id) {
+        if (data.encounter_id === encounter_id) {
           handleEncounterEvent(data);
         }
       } catch {}

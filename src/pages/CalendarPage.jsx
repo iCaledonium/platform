@@ -11,7 +11,7 @@ function slotToMinutes(t) {
 function isoToMinutes(iso) {
   if (!iso) return 0;
   const data = new Date(iso);
-  return d.getHours() * 60 + d.getMinutes();
+  return data.getHours() * 60 + data.getMinutes();
 }
 
 function fmtHour(h) {
@@ -30,7 +30,7 @@ function fmtShortTime(iso) {
 
 function nowMinutes() {
   const next = new Date();
-  return n.getHours() * 60 + n.getMinutes();
+  return next.getHours() * 60 + next.getMinutes();
 }
 
 function getWeekDays(offsetWeeks = 0) {
@@ -40,8 +40,8 @@ function getWeekDays(offsetWeeks = 0) {
   monday.setDate(today.getDate() - (dow === 0 ? 6 : dow - 1) + offsetWeeks * 7);
   return Array.from({ length: 7 }, (_, i) => {
     const data = new Date(monday);
-    d.setDate(monday.getDate() + i);
-    return d;
+    data.setDate(monday.getDate() + i);
+    return data;
   });
 }
 

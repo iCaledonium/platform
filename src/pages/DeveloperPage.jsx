@@ -2,9 +2,6 @@ import { useState, useEffect } from "react";
 import homeStyles from "./HomePage.module.css";
 import devStyles from "./DeveloperPage.module.css";
 
-const WORLD_ID = "e7368020-fc19-4914-95ac-2f7c5508a13c";
-const WORLD_NAME = "Anima — Stockholm";
-
 const ALL_SCOPES = [
   { id: "messages:read",  label: "messages:read",  desc: "Read conversation history" },
   { id: "messages:write", label: "messages:write", desc: "Send messages" },
@@ -16,13 +13,25 @@ const ALL_SCOPES = [
 
 export default function DeveloperPage() {
   const [keys, setKeys]         = useState([]);
+  const [worlds, setWorlds]     = useState([]);
   const [loading, setLoading]   = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [newKey, setNewKey]     = useState(null);
-  const [form, setForm]         = useState({ name: "", scopes: ["messages:read","messages:write","contacts:read"] });
+  const [form, setForm]         = useState({ name: "", world_id: "", scopes: ["messages:read","messages:write","contacts:read"] });
   const [creating, setCreating] = useState(false);
 
-  useEffect(() => { loadKeys(); }, []);
+  useEffect(() => {
+    loadKeys();
+    fetch("/api/worlds")
+      .then(r => r.ok ? r.json() : [])
+      .then(data => setWorlds(data))
+      .catch(() => {});
+  }, []);
+
+  function worldName(world_id) {
+    const w = worlds.find(w => w.id === world_id);
+    return w ? w.name : world_id?.slice(0, 8) || "Unknown world";
+  }
 
   function loadKeys() {
     fetch("/api/keys")
@@ -41,13 +50,13 @@ export default function DeveloperPage() {
   }
 
   async function createKey() {
-    if (!form.name || !form.scopes.length) return;
+    if (!form.name || !form.world_id || !form.scopes.length) return;
     setCreating(true);
     try {
       const res = await fetch("/api/keys", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: form.name, world_id: WORLD_ID, scopes: form.scopes }),
+        body: JSON.stringify({ name: form.name, world_id: form.world_id, scopes: form.scopes }),
       });
       const data = await res.json();
       setNewKey(data.key);
@@ -107,7 +116,7 @@ export default function DeveloperPage() {
                   {k.scopes.map(s => <span key={s} className={devStyles.scope}>{s}</span>)}
                 </div>
                 <p className={devStyles.keyMeta}>
-                  {WORLD_NAME} · created {k.inserted_at?.slice(0,10)}
+                  {worldName(k.world_id)} · created {k.inserted_at?.slice(0,10)}
                   {k.last_used_at ? ` · last used ${k.last_used_at.slice(0,10)}` : " · never used"}
                 </p>
               </div>
@@ -131,7 +140,16 @@ export default function DeveloperPage() {
               </div>
               <div className={devStyles.field}>
                 <label>World</label>
-                <input type="text" value={WORLD_NAME} disabled style={{ opacity: 0.5 }} />
+                <select
+                  value={form.world_id}
+                  onChange={e => setForm(f => ({ ...f, world_id: e.target.value }))}
+                  style={{ width: "100%", padding: "8px 12px", borderRadius: 6, border: "1px solid rgba(0,0,0,.12)", background: "#fff", fontSize: 14 }}
+                >
+                  <option value="">Select a world…</option>
+                  {worlds.map(w => (
+                    <option key={w.id} value={w.id}>{w.name}</option>
+                  ))}
+                </select>
               </div>
               <div className={devStyles.field}>
                 <label>Scopes</label>
@@ -153,7 +171,7 @@ export default function DeveloperPage() {
               </div>
               <div className={devStyles.formBtns}>
                 <button className={devStyles.btnCancel} onClick={() => setShowForm(false)}>Cancel</button>
-                <button className={devStyles.btnConfirm} onClick={createKey} disabled={creating || !form.name || !form.scopes.length}>
+                <button className={devStyles.btnConfirm} onClick={createKey} disabled={creating || !form.name || !form.world_id || !form.scopes.length}>
                   {creating ? "Creating…" : "Create key"}
                 </button>
               </div>

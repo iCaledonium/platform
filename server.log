@@ -1,0 +1,306 @@
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy rewrite rule created: "^/sim" ~> ""
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy rewrite rule created: "^/sim" ~> ""
+Platform API running on :4002
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[inspire-relationship] error: The operation was aborted due to timeout
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[inspire-relationship] error: The operation was aborted due to timeout
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[inspire-relationship] error: The operation was aborted due to timeout
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy rewrite rule created: "^/sim" ~> ""
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy rewrite rule created: "^/sim" ~> ""
+node:events:502
+      throw er; // Unhandled 'error' event
+      ^
+
+Error: listen EADDRINUSE: address already in use :::4002
+    at Server.setupListenHandle [as _listen2] (node:net:1908:16)
+    at listenInCluster (node:net:1965:12)
+    at Server.listen (node:net:2067:7)
+    at file:///home/magnus/platform/server/index.js:2156:8
+    at ModuleJob.run (node:internal/modules/esm/module_job:325:25)
+    at async ModuleLoader.import (node:internal/modules/esm/loader:606:24)
+    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:117:5)
+Emitted 'error' event on Server instance at:
+    at emitErrorNT (node:net:1944:8)
+    at process.processTicksAndRejections (node:internal/process/task_queues:82:21) {
+  code: 'EADDRINUSE',
+  errno: -98,
+  syscall: 'listen',
+  address: '::',
+  port: 4002
+}
+
+Node.js v20.20.1
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[inspire-relationship] error: The operation was aborted due to timeout
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy rewrite rule created: "^/sim" ~> ""
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy rewrite rule created: "^/sim" ~> ""
+node:events:502
+      throw er; // Unhandled 'error' event
+      ^
+
+Error: listen EADDRINUSE: address already in use :::4002
+    at Server.setupListenHandle [as _listen2] (node:net:1908:16)
+    at listenInCluster (node:net:1965:12)
+    at Server.listen (node:net:2067:7)
+    at file:///home/magnus/platform/server/index.js:2156:8
+    at ModuleJob.run (node:internal/modules/esm/module_job:325:25)
+    at async ModuleLoader.import (node:internal/modules/esm/loader:606:24)
+    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:117:5)
+Emitted 'error' event on Server instance at:
+    at emitErrorNT (node:net:1944:8)
+    at process.processTicksAndRejections (node:internal/process/task_queues:82:21) {
+  code: 'EADDRINUSE',
+  errno: -98,
+  syscall: 'listen',
+  address: '::',
+  port: 4002
+}
+
+Node.js v20.20.1
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy rewrite rule created: "^/sim" ~> ""
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy created: /  -> http://192.168.1.58:4000
+[HPM] Proxy rewrite rule created: "^/sim" ~> ""
+Platform API running on :4002
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[inspire-relationship] error: The operation was aborted due to timeout
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401
+[Events] Simulator SSE disconnected, retrying in 5s: SSE connect failed: 401

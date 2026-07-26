@@ -1,4 +1,4 @@
-import { Routes, Route, Navigate, useLocation } from "react-router-dom";
+import { Routes, Route, Navigate, useLocation, useNavigate } from "react-router-dom";
 import { useState, useEffect, useRef, useCallback } from "react";
 import ReactDOM from "react-dom";
 import LoginPage from "./pages/LoginPage.jsx";
@@ -12,6 +12,8 @@ import ActorsGalleryPage from "./pages/ActorsGalleryPage.jsx";
 import ActorsEditorPage from "./pages/ActorsEditorPage.jsx";
 import DeployWizardPage from "./pages/DeployWizardPage.jsx";
 import WorldsPage from "./pages/WorldsPage.jsx";
+import KnockEncounterPage from "./pages/KnockEncounterPage.jsx";
+import VenueEncounterPage from "./pages/VenueEncounterPage.jsx";
 
 const CONV_TO_TOOL = {
   text_thread:   "messages",
@@ -20,15 +22,17 @@ const CONV_TO_TOOL = {
   email_thread:  "email",
   call:          "voice",
   video_call:    "video",
+  missed_knock:  "missed_knock",
 };
 
 const TOOL_LABELS = {
-  messages: { label: "SMS",      color: "#378add", bg: "rgba(55,138,221,.1)" },
-  calendar: { label: "Calendar", color: "#b05c08", bg: "rgba(176,92,8,.1)" },
-  voicemail:{ label: "Voicemail",color: "#1d9e75", bg: "rgba(29,158,117,.1)" },
-  voice:    { label: "Voice",    color: "#1d9e75", bg: "rgba(29,158,117,.1)" },
-  email:    { label: "Email",    color: "#7f77dd", bg: "rgba(127,119,221,.1)" },
-  video:    { label: "Video",    color: "#b05c08", bg: "rgba(176,92,8,.1)"   },
+  messages:     { label: "SMS",          color: "#378add", bg: "rgba(55,138,221,.1)"  },
+  calendar:     { label: "Calendar",     color: "#b05c08", bg: "rgba(176,92,8,.1)"    },
+  voicemail:    { label: "Voicemail",    color: "#1d9e75", bg: "rgba(29,158,117,.1)"  },
+  voice:        { label: "Voice",        color: "#1d9e75", bg: "rgba(29,158,117,.1)"  },
+  email:        { label: "Email",        color: "#7f77dd", bg: "rgba(127,119,221,.1)" },
+  video:        { label: "Video",        color: "#b05c08", bg: "rgba(176,92,8,.1)"    },
+  missed_knock: { label: "Missed visit", color: "#b05c08", bg: "rgba(176,92,8,.1)"    },
 };
 
 function TypeBadge({ convType }) {
@@ -100,17 +104,17 @@ function BellSlot({ unread, onClick, notifications }) {
 function formatTime(isoStr) {
   if (!isoStr) return "";
   const data = new Date(isoStr);
-  return d.toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit" });
+  return data.toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit" });
 }
 
 function formatSection(isoStr) {
   if (!isoStr) return "Earlier";
   const data = new Date(isoStr);
   const now = new Date();
-  const diff = Math.floor((now - d) / 86400000);
+  const diff = Math.floor((now - data) / 86400000);
   if (diff === 0) return "Today";
   if (diff === 1) return "Yesterday";
-  return d.toLocaleDateString("sv-SE", { weekday: "long" });
+  return data.toLocaleDateString("sv-SE", { weekday: "long" });
 }
 
 function groupByDate(notifs) {
@@ -132,8 +136,10 @@ function initials(name) {
 }
 
 export default function App() {
+  const navigate = useNavigate();
   const [notifications, setNotifications] = useState([]);
   const [homeKnock, setHomeKnock] = useState(null); // {actor_id, actor_name, photo_url, address, world_id, home_place_id}
+  const [playerApproach, setPlayerApproach] = useState(null); // {actor_id, actor_name, photo_url, world_id, narrative}
   const [toasts, setToasts]               = useState([]);
   const [showCentre, setShowCentre]       = useState(false);
   const esRef                              = useRef(null);
@@ -163,8 +169,36 @@ export default function App() {
     es.onmessage = (e) => {
       try {
         const payload = JSON.parse(e.data);
-        if (payload.type === "home_knock") {
+        if (payload.type === "knock_user_door") {
           setHomeKnock(payload);
+          return;
+        }
+        if (payload.type === "knock_actor_left") {
+          // Actor gave up waiting — clear the door prompt and add missed knock notification
+          setHomeKnock(prev => {
+            if (prev?.actor_id === payload.actor_id) {
+              const now = new Date().toISOString();
+              const missedKnock = {
+                id:               `missed-knock-${payload.actor_id}-${Date.now()}`,
+                type:             "missed_knock",
+                sender_name:      prev.actor_name,
+                sender_actor_id:  payload.actor_id,
+                photo_url:        prev.photo_url,
+                world_id:         payload.world_id,
+                content:          `Knocked on your door and left.`,
+                inserted_at:      now,
+                read_at:          null,
+                conversation_type: "missed_knock",
+              };
+              setNotifications(ns => [missedKnock, ...ns]);
+              return null;
+            }
+            return prev;
+          });
+          return;
+        }
+        if (payload.type === "player_approach") {
+          setPlayerApproach(payload);
           return;
         }
         if (payload.type === "new_message") {
@@ -235,11 +269,13 @@ export default function App() {
     fetch("/api/apps")
       .then(r => r.ok ? r.json() : [])
       .then(apps => {
-        const app = apps.find(a => a.tool_type === toolType);
+        // First try to find app matching both world_id and tool_type
+        const app = apps.find(a => a.tool_type === toolType && a.world_id === notif.world_id)
+                 || apps.find(a => a.tool_type === toolType);
         if (app) {
           window.open(`/messages?app=${app.id}${contactParam}`, "_blank");
         } else {
-          window.location.href = `/home?install=${toolType}`;
+          window.location.href = `/home?install=${toolType}&world_id=${notif.world_id || ""}`;
         }
       });
   }
@@ -274,6 +310,8 @@ export default function App() {
         <Route path="/actors"            element={<ActorsGalleryPage />} />
         <Route path="/actors/:id"        element={<ActorsEditorPage />} />
         <Route path="/actors/:id/deploy" element={<DeployWizardPage />} />
+        <Route path="/encounter/knock/:encounterId" element={<KnockEncounterPage />} />
+        <Route path="/encounter/venue/:worldId/:locationId" element={<VenueEncounterPage />} />
         <Route path="*"             element={<Navigate to="/login" replace />} />
       </Routes>
 
@@ -352,8 +390,8 @@ export default function App() {
         ))}
       </div>
 
-      {/* Home knock overlay */}
-      {homeKnock && (
+      {/* Home knock overlay — hidden on messages page */}
+      {homeKnock && location.pathname !== "/messages" && (
         <div style={{position:"fixed",inset:0,zIndex:10000,background:"rgba(0,0,0,.7)",display:"flex",alignItems:"center",justifyContent:"center",padding:24}}>
           <div style={{background:"#1a1814",borderRadius:20,padding:32,maxWidth:380,width:"100%",display:"flex",flexDirection:"column",alignItems:"center",gap:18,boxShadow:"0 24px 64px rgba(0,0,0,.5)"}}>
             {homeKnock.photo_url && (
@@ -374,24 +412,86 @@ export default function App() {
                 try {
                   const resp = await fetch(`/api/worlds/${homeKnock.world_id}/encounter/start`, {
                     method:"POST", headers:{"Content-Type":"application/json"},
-                    body: JSON.stringify({ target_actor_id: homeKnock.actor_id, location_id: homeKnock.home_place_id, trigger: "home_knock" })
+                    body: JSON.stringify({ target_actor_id: homeKnock.actor_id, location_id: homeKnock.home_place_id, trigger: "knock_user_door", visit_reason: homeKnock.visit_reason })
                   });
-                  const data = await r.json();
+                  const data = await resp.json();
                   setHomeKnock(null);
-                  // Navigate to encounter
-                  window.location.href = `/home`;
+                  if (data.encounter_id) {
+                    // Fetch user then navigate to standalone encounter page
+                    const meResp = await fetch("/api/me");
+                    const userData = meResp.ok ? await meResp.json() : null;
+                    sessionStorage.setItem("encounterContext", JSON.stringify({
+                      world: {
+                        id:       homeKnock.world_id,
+                        timezone: homeKnock.timezone || "America/Los_Angeles"
+                      },
+                      user: userData,
+                      sceneData: {
+                        mode:         "scene",
+                        encounter_id: data.encounter_id,
+                        trigger:      "knock_user_door",
+                        location: {
+                          id:       homeKnock.home_place_id || "home",
+                          place_id: homeKnock.home_place_id || "home",
+                          name:     homeKnock.address || "Home",
+                          actors: [{
+                            actor_id:  homeKnock.actor_id,
+                            name:      homeKnock.actor_name,
+                            photo_url: homeKnock.photo_url
+                          }]
+                        }
+                      }
+                    }));
+                    navigate(`/encounter/knock/${data.encounter_id}`);
+                  }
                 } catch(e) { console.error("Failed to open door", e); }
               }} style={{flex:1,fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:13,fontWeight:500,padding:"11px 0",borderRadius:12,border:"none",background:"rgba(255,255,255,.92)",color:"#1a1814",cursor:"pointer"}}>
                 Open the door →
               </button>
               <button onClick={() => {
-                fetch(`/api/worlds/${homeKnock.world_id}/home-knock/decline`, {
+                fetch(`/api/worlds/${homeKnock.world_id}/knock-user-door/decline`, {
                   method:"POST", headers:{"Content-Type":"application/json"},
                   body: JSON.stringify({ actor_id: homeKnock.actor_id })
                 }).catch(()=>{});
                 setHomeKnock(null);
               }} style={{flex:1,fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:13,padding:"11px 0",borderRadius:12,border:"1px solid rgba(255,255,255,.15)",background:"rgba(255,255,255,.06)",color:"rgba(255,255,255,.5)",cursor:"pointer"}}>
                 Ignore
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Player approach overlay — actor already inside, initiating re-engagement */}
+      {playerApproach && (
+        <div style={{position:"fixed",inset:0,zIndex:10000,background:"rgba(0,0,0,.5)",display:"flex",alignItems:"flex-end",justifyContent:"center",padding:"0 24px 48px"}}>
+          <div style={{background:"#1a1814",borderRadius:20,padding:28,maxWidth:420,width:"100%",display:"flex",flexDirection:"column",gap:16,boxShadow:"0 24px 64px rgba(0,0,0,.5)"}}>
+            <div style={{display:"flex",alignItems:"center",gap:14}}>
+              {playerApproach.photo_url && (
+                <div style={{width:48,height:48,borderRadius:"50%",overflow:"hidden",border:"1px solid rgba(255,255,255,.12)",flexShrink:0}}>
+                  <img src={playerApproach.photo_url} style={{width:"100%",height:"100%",objectFit:"cover"}} alt="" />
+                </div>
+              )}
+              <p style={{fontFamily:"'Cormorant Garamond',Georgia,serif",fontSize:17,color:"rgba(255,255,255,.85)",margin:0,fontStyle:"italic",lineHeight:1.4}}>
+                {playerApproach.narrative || `${playerApproach.actor_name} walks over.`}
+              </p>
+            </div>
+            <div style={{display:"flex",gap:10}}>
+              <button onClick={async () => {
+                try {
+                  await fetch(`/api/worlds/${playerApproach.world_id}/encounter/start`, {
+                    method:"POST", headers:{"Content-Type":"application/json"},
+                    body: JSON.stringify({ target_actor_id: playerApproach.actor_id, trigger: "player_approach_at_home" })
+                  });
+                  setPlayerApproach(null);
+                  window.location.href = `/home`;
+                } catch(e) { console.error("Failed to start encounter", e); }
+              }} style={{flex:1,fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:13,fontWeight:500,padding:"10px 0",borderRadius:12,border:"none",background:"rgba(255,255,255,.92)",color:"#1a1814",cursor:"pointer"}}>
+                Engage
+              </button>
+              <button onClick={() => setPlayerApproach(null)}
+                style={{flex:1,fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:13,padding:"10px 0",borderRadius:12,border:"1px solid rgba(255,255,255,.12)",background:"rgba(255,255,255,.04)",color:"rgba(255,255,255,.4)",cursor:"pointer"}}>
+                Not now
               </button>
             </div>
           </div>
@@ -427,7 +527,10 @@ function NotifItem({ notif, onOpen, onClear }) {
       }}
     >
       <div style={{width:34,height:34,borderRadius:"50%",background:"rgba(181,148,90,.1)",border:"1px solid rgba(181,148,90,.18)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:500,color:"#b5945a",flexShrink:0,fontFamily:"'DM Sans',system-ui,sans-serif"}}>
-        {initials(notif.sender_name)}
+        {notif.conversation_type === "missed_knock"
+          ? <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#b05c08" strokeWidth="1.8" strokeLinecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/><circle cx="7" cy="12" r="1" fill="#b05c08"/></svg>
+          : initials(notif.sender_name)
+        }
       </div>
       <div style={{flex:1,minWidth:0}}>
         <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:2}}>

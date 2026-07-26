@@ -157,7 +157,7 @@ function ShareModal({ actor, onClose }) {
 }
 
 function ActorCard({ actor, shared, owned, onShare, onDelete, onDeploy, onUndeploy, deployed, onClick }) {
-  const ctx = sc(actor.attachment_style);
+  const c = sc(actor.attachment_style);
   const dots = COMPLETION.map(s => s.check(actor));
 
   return (
@@ -267,7 +267,7 @@ export default function ActorsGalleryPage() {
 
   const undeployActor = async (id) => {
     await fetch(`/api/actors/${id}/undeploy`, { method: "POST" });
-    setDeployedIds(p => { const next = new Set(p); n.delete(id); return n; });
+    setDeployedIds(p => { const next = new Set(p); next.delete(id); return next; });
     setDeployments(p => p.filter(d => d.platform_actor_id !== id));
   };
 
@@ -302,9 +302,7 @@ export default function ActorsGalleryPage() {
             <span style={{ color:"#d1cfca", fontSize:14 }}>/</span>
             <span style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", fontSize:24, fontWeight:500, letterSpacing:".22em", textTransform:"uppercase", color:"#1a1814" }}>Characters</span>
           </div>
-          {owned.length > 0 && (
-            <button onClick={() => setShowWizard(true)} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, letterSpacing:".06em", textTransform:"uppercase", padding:"10px 22px", borderRadius:10, background:"#1a1814", color:"#faf8f4", border:"none", cursor:"pointer" }}>New character +</button>
-          )}
+          <button onClick={() => setShowWizard(true)} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, letterSpacing:".06em", textTransform:"uppercase", padding:"10px 22px", borderRadius:10, background:"#1a1814", color:"#faf8f4", border:"none", cursor:"pointer" }}>New character +</button>
         </div>
 
         {Object.entries(worldGroups).map(([worldName, actorIds]) => {
@@ -361,7 +359,11 @@ export default function ActorsGalleryPage() {
         })()}
 
         {owned.length===0 && shared.length===0 && (
-          <p style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, color:"#a8a5a0" }}>No actors yet.</p>
+          <div style={{ textAlign:"center", padding:"4rem 2rem" }}>
+            <p style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", fontSize:22, color:"#1a1814", marginBottom:8 }}>No characters yet</p>
+            <p style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, color:"#a8a5a0", marginBottom:24 }}>Create your first character to get started.</p>
+            <button onClick={() => setShowWizard(true)} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, letterSpacing:".06em", textTransform:"uppercase", padding:"10px 22px", borderRadius:10, background:"#1a1814", color:"#faf8f4", border:"none", cursor:"pointer" }}>New character +</button>
+          </div>
         )}
       </div>
 

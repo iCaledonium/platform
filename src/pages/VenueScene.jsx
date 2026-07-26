@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import PresenceView from "./PresenceView.jsx";
+import VenueChatBubbles from "./VenueChatBubbles.jsx";
 
 const SIMULATOR_URL   = "https://anima.simulator.ngrok.dev";
 const ROTATION_MS     = 8000;
@@ -13,11 +14,22 @@ export default function VenueScene({ world, user, location, onLeave }) {
   const [actors,  setActors]  = useState(location.actors || []);
   const [leaving, setLeaving] = useState(false);
   const [toasts,  setToasts]  = useState([]);
-  const [clock,   setClock]   = useState(stockholmTime());
+  const [clock,   setClock]   = useState(worldTime(world?.timezone));
   const [encounter,      setEncounter]      = useState(null); // { actor, encounter_id }
   const [approaching,    setApproaching]    = useState(null); // { actor_id, actor_name, photo_url, narrative, location_id }
   const [encounterLoading, setEncounterLoading] = useState(false);
   const [encounterStatus,  setEncounterStatus]  = useState("Connecting…");
+  const [selectedAmbient, setSelectedAmbient] = useState(null);
+  const [ambientGenerating, setAmbientGenerating] = useState(false);
+  const [chats, setChats]     = useState([]); // [{id, is_venue, name, portrait_url, messages, open, loading, ended, encounter_id}]
+  const [deltas, setDeltas]   = useState([]);
+  const [weather, setWeather] = useState(null);
+
+  function handleAmbientPortraitReady(actorId, url) {
+    setActors(prev => prev.map(a => a.actor_id === actorId ? {...a, generated_portrait_url: url} : a));
+    setSelectedAmbient(prev => prev?.actor_id === actorId ? {...prev, generated_portrait_url: url} : prev);
+    setAmbientGenerating(false);
+  }
   const encounterRef = useRef(null);
   const leftEncounterAt               = useRef(null);   // timestamp — suppress approaches for 5min after leaving
   const dwellRef              = useRef(0);
@@ -59,8 +71,8 @@ export default function VenueScene({ world, user, location, onLeave }) {
 
   // Clock
   useEffect(() => {
-    const timer = setInterval(() => setClock(stockholmTime()), 10000);
-    return () => clearInterval(t);
+    const timer = setInterval(() => setClock(worldTime(world?.timezone)), 10000);
+    return () => clearInterval(timer);
   }, []);
 
   // Dwell
@@ -69,9 +81,9 @@ export default function VenueScene({ world, user, location, onLeave }) {
       dwellRef.current++;
       const mins = Math.floor(dwellRef.current / 60);
       const secs = dwellRef.current % 60;
-      setDwell(`${m}:${String(s).padStart(2, "0")}`);
+      setDwell(`${mins}:${String(secs).padStart(2, "0")}`);
     }, 1000);
-    return () => clearInterval(t);
+    return () => clearInterval(timer);
   }, []);
 
   // Presence poll — first fetch sets baseline, subsequent diffs detect arrivals
@@ -82,8 +94,10 @@ export default function VenueScene({ world, user, location, onLeave }) {
       fetch(`/api/worlds/${world.id}/presence`)
         .then(r => r.ok ? r.json() : [])
         .then(data => {
-          const loc = data.find(l => l.id === location.id || l.place_id === location.place_id);
-          if (!loc) { console.log('[VenueScene] loc not found, looking for:', location.id, location.place_id, 'in', data.map(l=>l.place_id)); return; }
+          const locs = data.locations || data;
+          if (data.weather && !weather) setWeather(data.weather);
+          const loc = locs.find(l => l.id === location.id || l.place_id === location.place_id);
+          if (!loc) { console.log('[VenueScene] loc not found, looking for:', location.id, location.place_id, 'in', locs.map(l=>l.place_id)); return; }
           const current = loc.actors || [];
           const currentIds = new Set(current.map(a => a.actor_id));
 
@@ -113,7 +127,7 @@ export default function VenueScene({ world, user, location, onLeave }) {
     // First poll immediately on mount to set baseline
     poll();
     const timer = setInterval(poll, 15000);
-    return () => clearInterval(t);
+    return () => clearInterval(timer);
   }, [world.id, location.id, location.place_id]);
 
   // SSE — open once on mount, never close/reopen on re-render
@@ -125,13 +139,20 @@ export default function VenueScene({ world, user, location, onLeave }) {
     es.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);
+        if (data.type === "weather_update") {
+          setWeather(data.data);
+        }
+        if (data.type === "relationship_delta") {
+          const d = data.data || data;
+          const id = crypto.randomUUID();
+          setDeltas(prev => [...prev, { id, warmth: d.warmth, trust: d.trust, tension: d.tension }]);
+          setTimeout(() => setDeltas(prev => prev.filter(x => x.id !== id)), 3000);
+        }
         if (data.type === "venue_event" && data.data?.type === "actor_arrived") {
           const arrival = data.data;
           if (arrival.actor_id === playerActorId) return;
-          // Skip if already present in the venue (e.g. they were here when we arrived)
           if (actors.some(a => a.actor_id === arrival.actor_id)) return;
           const toastId = crypto.randomUUID();
-          // Mark as known so poll doesn't fire a second toast
           if (knownActorIdsRef.current) {
             knownActorIdsRef.current = new Set([...knownActorIdsRef.current, arrival.actor_id]);
           }
@@ -189,6 +210,10 @@ export default function VenueScene({ world, user, location, onLeave }) {
   }
 
   async function handleReachOut(actor) {
+    if (actor.is_ambient) {
+      handleApproachAmbient(actor);
+      return;
+    }
     try {
       const resp = await fetch(`/api/worlds/${world.id}/encounter/start`, {
         method:  "POST",
@@ -209,6 +234,113 @@ export default function VenueScene({ world, user, location, onLeave }) {
     }
   }
 
+  // Auto-start venue chat on mount
+  useEffect(() => {
+    const playerActorId = user?.worlds?.find(w => w.world_id === world.id)?.actor_id;
+    if (!playerActorId) return;
+    setChats([{
+      id: "venue",
+      is_venue: true,
+      name: location.name,
+      portrait_url: null,
+      messages: [],
+      open: true,
+      loading: true,
+      ended: false,
+      encounter_id: null
+    }]);
+    fetch(`/api/worlds/${world.id}/ambient-encounter/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ player_actor_id: playerActorId, ambient_actor_id: null, venue: true,
+        location_id: location.place_id || location.id, weather: weather?.weather || null })
+    }).then(r => r.ok ? r.json() : null).then(data => {
+      if (data?.ok) {
+        setChats(prev => prev.map(c => c.id === "venue"
+          ? { ...c, encounter_id: data.encounter_id,
+              messages: data.opening ? [{ role: "assistant", content: data.opening, speaker: data.speaker }] : [],
+              loading: false }
+          : c));
+      } else {
+        setChats(prev => prev.map(c => c.id === "venue" ? { ...c, loading: false } : c));
+      }
+    }).catch(() => setChats(prev => prev.map(c => c.id === "venue" ? { ...c, loading: false } : c)));
+  }, []);
+
+  async function handleApproachAmbient(actor) {
+    const playerActorId = user?.worlds?.find(w => w.world_id === world.id)?.actor_id;
+    // If already open, just focus it
+    if (chats.find(c => c.id === actor.actor_id)) {
+      setChats(prev => prev.map(c => c.id === actor.actor_id ? { ...c, open: true } : c));
+      return;
+    }
+    const newChat = { id: actor.actor_id, is_venue: false, name: actor.name,
+      subtitle: actor.occupation || null,
+      portrait_url: actor.generated_portrait_url || null,
+      messages: [], open: true, loading: true, ended: false, encounter_id: null };
+    setChats(prev => [...prev, newChat]);
+    try {
+      const resp = await fetch(`/api/worlds/${world.id}/ambient-encounter/start`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ player_actor_id: playerActorId, ambient_actor_id: actor.actor_id, weather: weather?.weather || null })
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        const encId = data.encounter_id;
+        setChats(prev => prev.map(c => c.id === actor.actor_id
+          ? { ...c, encounter_id: encId, loading: true }
+          : c));
+        const pollOpen = setInterval(async () => {
+          const r = await fetch(`/api/worlds/${world.id}/ambient-encounter/${encId}/opening`).then(r=>r.ok?r.json():null);
+          if (r?.ready) {
+            clearInterval(pollOpen);
+            setChats(prev => prev.map(c => c.id === actor.actor_id
+              ? { ...c, loading: false, messages: r.opening ? [{ role: "assistant", content: r.opening, speaker: r.speaker }] : [] }
+              : c));
+          }
+        }, 2000);
+        setTimeout(() => clearInterval(pollOpen), 30000);
+      }
+    } catch { setChats(prev => prev.map(c => c.id === actor.actor_id ? { ...c, loading: false } : c)); }
+  }
+
+  async function handleChatSend(chatId, content) {
+    const chat = chats.find(c => c.id === chatId);
+    if (!chat?.encounter_id || chat.loading) return;
+    setChats(prev => prev.map(c => c.id === chatId
+      ? { ...c, messages: [...c.messages, { role: "user", content }], loading: true, typing: false }
+      : c));
+    try {
+      const resp = await fetch(`/api/worlds/${world.id}/ambient-encounter/${chat.encounter_id}/message`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content, venue: chat.is_venue })
+      });
+      const data = await resp.json();
+      if (data.ended) {
+        setChats(prev => prev.map(c => c.id === chatId ? { ...c, loading: false, ended: true } : c));
+      } else {
+        const newMsgs = data.lines
+          ? data.lines.map(([speaker, text]) => ({ role: "assistant", content: text, speaker }))
+          : [{ role: "assistant", content: data.reply || "", speaker: data.speaker }];
+        setChats(prev => prev.map(c => c.id === chatId
+          ? { ...c, loading: false, messages: [...c.messages, ...newMsgs] }
+          : c));
+      }
+    } catch { setChats(prev => prev.map(c => c.id === chatId ? { ...c, loading: false } : c)); }
+  }
+
+  function handleChatClose(chatId) {
+    const chat = chats.find(c => c.id === chatId);
+    if (chat?.encounter_id) {
+      fetch(`/api/worlds/${world.id}/ambient-encounter/${chat.encounter_id}/end`, { method: "POST" }).catch(() => {});
+    }
+    setChats(prev => prev.filter(c => c.id !== chatId));
+  }
+
+  function handleChatToggle(chatId) {
+    setChats(prev => prev.map(c => c.id === chatId ? { ...c, open: !c.open } : c));
+  }
+
   async function leave() {
     if (leaving) return;
     setLeaving(true);
@@ -221,7 +353,7 @@ export default function VenueScene({ world, user, location, onLeave }) {
   const glassDark = { background: "rgba(20,18,16,0.62)",   backdropFilter: "blur(28px)", WebkitBackdropFilter: "blur(28px)", border: "1px solid rgba(255,255,255,0.1)" };
 
   if (encounter) {
-    const photoUrl = encounter.actor.photo_url ? `${SIMULATOR_URL}${encounter.actor.photo_url}` : null;
+    const photoUrl = encounter.actor.photo_url ? (encounter.actor.photo_url.startsWith("http") ? encounter.actor.photo_url : `${SIMULATOR_URL}${encounter.actor.photo_url}`) : null;
 
     if (encounterLoading) {
       return (
@@ -257,7 +389,7 @@ export default function VenueScene({ world, user, location, onLeave }) {
   }
 
   if (approaching) {
-    const photoUrl = approaching.photo_url ? `${SIMULATOR_URL}${approaching.photo_url}` : null;
+    const photoUrl = approaching.photo_url ? (approaching.photo_url.startsWith("http") ? approaching.photo_url : `${SIMULATOR_URL}${approaching.photo_url}`) : null;
     return (
       <div style={{ fontFamily: "'DM Sans',system-ui,sans-serif", position: "fixed", inset: 0, zIndex: 1000, background: "#1a1814", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 32, gap: 24 }}>
         <style>{`@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap');`}</style>
@@ -295,6 +427,7 @@ export default function VenueScene({ world, user, location, onLeave }) {
   }
 
   return (
+    <>
     <div style={{ fontFamily: "'DM Sans',system-ui,sans-serif", position: "fixed", inset: 0, zIndex: 1000, overflow: "hidden" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap');
@@ -340,7 +473,7 @@ export default function VenueScene({ world, user, location, onLeave }) {
         <div style={{ flex: 1, overflowY: "auto" }}>
           {actors.length === 0
             ? <p style={{ fontSize: 11, color: "#a8a5a0", padding: "16px 14px", margin: 0 }}>Nobody here right now</p>
-            : actors.map(a => <ActorRow key={a.actor_id} actor={a} playerActorId={user?.worlds?.find(w => w.world_id === world.id)?.actor_id} onReachOut={handleReachOut} />)
+            : actors.map(a => <ActorRow key={a.actor_id} actor={a} playerActorId={user?.worlds?.find(w => w.world_id === world.id)?.actor_id} onReachOut={handleReachOut} onAmbientClick={(a) => { setSelectedAmbient(a); setAmbientGenerating(!a.generated_portrait_url); }} />)
           }
         </div>
         {photos.length > 1 && (
@@ -404,12 +537,117 @@ export default function VenueScene({ world, user, location, onLeave }) {
       </div>
 
     </div>
+
+    {/* Ambient NPC info bubble */}
+    {selectedAmbient && (
+      <div onClick={() => !ambientGenerating && setSelectedAmbient(null)}
+        style={{position:"fixed",inset:0,zIndex:1100,display:"flex",alignItems:"center",justifyContent:"center",padding:24,background:"rgba(0,0,0,.5)"}}>
+        <div onClick={e => e.stopPropagation()}
+          style={{background:"#fff",borderRadius:16,overflow:"hidden",maxWidth:320,width:"100%",boxShadow:"0 16px 48px rgba(0,0,0,.2)",fontFamily:"'DM Sans',system-ui,sans-serif"}}>
+
+          {/* Portrait area — 9:16 */}
+          <AmbientPortrait actor={selectedAmbient}
+            onPortraitReady={(id, url) => { handleAmbientPortraitReady(id, url); setAmbientGenerating(false); }}
+          />
+
+          {/* Info */}
+          <div style={{padding:"16px 20px 20px"}}>
+            <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+              <div style={{flex:1}}>
+                <div style={{fontSize:15,fontWeight:500,color:"#1a1814"}}>{selectedAmbient.name}{selectedAmbient.age ? `, ${selectedAmbient.age}` : ""}</div>
+                <div style={{fontSize:12,color:"#a8a5a0",marginTop:2}}>{selectedAmbient.occupation}</div>
+              </div>
+              <span style={{fontSize:10,padding:"3px 8px",borderRadius:20,background:selectedAmbient.is_staff?"#f0ece4":"#f5f5f5",color:selectedAmbient.is_staff?"#8a7a60":"#aaa",fontWeight:500}}>
+                {selectedAmbient.is_staff ? "Works here" : "Regular"}
+              </span>
+            </div>
+            {selectedAmbient.psychology && (
+              <div style={{borderTop:"1px solid #f0ece4",paddingTop:12,display:"flex",flexDirection:"column",gap:6}}>
+                {selectedAmbient.psychology.social_style && (
+                  <p style={{margin:0,fontSize:13,color:"#4a4744",lineHeight:1.5}}>{selectedAmbient.psychology.social_style}</p>
+                )}
+                {selectedAmbient.psychology.note && (
+                  <p style={{margin:0,fontSize:12,color:"#a8a5a0",lineHeight:1.5,fontStyle:"italic"}}>{selectedAmbient.psychology.note}</p>
+                )}
+              </div>
+            )}
+            <button onClick={() => setSelectedAmbient(null)} disabled={ambientGenerating}
+              style={{marginTop:16,width:"100%",padding:"9px 0",borderRadius:10,border:"1px solid #ede9e3",background:"none",fontSize:12,color: ambientGenerating ? "#ccc" : "#a8a5a0",cursor: ambientGenerating ? "default" : "pointer",fontFamily:"inherit"}}>
+              {ambientGenerating ? "Generating portrait…" : "Close"}
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+
+    <VenueChatBubbles
+      chats={chats}
+      deltas={deltas}
+      onSend={handleChatSend}
+      onClose={handleChatClose}
+      onToggle={handleChatToggle}
+    />
+    </>
   );
 }
 
-function ActorRow({ actor, onReachOut, playerActorId }) {
+function AmbientPortrait({ actor, onPortraitReady }) {
+  const [portraitUrl, setPortraitUrl] = useState(actor.generated_portrait_url || null);
+  const [generating, setGenerating]   = useState(false);
+  const pollRef = useRef(null);
+
+  useEffect(() => {
+    if (portraitUrl) return;
+
+    setGenerating(true);
+    fetch(`/api/ambient-actors/${actor.actor_id}/generate-portrait`, { method: "POST" })
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (data?.portrait_url) {
+          setPortraitUrl(data.portrait_url);
+          setGenerating(false);
+          onPortraitReady && onPortraitReady(actor.actor_id, data.portrait_url);
+        } else if (data?.generating) {
+          pollRef.current = setInterval(() => {
+            fetch(`/api/ambient-actors/${actor.actor_id}/portrait-status`)
+              .then(r => r.ok ? r.json() : null)
+              .then(d => {
+                if (d?.portrait_url) {
+                  setPortraitUrl(d.portrait_url);
+                  setGenerating(false);
+                  onPortraitReady && onPortraitReady(actor.actor_id, d.portrait_url);
+                  clearInterval(pollRef.current);
+                }
+              });
+          }, 5000);
+        }
+      })
+      .catch(() => setGenerating(false));
+
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, []);
+
+  return generating && !portraitUrl ? (
+    <div style={{ width:"100%", aspectRatio:"9/16", background:"#f0ece4", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:12 }}>
+      <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+        <circle cx="16" cy="16" r="12" stroke="#d4cfc8" strokeWidth="2" strokeDasharray="8 4">
+          <animateTransform attributeName="transform" type="rotate" from="0 16 16" to="360 16 16" dur="1.2s" repeatCount="indefinite"/>
+        </circle>
+      </svg>
+      <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#b0aca6" }}>Generating portrait…</span>
+    </div>
+  ) : portraitUrl ? (
+    <div style={{ width:"100%", aspectRatio:"9/16", overflow:"hidden" }}>
+      <img src={portraitUrl} alt={actor.name} style={{ width:"100%", height:"100%", objectFit:"cover", display:"block" }} />
+    </div>
+  ) : null;
+}
+
+function ActorRow({ actor, onReachOut, onAmbientClick, playerActorId }) {
   const [hover, setHover] = useState(false);
-  const photoUrl = actor.photo_url ? `${SIMULATOR_URL}${actor.photo_url}` : null;
+  const photoUrl = actor.is_ambient
+    ? (actor.generated_portrait_url || null)
+    : (actor.photo_url ? (actor.photo_url.startsWith("http") ? actor.photo_url : `${SIMULATOR_URL}${actor.photo_url}`) : null);
   return (
     <div
       className="venue-actor-row"
@@ -423,26 +661,31 @@ function ActorRow({ actor, onReachOut, playerActorId }) {
           : <span style={{ fontSize: 11, fontWeight: 500, color: "#1a1814" }}>{actor.name?.[0] || "?"}</span>
         }
       </div>
-      <div style={{ minWidth: 0, flex: 1 }}>
-        <p style={{ fontSize: 12, fontWeight: 500, color: "#1a1814", lineHeight: 1.3, margin: 0 }}>{actor.name}</p>
-        <p style={{ fontSize: 10, color: "#a8a5a0", margin: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-          {actor.in_transit ? "in transit" : actor.activity_slug?.replace(/_/g, " ") || actor.occupation || "—"}
-        </p>
+      <div style={{ minWidth: 0, flex: 1, overflow: "hidden" }}>
+        <p style={{ fontSize: 12, fontWeight: 500, color: "#1a1814", lineHeight: 1.3, margin: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{actor.name}</p>
+        {hover && actor.actor_id !== playerActorId
+          ? actor.is_ambient
+            ? <div style={{display:"flex", gap:5, marginTop:3}}>
+                <button onClick={() => { if(onAmbientClick) { onAmbientClick(actor); } }}
+                  style={{background:"#1a1814", border:"none", borderRadius:8, padding:"3px 8px", fontSize:10, fontWeight:500, color:"#fff", cursor:"pointer", fontFamily:"inherit"}}>ℹ Who?</button>
+                <button onClick={() => onReachOut && onReachOut(actor)}
+                  style={{background:"#1a1814", border:"none", borderRadius:8, padding:"3px 8px", fontSize:10, fontWeight:500, color:"#fff", cursor:"pointer", fontFamily:"inherit"}}>Approach</button>
+              </div>
+            : <div style={{marginTop:3}}>
+                <button onClick={() => onReachOut && onReachOut(actor)}
+                  style={{background:"#1a1814", border:"none", borderRadius:8, padding:"3px 8px", fontSize:10, fontWeight:500, color:"#fff", cursor:"pointer", fontFamily:"inherit", letterSpacing:".02em"}}>Reach out</button>
+              </div>
+          : <p style={{ fontSize: 10, color: "#a8a5a0", margin: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {actor.in_transit ? "in transit" : actor.activity_slug?.replace(/_/g, " ") || actor.occupation || "—"}
+            </p>
+        }
       </div>
-      {hover && actor.actor_id !== playerActorId && (
-        <button
-          onClick={() => onReachOut && onReachOut(actor)}
-          style={{ flexShrink: 0, background: "#1a1814", border: "none", borderRadius: 10, padding: "4px 9px", fontSize: 10, fontWeight: 500, color: "#fff", cursor: "pointer", fontFamily: "inherit", letterSpacing: ".02em" }}
-        >
-          Reach out
-        </button>
-      )}
     </div>
   );
 }
 
-function stockholmTime() {
+function worldTime(timezone) {
   return new Date().toLocaleTimeString("sv-SE", {
-    hour: "2-digit", minute: "2-digit", timeZone: "Europe/Stockholm"
+    hour: "2-digit", minute: "2-digit", timeZone: timezone || "Europe/Stockholm"
   });
 }
