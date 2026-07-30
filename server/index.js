@@ -8,6 +8,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import multer from "multer";
 import db from "./db.js";
+import { registerGenerate3DRoutes } from "./generate3d.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } }); // 100mb for videos
 
@@ -2396,6 +2397,33 @@ app.get("/api/actors", (req, res) => {
 });
 
 // ── DELETE /api/actors/:id — hard delete undeployed actor ───────────────────
+// ── POST /api/actors/:id/abandon-draft — beacon-compatible cleanup on window
+// close. navigator.sendBeacon() only supports POST, not DELETE, and it's
+// the one API browsers actually honour reliably as a tab is closing — a
+// normal fetch()/DELETE inside a beforeunload handler is not guaranteed to
+// complete. Only ever deletes if status is still "draft" — never touches
+// a finished, active character just because its tab happened to close.
+app.post("/api/actors/:id/abandon-draft", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).end();
+
+  const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ? AND status = 'draft'`).get(req.params.id, user.id);
+  if (!actor) return res.status(204).end(); // not a draft (already finished, or gone) — nothing to do
+
+  const mediaFiles = db.prepare(`SELECT url FROM actor_media WHERE actor_id = ?`).all(req.params.id);
+  for (const m of mediaFiles) {
+    try { fs.unlinkSync(path.join(__dirname, "../public", m.url)); } catch {}
+  }
+  const tables = ["actor_psychology","actor_big5","actor_disc","actor_hds","actor_economic",
+    "actor_lifestyle","actor_mental_health","actor_education","actor_upbringing",
+    "actor_diagnoses","actor_media","actor_shares","actor_assessment_results","actor_deployments"];
+  db.transaction(() => {
+    for (const t of tables) { try { db.prepare(`DELETE FROM ${t} WHERE actor_id = ?`).run(req.params.id); } catch {} }
+    db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
+  })();
+  res.status(204).end();
+});
+
 app.delete("/api/actors/:id", (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
@@ -2947,19 +2975,56 @@ Based on the visual reference, describe the fictional character's appearance. Re
   } catch(e) { console.error("[generate/appearance]", e); res.status(500).json({ error: e.message }); }
 });
 
-// ── POST /api/actors — create canonical actor ─────────────────────────────────
+// ── POST /api/actors — create canonical actor, or finalize an existing draft ──
+// Pass { id } in the body to finalize a draft created earlier by the 3D
+// creation step (updates in place, sets status to "active") instead of
+// inserting a new row. Pass { draft: true } with no id to create a new
+// draft (status "draft") rather than an immediately-active actor.
 app.post("/api/actors", (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
-  const { identity, psychology, personality, lifestyle, economy } = req.body;
+  const { id: existingId, identity, psychology, personality, lifestyle, economy, draft } = req.body;
   if (!identity?.first_name) return res.status(400).json({ error: "first_name required" });
-  const id   = randomUUID();
   const now  = new Date().toISOString();
-  const name        = [identity.first_name?.trim(), identity.last_name?.trim()].filter(Boolean).join(" ");
+  const name = [identity.first_name?.trim(), identity.last_name?.trim()].filter(Boolean).join(" ");
+
+  if (existingId) {
+    // ── Finalize an existing draft: verify ownership, then UPDATE in place ──
+    const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(existingId, user.id);
+    if (!actor) return res.status(404).json({ error: "not found" });
+    const id = existingId;
+    const run = db.transaction(() => {
+      db.prepare(`UPDATE actors SET name=?, first_name=?, last_name=?, age=?, gender=?, occupation=?, appearance=?, status=?, updated_at=? WHERE id=?`)
+        .run(name, identity.first_name?.trim(), identity.last_name?.trim()||null, identity.age||null, identity.gender||"female", identity.occupation||null, identity.appearance||null, "active", now, id);
+      const p = psychology||{};
+      db.prepare(`UPDATE actor_psychology SET attachment_style=?, wound=?, what_they_want=?, blindspot=?, defenses=?, contradiction=?, backstory=?, orientation=?, view_on_sex=?, marital_status=?, coping_mechanisms=?, updated_at=? WHERE actor_id=?`)
+        .run(personality?.attachment_style||p.attachment_style||"secure", p.wound||null, p.what_they_want||null, p.blindspot||null, p.defenses||null, p.contradiction||null, p.backstory||null, identity.orientation||"straight", p.view_on_sex||null, p.marital_status||"single", p.coping_mechanisms||null, now, id);
+      const b = personality?.big5||{};
+      db.prepare(`UPDATE actor_big5 SET openness=?, conscientiousness=?, extraversion=?, agreeableness=?, neuroticism=?, updated_at=? WHERE actor_id=?`)
+        .run(b.openness||50, b.conscientiousness||50, b.extraversion||50, b.agreeableness||50, b.neuroticism||50, now, id);
+      const disc = personality?.disc||{};
+      db.prepare(`UPDATE actor_disc SET d=?, i=?, s=?, c=?, updated_at=? WHERE actor_id=?`)
+        .run(disc.d||50, disc.i||50, disc.s||50, disc.c||50, now, id);
+      const h = personality?.hds||{};
+      db.prepare(`UPDATE actor_hds SET bold=?, cautious=?, colorful=?, diligent=?, dutiful=?, excitable=?, imaginative=?, leisurely=?, mischievous=?, reserved=?, skeptical=?, updated_at=? WHERE actor_id=?`)
+        .run(h.bold||30, h.cautious||30, h.colorful||30, h.diligent||30, h.dutiful||30, h.excitable||30, h.imaginative||30, h.leisurely||30, h.mischievous||30, h.reserved||30, h.skeptical||30, now, id);
+      const l = lifestyle||{};
+      db.prepare(`UPDATE actor_lifestyle SET alcohol_relationship=?, drug_use=?, substance_context=?, sleep_pattern=?, sleep_quality=?, exercise_habit=?, exercise_type=?, social_frequency=?, diet=?, lifestyle_note=?, updated_at=? WHERE actor_id=?`)
+        .run(l.alcohol_relationship||null, l.drug_use||"none", l.substance_context||null, l.sleep_pattern||"normal", l.sleep_quality||"good", l.exercise_habit||null, l.exercise_type||null, l.social_frequency||null, l.diet||null, l.lifestyle_note||null, now, id);
+      const e = economy||{};
+      db.prepare(`UPDATE actor_economic SET financial_situation=?, income_stability=?, monthly_income_sek=?, spending_style=?, savings_habit=?, attitude_to_wealth=?, financial_anxiety=?, behavior_note=?, updated_at=? WHERE actor_id=?`)
+        .run(e.financial_situation||"stable", e.income_stability||"stable", e.monthly_income_sek?parseInt(e.monthly_income_sek):null, e.spending_style||"balanced", e.savings_habit||"moderate", e.attitude_to_wealth||"practical", e.financial_anxiety||0.3, e.behavior_note||null, now, id);
+    });
+    run();
+    return res.json({ id, name, status: "active" });
+  }
+
+  // ── Create a new actor (draft or immediately-active) ─────────────────────
+  const id = randomUUID();
   const mediaFolder = name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"") + "-" + id.slice(0,8);
   const run = db.transaction(() => {
     db.prepare(`INSERT INTO actors (id, owner_id, name, first_name, last_name, age, gender, occupation, appearance, media_folder, status, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(id, user.id, name, identity.first_name?.trim(), identity.last_name?.trim()||null, identity.age||null, identity.gender||"female", identity.occupation||null, identity.appearance||null, mediaFolder, "active", now, now);
+      .run(id, user.id, name, identity.first_name?.trim(), identity.last_name?.trim()||null, identity.age||null, identity.gender||"female", identity.occupation||null, identity.appearance||null, mediaFolder, draft ? "draft" : "active", now, now);
     const p = psychology||{};
     db.prepare(`INSERT INTO actor_psychology (actor_id, attachment_style, wound, what_they_want, blindspot, defenses, contradiction, backstory, orientation, view_on_sex, marital_status, coping_mechanisms, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(id, personality?.attachment_style||p.attachment_style||"secure", p.wound||null, p.what_they_want||null, p.blindspot||null, p.defenses||null, p.contradiction||null, p.backstory||null, identity.orientation||"straight", p.view_on_sex||null, p.marital_status||"single", p.coping_mechanisms||null, now, now);
@@ -2980,7 +3045,7 @@ app.post("/api/actors", (req, res) => {
       .run(id, e.financial_situation||"stable", e.income_stability||"stable", e.monthly_income_sek?parseInt(e.monthly_income_sek):null, e.spending_style||"balanced", e.savings_habit||"moderate", e.attitude_to_wealth||"practical", e.financial_anxiety||0.3, e.behavior_note||null, now, now);
   });
   run();
-  res.json({ id, name: identity.name, status: "created" });
+  res.json({ id, name: identity.name, status: draft ? "draft" : "created" });
 });
 
 
@@ -3027,6 +3092,8 @@ app.get("/api/actors/:id/assessments", (req, res) => {
   })));
 });
 
+
+registerGenerate3DRoutes(app, { db, __dirname, authUser });
 
 // ── /media/* — pipe directly to simulator over LAN ──────────────────────────
 import http from "http";

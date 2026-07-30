@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import AssessmentDetailView from "./AssessmentDetailView";
 
-const STEPS = ["Identity", "Psychology", "Personality", "Lifestyle", "Economy", "Review"];
+const STEPS = ["Appearance", "Psychology", "Personality", "Lifestyle", "Economy", "Review"];
 
 const S = {
   overlay: { position:"fixed",inset:0,zIndex:1000,background:"rgba(238,236,234,0.72)",backdropFilter:"blur(12px)",WebkitBackdropFilter:"blur(12px)",display:"flex",alignItems:"center",justifyContent:"center",padding:"1.5rem" },
@@ -108,11 +108,41 @@ export default function CharacterWizard({ user, worlds, onClose, onCreated }) {
   const [lifestyle, setLifestyle] = useState({ alcohol_relationship:"rare", drug_use:"none", substance_context:"", sleep_pattern:"normal", sleep_quality:"good", exercise_habit:"regular", exercise_type:"", social_frequency:"weekly", diet:"", lifestyle_note:"" });
   const [economy, setEconomy]   = useState({ financial_situation:"stable", income_stability:"stable", monthly_income_sek:"", spending_style:"balanced", savings_habit:"moderate", attitude_to_wealth:"practical", financial_anxiety:0.3, behavior_note:"" });
 
+  // ── 3D character creation (Session 93+) ──────────────────────────────────
+  // actorId is created LAZILY — only when Generate Face is first clicked, not
+  // when the wizard opens. Before that point everything here is local state,
+  // same as every other field, so aborting the wizard loses nothing extra.
+  // If the wizard is closed after actorId exists but before final Save, the
+  // close handler below deletes the draft actor, same rollback pattern
+  // handleSave already uses.
+  const [actorId, setActorId] = useState(null);
+  const [bodyHeight, setBodyHeight] = useState(50);
+  const [bodyBreastSize, setBodyBreastSize] = useState(50);
+  // idle | creating_actor | generating_face | exporting | ready | error
+  const [character3DStatus, setCharacter3DStatus] = useState("idle");
+  const [character3DError, setCharacter3DError] = useState(null);
+
   useEffect(() => {
     const prev = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     return () => { document.body.style.overflow = prev; };
   }, []);
+
+  // A normal fetch()/DELETE inside beforeunload isn't reliable — browsers
+  // don't guarantee it completes before the tab closes. sendBeacon is the
+  // one API actually designed for this. Only fires while a draft exists;
+  // cleaned up automatically once actorId changes or the wizard unmounts
+  // (which happens right after a successful final save), so a finished
+  // character is never accidentally abandoned just because the tab closes
+  // shortly after.
+  useEffect(() => {
+    if (!actorId) return;
+    const handleBeforeUnload = () => {
+      navigator.sendBeacon(`/api/actors/${actorId}/abandon-draft`);
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [actorId]);
 
   function upd(setter) { return (k,v) => setter(p=>({...p,[k]:v})); }
   function parseJSON(text) {
@@ -343,19 +373,99 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
     }
   }
 
+  // ── 3D character creation (mocked pipeline for now — replace the
+  // setTimeout progression with real daz-script-server / export calls
+  // once the backend routes exist) ─────────────────────────────────────────
+  const IN_PROGRESS_STAGES = ["queued","clearing_scene","uploading_photo","generating_face","applying_body_shape","selecting_node","exporting","converting","downloading"];
+
+  async function handleGenerateFace() {
+    setCharacter3DError(null);
+    try {
+      let id = actorId;
+      if (!id) {
+        setCharacter3DStatus("creating_actor");
+        const res = await fetch("/api/actors", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ identity, draft: true }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || "Could not create draft character");
+        id = data.id;
+        setActorId(id);
+      }
+
+      // The backend looks up the reference photo from actor_media — it has
+      // to actually be on the server before generate-3d runs, not just
+      // sitting as a local File in the Photos field.
+      if (!photos.profile) throw new Error("Upload a reference photo first");
+      setCharacter3DStatus("uploading_photo");
+      const fd = new FormData();
+      fd.append("photo", photos.profile);
+      fd.append("state_slug", "profile");
+      fd.append("media_type", "photo");
+      fd.append("filename", photos.profile.name);
+      const uploadRes = await fetch(`/api/actors/${id}/media`, { method: "POST", body: fd });
+      if (!uploadRes.ok) throw new Error("Photo upload failed");
+
+      const startRes = await fetch(`/api/actors/${id}/generate-3d`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ gender: identity.gender, height: bodyHeight, breastSize: bodyBreastSize }),
+      });
+      const startData = await startRes.json();
+      if (!startRes.ok || startData.error) throw new Error(startData.error || "Could not start 3D generation");
+
+      // Poll for status — the pipeline runs for minutes on the server,
+      // this request just kicked it off.
+      await new Promise((resolve, reject) => {
+        const poll = setInterval(async () => {
+          try {
+            const statusRes = await fetch(`/api/actors/${id}/generate-3d`);
+            const status = await statusRes.json();
+            setCharacter3DStatus(status.stage);
+            if (status.stage === "ready") { clearInterval(poll); resolve(); }
+            if (status.stage === "error") { clearInterval(poll); reject(new Error(status.error || "3D generation failed")); }
+          } catch (pollErr) {
+            clearInterval(poll); reject(pollErr);
+          }
+        }, 2500);
+      });
+    } catch (e) {
+      setCharacter3DStatus("error");
+      setCharacter3DError(e.message || "3D generation failed");
+    }
+  }
+
+  async function handleCloseWizard() {
+    const msg = actorId
+      ? "Close the wizard? This character was never finished and will be deleted."
+      : "Close the wizard? All unsaved work will be lost.";
+    if (!window.confirm(msg)) return;
+    if (actorId) {
+      await fetch(`/api/actors/${actorId}`, { method: "DELETE" }).catch(() => {});
+    }
+    onClose();
+  }
+
   async function handleSave() {
     if (!identity.first_name) { setError("First name is required"); return; }
     setSaving(true); setError(null);
-    let actorId = null;
+    // Declared outside try so the catch block can see them too — same
+    // reason the original code declared its actorId variable up here.
+    let isDraft = !!actorId;
+    let savedActorId = actorId;
     try {
-      // 1. Create actor
+      // If Generate Face already created a draft actor earlier in this
+      // session, finish it by POSTing with its id (the backend updates
+      // in place and flips status to active) instead of creating a duplicate.
       const res = await fetch("/api/actors", {
-        method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ identity, psychology:{...psychology, attachment_style:personality.attachment_style}, personality, lifestyle, economy }),
+        method: "POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ id: isDraft ? actorId : undefined, identity, psychology:{...psychology, attachment_style:personality.attachment_style}, personality, lifestyle, economy, draft:false }),
       });
       const data = await res.json();
-      if (!res.ok || d.error) throw new Error(d.error || "Save failed");
-      actorId = d.id;
+      if (!res.ok || data.error) throw new Error(data.error || "Save failed");
+      if (!isDraft) setActorId(data.id);
+      savedActorId = data.id || actorId;
 
       const resizeForUpload = (file) => new Promise((res) => {
         const img = new Image();
@@ -382,24 +492,27 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
         fd.append("state_slug", slug);
         fd.append("media_type", "photo");
         fd.append("filename", resized.name);
-        await fetch(`/api/actors/${actorId}/media`, {method:"POST",body:fd}).catch(()=>{});
+        await fetch(`/api/actors/${savedActorId}/media`, {method:"POST",body:fd}).catch(()=>{});
       }
 
       // 3. Save assessments — non-fatal
       for (const [atype, result] of Object.entries(assessmentResults)) {
         if (result?.answers?.length) {
-          await fetch(`/api/actors/${actorId}/assessments`, {
+          await fetch(`/api/actors/${savedActorId}/assessments`, {
             method:"POST", headers:{"Content-Type":"application/json"},
             body:JSON.stringify({ assessment_type:atype, ...result }),
           }).catch(()=>{});
         }
       }
 
-      onCreated?.(d); onClose();
+      onCreated?.(data); onClose();
     } catch(e) {
-      // Rollback — delete actor if it was created
-      if (actorId) {
-        await fetch(`/api/actors/${actorId}`, { method:"DELETE" }).catch(()=>{});
+      // Only roll back an actor freshly created in THIS save attempt.
+      // A pre-existing draft (already has a generated 3D character on it)
+      // is left alone on failure so that work isn't lost — just show the
+      // error and let the user retry Save.
+      if (!isDraft && savedActorId) {
+        await fetch(`/api/actors/${savedActorId}`, { method:"DELETE" }).catch(()=>{});
       }
       setError(e.message||"Save failed");
       setSaving(false);
@@ -420,7 +533,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
   return (
     <>
     <div style={S.overlay}>
-      <div style={{...S.modal, position:"relative"}}>
+      <div style={{...S.modal, position:"relative", maxWidth: step===1 ? 980 : S.modal.maxWidth}}>
         {/* Loading spinner overlay */}
         {(assessRunning || generating) && (
           <div style={{ position:"absolute", inset:0, zIndex:10, borderRadius:24, background:"rgba(255,255,255,0.82)", backdropFilter:"blur(8px)", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:16 }}>
@@ -446,7 +559,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
         <div style={S.head}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
             <div style={{...S.serif,fontSize:26,fontWeight:400,color:"#1a1814"}}>{step<6?"New Character":(identity.first_name+" "+identity.last_name).trim()||"Review"}</div>
-            <button onClick={()=>{ if(window.confirm("Close the wizard? All unsaved work will be lost.")) onClose(); }} style={{background:"none",border:"1px solid rgba(0,0,0,0.08)",borderRadius:8,padding:"6px 12px",cursor:"pointer",fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:12,color:"#a8a5a0"}}>✕</button>
+            <button onClick={handleCloseWizard} style={{background:"none",border:"1px solid rgba(0,0,0,0.08)",borderRadius:8,padding:"6px 12px",cursor:"pointer",fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:12,color:"#a8a5a0"}}>✕</button>
           </div>
           <div style={{display:"flex",gap:0}}>
             {STEPS.map((label,i)=>{
@@ -465,8 +578,9 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
         <div style={S.body}>
           {error&&<div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:12,color:"#c0392b",background:"rgba(192,57,43,0.06)",border:"1px solid rgba(192,57,43,0.15)",borderRadius:8,padding:"10px 14px",marginBottom:18}}>{error}</div>}
 
-          {/* STEP 1: IDENTITY */}
-          {step===1&&<>
+          {/* STEP 1: APPEARANCE (identity fields + 3D character creation) */}
+          {step===1&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:32,alignItems:"start"}}>
+          <div>
             <div style={S.row2}>
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
                 <Field label="First Name"><input style={S.input} value={identity.first_name} onChange={e=>updI("first_name",e.target.value)} placeholder="Emma…" /></Field>
@@ -496,7 +610,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
               <input style={S.input} value={identity.occupation} onChange={e=>updI("occupation",e.target.value)} placeholder="Photographer, nurse, architect…" />
             </Field>
 
-            <Field label="Photos" hint="Upload a profile photo. Used for appearance generation and displayed throughout the platform.">
+            <Field label="Photos" hint="Face forward, neutral background, good even lighting — like a passport photo. This drives both the appearance description and the 3D face generation, so composition matters here.">
               <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8}}>
                 {PHOTO_SLOTS.map(slot=>(
                   <div key={slot.slug}
@@ -512,8 +626,13 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
                         <div style={{position:"absolute",bottom:0,left:0,right:0,padding:"3px 5px",background:"rgba(0,0,0,0.45)",fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:9,color:"#fff",letterSpacing:"0.08em",textTransform:"uppercase",textAlign:"center"}}>{slot.label}</div>
                       </>
                     ):(
-                      <div style={{width:"100%",height:"100%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:4}}>
-                        <div style={{fontSize:16,opacity:.25}}>+</div>
+                      <div style={{width:"100%",height:"100%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:5}}>
+                        <svg width="34" height="34" viewBox="0 0 34 34" style={{opacity:0.3}}>
+                          {/* passport-photo-style head-and-shoulders guide */}
+                          <rect x="1" y="1" width="32" height="32" rx="3" fill="none" stroke="#a8a5a0" strokeWidth="1" strokeDasharray="2,2" />
+                          <circle cx="17" cy="12" r="6.5" fill="none" stroke="#a8a5a0" strokeWidth="1.4" />
+                          <path d="M6 30 C6 21, 12 18, 17 18 C22 18, 28 21, 28 30" fill="none" stroke="#a8a5a0" strokeWidth="1.4" />
+                        </svg>
                         <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:9,color:"#a8a5a0",letterSpacing:"0.1em",textTransform:"uppercase"}}>{slot.label}</div>
                       </div>
                     )}
@@ -655,7 +774,66 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
                 ))}
               </div>
             </div>
-          </>}
+          </div>
+
+          {/* Right column — 3D character creation. Locked after this step:
+              face, body shape, and the underlying mesh can't be changed
+              later without regenerating the character. */}
+          <div>
+            <div style={{...S.secLabel, marginTop:0}}>3D Character</div>
+            <div style={{display:"flex",alignItems:"flex-start",gap:8,fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#6b6760",background:"rgba(176,92,8,0.05)",border:"1px solid rgba(176,92,8,0.15)",borderRadius:10,padding:"10px 12px",marginBottom:16,lineHeight:1.5}}>
+              <span style={{color:"#b05c08"}}>🔒</span>
+              <span>Face, body shape and mesh are set once here and can't be changed later without regenerating the character. Hair and outfits stay editable afterward.</span>
+            </div>
+
+            {/* Preview viewport — placeholder for now. Will mount the real
+                Three.js viewer (ActorModelPanel-derived) once it's confirmed
+                to run inside a modal context. */}
+            <div style={{position:"relative",borderRadius:14,overflow:"hidden",height:280,background:"#141311",marginBottom:16}}>
+              <div style={{position:"absolute",inset:0,backgroundImage:"linear-gradient(rgba(220,211,190,0.08) 1px, transparent 1px), linear-gradient(90deg, rgba(220,211,190,0.08) 1px, transparent 1px)",backgroundSize:"36px 36px",maskImage:"radial-gradient(ellipse 70% 60% at 50% 55%, black 30%, transparent 75%)",WebkitMaskImage:"radial-gradient(ellipse 70% 60% at 50% 55%, black 30%, transparent 75%)"}} />
+              <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
+                {character3DStatus==="ready" ? (
+                  <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:8}}>
+                    <div style={{width:100,height:150,borderRadius:"50px 50px 6px 6px",border:"2px dashed #c7b48c",display:"flex",alignItems:"center",justifyContent:"center",fontSize:28}}>🧍</div>
+                    <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#c7b48c"}}>✓ 3D character generated</div>
+                  </div>
+                ) : character3DStatus==="idle" ? (
+                  <div style={{textAlign:"center",fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#8a8171",maxWidth:200}}>
+                    Set gender and generate a face to see a preview
+                  </div>
+                ) : character3DStatus==="error" ? (
+                  <div style={{textAlign:"center",fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#c0392b",maxWidth:220}}>
+                    {character3DError || "Something went wrong"}
+                  </div>
+                ) : (
+                  <div style={{textAlign:"center",fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#c7b48c"}}>
+                    {character3DStatus==="creating_actor" && "Creating draft character…"}
+                    {character3DStatus==="queued" && "Queued…"}
+                    {character3DStatus==="clearing_scene" && "Clearing previous scene…"}
+                    {character3DStatus==="uploading_photo" && "Uploading reference photo…"}
+                    {character3DStatus==="generating_face" && "Generating face…"}
+                    {character3DStatus==="applying_body_shape" && "Applying body shape…"}
+                    {character3DStatus==="selecting_node" && "Preparing export…"}
+                    {character3DStatus==="exporting" && "Exporting mesh & rig…"}
+                    {character3DStatus==="converting" && "Converting to glTF…"}
+                    {character3DStatus==="downloading" && "Bringing the model home…"}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <button
+              onClick={handleGenerateFace}
+              disabled={IN_PROGRESS_STAGES.includes(character3DStatus) || character3DStatus==="creating_actor"}
+              style={{...S.btnAmberFull, marginBottom:20, opacity:(IN_PROGRESS_STAGES.includes(character3DStatus) || character3DStatus==="creating_actor")?0.6:1}}>
+              {character3DStatus==="ready" ? "◈ Regenerate Face" : (IN_PROGRESS_STAGES.includes(character3DStatus) || character3DStatus==="creating_actor") ? "◈ Working…" : "◈ Generate Face"}
+            </button>
+
+            <div style={S.secLabel}>Body Shape</div>
+            <Slider label="Height" value={bodyHeight} onChange={setBodyHeight} />
+            <Slider label="Breast Size" value={bodyBreastSize} onChange={setBodyBreastSize} />
+          </div>
+          </div>}
 
           {/* STEP 2: PSYCHOLOGY */}
           {step===2&&<>
