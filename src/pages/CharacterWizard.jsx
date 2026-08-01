@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef } from "react";
+import ReactDOM from "react-dom";
+import { useNavigate } from "react-router-dom";
 import AssessmentDetailView from "./AssessmentDetailView";
+import MiniGlbViewer from "./MiniGlbViewer";
 
 const STEPS = ["Appearance", "Psychology", "Personality", "Lifestyle", "Economy", "Review"];
 
 const S = {
-  overlay: { position:"fixed",inset:0,zIndex:1000,background:"rgba(238,236,234,0.72)",backdropFilter:"blur(12px)",WebkitBackdropFilter:"blur(12px)",display:"flex",alignItems:"center",justifyContent:"center",padding:"1.5rem" },
-  modal: { background:"rgba(255,255,255,0.92)",cursor:"default",backdropFilter:"blur(40px) saturate(200%)",WebkitBackdropFilter:"blur(40px) saturate(200%)",border:"1px solid rgba(255,255,255,0.95)",boxShadow:"0 8px 64px rgba(0,0,0,0.12),0 1px 0 rgba(255,255,255,1) inset",borderRadius:24,width:"100%",maxWidth:620,maxHeight:"90vh",display:"flex",flexDirection:"column",overflow:"hidden" },
   head: { padding:"1.75rem 2rem 1.25rem",borderBottom:"1px solid rgba(0,0,0,0.06)",flexShrink:0 },
   body: { flex:1,overflowY:"auto",padding:"1.75rem 2rem" },
   foot: { padding:"1.25rem 2rem",borderTop:"1px solid rgba(0,0,0,0.06)",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0 },
@@ -35,15 +36,42 @@ const S = {
   assessResult: { fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#6b6760",marginTop:6,lineHeight:1.6,padding:"8px 12px",background:"rgba(0,0,0,0.03)",borderRadius:8,marginBottom:4 },
 };
 
-function Field({ label, hint, children }) {
-  return <div style={S.sf}><label style={S.label}>{label}</label>{children}{hint&&<div style={S.hint}>{hint}</div>}</div>;
-}
-function Slider({ label, value, onChange }) {
+// Real macOS activity indicator — a ring of tapered blades, each fading
+// through the same opacity cycle at a staggered start point (negative
+// animation-delay), which is how the authentic spinner works: nothing
+// actually rotates, only opacity sweeps around the ring. Genuinely
+// different from a single rotating arc, which is what was here before.
+function MacSpinner({ size = 40 }) {
+  const blades = 12;
   return (
-    <div style={S.sliderRow}>
+    <div style={{ position: "relative", width: size, height: size }}>
+      {Array.from({ length: blades }).map((_, i) => (
+        <div key={i} style={{
+          position: "absolute", top: "50%", left: "50%",
+          width: size * 0.09, height: size * 0.26,
+          background: "#c9973a",
+          borderRadius: size * 0.045,
+          transform: `rotate(${(360 / blades) * i}deg) translate(0, -${size * 0.37}px)`,
+          transformOrigin: "center",
+          opacity: 0.35,
+          animation: "macSpinnerBlade 1s linear infinite",
+          animationDelay: `${-(i / blades)}s`,
+        }} />
+      ))}
+      <style>{`@keyframes macSpinnerBlade { 0% { opacity: 1; } 100% { opacity: 0.35; } }`}</style>
+    </div>
+  );
+}
+
+function Field({ label, hint, children, required }) {
+  return <div style={S.sf}><label style={S.label}>{label}{required&&<span style={{color:"#c0392b"}}> *</span>}</label>{children}{hint&&<div style={S.hint}>{hint}</div>}</div>;
+}
+function Slider({ label, value, onChange, disabled }) {
+  return (
+    <div style={{...S.sliderRow, opacity: disabled?0.4:1}}>
       <span style={S.sliderLbl}>{label}</span>
-      <input type="range" min={0} max={100} value={value} onChange={e=>onChange(Number(e.target.value))} style={{flex:1,accentColor:"#b05c08",height:4}} />
-      <span style={S.sliderVal}>{value}</span>
+      <input type="range" min={0} max={100} value={value} disabled={disabled} onChange={e=>onChange(Number(e.target.value))} style={{flex:1,accentColor:"#b05c08",height:4,cursor:disabled?"not-allowed":"pointer"}} />
+      <span style={S.sliderVal}>{disabled?"—":value}</span>
     </div>
   );
 }
@@ -57,7 +85,8 @@ async function callAI(prompt) {
   return d.text || "";
 }
 
-export default function CharacterWizard({ user, worlds, onClose, onCreated }) {
+export default function CharacterWizard({ user, worlds }) {
+  const navigate = useNavigate();
   const [step, setStep]       = useState(1);
   const [saving, setSaving]   = useState(false);
   const [generating, setGenerating] = useState(null);
@@ -72,7 +101,6 @@ export default function CharacterWizard({ user, worlds, onClose, onCreated }) {
   const [assessments, setAssessments] = useState({ iwm:"", attachment:"", intimacy:"", cogstyle:"" });
   const [assessmentResults, setAssessmentResults] = useState({});
   const [viewingAssessment, setViewingAssessment] = useState(null);
-  const [skippedFields, setSkippedFields] = useState(new Set());
   const ASSESS_CHAIN = ["iwm","attachment","intimacy","cogstyle","big5","disc","hds"];
   const assessDone = key => {
     if (key==="iwm") return !!assessments.iwm;
@@ -86,7 +114,7 @@ export default function CharacterWizard({ user, worlds, onClose, onCreated }) {
   };
   const fileRef = useRef(null);
 
-  const [identity, setIdentity] = useState({ first_name:"", last_name:"", age:"", gender:"female", occupation:"", orientation:"straight", appearance:"" });
+  const [identity, setIdentity] = useState({ first_name:"", last_name:"", age:"", gender:"", occupation:"", orientation:"", appearance:"" });
   const [appearanceFields, setAppearanceFields] = useState({
     // General — Haiku fills
     height:"", build:"", body_shape:"", hair:"", eyes:"", face:"", style:"", notable:"",
@@ -116,17 +144,27 @@ export default function CharacterWizard({ user, worlds, onClose, onCreated }) {
   // close handler below deletes the draft actor, same rollback pattern
   // handleSave already uses.
   const [actorId, setActorId] = useState(null);
-  const [bodyHeight, setBodyHeight] = useState(50);
-  const [bodyBreastSize, setBodyBreastSize] = useState(50);
+  // Session 96: these three (Height, Arms Length, Legs Length) are the
+  // only body-shape morphs actually confirmed real end-to-end tonight —
+  // real DAZ dial (body_bs_Proportion*), favorited, exported, and
+  // verified as genuine adjustable shape keys via check_shape_keys.py
+  // on a real .blend. Breast Size (the old second slider) was never
+  // confirmed real at any point and is dropped rather than carried
+  // forward on a guess.
+  const [bodyTorsoLength, setBodyTorsoLength] = useState(50);
+  const [bodyArmsLength, setBodyArmsLength] = useState(50);
+  const [bodyLegsLength, setBodyLegsLength] = useState(50);
   // idle | creating_actor | generating_face | exporting | ready | error
   const [character3DStatus, setCharacter3DStatus] = useState("idle");
   const [character3DError, setCharacter3DError] = useState(null);
-
-  useEffect(() => {
-    const prev = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    return () => { document.body.style.overflow = prev; };
-  }, []);
+  const [glbUrl, setGlbUrl] = useState(null);
+  // Dev-only: pick an existing local GLB file to test the slider
+  // wiring against it directly, skipping the full Face Transfer
+  // pipeline (~2 min per run). A typed path can't work here — browsers
+  // can't fetch() an arbitrary filesystem path, only a real file picker
+  // can read local disk directly (via the File API). Not meant to ship
+  // in this form long-term.
+  const debugFileInputRef = useRef(null);
 
   // A normal fetch()/DELETE inside beforeunload isn't reliable — browsers
   // don't guarantee it completes before the tab closes. sendBeacon is the
@@ -161,16 +199,6 @@ export default function CharacterWizard({ user, worlds, onClose, onCreated }) {
     }
     if (start !== -1 && end > start) cleaned = cleaned.slice(start, end + 1);
     return JSON.parse(cleaned);
-  }
-  function updAF(key, val) {
-    setSkippedFields(s => { const next = new Set(s); n.delete(key); return n; });
-    setAppearanceFields(p => {
-      const next = {...p, [key]: val};
-      // Serialise to appearance text
-      const lines = Object.entries(next).filter(([,v])=>v).map(([k,v])=>`${k.replace(/_/g," ")}: ${v}`).join("\n");
-      setIdentity(id => ({...id, appearance: lines}));
-      return next;
-    });
   }
   const updI=upd(setIdentity), updP=upd(setPsychology), updL=upd(setLifestyle), updE=upd(setEconomy);
 
@@ -376,10 +404,15 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
   // ── 3D character creation (mocked pipeline for now — replace the
   // setTimeout progression with real daz-script-server / export calls
   // once the backend routes exist) ─────────────────────────────────────────
-  const IN_PROGRESS_STAGES = ["queued","clearing_scene","uploading_photo","generating_face","applying_body_shape","selecting_node","exporting","converting","downloading"];
+  const IN_PROGRESS_STAGES = ["queued","starting_daz_studio","uploading_photo","generating_face","recovering_daz_studio","applying_body_shape","selecting_node","exporting","converting","downloading"];
 
   async function handleGenerateFace() {
     setCharacter3DError(null);
+    if (!identity.first_name || !identity.last_name || !identity.gender) {
+      setError("First Name, Last Name, and Gender are required before creating a 3D character.");
+      return;
+    }
+    setError(null);
     try {
       let id = actorId;
       if (!id) {
@@ -409,7 +442,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
 
       const startRes = await fetch(`/api/actors/${id}/generate-3d`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ gender: identity.gender, height: bodyHeight, breastSize: bodyBreastSize }),
+        body: JSON.stringify({ gender: identity.gender, torsoLength: bodyTorsoLength, armsLength: bodyArmsLength, legsLength: bodyLegsLength }),
       });
       const startData = await startRes.json();
       if (!startRes.ok || startData.error) throw new Error(startData.error || "Could not start 3D generation");
@@ -422,7 +455,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
             const statusRes = await fetch(`/api/actors/${id}/generate-3d`);
             const status = await statusRes.json();
             setCharacter3DStatus(status.stage);
-            if (status.stage === "ready") { clearInterval(poll); resolve(); }
+            if (status.stage === "ready") { setGlbUrl(status.glbUrl); clearInterval(poll); resolve(); }
             if (status.stage === "error") { clearInterval(poll); reject(new Error(status.error || "3D generation failed")); }
           } catch (pollErr) {
             clearInterval(poll); reject(pollErr);
@@ -435,6 +468,22 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
     }
   }
 
+  // On 3D generation failure: show the error for a few seconds so it's
+  // actually readable, then abort the same way the ✕ button does — delete
+  // the draft actor if one exists, navigate back to the gallery. No
+  // confirm() dialog here, unlike a manual close — there's nothing left
+  // to confirm once generation has genuinely failed.
+  useEffect(() => {
+    if (character3DStatus !== "error") return;
+    const t = setTimeout(async () => {
+      if (actorId) {
+        await fetch(`/api/actors/${actorId}`, { method: "DELETE" }).catch(() => {});
+      }
+      navigate("/actors");
+    }, 4000);
+    return () => clearTimeout(t);
+  }, [character3DStatus]);
+
   async function handleCloseWizard() {
     const msg = actorId
       ? "Close the wizard? This character was never finished and will be deleted."
@@ -443,7 +492,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
     if (actorId) {
       await fetch(`/api/actors/${actorId}`, { method: "DELETE" }).catch(() => {});
     }
-    onClose();
+    navigate("/actors");
   }
 
   async function handleSave() {
@@ -505,7 +554,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
         }
       }
 
-      onCreated?.(data); onClose();
+      navigate("/actors");
     } catch(e) {
       // Only roll back an actor freshly created in THIS save attempt.
       // A pre-existing draft (already has a generated 3D character on it)
@@ -530,10 +579,17 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
     {key:"view_on_sex",       label:"View on Sex & Intimacy",  ph:"Their relationship with sex, intimacy and physical closeness…"},
   ];
 
+  // Age/Sexual Orientation/Occupation and the body-shape sliders only
+  // make sense once there's an actual character to attach them to —
+  // disabled until the GLB is genuinely loaded, same condition already
+  // used elsewhere to decide whether to render MiniGlbViewer at all.
+  const glbReady = character3DStatus==="ready" && !!glbUrl;
+  const step1Complete = glbReady && !!identity.age && !!identity.orientation && !!identity.occupation;
+
   return (
     <>
-    <div style={S.overlay}>
-      <div style={{...S.modal, position:"relative", maxWidth: step===1 ? 980 : S.modal.maxWidth}}>
+    <div style={{background:"#eeecea",minHeight:"100vh",position:"relative"}}>
+      <div style={{position:"relative",zIndex:1,display:"flex",flexDirection:"column",minHeight:"100vh"}}>
         {/* Loading spinner overlay */}
         {(assessRunning || generating) && (
           <div style={{ position:"absolute", inset:0, zIndex:10, borderRadius:24, background:"rgba(255,255,255,0.82)", backdropFilter:"blur(8px)", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:16 }}>
@@ -579,39 +635,24 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
           {error&&<div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:12,color:"#c0392b",background:"rgba(192,57,43,0.06)",border:"1px solid rgba(192,57,43,0.15)",borderRadius:8,padding:"10px 14px",marginBottom:18}}>{error}</div>}
 
           {/* STEP 1: APPEARANCE (identity fields + 3D character creation) */}
-          {step===1&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:32,alignItems:"start"}}>
+          {step===1&&<div style={{display:"grid",gridTemplateColumns:"340px minmax(0,1fr) 300px",gap:28,alignItems:"start",minHeight:"calc(100vh - 260px)"}}>
           <div>
-            <div style={S.row2}>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-                <Field label="First Name"><input style={S.input} value={identity.first_name} onChange={e=>updI("first_name",e.target.value)} placeholder="Emma…" /></Field>
-                <Field label="Last Name"><input style={S.input} value={identity.last_name} onChange={e=>updI("last_name",e.target.value)} placeholder="Lindqvist…" /></Field>
-              </div>
-              <Field label="Age"><input style={{...S.input,width:80}} type="number" min={18} max={99} value={identity.age} onChange={e=>updI("age",e.target.value)} placeholder="28" /></Field>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:18}}>
+              <Field label="First Name" required><input style={S.input} value={identity.first_name} onChange={e=>updI("first_name",e.target.value)} placeholder="Emma…" /></Field>
+              <Field label="Last Name" required><input style={S.input} value={identity.last_name} onChange={e=>updI("last_name",e.target.value)} placeholder="Lindqvist…" /></Field>
             </div>
-            <div style={S.row2}>
-              <Field label="Gender">
-                <select style={S.select} value={identity.gender} onChange={e=>updI("gender",e.target.value)}>
-                  <option value="female">Female — she/her</option>
-                  <option value="male">Male — he/him</option>
-                  <option value="neutral">Non-binary — they/them</option>
-                </select>
-              </Field>
-              <Field label="Sexual Orientation">
-                <select style={S.select} value={identity.orientation} onChange={e=>updI("orientation",e.target.value)}>
-                  <option value="straight">Straight</option>
-                  <option value="bisexual">Bisexual</option>
-                  <option value="gay">Gay / Lesbian</option>
-                  <option value="pansexual">Pansexual</option>
-                  <option value="asexual">Asexual</option>
-                </select>
-              </Field>
-            </div>
-            <Field label="Occupation" hint="Shapes schedule, income and daily behaviour.">
-              <input style={S.input} value={identity.occupation} onChange={e=>updI("occupation",e.target.value)} placeholder="Photographer, nurse, architect…" />
+
+            <Field label="Gender" required>
+              <select style={S.select} value={identity.gender} onChange={e=>updI("gender",e.target.value)}>
+                <option value="">— Select Gender —</option>
+                <option value="female">Female — she/her</option>
+                <option value="male">Male — he/him</option>
+                <option value="neutral">Non-binary — they/them</option>
+              </select>
             </Field>
 
-            <Field label="Photos" hint="Face forward, neutral background, good even lighting — like a passport photo. This drives both the appearance description and the 3D face generation, so composition matters here.">
-              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8}}>
+            <Field label="Reference Photo" hint="Face forward, neutral background, good even lighting — like a passport photo. This drives both the appearance description and the 3D face generation, so composition matters here.">
+              <div style={{display:"grid",gridTemplateColumns:`repeat(${PHOTO_SLOTS.length},1fr)`,gap:8,maxWidth:180}}>
                 {PHOTO_SLOTS.map(slot=>(
                   <div key={slot.slug}
                     onDragOver={e=>e.preventDefault()}
@@ -642,162 +683,49 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
               <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}} onChange={e=>{if(activeSlotRef.current)handleSlotFile(activeSlotRef.current,e);}} />
             </Field>
 
-            <div style={S.sf}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:7}}>
-                <label style={{...S.label,margin:0}}>Appearance</label>
-                <button style={S.btnAmber} disabled={Object.keys(photos).length===0||generating==="appearance"}
-                  onClick={async()=>{
-                    console.log("[appearance] photos:", Object.keys(photos));
-                    if(Object.keys(photos).length===0) return;
-                    setGenerating("appearance");
-                    try {
-                      const toBase64 = f => new Promise((res,rej)=>{
-                        const img = new Image();
-                        const url = URL.createObjectURL(f);
-                        img.onload = () => {
-                          const MAX = 512;
-                          const scale = Math.min(1, MAX / Math.max(img.width, img.height));
-                          const canvas = document.createElement("canvas");
-                          canvas.width = Math.round(img.width * scale);
-                          canvas.height = Math.round(img.height * scale);
-                          canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
-                          URL.revokeObjectURL(url);
-                          res(canvas.toDataURL("image/jpeg", 0.7).split(",")[1]);
-                        };
-                        img.onerror = rej;
-                        img.src = url;
-                      });
-                      const APPEARANCE_PRIORITY = ["profile"];
-                      const photoFiles = APPEARANCE_PRIORITY.map(s=>photos[s]).filter(Boolean).slice(0,1);
-                      console.log("[appearance] photoFiles:", photoFiles.length, "priority slots checked");
-                      if(photoFiles.length===0) throw new Error("Upload a profile photo first.");
-                      const imgs = await Promise.all(photoFiles.map(toBase64));
-                      console.log("[appearance] imgs encoded:", imgs.length, "sizes:", imgs.map(i=>i.length));
-                      const resp = await fetch("/api/generate/appearance",{
-                        method:"POST",headers:{"Content-Type":"application/json"},
-                        body:JSON.stringify({images:imgs,name:(identity.first_name+" "+identity.last_name).trim(),gender:identity.gender,age:identity.age}),
-                      });
-                      console.log("[appearance] response status:", resp.status);
-                      const data = await resp.json();
-                      console.log("[appearance] response body:", JSON.stringify(d).slice(0,200));
-                      if(d.error) throw new Error(d.error);
-                      if(d.fields) {
-                        setAppearanceFields(p => {
-                          const next = {...p, ...d.fields};
-                          // Mark fields that Haiku was expected to fill but left empty
-                          const expected = ["height","build","body_shape","hair","eyes","face","style","presence","body_confidence","grooming","breasts","ass","bust","figure","waist_hip_ratio","legs","physique","shoulders","height_dominance"];
-                          const skipped = new Set(expected.filter(k => d.fields[k] === undefined || d.fields[k] === ""));
-                          setSkippedFields(skipped);
-                          const lines = Object.entries(next).filter(([,v])=>v).map(([k,v])=>`${k.replace(/_/g," ")}: ${v}`).join("\n");
-                          setIdentity(id => ({...id, appearance: lines}));
-                          return next;
-                        });
-                      }
-                    } catch(err) { console.error("[appearance]", err); setError("Generation failed: " + err.message); }
-                    setGenerating(null);
-                  }}>
-                  {generating==="appearance"?"…":"✦ Generate from Photos"}
-                </button>
-              </div>
-              {Object.keys(photos).length===0&&<div style={{...S.hint,marginBottom:10}}>Upload photos above to enable generation. Red fields must be filled manually.</div>}
+            <button
+              onClick={handleGenerateFace}
+              disabled={IN_PROGRESS_STAGES.includes(character3DStatus) || character3DStatus==="creating_actor"}
+              style={{...S.btnAmberFull, marginBottom:18, opacity:(IN_PROGRESS_STAGES.includes(character3DStatus) || character3DStatus==="creating_actor")?0.6:1}}>
+              {character3DStatus==="ready" ? "◈ Regenerate 3D Character" : (IN_PROGRESS_STAGES.includes(character3DStatus) || character3DStatus==="creating_actor") ? "◈ Working…" : "◈ Create 3D Character"}
+            </button>
 
-              {/* General — Haiku fills */}
-              <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:10,letterSpacing:"0.16em",textTransform:"uppercase",color:"#a8a5a0",marginBottom:8}}>General</div>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
-                {[
-                  {k:"height",         label:"Height",          ph:"tall / average / petite"},
-                  {k:"build",          label:"Build",           ph:"slim / athletic / curvy…"},
-                  {k:"body_shape",     label:"Body Shape",      ph:"hourglass / pear / apple…"},
-                  {k:"hair",           label:"Hair",            ph:"dark brown, shoulder length, wavy"},
-                  {k:"eyes",           label:"Eyes",            ph:"green, slightly almond-shaped"},
-                  {k:"face",           label:"Face",            ph:"oval, high cheekbones, clear skin"},
-                  {k:"style",          label:"Style",           ph:"minimal, dark tones, quality basics"},
-                  {k:"notable",        label:"Notable",         ph:"small scar above lip — or none"},
-                  {k:"presence",       label:"Presence",        ph:"warm / commanding / magnetic…"},
-                  {k:"body_confidence",label:"Body Confidence", ph:"high / moderate / low"},
-                  {k:"grooming",       label:"Grooming",        ph:"meticulous / natural / casual"},
-                  {k:"tension_markers",label:"Tension Markers", ph:"none / jaw tension / closed posture"},
-                ].map(f=>(
-                  <div key={f.k}>
-                    <label style={{...S.label,marginBottom:4,color:skippedFields.has(f.k)?"rgba(192,57,43,0.8)":undefined}}>{f.label}{skippedFields.has(f.k)?" — fill manually":""}</label>
-                    <input style={{...S.input,borderColor:skippedFields.has(f.k)?"rgba(192,57,43,0.4)":undefined}} value={appearanceFields[f.k]} onChange={e=>updAF(f.k,e.target.value)} placeholder={f.ph} />
-                  </div>
-                ))}
-              </div>
-
-              {/* Gender-specific — Haiku fills */}
-              {identity.gender==="female"&&<>
-                <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:10,letterSpacing:"0.16em",textTransform:"uppercase",color:"#a8a5a0",marginBottom:8}}>Physical — Female</div>
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
-                  {[
-                    {k:"breasts",        label:"Breasts",         ph:"average / full / large…"},
-                    {k:"ass",            label:"Ass",             ph:"round / flat / prominent…"},
-                    {k:"waist_hip_ratio",label:"Waist-Hip Ratio", ph:"low (very curvy) / average / high"},
-                    {k:"legs",           label:"Legs",            ph:"long / average / athletic…"},
-                  ].map(f=>(
-                    <div key={f.k}>
-                      <label style={{...S.label,marginBottom:4,color:skippedFields.has(f.k)?"rgba(192,57,43,0.8)":undefined}}>{f.label}{skippedFields.has(f.k)?" — fill manually":""}</label>
-                      <input style={{...S.input,borderColor:skippedFields.has(f.k)?"rgba(192,57,43,0.4)":undefined}} value={appearanceFields[f.k]} onChange={e=>updAF(f.k,e.target.value)} placeholder={f.ph} />
-                    </div>
-                  ))}
-                </div>
-              </>}
-
-              {identity.gender==="male"&&<>
-                <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:10,letterSpacing:"0.16em",textTransform:"uppercase",color:"#a8a5a0",marginBottom:8}}>Physical — Male</div>
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
-                  {[
-                    {k:"physique",          label:"Physique",          ph:"slim / toned / muscular / heavy"},
-                    {k:"shoulders",         label:"Shoulders",         ph:"broad / average / narrow"},
-                    {k:"height_dominance",  label:"Height Dominance",  ph:"very tall / tall / average…"},
-                  ].map(f=>(
-                    <div key={f.k}>
-                      <label style={{...S.label,marginBottom:4,color:skippedFields.has(f.k)?"rgba(192,57,43,0.8)":undefined}}>{f.label}{skippedFields.has(f.k)?" — fill manually":""}</label>
-                      <input style={{...S.input,borderColor:skippedFields.has(f.k)?"rgba(192,57,43,0.4)":undefined}} value={appearanceFields[f.k]} onChange={e=>updAF(f.k,e.target.value)} placeholder={f.ph} />
-                    </div>
-                  ))}
-                </div>
-              </>}
-
-              {/* Manual only — red */}
-              <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:10,letterSpacing:"0.16em",textTransform:"uppercase",color:"rgba(192,57,43,0.7)",marginBottom:8}}>Manual Only — Cannot Be Generated from Photos</div>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-                {[
-                  {k:"voice",           label:"Voice",           ph:"warm and low / bright / husky…"},
-                  {k:"sexual_presence", label:"Sexual Presence", ph:"high / moderate / low"},
-                  ...(identity.gender==="male"?[{k:"endowment",label:"Endowment",ph:"average / above average / well-endowed"}]:[]),
-                ].map(f=>(
-                  <div key={f.k}>
-                    <label style={{...S.label,marginBottom:4,color:"rgba(192,57,43,0.7)"}}>{f.label}</label>
-                    <input style={{...S.input,borderColor:"rgba(192,57,43,0.3)"}} value={appearanceFields[f.k]} onChange={e=>updAF(f.k,e.target.value)} placeholder={f.ph} />
-                  </div>
-                ))}
-              </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+              <Field label="Age" required><input style={S.input} type="number" min={18} max={99} value={identity.age} onChange={e=>updI("age",e.target.value)} placeholder="28" disabled={!glbReady} /></Field>
+              <Field label="Sexual Orientation" required>
+                <select style={S.select} value={identity.orientation} onChange={e=>updI("orientation",e.target.value)} disabled={!glbReady}>
+                  <option value="">— Select Sexual —</option>
+                  <option value="straight">Straight</option>
+                  <option value="bisexual">Bisexual</option>
+                  <option value="gay">Gay / Lesbian</option>
+                  <option value="pansexual">Pansexual</option>
+                  <option value="asexual">Asexual</option>
+                </select>
+              </Field>
             </div>
+            <Field label="Occupation" required hint="Shapes schedule, income and daily behaviour.">
+              <input style={S.input} value={identity.occupation} onChange={e=>updI("occupation",e.target.value)} placeholder="Photographer, nurse, architect…" disabled={!glbReady} />
+            </Field>
+
           </div>
 
-          {/* Right column — 3D character creation. Locked after this step:
+          {/* Center column — 3D preview only. Locked after this step:
               face, body shape, and the underlying mesh can't be changed
               later without regenerating the character. */}
-          <div>
-            <div style={{...S.secLabel, marginTop:0}}>3D Character</div>
-            <div style={{display:"flex",alignItems:"flex-start",gap:8,fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#6b6760",background:"rgba(176,92,8,0.05)",border:"1px solid rgba(176,92,8,0.15)",borderRadius:10,padding:"10px 12px",marginBottom:16,lineHeight:1.5}}>
-              <span style={{color:"#b05c08"}}>🔒</span>
-              <span>Face, body shape and mesh are set once here and can't be changed later without regenerating the character. Hair and outfits stay editable afterward.</span>
-            </div>
-
+          <div style={{alignSelf:"stretch",display:"flex",flexDirection:"column",minWidth:0}}>
             {/* Preview viewport — placeholder for now. Will mount the real
                 Three.js viewer (ActorModelPanel-derived) once it's confirmed
-                to run inside a modal context. */}
-            <div style={{position:"relative",borderRadius:14,overflow:"hidden",height:280,background:"#141311",marginBottom:16}}>
-              <div style={{position:"absolute",inset:0,backgroundImage:"linear-gradient(rgba(220,211,190,0.08) 1px, transparent 1px), linear-gradient(90deg, rgba(220,211,190,0.08) 1px, transparent 1px)",backgroundSize:"36px 36px",maskImage:"radial-gradient(ellipse 70% 60% at 50% 55%, black 30%, transparent 75%)",WebkitMaskImage:"radial-gradient(ellipse 70% 60% at 50% 55%, black 30%, transparent 75%)"}} />
-              <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
-                {character3DStatus==="ready" ? (
-                  <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:8}}>
-                    <div style={{width:100,height:150,borderRadius:"50px 50px 6px 6px",border:"2px dashed #c7b48c",display:"flex",alignItems:"center",justifyContent:"center",fontSize:28}}>🧍</div>
-                    <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#c7b48c"}}>✓ 3D character generated</div>
-                  </div>
-                ) : character3DStatus==="idle" ? (
+                to run inside a modal context. Fills whatever vertical space
+                is actually available on the page now that this is a real
+                route, not guessing another fixed pixel height. */}
+            <div style={{position:"relative",borderRadius:14,overflow:"hidden",flex:1,minWidth:0,minHeight:400,background:"#141311",marginBottom:16}}>
+              {character3DStatus==="ready" && glbUrl ? (
+                <MiniGlbViewer glbUrl={glbUrl} bodyTorsoLength={bodyTorsoLength} bodyArmsLength={bodyArmsLength} bodyLegsLength={bodyLegsLength} />
+              ) : (
+                <>
+                  <div style={{position:"absolute",inset:0,backgroundImage:"linear-gradient(rgba(220,211,190,0.08) 1px, transparent 1px), linear-gradient(90deg, rgba(220,211,190,0.08) 1px, transparent 1px)",backgroundSize:"36px 36px",maskImage:"radial-gradient(ellipse 70% 60% at 50% 55%, black 30%, transparent 75%)",WebkitMaskImage:"radial-gradient(ellipse 70% 60% at 50% 55%, black 30%, transparent 75%)"}} />
+                  <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
+                {character3DStatus==="idle" ? (
                   <div style={{textAlign:"center",fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#8a8171",maxWidth:200}}>
                     Set gender and generate a face to see a preview
                   </div>
@@ -805,11 +733,32 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
                   <div style={{textAlign:"center",fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#c0392b",maxWidth:220}}>
                     {character3DError || "Something went wrong"}
                   </div>
-                ) : (
-                  <div style={{textAlign:"center",fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#c7b48c"}}>
+                ) : null}
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* Portalled directly to document.body — bulletproof against
+                whatever ancestor was constraining position:fixed (never
+                found the exact culprit despite checking every file in
+                this chain; a portal sidesteps the question entirely by
+                removing the ancestor chain altogether). Layout now
+                actually matches KnockingDoorScene's real pattern: ring
+                around the reference photo, not a bare floating spinner,
+                plus the same italic serif status text treatment. */}
+            {character3DStatus!=="ready" && character3DStatus!=="idle" && character3DStatus!=="error" && ReactDOM.createPortal(
+              <div style={{position:"fixed",inset:0,zIndex:9999,background:"#0d0c0a",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:20}}>
+                  {photos.profile && (
+                    <img src={URL.createObjectURL(photos.profile)} alt="" style={{width:100,height:100,borderRadius:"50%",objectFit:"cover",display:"block",border:"1.5px solid rgba(255,255,255,0.12)"}} />
+                  )}
+                  <MacSpinner size={40} />
+                  <p style={{fontFamily:"'Cormorant Garamond',Georgia,serif",fontSize:15,fontStyle:"italic",color:"rgba(255,255,255,0.5)",letterSpacing:"0.04em",margin:0,textAlign:"center"}}>
                     {character3DStatus==="creating_actor" && "Creating draft character…"}
                     {character3DStatus==="queued" && "Queued…"}
-                    {character3DStatus==="clearing_scene" && "Clearing previous scene…"}
+                    {character3DStatus==="starting_daz_studio" && "Starting a fresh DAZ Studio session…"}
+                    {character3DStatus==="recovering_daz_studio" && "Recovering DAZ Studio, retrying…"}
                     {character3DStatus==="uploading_photo" && "Uploading reference photo…"}
                     {character3DStatus==="generating_face" && "Generating face…"}
                     {character3DStatus==="applying_body_shape" && "Applying body shape…"}
@@ -817,23 +766,80 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
                     {character3DStatus==="exporting" && "Exporting mesh & rig…"}
                     {character3DStatus==="converting" && "Converting to glTF…"}
                     {character3DStatus==="downloading" && "Bringing the model home…"}
-                  </div>
-                )}
-              </div>
-            </div>
+                  </p>
+                </div>
+              </div>,
+              document.body
+            )}
 
+            {/* DEV ONLY — loads an existing local GLB directly into the
+                preview for testing (e.g. the slider wiring) without
+                running the full Face Transfer pipeline each time.
+                Native file picker, not a typed path — a browser can't
+                fetch() an arbitrary filesystem path (security sandbox,
+                not a bug), but a real <input type="file"> can read
+                local disk directly via the File API. */}
+            <input
+              ref={debugFileInputRef}
+              type="file"
+              accept=".glb"
+              style={{display:"none"}}
+              onChange={e=>{
+                const file = e.target.files?.[0];
+                if (!file) return;
+                if (glbUrl && glbUrl.startsWith("blob:")) URL.revokeObjectURL(glbUrl);
+                setGlbUrl(URL.createObjectURL(file));
+                setCharacter3DStatus("ready");
+              }}
+            />
             <button
-              onClick={handleGenerateFace}
-              disabled={IN_PROGRESS_STAGES.includes(character3DStatus) || character3DStatus==="creating_actor"}
-              style={{...S.btnAmberFull, marginBottom:20, opacity:(IN_PROGRESS_STAGES.includes(character3DStatus) || character3DStatus==="creating_actor")?0.6:1}}>
-              {character3DStatus==="ready" ? "◈ Regenerate Face" : (IN_PROGRESS_STAGES.includes(character3DStatus) || character3DStatus==="creating_actor") ? "◈ Working…" : "◈ Generate Face"}
-            </button>
+              style={{...S.btnSecondary, width:"100%", flexShrink:0}}
+              onClick={()=>debugFileInputRef.current?.click()}
+            >Dev: Load Local GLB File…</button>
+          </div>
 
-            <div style={S.secLabel}>Body Shape</div>
-            <Slider label="Height" value={bodyHeight} onChange={setBodyHeight} />
-            <Slider label="Breast Size" value={bodyBreastSize} onChange={setBodyBreastSize} />
+          {/* Right column — Adjustments. A genuinely separate column
+              from the viewer, not stacked underneath it.
+              Structure matches the approved mockup exactly. Only the
+              three confirmed real body-shape morphs are live (Legs
+              Length/Arms Length/Torso Length — each in its own real DAZ
+              category, confirmed via Parameter Settings in DAZ Studio).
+              Everything else here is a disabled placeholder: no real
+              morph or data backs it yet, so it renders but can't be
+              dragged — kept visible so the structure is right and it's
+              ready to enable/edit/remove field by field later, rather
+              than guessing stop-lists or reinventing the layout now. */}
+          <div>
+            <div style={{...S.secLabel, marginTop:0}}>Adjustments</div>
+
+            <div style={S.secLabel}>Head</div>
+            <Slider label="Eyes" value={50} disabled />
+            <Slider label="Face" value={50} disabled />
+
+            <div style={S.secLabel}>Chest</div>
+            <Slider label="Bust Size" value={50} disabled />
+            <Slider label="Breasts" value={50} disabled />
+
+            <div style={S.secLabel}>Waist</div>
+            <Slider label="Torso Length" value={bodyTorsoLength} onChange={setBodyTorsoLength} disabled={!glbReady} />
+            <Slider label="Body Shape" value={50} disabled />
+            <Slider label="Waist-Hip" value={50} disabled />
+            <Slider label="Ass" value={50} disabled />
+
+            <div style={S.secLabel}>Legs</div>
+            <Slider label="Legs Length" value={bodyLegsLength} onChange={setBodyLegsLength} disabled={!glbReady} />
+            <Slider label="Legs" value={50} disabled />
+
+            <div style={S.secLabel}>Arms</div>
+            <Slider label="Arms Length" value={bodyArmsLength} onChange={setBodyArmsLength} disabled={!glbReady} />
           </div>
           </div>}
+
+          {/* Steps 2-6 stay narrow and centered — unlike Appearance, these
+              are single-column text fields, and stretching them across a
+              full-width page just makes long, sparse input boxes hard to
+              read. */}
+          {step!==1&&<div style={{maxWidth:680,margin:"0 auto"}}>
 
           {/* STEP 2: PSYCHOLOGY */}
           {step===2&&<>
@@ -1130,13 +1136,14 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
               <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#a8a5a0",marginTop:10}}>Saves to your character registry. Deploy to a world separately from the character profile.</div>
             </div>
           </>}
+          </div>}
         </div>
 
         {/* Footer */}
         <div style={S.foot}>
           <button style={S.btnSecondary} onClick={()=>{setError(null);setStep(s=>Math.max(s-1,1))}} disabled={step===1}>← Back</button>
           <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#a8a5a0"}}>Step {step} of 6</div>
-          {step<6&&<button style={S.btnPrimary} onClick={()=>{setError(null);setStep(s=>s+1)}}>{step===5?"Review →":"Next →"}</button>}
+          {step<6&&<button style={{...S.btnPrimary, opacity:(step===1 && !step1Complete)?0.4:1, cursor:(step===1 && !step1Complete)?"not-allowed":"pointer"}} onClick={()=>{setError(null);setStep(s=>s+1)}} disabled={step===1 && !step1Complete}>{step===5?"Review →":"Next →"}</button>}
           {step===6&&<div />}
         </div>
 

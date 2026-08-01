@@ -8,11 +8,28 @@ import path from "path";
 import { fileURLToPath } from "url";
 import multer from "multer";
 import db from "./db.js";
-import { registerGenerate3DRoutes } from "./generate3d.js";
+import { registerGenerate3DRoutes, deleteActorTmpFolder } from "./generate3d.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } }); // 100mb for videos
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// ── Crash safety net ─────────────────────────────────────────────────────────
+// Without this, ANY unhandled error anywhere in the process — including in
+// unrelated background work like the simulator SSE reconnect loop — kills
+// the entire server, taking down every in-flight request (character
+// creation, 3D generation, everything) regardless of what actually failed.
+// Confirmed cause of a real crash (30 Jul, ~09:57): a simulator SSE
+// timeout threw inside undici's fetch internals and brought the whole
+// process down mid-generation, unrelated to the generation itself.
+// Registered as early as possible, before any route or background task
+// that could throw.
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException] not crashing the process:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection] not crashing the process:", reason);
+});
 
 // ── Local LLM helper (dirty-muse on M4) — replaces Haiku for structured JSON tasks ──
 const DIRTY_MUSE_URL  = "http://192.168.1.60:11434/api/chat";
@@ -2421,6 +2438,7 @@ app.post("/api/actors/:id/abandon-draft", (req, res) => {
     for (const t of tables) { try { db.prepare(`DELETE FROM ${t} WHERE actor_id = ?`).run(req.params.id); } catch {} }
     db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
   })();
+  deleteActorTmpFolder(req.params.id); // not awaited — see comment in generate3d.js
   res.status(204).end();
 });
 
@@ -2451,6 +2469,7 @@ app.delete("/api/actors/:id", (req, res) => {
     try { db.prepare(`DELETE FROM actor_deployments WHERE platform_actor_id = ?`).run(req.params.id); } catch {}
     db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
   })();
+  deleteActorTmpFolder(req.params.id); // not awaited — see comment in generate3d.js
   res.json({ ok: true });
 });
 

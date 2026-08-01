@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import CharacterWizard from "./CharacterWizard.jsx";
 import DeployWizardModal from "./DeployWizardModal.jsx";
 
 const STYLE_COLOR = {
@@ -246,7 +245,6 @@ export default function ActorsGalleryPage() {
   const [deployedIds, setDeployedIds] = useState(new Set());
   const [deployments, setDeployments] = useState([]);
   const [shareActor, setShareActor]   = useState(null);
-  const [showWizard, setShowWizard]   = useState(false);
   const [deployActor, setDeployActor] = useState(null);
   const navigate = useNavigate();
 
@@ -302,7 +300,7 @@ export default function ActorsGalleryPage() {
             <span style={{ color:"#d1cfca", fontSize:14 }}>/</span>
             <span style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", fontSize:24, fontWeight:500, letterSpacing:".22em", textTransform:"uppercase", color:"#1a1814" }}>Characters</span>
           </div>
-          <button onClick={() => setShowWizard(true)} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, letterSpacing:".06em", textTransform:"uppercase", padding:"10px 22px", borderRadius:10, background:"#1a1814", color:"#faf8f4", border:"none", cursor:"pointer" }}>New character +</button>
+          <button onClick={() => navigate("/actors/new")} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, letterSpacing:".06em", textTransform:"uppercase", padding:"10px 22px", borderRadius:10, background:"#1a1814", color:"#faf8f4", border:"none", cursor:"pointer" }}>New character +</button>
         </div>
 
         {Object.entries(worldGroups).map(([worldName, actorIds]) => {
@@ -362,19 +360,12 @@ export default function ActorsGalleryPage() {
           <div style={{ textAlign:"center", padding:"4rem 2rem" }}>
             <p style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", fontSize:22, color:"#1a1814", marginBottom:8 }}>No characters yet</p>
             <p style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, color:"#a8a5a0", marginBottom:24 }}>Create your first character to get started.</p>
-            <button onClick={() => setShowWizard(true)} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, letterSpacing:".06em", textTransform:"uppercase", padding:"10px 22px", borderRadius:10, background:"#1a1814", color:"#faf8f4", border:"none", cursor:"pointer" }}>New character +</button>
+            <button onClick={() => navigate("/actors/new")} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, letterSpacing:".06em", textTransform:"uppercase", padding:"10px 22px", borderRadius:10, background:"#1a1814", color:"#faf8f4", border:"none", cursor:"pointer" }}>New character +</button>
           </div>
         )}
       </div>
 
       {shareActor && <ShareModal actor={shareActor} onClose={() => setShareActor(null)} />}
-
-      {showWizard && (
-        <CharacterWizard
-          onClose={() => setShowWizard(false)}
-          onCreated={a => { setShowWizard(false); fetch("/api/actors").then(r=>r.ok?r.json():[]).then(setOwned).catch(()=>{}); }}
-        />
-      )}
 
       {deployActor && (
         <DeployWizardModal

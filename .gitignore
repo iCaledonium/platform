@@ -9,3 +9,5 @@ public/media/
 public/media/
 deploy-logs/
 deploy-logs/
+.env
+cleanup_drafts.mjs

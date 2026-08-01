@@ -9,6 +9,7 @@ import MessagesPage from "./pages/MessagesPage.jsx";
 import CalendarPage from "./pages/CalendarPage.jsx";
 import VoicemailPage from "./pages/VoicemailPage.jsx";
 import ActorsGalleryPage from "./pages/ActorsGalleryPage.jsx";
+import CharacterWizard from "./pages/CharacterWizard.jsx";
 import ActorsEditorPage from "./pages/ActorsEditorPage.jsx";
 import DeployWizardPage from "./pages/DeployWizardPage.jsx";
 import WorldsPage from "./pages/WorldsPage.jsx";
@@ -308,6 +309,7 @@ export default function App() {
         <Route path="/calendar"     element={<CalendarPage />} />
         <Route path="/voicemail"    element={<VoicemailPage />} />
         <Route path="/actors"            element={<ActorsGalleryPage />} />
+        <Route path="/actors/new"        element={<CharacterWizard />} />
         <Route path="/actors/:id"        element={<ActorsEditorPage />} />
         <Route path="/actors/:id/deploy" element={<DeployWizardPage />} />
         <Route path="/encounter/knock/:encounterId" element={<KnockEncounterPage />} />
