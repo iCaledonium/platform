@@ -270,7 +270,11 @@ export default function ActorsGalleryPage() {
   };
 
   const inPlay    = owned.filter(a => deployedIds.has(a.id));
-  const notInPlay = owned.filter(a => !deployedIds.has(a.id));
+  // Session 103 (user law) — "Not in play" is the shelf for FINISHED
+  // characters awaiting a world (ready_to_deploy, plus pre-lifecycle
+  // finished actors), never half-built drafts: those live in the
+  // wizard's drafts rail and nowhere else.
+  const notInPlay = owned.filter(a => !deployedIds.has(a.id) && a.status !== "draft");
 
   // Group in-play owned actors by world name
   const worldGroups = deployments.reduce((acc, d) => {
@@ -335,7 +339,7 @@ export default function ActorsGalleryPage() {
 
         {shared.length > 0 && (() => {
           const sharedInPlay    = shared.filter(a => deployedIds.has(a.id));
-          const sharedNotInPlay = shared.filter(a => !deployedIds.has(a.id));
+          const sharedNotInPlay = shared.filter(a => !deployedIds.has(a.id) && a.status !== "draft");
           return (
             <>
               {sharedInPlay.length > 0 && (

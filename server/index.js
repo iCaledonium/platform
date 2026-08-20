@@ -5,10 +5,56 @@ import { randomUUID } from "crypto";
 import * as OTPAuth from "otpauth";
 import QRCode from "qrcode";
 import path from "path";
+import os from "os";
+import zlib from "zlib";
 import { fileURLToPath } from "url";
 import multer from "multer";
 import db from "./db.js";
 import { registerGenerate3DRoutes, deleteActorTmpFolder } from "./generate3d.js";
+import { mergeAnimationIntoActorGlb, removeAnimationFromActorGlb, parseDufFrames } from "./animations.js";
+
+// Session 102 — drafts carry their wizard adjustment state (all morph
+// slider values, the named body sliders, pose values, reference URLs,
+// measurements) as one JSON blob, so a draft reloads as the SAME
+// in-progress character, not just the same base GLB. Idempotent ALTER
+// at boot: succeeds once, throws harmlessly ever after (SQLite has no
+// ADD COLUMN IF NOT EXISTS).
+try { db.prepare(`ALTER TABLE actors ADD COLUMN draft_state TEXT`).run(); } catch {}
+// Session 106 — default home. The wizard's Economy-step picker writes a
+// preferred interior template (a shared /media/homes asset, cataloged in
+// interior_templates); world/place binding stays with the deploy wizard.
+// Same idempotent-at-boot pattern as draft_state above.
+try { db.prepare(`ALTER TABLE actors ADD COLUMN default_home_template_url TEXT`).run(); } catch {}
+// Session 107 — the actors-table rebuild (Session ~105 schema recovery)
+// came back WITHOUT the appearance column while the save handlers still
+// referenced it; every draft finalize 500'd from that day until the
+// first save attempt found it (SqliteError: no such column: appearance,
+// index.js:3276). Restored here so a rebuilt DB self-heals instead of
+// mining itself.
+try { db.prepare(`ALTER TABLE actors ADD COLUMN appearance TEXT`).run(); } catch {}
+// Session 147 — per-user preferences (first consumer: Explore display
+// sliders). One TEXT JSON column, namespaced object inside (e.g.
+// { exploreDisplay: {...} }) so future preference groups merge rather
+// than collide. Same idempotent-at-boot pattern as draft_state above.
+try { db.prepare(`ALTER TABLE users ADD COLUMN preferences TEXT`).run(); } catch {}
+// Session 148 — nationality on the actor identity (ISO 3166-1 alpha-2
+// code, e.g. "SE", "US"; the wizard renders it with a flag). First of
+// the nationality/language attributes ruled in: pins what the three
+// LLMs otherwise each infer differently from a name.
+try { db.prepare(`ALTER TABLE actors ADD COLUMN nationality TEXT`).run(); } catch {}
+// Session 107, landmine #3 from the same rebuild: the recreated actors
+// table lost PRIMARY KEY on id, which silently broke EVERY foreign key
+// referencing actors ("foreign key mismatch" on actor_media insert) and
+// removed the duplicate-id guard. SQLite cannot ALTER a PK in, but a
+// unique index is the full equivalent for FK-parent and uniqueness
+// purposes. Idempotent.
+db.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS idx_actors_id_unique ON actors(id)`).run();
+db.prepare(`CREATE TABLE IF NOT EXISTS interior_templates (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  glb_url TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+)`).run();
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } }); // 100mb for videos
 
@@ -44,7 +90,13 @@ async function callDirtyMuse(system, userContent, maxTokens = 600) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model: DIRTY_MUSE_MODEL, stream: false, keep_alive: -1,
-      options: { num_ctx: 2048 }, messages }),
+      // Session 103 — maxTokens was ACCEPTED but never SENT: num_ctx
+      // was hardcoded 2048 and num_predict absent, so every caller
+      // requesting more than the window got silently truncated output
+      // (found live: the 4000-token full-profile route — the only
+      // caller that ever exceeded the window — was the only one that
+      // failed, mid-JSON; dirty-muse itself was healthy all along).
+      options: { num_ctx: 4096, num_predict: maxTokens }, messages }),
     signal: AbortSignal.timeout(120_000)
   });
   if (!res.ok) throw new Error(`dirty-muse ${res.status}`);
@@ -1290,6 +1342,37 @@ function parseVideoMeta(filename) {
   return { location, position, outfit, action, clip_type, suffix };
 }
 
+// Deletes the actor's entire media_folder directory on disk — the GLB,
+// portraits, archives, everything pullGlbToServer() and
+// archiveWorldMedia() ever wrote there. Neither abandon-draft nor the
+// hard-delete endpoint previously did this: both only removed files
+// tracked in actor_media, and the GLB itself is never tracked there —
+// only via actors.glb_url (see generate3d.js). Confirmed root cause of
+// ~122 orphaned media folders found in production (Session 99).
+// Guarded so a missing/empty media_folder can never resolve to the
+// parent "actors" directory itself — that would delete every
+// character's media at once.
+function deleteActorMediaFolder(mediaFolder) {
+  if (!mediaFolder || typeof mediaFolder !== "string" || mediaFolder.trim() === "") {
+    console.warn("[deleteActorMediaFolder] skipped — empty/missing media_folder");
+    return;
+  }
+  const actorsRoot = path.join(__dirname, "../public/media/actors");
+  const targetDir = path.join(actorsRoot, mediaFolder);
+  // Defense in depth against path traversal — resolved target must stay
+  // strictly inside the actors media root.
+  if (!targetDir.startsWith(actorsRoot + path.sep)) {
+    console.warn(`[deleteActorMediaFolder] skipped — resolved path escapes actors root: ${targetDir}`);
+    return;
+  }
+  try {
+    fs.rmSync(targetDir, { recursive: true, force: true });
+    console.log(`[deleteActorMediaFolder] removed ${targetDir}`);
+  } catch (e) {
+    console.warn(`[deleteActorMediaFolder] failed for ${targetDir}:`, e.message);
+  }
+}
+
 async function archiveWorldMedia(platformActorId, worldId, worldName, mediaFolder, simActorId) {
   console.log(`[archive] Starting archive for actor ${platformActorId} world ${worldId}`);
 
@@ -1505,6 +1588,8 @@ app.post("/api/actors/:id/deploy", async (req, res) => {
     const deployStatus = simRes.warning ? 'pending_boot' : 'deployed';
     db.prepare(`INSERT OR REPLACE INTO actor_deployments (id, platform_actor_id, world_id, simulator_actor_id, world_name, deploy_status, deployed_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(crypto.randomUUID(), actorId, world.id, simRes.simulator_actor_id, world.name, deployStatus, now, now);
+    // Session 103 — the lifecycle's final step: deployed = active.
+    db.prepare(`UPDATE actors SET status = 'active', updated_at = ? WHERE id = ?`).run(now, actorId);
 
     res.json({ ok: true, simulator_actor_id: simRes.simulator_actor_id });
   } catch (e) {
@@ -2233,7 +2318,185 @@ app.get("/api/actors/:id/worlds", async (req, res) => {
 });
 
 // ── Static media ─────────────────────────────────────────────────────────────
+// Session 102 — wire-compression for GLBs. Character files are ~47MB
+// and the free ngrok tunnel made every draft load a multi-minute
+// stall. Draco already compresses the MESH chunks, but force-sampled
+// idle/walk animation tracks (254-bone rig, float32 samplers) ship
+// uncompressed and are the bulk of the file — and they gzip well.
+// Done inline with zlib (no new dependency; the standard compression
+// middleware refuses application/octet-stream anyway). Falls through
+// to express.static for non-gzip clients or missing files.
+// ── POST /api/actors/:id/animations — Session 143 ─────────────────────
+// "Upload an animation and it is merged": multipart file (field
+// "animation": .glb/.gltf/.fbx/.blend) + clip_name (+ loop=true for
+// looping clips) -> merged into the actor's CURRENT canonical GLB via
+// Blender headless on the Mac Mini (merge_animation_into_glb.py —
+// bone-name guard included, so a wrong-skeleton clip is refused with a
+// real error, not merged into a frozen statue). updated_at bump is the
+// cache-bust: /media/*.glb is served immutable and every client load
+// appends ?v=updated_at, so bumping it IS the invalidation.
+app.post("/api/actors/:id/animations", upload.single("animation"), async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const actor = db.prepare(`SELECT * FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
+  if (!actor) return res.status(404).json({ error: "not found" });
+  if (!actor.glb_url) return res.status(400).json({ error: "actor has no 3D model (glb_url is empty)" });
+  if (!req.file) return res.status(400).json({ error: "no animation file uploaded (multipart field: animation)" });
+  const clipName = String(req.body.clip_name || "").trim();
+  if (!/^[a-zA-Z0-9_-]{1,32}$/.test(clipName)) {
+    return res.status(400).json({ error: "clip_name required: 1-32 chars, letters/digits/_/- only" });
+  }
+  const ext = path.extname(req.file.originalname || "").toLowerCase();
+  if (![".duf", ".blend"].includes(ext)) {
+    return res.status(400).json({ error: `unsupported animation format "${ext}" — .duf or .blend (foreign-skeleton .fbx/.glb needs a retarget step that isn't built yet)` });
+  }
+  const glbAbsPath = path.join(__dirname, "../public", decodeURIComponent(actor.glb_url.split("?")[0]));
+  if (!fs.existsSync(glbAbsPath)) {
+    return res.status(500).json({ error: `actor glb_url points to a missing file: ${actor.glb_url}` });
+  }
+  // Session 144 — LEDGER MODEL: the retained master .blend beside the
+  // GLB is the source of truth; every clip op edits it and re-derives
+  // the GLB from it (update_master_animations.py via runLedgerOp).
+  const masterBlendAbsPath = glbAbsPath.replace(/\.glb$/, ".blend");
+  if (!fs.existsSync(masterBlendAbsPath)) {
+    return res.status(400).json({ error: "This character has no retained master .blend beside its GLB (generated before master retention, Session 144). Regenerate the 3D character once — the pipeline now saves the master alongside the GLB." });
+  }
+  const tmpAnimPath = path.join(os.tmpdir(), `anim_${randomUUID()}${ext}`);
+  fs.writeFileSync(tmpAnimPath, req.file.buffer);
+  try {
+    let detectedFrames = null;
+    if (ext === ".duf") {
+      try { detectedFrames = parseDufFrames(req.file.buffer); }
+      catch (e) { console.warn(`[actor-animations] .duf frame parse failed (informational only): ${e.message}`); }
+    }
+    const mergeLog = await mergeAnimationIntoActorGlb({
+      actorId: actor.id,
+      localMasterBlendAbsPath: masterBlendAbsPath,
+      localGlbAbsPath: glbAbsPath,
+      localAnimAbsPath: tmpAnimPath,
+      clipName,
+      loop: req.body.loop === "true" || req.body.loop === "1",
+    });
+    const now = new Date().toISOString();
+    db.prepare(`UPDATE actors SET updated_at = ? WHERE id = ?`).run(now, actor.id);
+    res.json({ ok: true, clip: clipName, updated_at: now, detected_frames: detectedFrames, log_tail: mergeLog.slice(-2000) });
+  } catch (e) {
+    console.error(`[actor-animations] merge failed for ${actor.id}:`, e);
+    res.status(e.statusCode || 500).json({ error: String(e.message || e).slice(0, 4000) });
+  } finally {
+    try { fs.unlinkSync(tmpAnimPath); } catch {}
+  }
+});
+
+// ── DELETE /api/actors/:id/animations/:clipName — Session 143 ─────────
+// Removes a clip from the actor's canonical GLB (Blender run on the
+// Mac Mini, atomic swap, updated_at cache-bust — the merge's mirror
+// image). idle and walk are protected: Explore's locomotion state
+// machine depends on them existing.
+app.delete("/api/actors/:id/animations/:clipName", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const actor = db.prepare(`SELECT * FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
+  if (!actor) return res.status(404).json({ error: "not found" });
+  if (!actor.glb_url) return res.status(400).json({ error: "actor has no 3D model (glb_url is empty)" });
+  const clipName = String(req.params.clipName || "").trim();
+  if (!/^[a-zA-Z0-9_-]{1,32}$/.test(clipName)) return res.status(400).json({ error: "invalid clip name" });
+  if (clipName === "idle" || clipName === "walk") {
+    return res.status(400).json({ error: `"${clipName}" is protected — Explore's locomotion depends on it` });
+  }
+  const glbAbsPath = path.join(__dirname, "../public", decodeURIComponent(actor.glb_url.split("?")[0]));
+  if (!fs.existsSync(glbAbsPath)) {
+    return res.status(500).json({ error: `actor glb_url points to a missing file: ${actor.glb_url}` });
+  }
+  const masterBlendAbsPath = glbAbsPath.replace(/\.glb$/, ".blend");
+  if (!fs.existsSync(masterBlendAbsPath)) {
+    return res.status(400).json({ error: "This character has no retained master .blend beside its GLB (generated before master retention, Session 144). Regenerate the 3D character once." });
+  }
+  try {
+    const log = await removeAnimationFromActorGlb({ actorId: actor.id, localMasterBlendAbsPath: masterBlendAbsPath, localGlbAbsPath: glbAbsPath, clipName });
+    const now = new Date().toISOString();
+    db.prepare(`UPDATE actors SET updated_at = ? WHERE id = ?`).run(now, actor.id);
+    res.json({ ok: true, removed: clipName, updated_at: now, log_tail: log.slice(-1500) });
+  } catch (e) {
+    console.error(`[actor-animations] removal failed for ${actor.id}:`, e);
+    res.status(500).json({ error: String(e.message || e).slice(0, 4000) });
+  }
+});
+
+app.get(/^\/media\/.*\.glb$/, (req, res, next) => {
+  if (!/gzip/.test(req.headers["accept-encoding"] || "")) return next();
+  const filePath = path.join(__dirname, "../public", decodeURIComponent(req.path));
+  fs.stat(filePath, (err, st) => {
+    if (err || !st.isFile()) return next();
+    res.setHeader("Content-Type", "model/gltf-binary");
+    res.setHeader("Content-Encoding", "gzip");
+    res.setHeader("Vary", "Accept-Encoding");
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable"); // content-addressed by actorId — safe to cache hard
+    const stream = fs.createReadStream(filePath).pipe(zlib.createGzip({ level: 6 }));
+    stream.on("error", (e) => { console.error("[glb-gzip]", e); if (!res.headersSent) next(); });
+    stream.pipe(res);
+  });
+});
 app.use("/media", express.static(path.join(__dirname, "../public/media")));
+
+// ── GET /api/accessories — dynamic discovery of real accessory assets ──
+// Scans public/media/accessories/ recursively. Every .glb found is
+// parsed as type_length_name (underscore-separated; "name" is
+// everything after the first two segments, since display names can
+// themselves contain underscores like "kin_hair"). A same-named .png
+// alongside it is used as the thumbnail if present.
+app.get("/api/accessories", (req, res) => {
+  const accessoriesRoot = path.join(__dirname, "../public/media/accessories");
+  const results = [];
+
+  function scanDir(dir, relativeParts) {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return; // directory doesn't exist yet — no results from here, not an error
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        scanDir(fullPath, [...relativeParts, entry.name]);
+      } else if (entry.name.toLowerCase().endsWith(".glb")) {
+        const baseName = entry.name.slice(0, -4);
+        const parts = baseName.split("_");
+        const type = parts[0] || "";
+        const length = parts[1] || "";
+        const nameParts = parts.slice(2);
+        const displayName = nameParts.length > 0
+          ? nameParts.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ")
+          : baseName;
+        const thumbFile = entry.name.slice(0, -4) + ".png";
+        const hasThumbnail = fs.existsSync(path.join(dir, thumbFile));
+        const urlParts = [...relativeParts, entry.name];
+        const thumbUrlParts = [...relativeParts, thumbFile];
+        // Session 103 — cache-busting by mtime: /media/*.glb is served
+        // with Cache-Control immutable (right for actorId-addressed
+        // character files, WRONG for accessories edited in place —
+        // found live: Draco-recompressed hair served stale forever,
+        // wrong hair per URL). A changed file gets a new URL; an
+        // unchanged one keeps its hard cache.
+        let v = 0;
+        try { v = Math.floor(fs.statSync(fullPath).mtimeMs); } catch {}
+        results.push({
+          category: relativeParts.join("/"),
+          filename: entry.name,
+          type,
+          length,
+          displayName,
+          glbUrl: `/media/accessories/${urlParts.join("/")}?v=${v}`,
+          thumbnailUrl: hasThumbnail ? `/media/accessories/${thumbUrlParts.join("/")}?v=${v}` : null,
+        });
+      }
+    }
+  }
+
+  scanDir(accessoriesRoot, []);
+  res.json({ accessories: results });
+});
 
 const PORT = 4002;
 // ── Simulator proxies ─────────────────────────────────────────────────────────
@@ -2397,11 +2660,21 @@ async function connectSimulatorEvents() {
 
 
 // ── GET /api/actors — list canonical actors owned by or shared with the user ─
+// ── GET /api/interior-templates — home template catalog (Session 106) ────────
+// Read by CharacterWizard's default-home picker. Assets live in
+// /media/homes/ (shared library, sibling of accessories/poses).
+app.get("/api/interior-templates", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const templates = db.prepare(`SELECT id, name, glb_url FROM interior_templates ORDER BY name`).all();
+  res.json({ templates });
+});
+
 app.get("/api/actors", (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
   const actors = db.prepare(`
-    SELECT a.id, a.name, a.age, a.gender, a.occupation, a.status,
+    SELECT a.id, a.name, a.age, a.gender, a.occupation, a.status, a.updated_at,
            p.attachment_style, b.openness, b.conscientiousness, b.extraversion, b.agreeableness, b.neuroticism,
            (SELECT url FROM actor_media WHERE actor_id = a.id AND media_type = 'photo' AND state_slug IN ('photo_close','profile') LIMIT 1) as photo_url
     FROM actors a
@@ -2414,6 +2687,120 @@ app.get("/api/actors", (req, res) => {
 });
 
 // ── DELETE /api/actors/:id — hard delete undeployed actor ───────────────────
+// ── POST /api/actors/:id/draft-state — persist the wizard's adjustment
+// snapshot on a draft (Session 102). Drafts only, owner only: a
+// finished character's shape is baked into its canonical GLB at
+// wizard completion; draft_state is strictly the in-progress
+// representation. Read side needs no route of its own — GET
+// /api/actors/:id already does SELECT a.*, so the column flows to the
+// client automatically.
+// Session 103 — RENAME a draft: the media folder convention is
+// {first}-{last}-{id8}, so a name change must move the folder and
+// rewrite every stored reference, atomically, server-side. Drafts
+// only. Uses the EXACT slug formula from actor creation. The client
+// needs no in-session state updates: the server resolves media_folder
+// fresh per request, and the browser's immutable cache carries the
+// session's already-loaded GLB URL; the next draft load reads the new
+// row.
+app.post("/api/actors/:id/rename", express.json(), (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not logged in" });
+  const { first_name, last_name } = req.body || {};
+  if (!first_name || !last_name) return res.status(400).json({ error: "first_name and last_name required" });
+  const actor = db.prepare(`SELECT id, media_folder, glb_url FROM actors WHERE id = ? AND owner_id = ? AND status = 'draft'`).get(req.params.id, user.id);
+  if (!actor) return res.status(404).json({ error: "not a draft you own" });
+  const name = `${first_name} ${last_name}`.trim();
+  const newFolder = name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"") + "-" + actor.id.slice(0,8);
+  if (newFolder === actor.media_folder) {
+    db.prepare(`UPDATE actors SET name = ?, first_name = ?, last_name = ?, updated_at = ? WHERE id = ?`)
+      .run(name, first_name, last_name, new Date().toISOString(), actor.id);
+    return res.json({ renamed: true, media_folder: actor.media_folder, moved: false });
+  }
+  const oldDir = path.join(__dirname, "../public/media/actors", actor.media_folder);
+  const newDir = path.join(__dirname, "../public/media/actors", newFolder);
+  try {
+    if (fs.existsSync(newDir)) throw new Error(`target folder already exists: ${newFolder}`);
+    if (fs.existsSync(oldDir)) fs.renameSync(oldDir, newDir);
+    else console.warn(`[rename] ${actor.id}: old media folder missing on disk (${actor.media_folder}) — updating references only`);
+    const oldSeg = `/media/actors/${actor.media_folder}/`;
+    const newSeg = `/media/actors/${newFolder}/`;
+    const newGlbUrl = actor.glb_url ? actor.glb_url.split(oldSeg).join(newSeg) : actor.glb_url;
+    db.transaction(() => {
+      db.prepare(`UPDATE actors SET name = ?, first_name = ?, last_name = ?, media_folder = ?, glb_url = ?, updated_at = ? WHERE id = ?`)
+        .run(name, first_name, last_name, newFolder, newGlbUrl, new Date().toISOString(), actor.id);
+      db.prepare(`UPDATE actor_media SET url = replace(url, ?, ?) WHERE actor_id = ?`).run(oldSeg, newSeg, actor.id);
+      try { db.prepare(`UPDATE actor_media SET thumbnail_url = replace(thumbnail_url, ?, ?) WHERE actor_id = ?`).run(oldSeg, newSeg, actor.id); } catch {}
+    })();
+    console.log(`[rename] ${actor.id}: ${actor.media_folder} -> ${newFolder} (folder moved, row + media urls rewritten)`);
+    res.json({ renamed: true, media_folder: newFolder, glb_url: newGlbUrl, moved: true });
+  } catch (err) {
+    console.error(`[rename] ${actor.id} FAILED:`, err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// ── GET/POST /api/me/preferences — per-user preferences (Session 147) ─
+// Namespaced JSON on users.preferences. POST merges at the TOP level
+// only ({...existing, ...incoming}): a client owning one namespace
+// (e.g. exploreDisplay) can't clobber another's. A preferences value
+// that fails to parse is treated as {} and overwritten on next save —
+// reported in the response, not silently.
+app.get("/api/me/preferences", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const row = db.prepare(`SELECT preferences FROM users WHERE id = ?`).get(user.id);
+  let prefs = {}, parseError = false;
+  if (row?.preferences) {
+    try { prefs = JSON.parse(row.preferences); }
+    catch { parseError = true; console.error(`[preferences] unparseable JSON for user ${user.id} — serving {} (will be overwritten on next save)`); }
+  }
+  res.json({ preferences: prefs, ...(parseError ? { warning: "stored preferences were unparseable and were reset" } : {}) });
+});
+
+app.post("/api/me/preferences", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const incoming = req.body?.preferences;
+  if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) {
+    return res.status(400).json({ error: "preferences object required" });
+  }
+  const row = db.prepare(`SELECT preferences FROM users WHERE id = ?`).get(user.id);
+  let existing = {};
+  if (row?.preferences) {
+    try { existing = JSON.parse(row.preferences); }
+    catch { console.error(`[preferences] unparseable existing JSON for user ${user.id} — replacing with incoming merge base {}`); }
+  }
+  const merged = { ...existing, ...incoming };
+  db.prepare(`UPDATE users SET preferences = ?, updated_at = ? WHERE id = ?`)
+    .run(JSON.stringify(merged), new Date().toISOString(), user.id);
+  res.json({ saved: true, preferences: merged });
+});
+
+app.post("/api/actors/:id/draft-state", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  // Session 147 — was `AND status = 'draft'`. Under the Plan A ruling
+  // (deployed GLB is canonically body-only; wardrobe config in
+  // draft_state IS the dressed state) this state must be writable for
+  // every owned actor, forever — the old "finished characters are
+  // baked, draft_state is in-progress only" premise no longer holds.
+  // The client merges the full existing object before posting, so
+  // wizard-era fields on finished actors are preserved, not clobbered.
+  const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
+  if (!actor) return res.status(404).json({ error: "not an actor you own" });
+  const state = req.body?.state;
+  if (!state || typeof state !== "object") return res.status(400).json({ error: "state object required" });
+  db.prepare(`UPDATE actors SET draft_state = ?, updated_at = ? WHERE id = ?`)
+    .run(JSON.stringify(state), new Date().toISOString(), req.params.id);
+  // Session 103 — the Mac Mini scratch cleanup that lived here is
+  // MOVED to finalize/abandon: auto-persist made every adjustment a
+  // save, so a fresh character's scratch died 1.5s after the first
+  // slider drag — before any archiving could happen (found live).
+  // Scratch now survives the whole draft phase and dies only at the
+  // deliberate ends of a character's life.
+  res.json({ saved: true });
+});
+
 // ── POST /api/actors/:id/abandon-draft — beacon-compatible cleanup on window
 // close. navigator.sendBeacon() only supports POST, not DELETE, and it's
 // the one API browsers actually honour reliably as a tab is closing — a
@@ -2424,7 +2811,7 @@ app.post("/api/actors/:id/abandon-draft", (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).end();
 
-  const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ? AND status = 'draft'`).get(req.params.id, user.id);
+  const actor = db.prepare(`SELECT id, media_folder FROM actors WHERE id = ? AND owner_id = ? AND status = 'draft'`).get(req.params.id, user.id);
   if (!actor) return res.status(204).end(); // not a draft (already finished, or gone) — nothing to do
 
   const mediaFiles = db.prepare(`SELECT url FROM actor_media WHERE actor_id = ?`).all(req.params.id);
@@ -2439,6 +2826,7 @@ app.post("/api/actors/:id/abandon-draft", (req, res) => {
     db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
   })();
   deleteActorTmpFolder(req.params.id); // not awaited — see comment in generate3d.js
+  deleteActorMediaFolder(actor.media_folder); // the GLB itself — see function comment for why this was missing
   res.status(204).end();
 });
 
@@ -2446,7 +2834,7 @@ app.delete("/api/actors/:id", (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
 
-  const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
+  const actor = db.prepare(`SELECT id, media_folder FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
   if (!actor) return res.status(404).json({ error: "not found" });
 
   const deployment = db.prepare(`SELECT id FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL`).get(req.params.id);
@@ -2470,6 +2858,7 @@ app.delete("/api/actors/:id", (req, res) => {
     db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
   })();
   deleteActorTmpFolder(req.params.id); // not awaited — see comment in generate3d.js
+  deleteActorMediaFolder(actor.media_folder); // the GLB itself — see function comment for why this was missing
   res.json({ ok: true });
 });
 
@@ -2489,6 +2878,21 @@ app.get("/api/actors/:id", (req, res) => {
   }
 
   const psychology = db.prepare(`SELECT * FROM actor_psychology WHERE actor_id = ?`).get(id);
+  // Session 103 — the editor shows MEASURED truth where the appearance
+  // prose blob used to sit: read the pipeline measurements file when
+  // one exists (drafts and modern actors have it; legacy actors show
+  // nothing, honestly).
+  let measurements = null;
+  try {
+    const mrow = db.prepare(`SELECT media_folder FROM actors WHERE id = ?`).get(id);
+    if (mrow?.media_folder) {
+      const mdir = path.join(__dirname, "../public/media/actors", mrow.media_folder);
+      const { readdirSync, readFileSync } = require("fs");
+      const mfile = readdirSync(mdir).find(f => f.endsWith("-measurements.json"));
+      if (mfile) measurements = JSON.parse(readFileSync(path.join(mdir, mfile), "utf8"));
+    }
+  } catch {}
+
   const big5       = db.prepare(`SELECT * FROM actor_big5 WHERE actor_id = ?`).get(id);
   const disc       = db.prepare(`SELECT * FROM actor_disc WHERE actor_id = ?`).get(id);
   const hds        = db.prepare(`SELECT * FROM actor_hds WHERE actor_id = ?`).get(id);
@@ -2500,7 +2904,12 @@ app.get("/api/actors/:id", (req, res) => {
   const diagnoses  = db.prepare(`SELECT * FROM actor_diagnoses WHERE actor_id = ? ORDER BY inserted_at`).all(id);
   const expenses   = db.prepare(`SELECT * FROM actor_expense_defaults WHERE actor_id = ? ORDER BY name`).all(id);
 
-  res.json({ actor, psychology, big5, disc, hds, lifestyle, economic, mental, upbringing, education, diagnoses, expenses });
+  // Session 102 — mediaPhotos: the canonical photo rows (profile +
+  // body_*), so draft loading restores photo slots from actor_media
+  // instead of guessing file conventions (the pipeline's pulled
+  // copies live elsewhere and may predate the pull fix).
+  const mediaPhotos = db.prepare(`SELECT state_slug, url FROM actor_media WHERE actor_id = ? AND media_type = 'photo' AND world_id IS NULL`).all(req.params.id);
+  res.json({ actor, psychology, big5, disc, hds, lifestyle, economic, mental, upbringing, education, diagnoses, expenses, mediaPhotos, measurements });
 });
 
 // ── PUT /api/actors/:id — update canonical profile ────────────────────────────
@@ -2937,12 +3346,30 @@ app.post("/api/generate/profile", async (req, res) => {
   const key = process.env.CLAUDE_API_KEY;
   if (!key) return res.status(500).json({ error: "no API key" });
   try {
-    const text = await callDirtyMuse(
-      "You are a character design assistant. Return ONLY raw JSON. No markdown, no code fences, no backticks, no explanation. Start your response with { and end with }.",
-      prompt, 4000
-    );
+    // Session 103 — this route's comment always said "via Haiku" but
+    // the body called dirty-muse on the user's LOCAL machine (.60):
+    // full-profile generation silently depended on a workstation
+    // being awake, and failed when it wasn't (found live: Generation
+    // failed, log ending at the .60 post with no reply). Structured
+    // JSON is Haiku's job in the capability routing; the platform
+    // must be able to birth characters on its own.
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 4000,
+        system: "You are a character design assistant. Return ONLY raw JSON. No markdown, no code fences, no backticks, no explanation. Start your response with { and end with }.",
+        messages: [{ role: "user", content: prompt }],
+      }),
+      signal: AbortSignal.timeout(120_000),
+    });
+    if (!r.ok) { const body = await r.text().catch(() => ""); throw new Error(`anthropic ${r.status}: ${body.slice(0, 200)}`); }
+    const data = await r.json();
+    const text = (data.content || []).map(c => c.text || "").join("");
+    if (!text) throw new Error("anthropic returned empty content");
     res.json({ text });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error("[generate/profile] FAILED:", e.message); res.status(500).json({ error: e.message }); }
 });
 
 // ── POST /api/generate/appearance — describe character from photos via Haiku ──
@@ -3002,7 +3429,7 @@ Based on the visual reference, describe the fictional character's appearance. Re
 app.post("/api/actors", (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
-  const { id: existingId, identity, psychology, personality, lifestyle, economy, draft } = req.body;
+  const { id: existingId, identity, psychology, personality, lifestyle, economy, draft, default_home_template_url } = req.body;
   if (!identity?.first_name) return res.status(400).json({ error: "first_name required" });
   const now  = new Date().toISOString();
   const name = [identity.first_name?.trim(), identity.last_name?.trim()].filter(Boolean).join(" ");
@@ -3013,8 +3440,13 @@ app.post("/api/actors", (req, res) => {
     if (!actor) return res.status(404).json({ error: "not found" });
     const id = existingId;
     const run = db.transaction(() => {
-      db.prepare(`UPDATE actors SET name=?, first_name=?, last_name=?, age=?, gender=?, occupation=?, appearance=?, status=?, updated_at=? WHERE id=?`)
-        .run(name, identity.first_name?.trim(), identity.last_name?.trim()||null, identity.age||null, identity.gender||"female", identity.occupation||null, identity.appearance||null, "active", now, id);
+      db.prepare(`UPDATE actors SET name=?, first_name=?, last_name=?, age=?, gender=?, nationality=?, occupation=?, appearance=?, default_home_template_url=?, status=?, updated_at=? WHERE id=?`)
+        .run(name, identity.first_name?.trim(), identity.last_name?.trim()||null, identity.age||null, identity.gender||"female", identity.nationality||null, identity.occupation||null, identity.appearance||null, default_home_template_url||null, "ready_to_deploy", now, id);
+      // Session 103 — honest lifecycle (user law): draft -> ready_to_deploy
+      // (Save) -> active (deploy). "active" used to mean only "left the
+      // wizard", overloading it with "lives in a world"; the gallery
+      // must never offer half-built drafts for deployment, and active
+      // must mean deployed.
       const p = psychology||{};
       db.prepare(`UPDATE actor_psychology SET attachment_style=?, wound=?, what_they_want=?, blindspot=?, defenses=?, contradiction=?, backstory=?, orientation=?, view_on_sex=?, marital_status=?, coping_mechanisms=?, updated_at=? WHERE actor_id=?`)
         .run(personality?.attachment_style||p.attachment_style||"secure", p.wound||null, p.what_they_want||null, p.blindspot||null, p.defenses||null, p.contradiction||null, p.backstory||null, identity.orientation||"straight", p.view_on_sex||null, p.marital_status||"single", p.coping_mechanisms||null, now, id);
@@ -3035,15 +3467,22 @@ app.post("/api/actors", (req, res) => {
         .run(e.financial_situation||"stable", e.income_stability||"stable", e.monthly_income_sek?parseInt(e.monthly_income_sek):null, e.spending_style||"balanced", e.savings_habit||"moderate", e.attitude_to_wealth||"practical", e.financial_anxiety||0.3, e.behavior_note||null, now, id);
     });
     run();
-    return res.json({ id, name, status: "active" });
+    // Session 148 — "the Save-to-registry button doesn't delete the tmp
+    // files" (Magnus): finalize now runs the same Mac Mini scratch
+    // cleanup as abandon-draft and hard-delete. Safe since tonight's
+    // pack_all fix — the retained master is self-contained, so the
+    // generation scratch has no recovery role left. Not awaited, same
+    // as the other call sites.
+    deleteActorTmpFolder(id);
+    return res.json({ id, name, status: "ready_to_deploy" });
   }
 
   // ── Create a new actor (draft or immediately-active) ─────────────────────
   const id = randomUUID();
   const mediaFolder = name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"") + "-" + id.slice(0,8);
   const run = db.transaction(() => {
-    db.prepare(`INSERT INTO actors (id, owner_id, name, first_name, last_name, age, gender, occupation, appearance, media_folder, status, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(id, user.id, name, identity.first_name?.trim(), identity.last_name?.trim()||null, identity.age||null, identity.gender||"female", identity.occupation||null, identity.appearance||null, mediaFolder, draft ? "draft" : "active", now, now);
+    db.prepare(`INSERT INTO actors (id, owner_id, name, first_name, last_name, age, gender, nationality, occupation, appearance, default_home_template_url, media_folder, status, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, user.id, name, identity.first_name?.trim(), identity.last_name?.trim()||null, identity.age||null, identity.gender||"female", identity.nationality||null, identity.occupation||null, identity.appearance||null, default_home_template_url||null, mediaFolder, draft ? "draft" : "ready_to_deploy", now, now);
     const p = psychology||{};
     db.prepare(`INSERT INTO actor_psychology (actor_id, attachment_style, wound, what_they_want, blindspot, defenses, contradiction, backstory, orientation, view_on_sex, marital_status, coping_mechanisms, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(id, personality?.attachment_style||p.attachment_style||"secure", p.wound||null, p.what_they_want||null, p.blindspot||null, p.defenses||null, p.contradiction||null, p.backstory||null, identity.orientation||"straight", p.view_on_sex||null, p.marital_status||"single", p.coping_mechanisms||null, now, now);
@@ -3064,6 +3503,10 @@ app.post("/api/actors", (req, res) => {
       .run(id, e.financial_situation||"stable", e.income_stability||"stable", e.monthly_income_sek?parseInt(e.monthly_income_sek):null, e.spending_style||"balanced", e.savings_habit||"moderate", e.attitude_to_wealth||"practical", e.financial_anxiety||0.3, e.behavior_note||null, now, now);
   });
   run();
+  // Session 148 — same finalize-time scratch cleanup as the UPDATE
+  // branch above; gated on !draft so a mid-wizard draft save never
+  // wipes the scratch the generation pipeline still works in.
+  if (!draft) deleteActorTmpFolder(id);
   res.json({ id, name: identity.name, status: draft ? "draft" : "created" });
 });
 

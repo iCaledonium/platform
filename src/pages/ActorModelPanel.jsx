@@ -8,17 +8,32 @@
 //
 // Standalone: no imports from PresenceView, no backend, no DB. Models and clips
 // are read from local disk. Persistence comes after the rig question is settled.
+// (Session 107 already broke "no backend" — this loads the actor's own GLB via
+// /api/actors/:id. Session 109 adds a second, deliberate exception: Wardrobe
+// below imports MiniGlbViewer + AccessoryEditor, the SAME dressing components
+// CharacterWizard uses, rather than re-implementing a second copy. "Standalone"
+// now means "doesn't own a database", not "shares nothing".)
 //
 // Deps: three, @pixiv/three-vrm  (FBXLoader ships inside three)
 
 import { useEffect, useRef, useState } from "react";
+import ReactDOM from "react-dom";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { PointerLockControls } from "three/examples/jsm/controls/PointerLockControls.js";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { VRMLoaderPlugin, VRMUtils } from "@pixiv/three-vrm";
+import { MeshBVH, StaticGeometryGenerator } from "three-mesh-bvh";
+import MiniGlbViewer from "./MiniGlbViewer";
+import AccessoryEditor, {
+  defaultAccessories,
+  fetchAccessoryOptions,
+  buildViewerAccessories,
+  ACCESSORY_REGION_CAMERA,
+} from "./AccessoryEditor";
 
 // The bones that must resolve for retargeting to be viable at all.
 const REQUIRED_BONES = [
@@ -261,16 +276,47 @@ function bindDirectClip(root, clipName, source) {
 // and the room is built around that.
 const TARGET_HEIGHT = 1.7;
 const ROOM = 12;         // floor is ROOM x ROOM, metres
+
+// Session 118 — Magnus: "how hard can it be to change her spawn
+// position?" Fair — a room's layout doesn't change between sessions,
+// so re-detecting furniture via raycasting on every load was solving a
+// harder problem than the one that actually exists. Verified-by-eye
+// spawn points go here, keyed by the room file's name; when an entry
+// exists it's used directly, no raycasting at all. Rooms without an
+// entry fall back to the dynamic centre-probe/grid-scan detection
+// below — that detection is now believed correct (Session 116/117
+// fixed the margin and the null-as-furniture bug with console-verified
+// data), but a known value is still simpler and can't misfire on a
+// margin or a stray ray ever again. Add entries as: "exact-filename.glb":
+// { x: ..., z: ... } — read the x/z off the "Holder position after
+// clamp" console line once you've confirmed by eye it looks right, and
+// it never needs detecting again for that room.
+const KNOWN_ROOM_SPAWNS = {};
+
 const WALL_H = 2.8;
 const UP = new THREE.Vector3(0, 1, 0);
 const EYE_HEIGHT = 1.65;
 const PLAYER_SPEED = 1.5;   // m/s, a shade faster than her walk
-const BODY_RADIUS = 0.32;   // how close either of you may get to a wall
-const PROBE_EVERY = 70;     // ms between wall probes — raycasts are not cheap
+const BODY_RADIUS = 0.32;   // how close either of you may get to a wall — still used for the exclusion-zone margin
+// Session 132 — the whole probeWalls/slide/STOP_DISTANCE lineage
+// (Sessions 111, 127–131) is gone, replaced by resolveCapsule further
+// down: real geometric capsule-vs-triangle collision via
+// three-mesh-bvh's shapecast, the established pattern for exactly
+// this, not another hand-tuned raycast variant. It has no PROBE_EVERY-
+// style throttle to go stale, so the tunneling problem those sessions
+// were chasing with ever-larger distance margins doesn't apply to this
+// system the same way — it resolves actual overlap at the real final
+// position every frame, not a cached reading from up to 70ms ago.
 // 30° is a portrait lens: correct proportions, but it flattens depth and makes
 // anything near the camera loom. First person wants something close to human
 // central vision.
-const FOV_ORBIT = 35;
+// Session 148 — was 35, while Inspect's MiniGlbViewer renders at 45.
+// With the shared instance making the character provably identical
+// (the [STATE] instrument: every part visible, geometry frozen to the
+// millimeter across modes), the remaining Explore/Inspect difference
+// was the LENS: two FOVs foreshorten the same head differently at
+// equal distance. One character, one lens.
+const FOV_ORBIT = 45;
 const FOV_FPV = 70;
 
 function buildRoom() {
@@ -526,6 +572,10 @@ function surveyMaterials(root) {
   };
 }
 
+// Session 108→109 — the read-only wardrobe mirror constants that used to
+// live here are gone. Wardrobe now renders the real <AccessoryEditor>
+// (imported above), which owns the override/occlusion rules itself.
+
 function detectRoles(names) {
   const find = (re) => names.find((n) => re.test(n)) ?? null;
   return {
@@ -539,6 +589,13 @@ export default function ActorModelPanel({ actorId }) {
   const mountRef = useRef(null);
   const rendererRef = useRef(null);
   const sceneRef = useRef(null);
+  // Session 147 — Display sliders reach the lights through these.
+  const hemiLightRef = useRef(null);
+  const keyLightRef = useRef(null);
+  const rimLightRef = useRef(null);
+  // Scene setup runs in a mount effect that must not re-run on display
+  // changes — it reads initial values through this ref instead.
+  const displayRef = useRef(null);
   const cameraRef = useRef(null);
   const controlsRef = useRef(null);
   const vrmRef = useRef(null);
@@ -555,14 +612,73 @@ export default function ActorModelPanel({ actorId }) {
   const rulerRef = useRef(null);
   // Where her feet actually end up in world space, measured rather than assumed.
   const feetYRef = useRef(0);
-  // Wall distances on the four axes, refreshed on a timer rather than every
-  // frame. A 315k-triangle room is far too much geometry to raycast at 60Hz.
-  const probeActorRef = useRef({ at: 0, d: null });
-  const probePlayerRef = useRef({ at: 0, d: null });
+  // Session 132 — Magnus: "check the internet how this is done." Found
+  // the actual established pattern (three-mesh-bvh's own reference
+  // character-movement example): a capsule (segment + radius) checked
+  // directly against real mesh triangles via shapecast, not point-rays
+  // fired in a handful of directions. Replaces probeWalls/slide/
+  // STOP_DISTANCE/the fan-angle system entirely — see resolveCapsule
+  // below. probeActorRef/probePlayerRef (the old throttled-raycast
+  // caches) are gone with it — resolveCapsule has no equivalent cache,
+  // it checks real overlap fresh every call.
+  //
+  // Session 140 — ONE merged world-space BVH for the whole room
+  // (StaticGeometryGenerator, exactly like the reference example),
+  // replacing Session 132's one-BVH-per-mesh set. That per-mesh split
+  // was a deliberate risk call when StaticGeometryGenerator's
+  // availability was unverified at 2am; its availability is now
+  // CONFIRMED by listing the installed package's actual exports
+  // (three-mesh-bvh 0.9.14, checked via node -e on the platform
+  // server, 15 Aug). The merge is load-bearing, not a convenience:
+  // sequential per-mesh depenetration has no convergence guarantee
+  // when several meshes (a doorway's two frame pieces) touch her at
+  // once — the suspected cause of the bathroom/hallway navigation
+  // failures — and baking every matrixWorld into one world-space
+  // geometry also deletes the Session 137 per-mesh scale compensation
+  // outright instead of maintaining it. RESOLVE_ITERATIONS (Session
+  // 139's compensation for the per-mesh split) is gone with it.
+  // colliderRef: { geometry (world-space, with .boundsTree), triangles }.
+  const colliderRef = useRef(null);
+  // Diagnostic only: world-space Box3 per source mesh, so correction
+  // logs can still name what she hit even though the collision
+  // geometry itself is one anonymous merged buffer.
+  const collisionNameBoxesRef = useRef([]);
   // Walk limits come from whatever room is loaded, procedural or real.
   const boundsRef = useRef({ minX: -ROOM / 2, maxX: ROOM / 2, minZ: -ROOM / 2, maxZ: ROOM / 2 });
+  // Session 113 — hard circular no-go zones (currently: whatever
+  // obstacle sits at the room's centre, usually the coffee table).
+  // Deterministic distance check, not another raycast probe — Magnus's
+  // call after the height-probe approach still let her end up on top of
+  // furniture: "make an invisible pillar... impossible to walk inside
+  // the table's radius." {x, z, radius} in world space, populated at
+  // room load, applied as a final position clamp after every movement
+  // path (WASD walking, FPV auto-wander, and the initial spawn).
+  const furnitureExclusionsRef = useRef([]);
   const keysRef = useRef(new Set());
   const walkRef = useRef({ on: false, speed: 1.35, roles: null, current: null, flip: false });
+  // Session 112 — tracks how long a real WASD input has produced near-zero
+  // actual displacement (slide() blocked it). Used only to break a
+  // furniture-corner deadlock after it's persisted a moment, not to
+  // second-guess normal wall/furniture sliding on a single frame.
+  const stuckRef = useRef({ since: 0, lastLog: 0 });
+  // Session 135 — Magnus: "she can still walk thru the furnitures,"
+  // reported alongside a console log that showed zero Blocked lines at
+  // all — meaning resolveCapsule wasn't finding a penetration to
+  // correct, not that it was finding one and failing to push her out.
+  // Throttled log of every real correction resolveCapsule actually
+  // makes, so we can see directly whether it fires at all near
+  // whatever furniture this turns out to be, instead of inferring it
+  // from the absence of the (different) stuck-detection log.
+  const correctionLogRef = useRef(0);
+  // Session 119 — last position where a real input actually produced
+  // real movement. Not a guess at "somewhere safe in the room" — she
+  // was physically there and moving, so by definition nothing was
+  // blocking her. Basis for the hard last-resort escape below: if she's
+  // ever genuinely boxed in on all four sides (the existing nudge
+  // correctly refuses to push through real geometry in that case, which
+  // is right, but leaves her with no recovery path at all), return her
+  // to here instead of leaving her frozen indefinitely.
+  const lastGoodPositionRef = useRef(new THREE.Vector3());
   // Live inputs to the clip state machine, so a wrong clip can be read off the
   // panel instead of reasoned about.
   const walkDebugRef = useRef(null);
@@ -582,8 +698,22 @@ export default function ActorModelPanel({ actorId }) {
   const clipGroundRef = useRef(new Map());
   const currentActionRef = useRef(null);
   const frameRef = useRef(null);
-  const clockRef = useRef(new THREE.Clock());
+  // Session 122 — attempted THREE.Clock → Timer migration, broke the
+  // build on a guessed addon import path; reverted with the demand that
+  // any retry verify the real path from node_modules first.
+  // Session 147 — verified: at three 0.185 there IS no addon path
+  // (examples/jsm/misc/Timer.js does not exist); Timer was promoted to
+  // CORE (`typeof three.Timer === "function"`, update/getDelta
+  // confirmed via node against the installed package). So no new
+  // import at all — the existing THREE namespace carries it. Also
+  // fixed here: the old `useRef(new THREE.Clock())` constructed a new
+  // Clock on EVERY render (useRef's argument is evaluated each time
+  // even though the first is kept) — that was the wall of repeated
+  // deprecation warnings, one per render. Lazy construction in the
+  // animate loop: exactly one Timer, ever.
+  const timerRef = useRef(null);
   const objectUrlsRef = useRef([]);
+  const dracoLoaderRef = useRef(null);
 
   const [report, setReport] = useState(null);
   const [clips, setClips] = useState([]);
@@ -592,8 +722,21 @@ export default function ActorModelPanel({ actorId }) {
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(null);
   const [fps, setFps] = useState(0);
+  // Session 120 — Magnus needs a real, verified spawn point for this
+  // room after three rounds of the dynamic detection getting the shape
+  // wrong for a clustered furniture layout. Easiest way to get one:
+  // let him walk her to a spot that looks right and read the number
+  // straight off the screen, instead of digging through console logs.
+  const [holderXZ, setHolderXZ] = useState(null);
   const [bgUrl, setBgUrl] = useState(null);
   const [expression, setExpression] = useState("");
+  // Session 107 — panel modes. "explore" is the inhabited view: her home
+  // loaded, locomotion on, minimal chrome; the walking/FP machinery below
+  // was all built in the VRM sessions and is simply auto-engaged here.
+  // "inspect" is the original diagnostic surface, unchanged. Explore is
+  // the default because the panel's day job is now showing the character
+  // living, not debugging rigs.
+  const [mode, setMode] = useState("explore");
   const [walkMode, setWalkMode] = useState(false);
   const [walkSpeed, setWalkSpeed] = useState(1.35);
   const [flipFacing, setFlipFacing] = useState(false);
@@ -604,7 +747,26 @@ export default function ActorModelPanel({ actorId }) {
   const [walkDebug, setWalkDebug] = useState(null);
   const [matInfo, setMatInfo] = useState(null);
   const [shading, setShading] = useState("source");
-  const [exposure, setExposure] = useState(1.0);
+  // Session 147 — Explore display settings ("Display" card, right panel,
+  // Explore mode). Replaces the orphaned `exposure` state that sat here
+  // wired to toneMappingExposure with no UI ever calling its setter (a
+  // past-session stub, absorbed rather than left as drift). Defaults are
+  // exactly the previously hardcoded scene values. Persisted to
+  // localStorage (instant, per-browser) AND users.preferences in the DB
+  // (per Magnus: user preference, survives browser changes) under the
+  // exploreDisplay namespace.
+  const EXPLORE_DISPLAY_DEFAULTS = { exposure: 1.0, envIntensity: 1.0, keyIntensity: 0.9, ambientIntensity: 0.25, rimIntensity: 0.3, shadows: false, sunAzimuth: 37, sunElevation: 45 };
+  const [display, setDisplay] = useState(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem("anima_explore_display") || "null");
+      if (stored && typeof stored === "object") return { ...EXPLORE_DISPLAY_DEFAULTS, ...stored };
+    } catch (e) { console.warn("[ActorModelPanel] stored display settings unreadable, using defaults:", e); }
+    return { ...EXPLORE_DISPLAY_DEFAULTS };
+  });
+  const displayPrefsSaveTimerRef = useRef(null);
+  // Same render-time-assignment pattern as saveWardrobeRef below: the
+  // scene-setup mount effect reads initial light values through this.
+  displayRef.current = display;
   const [wideFrame, setWideFrame] = useState(true);
   const [skinInfo, setSkinInfo] = useState(null);
   const [normalizeSkin, setNormalizeSkin] = useState(true);
@@ -616,6 +778,425 @@ export default function ActorModelPanel({ actorId }) {
   const [locked, setLocked] = useState(false);
   const [showRuler, setShowRuler] = useState(false);
   const [shadingAuto, setShadingAuto] = useState(false);
+
+  // ---- Wardrobe (Session 109 — Magnus's explicit call: "share dressing
+  // components with the character wizard, one place to change"). Same
+  // state shape as CharacterWizard's Accessories step, seeded from this
+  // actor's draft_state and saved back to it. null/{} = no draft_state on
+  // this actor yet (legacy actor, or nothing picked) — defaultAccessories()
+  // covers rendering either way, same convention as the wizard's own
+  // initial state.
+  const [accessories, setAccessories] = useState(() => defaultAccessories());
+  const [selectedAccessoryGlbUrls, setSelectedAccessoryGlbUrls] = useState({});
+  const [accessoryScales, setAccessoryScales] = useState({});
+  const [accessoryOffsets, setAccessoryOffsets] = useState({});
+  const [accessoryRotations, setAccessoryRotations] = useState({});
+  const [accessoryParts, setAccessoryParts] = useState({});
+  const [accessoryTints, setAccessoryTints] = useState({});
+  const [accessoryPartNames, setAccessoryPartNames] = useState({});
+  const [activeSlot, setActiveSlot] = useState(null);
+  const [scaleDetailSlot, setScaleDetailSlot] = useState(null);
+  const [activePart, setActivePart] = useState(null);
+  const [activeAccessoryRegion, setActiveAccessoryRegion] = useState("Torso");
+  const [dynamicAccessoryOptions, setDynamicAccessoryOptions] = useState({});
+  const [actorStatus, setActorStatus] = useState(null);
+  const [actorGlbUrl, setActorGlbUrl] = useState(null);
+  const [savingWardrobe, setSavingWardrobe] = useState(false);
+  const [wardrobeSaveError, setWardrobeSaveError] = useState(null);
+  const [wardrobeSaveOk, setWardrobeSaveOk] = useState(false);
+  const [draftStateUnparseable, setDraftStateUnparseable] = useState(false);
+  // Session 109 — Inspect's main stage now runs MiniGlbViewer instead of
+  // the bespoke engine (Magnus: "let inspect use the miniglbViewer" —
+  // Explore keeps the bespoke engine unchanged; MiniGlbViewer can't do
+  // room/walk/FPV at all). MiniGlbViewer only plays animations already
+  // embedded in the GLB (gltf.animations) — no arbitrary FBX upload, no
+  // retargeting, matching the roadmap direction (DAZ-exported animations,
+  // Mixamo retarget testing dropped). embeddedAnimations is populated by
+  // MiniGlbViewer's own onAnimationsLoaded callback.
+  const [embeddedAnimations, setEmbeddedAnimations] = useState([]);
+  // Session 143 — "upload an animation and it is merged": drives
+  // POST /api/actors/:id/animations (server/animations.js). Accepts
+  // .duf too — the server does the DAZ pass and parses the frame
+  // range out of the file itself. On success the page reloads the
+  // actor GLB fresh (updated_at bump = new ?v= = cache miss).
+  const [animUploadBusy, setAnimUploadBusy] = useState(false);
+  const [animUploadMsg, setAnimUploadMsg] = useState(null);
+  const [animUploadClipName, setAnimUploadClipName] = useState("");
+  const [animUploadLoop, setAnimUploadLoop] = useState(false);
+
+  // Session 143 — clip deletion (trash icon per clip). idle/walk are
+  // protected server-side and get no trash icon here.
+  const [animDeleting, setAnimDeleting] = useState(null);
+
+  async function handleAnimationDelete(name) {
+    if (!actorId || animDeleting) return;
+    if (!window.confirm(`Remove the clip "${name}" from this character's model? This edits the GLB itself.`)) return;
+    setAnimDeleting(name);
+    setAnimUploadMsg({ err: false, text: `Removing "${name}"...` });
+    try {
+      const resp = await fetch(`/api/actors/${actorId}/animations/${encodeURIComponent(name)}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+      setAnimUploadMsg({ err: false, text: `Removed "${name}". Refreshing the model...` });
+      // In-place refresh — same reasoning as the upload handler above.
+      // Session 148 — shared instance: no dirty flag, no rebake. The
+      // reload below hands MiniGlbViewer the fresh GLB; onCharacterReady
+      // fires with the new live root and Explore adopts it directly.
+      await loadActorModel(actorId);
+      setAnimUploadMsg({ err: false, text: `Removed "${name}".` });
+      setAnimDeleting(null);
+    } catch (e) {
+      setAnimUploadMsg({ err: true, text: `Removal failed: ${String(e.message || e).slice(0, 600)}` });
+      setAnimDeleting(null);
+    }
+  }
+
+  async function handleAnimationUpload(file) {
+    console.log(`[ActorModelPanel] animation upload: file="${file?.name}" clipName="${animUploadClipName}" actorId=${actorId}`);
+    if (!file || !actorId) return;
+    const clipName = animUploadClipName.trim();
+    if (!/^[a-zA-Z0-9_-]{1,32}$/.test(clipName)) {
+      setAnimUploadMsg({ err: true, text: "Clip name first: 1-32 chars, letters/digits/_/- (e.g. \"sit\")." });
+      return;
+    }
+    setAnimUploadBusy(true);
+    setAnimUploadMsg({ err: false, text: `Merging "${clipName}" — a .duf goes through DAZ and can take a few minutes...` });
+    try {
+      const form = new FormData();
+      form.append("animation", file);
+      form.append("clip_name", clipName);
+      if (animUploadLoop) form.append("loop", "true");
+      const resp = await fetch(`/api/actors/${actorId}/animations`, {
+        method: "POST",
+        credentials: "include",
+        body: form,
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+      setAnimUploadMsg({ err: false, text: `Merged "${data.clip}"${data.detected_frames ? ` (${data.detected_frames} frames detected)` : ""}. Refreshing the model...` });
+      // Session 143 — in-place refresh, NOT window.location.reload():
+      // the full reload dumped the user back on the Identity page (the
+      // 3D panel's selection isn't in the URL). loadActorModel already
+      // does the honest refresh — re-fetches the actor (new updated_at
+      // -> new cache-busted GLB), reloads BOTH viewers, and rebuilds
+      // the wardrobe mirror index — without losing where you are.
+      // Session 148 — shared instance: no dirty flag, no rebake. The
+      // reload below hands MiniGlbViewer the fresh GLB; onCharacterReady
+      // fires with the new live root and Explore adopts it directly.
+      await loadActorModel(actorId);
+      setAnimUploadMsg({ err: false, text: `Merged "${data.clip}"${data.detected_frames ? ` (${data.detected_frames} frames)` : ""}.` });
+      setAnimUploadBusy(false);
+    } catch (e) {
+      setAnimUploadMsg({ err: true, text: `Merge failed: ${String(e.message || e).slice(0, 600)}` });
+      setAnimUploadBusy(false);
+    }
+  }
+  const [inspectActiveAnimation, setInspectActiveAnimation] = useState("idle");
+  // Session 148, SIXTH and final pass — ONE DRIVER. Explore no longer
+  // owns an AnimationMixer at all: two mixers on the shared root traded
+  // stale property-state snapshots (bones AND morph influences — the
+  // bared-forehead face in Explore was the master's facial morphs being
+  // fought over). MiniGlbViewer's mixer is the ONLY animator, always;
+  // Explore just names the clip it wants through the SAME activeAnimation
+  // prop Inspect uses. Inspect is the master — including for playback.
+  const [exploreAnim, setExploreAnim] = useState("idle");
+  // Session 109 — Animations and Wardrobe are separate tabs within
+  // Inspect's right panel, not stacked in one scroll.
+  const [inspectTab, setInspectTab] = useState("animations");
+  // Full draft_state object, kept verbatim so Save can merge wardrobe
+  // fields back in without clobbering psychology/body/economy/etc. —
+  // POST /api/actors/:id/draft-state is a full overwrite, not a merge.
+  const fullDraftStateRef = useRef({});
+  const autoSaveWardrobeTimerRef = useRef(null);
+  // Session 110 — MiniGlbViewer hands up its bake function the same way
+  // CharacterWizard captures it (onExportReady). Used to refresh
+  // Explore's own separately-loaded mesh with live wardrobe edits when
+  // switching back to it — the two engines don't share geometry, so a
+  // tint change made in Inspect otherwise never reaches Explore's copy.
+  const exportGlbRef = useRef(null);
+
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchAccessoryOptions()
+      .then((grouped) => { if (!cancelled) setDynamicAccessoryOptions(grouped); })
+      .catch((err) => console.error("[ActorModelPanel] Failed to fetch /api/accessories:", err));
+    return () => { cancelled = true; };
+  }, []);
+
+  async function saveWardrobe() {
+    // Session 147 — was also gated on actorStatus === "draft", which made
+    // every wardrobe edit on a finished actor a silent no-op (found live
+    // on Lindsey, ready_to_deploy). Under Plan A the wardrobe config IS
+    // the canonical dressed state — deployed GLBs are body-only — so it
+    // must persist for every status. Server-side gate lifted in the same
+    // session (index.js /draft-state route).
+    if (!actorId || draftStateUnparseable) return;
+    setSavingWardrobe(true);
+    setWardrobeSaveError(null);
+    try {
+      const merged = {
+        ...fullDraftStateRef.current,
+        accessories, selectedAccessoryGlbUrls, accessoryScales, accessoryOffsets,
+        accessoryRotations, accessoryParts, accessoryTints,
+      };
+      const resp = await fetch(`/api/actors/${actorId}/draft-state`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ state: merged }),
+      });
+      if (!resp.ok) throw new Error(`save failed (${resp.status})`);
+      fullDraftStateRef.current = merged;
+      setWardrobeSaveOk(true);
+      setTimeout(() => setWardrobeSaveOk(false), 2000);
+    } catch (e) {
+      // Real failure (network, server) — this one DOES surface, as a
+      // small caption in WardrobeCard, not a blocking box. The routine
+      // "not in draft status" case above returns before this and never
+      // sets an error at all — that's expected, not a failure.
+      console.error("[ActorModelPanel] wardrobe auto-save failed:", e);
+      setWardrobeSaveError(`Could not save wardrobe: ${e?.message ?? String(e)}`);
+    } finally {
+      setSavingWardrobe(false);
+    }
+  }
+
+  // Session 109 — auto-save, no button. Magnus: "changing top or any
+  // asset should auto save like character wizard, no save button
+  // needed." Same 1.5s debounce as CharacterWizard's own
+  // persistDraftState effect, watching the same seven accessory fields
+  // saveWardrobe writes.
+  useEffect(() => {
+    if (!actorId) return;
+    if (autoSaveWardrobeTimerRef.current) clearTimeout(autoSaveWardrobeTimerRef.current);
+    autoSaveWardrobeTimerRef.current = setTimeout(() => { saveWardrobe(); }, 1500);
+    return () => { if (autoSaveWardrobeTimerRef.current) clearTimeout(autoSaveWardrobeTimerRef.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [actorId, JSON.stringify(accessories), JSON.stringify(selectedAccessoryGlbUrls), JSON.stringify(accessoryScales), JSON.stringify(accessoryOffsets), JSON.stringify(accessoryRotations), JSON.stringify(accessoryParts), JSON.stringify(accessoryTints)]);
+
+  // Session 117 — Magnus: "why isn't the scaling saved in wardrobe?"
+  // Traced: scale WAS wired into the save correctly (watch list, save
+  // payload, restore-on-load all confirmed). The real gap — adjust a
+  // scale slider, then navigate away (back to the character list,
+  // switch actors) before the 1.5s debounce fires, and the pending
+  // save is just CANCELLED, silently, no error. Scale sliders get
+  // dragged and left; a single accessory pick is a more isolated,
+  // deliberate action less likely to be followed by leaving
+  // immediately — so scale specifically would go missing more than
+  // anything else, without this being scale-specific in the code.
+  //
+  // saveWardrobeRef is updated on every render (not inside an effect —
+  // a plain assignment during render, a standard pattern for this) so
+  // it always holds the CURRENT closure over accessories/scales/etc.
+  // The empty-deps effect below only runs its cleanup on true unmount,
+  // and reads from that ref rather than closing over the first
+  // render's (stale) saveWardrobe.
+  const saveWardrobeRef = useRef(saveWardrobe);
+  saveWardrobeRef.current = saveWardrobe;
+  useEffect(() => {
+    return () => {
+      if (autoSaveWardrobeTimerRef.current) {
+        clearTimeout(autoSaveWardrobeTimerRef.current);
+        saveWardrobeRef.current();
+      }
+    };
+  }, []);
+  // ── Session 148 — SHARED INSTANCE (ruled by Magnus: "Inspect is the
+  // master"). The export→reimport→re-apply pipeline that used to feed
+  // Explore produced a subtly DIFFERENT character every time (hair
+  // 7.9cm low by direct measurement, visibly shorter neck) and an
+  // evening of divergence bugs. Deleted wholesale — the bridge, the
+  // wardrobe index, the live mirror, the rebake cycle (~250 lines).
+  // Explore now ADOPTS MiniGlbViewer's live root on mode switch and
+  // releases it back: one character, two cameras, nothing to diverge.
+  // Wardrobe edits reflect instantly because there is only one set of
+  // meshes. The dressed export survives solely for Save GLB.
+  const liveCharRef = useRef(null); // { root, animations, originalParent, savedTransform }
+  const [charReadyTick, setCharReadyTick] = useState(0);
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
+
+  function handleCharacterReady({ root, animations }) {
+    // A new root (glbUrl change / regeneration) replaces the old one —
+    // if the old was adopted, drop our refs; MiniGlbViewer disposes it.
+    if (liveCharRef.current && liveCharRef.current.root !== root && rootRef.current === liveCharRef.current.root) {
+      releaseCharacter({ reparent: false });
+    }
+    liveCharRef.current = { root, animations, originalParent: root.parent, savedTransform: null };
+    setCharReadyTick((t) => t + 1);
+  }
+
+  function adoptCharacter() {
+    const lc = liveCharRef.current;
+    const scene = sceneRef.current;
+    if (!lc || !scene || rootRef.current === lc.root) return;
+    const { root, animations } = lc;
+    lc.originalParent = root.parent || lc.originalParent;
+    lc.savedTransform = { p: root.position.clone(), r: root.rotation.clone(), s: root.scale.clone() };
+
+    const holder = new THREE.Group();
+    holder.add(root); // three re-parents automatically
+    scene.add(holder);
+    holderRef.current = holder;
+    rootRef.current = root;
+
+    // Ground WITHIN the holder without disturbing authored semantics —
+    // measured, offset locally, exact transform restored on release.
+    holder.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(holder);
+    root.position.y -= box.min.y;
+
+    // Shadows (Session 147 level 3) — live meshes never pass through
+    // loadModel now; flag on every adoption so garments added since
+    // the last one are covered too.
+    // Session 148, second pass — AND the detached-bind correction: the
+    // garments are bound bindMode="detached" (Session 100), whose bind
+    // matrix is FROZEN at bind time. That's invisible while the root
+    // sits at MiniGlbViewer's origin, but the moment adoption
+    // translates the hierarchy, detached meshes get the offset TWICE
+    // (bones + uncompensated node transform) — confirmed live: naked
+    // body at spawn, ghost outfit floating beside her at exactly the
+    // adoption offset. While adopted, garments run "attached" (bind
+    // matrix auto-tracks the transform, same compensation the body
+    // uses); their Session 100 detached state is restored verbatim on
+    // release.
+    lc.savedBinds = [];
+    root.traverse((o) => {
+      if (o.isMesh) {
+        // Session 148, third pass — hair does NOT cast: semi-transparent
+        // hair cards throw their solid silhouettes onto the chest as
+        // strand-shaped dark slits (confirmed live; invisible in
+        // Inspect only because its renderer has no shadow map). Same
+        // hair-is-special judgment as ACCESSORY_INFLATE / SHRINKWRAP.
+        const isHair = (o.userData?.accessoryUrl || "").includes("/hair/");
+        o.castShadow = !isHair;
+        o.receiveShadow = true;
+      }
+      if (o.isSkinnedMesh && o.userData?.isAccessoryMesh) {
+        lc.savedBinds.push({ mesh: o, bindMode: o.bindMode, bindMatrix: o.bindMatrix.clone() });
+        o.bindMode = "attached";
+      }
+    });
+
+    // Session 148, sixth pass — ONE DRIVER (see exploreAnim above):
+    // Explore creates NO mixer, binds NO actions, applies NO grounding.
+    // MiniGlbViewer keeps animating the root exactly as in Inspect —
+    // the [STATE] numbers proved it grounds these clips at 0.0000 with
+    // correct proportions. Explore only lists the clips and requests
+    // idle; the walk state machine requests by name the same way.
+    mixerRef.current = null;
+    actionsRef.current.clear();
+    groundRef.current.target = 0;
+    groundRef.current.applied = 0;
+    const found = (animations || []).map((source, i) => ({
+      name: source.name || `clip ${i + 1}`,
+      duration: source.duration, mapped: source.tracks.length,
+      sourceTracks: source.tracks.length, skipped: 0, droppedScale: 0,
+    }));
+    setClips(found);
+    if (found.length) {
+      const detected = detectRoles(found.map((c) => c.name));
+      setRoles(detected);
+      setExploreAnim(detected.idle ?? found[0].name);
+      setPlaying(detected.idle ?? found[0].name);
+    }
+
+    // Placement — same roomRef-aware clamp path loadModel used.
+    if (roomRef.current) {
+      const b = boundsRef.current;
+      holder.position.set((b.minX + b.maxX) / 2, floorYRef.current, (b.minZ + b.maxZ) / 2);
+      clampOutsideExclusions(holder.position);
+      resolveCapsule(holder.position);
+    } else {
+      holder.position.y = floorYRef.current;
+    }
+    lastGoodPositionRef.current.copy(holder.position);
+    holder.updateMatrixWorld(true);
+    const world = new THREE.Box3().setFromObject(holder);
+    feetYRef.current = world.min.y;
+    setFitInfo({ standHeight: world.max.y - world.min.y, feetY: world.min.y, floorY: floorYRef.current });
+    setMatInfo(surveyMaterials(root));
+    setSkinInfo(surveySkinning(root));
+    // Session 148, third pass — the "Load a room, then a character..."
+    // empty-state keys on `report`, which only loadModel ever set;
+    // adoption is a full character arrival and must say so.
+    setReport({ ...inspect(null, root), source: "live character (shared instance)", isFbx: false });
+    console.log(`[ActorModelPanel] Adopted the LIVE character root (shared instance) — ${found.length} clip(s) bound, grounded, shadows flagged.`);
+  }
+
+  function releaseCharacter({ reparent = true } = {}) {
+    const lc = liveCharRef.current;
+    if (!lc || rootRef.current !== lc.root) return;
+    if (mixerRef.current) { mixerRef.current.stopAllAction(); mixerRef.current = null; }
+    actionsRef.current.clear();
+    currentActionRef.current = null;
+    walkRef.current.current = null;
+    const { root } = lc;
+    // Session 148, second pass — restore the Session 100 detached binds
+    // exactly as found (see the adoption-side comment).
+    for (const b of (lc.savedBinds || [])) {
+      b.mesh.bindMode = b.bindMode;
+      b.mesh.bindMatrix.copy(b.bindMatrix);
+      b.mesh.bindMatrixInverse.copy(b.bindMatrix).invert();
+    }
+    lc.savedBinds = null;
+    if (lc.savedTransform) {
+      root.position.copy(lc.savedTransform.p);
+      root.rotation.copy(lc.savedTransform.r);
+      root.scale.copy(lc.savedTransform.s);
+    }
+    if (reparent && lc.originalParent) lc.originalParent.add(root);
+    const scene = sceneRef.current;
+    if (holderRef.current && scene) scene.remove(holderRef.current);
+    holderRef.current = null;
+    rootRef.current = null;
+    console.log("[ActorModelPanel] Released the live character root back to Inspect.");
+  }
+
+  // Adopt on entering Explore (or when a fresh root arrives while
+  // there); release on leaving. Sixth pass: MiniGlbViewer's mixer NEVER
+  // yields — it is the sole animator in both modes.
+  // ── SESSION 148 PROBE (remove with the [STATE] instrument): the
+  // [STATE] numbers proved the whole character floats +0.2176m in
+  // Explore — the centre-probe FURNITURE height. This names which
+  // variable carries it.
+  useEffect(() => {
+    const t = setInterval(() => {
+      if (holderRef.current) console.log(`[FLOOR] holderY=${holderRef.current.position.y.toFixed(4)} floorYRef=${floorYRef.current.toFixed(4)} feetYRef=${feetYRef.current.toFixed(4)} groundApplied=${groundRef.current.applied.toFixed(4)}`);
+    }, 4000);
+    return () => clearInterval(t);
+  }, []);
+  // Session 148, second pass — also re-runs when a garment finishes
+  // loading (accessoryPartNames): a mesh added to the ALREADY-adopted
+  // root arrives detached-bound and would ghost (see adoptCharacter's
+  // bind comment); flipNewAccessoryBinds picks it up.
+  function flipNewAccessoryBinds() {
+    const lc = liveCharRef.current;
+    if (!lc || rootRef.current !== lc.root || !lc.savedBinds) return;
+    const known = new Set(lc.savedBinds.map((b) => b.mesh));
+    let flipped = 0;
+    lc.root.traverse((o) => {
+      if (o.isSkinnedMesh && o.userData?.isAccessoryMesh && !known.has(o)) {
+        lc.savedBinds.push({ mesh: o, bindMode: o.bindMode, bindMatrix: o.bindMatrix.clone() });
+        o.bindMode = "attached";
+        o.castShadow = !(o.userData?.accessoryUrl || "").includes("/hair/");
+        o.receiveShadow = true;
+        flipped += 1;
+      }
+    });
+    if (flipped) console.log(`[ActorModelPanel] ${flipped} garment mesh(es) loaded while adopted — bind flipped to attached in place.`);
+  }
+  useEffect(() => {
+    if (mode === "explore") { adoptCharacter(); flipNewAccessoryBinds(); }
+    else releaseCharacter();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, charReadyTick, JSON.stringify(accessoryPartNames)]);
+
+
+
 
   function trackUrl(file) {
     const url = URL.createObjectURL(file);
@@ -650,6 +1231,17 @@ export default function ActorModelPanel({ actorId }) {
     // sheen, not the texture.
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.0;
+    // Session 147 — shadows are opt-in at three levels in three.js;
+    // this is level 1, the master switch. Toggled live by the Display
+    // card (shadowMap.enabled flips cheaply; the per-light/per-mesh
+    // flags below are set unconditionally and cost nothing while this
+    // is off). PCFSoft: the soft edge fights least with the baked
+    // lighting archviz rooms carry.
+    renderer.shadowMap.enabled = displayRef.current.shadows;
+    // Session 147, same night — PCFSoftShadowMap is deprecated at three
+    // 0.185 (runtime warning states PCFShadowMap is used instead); set
+    // the replacement explicitly rather than ride a deprecation fallback.
+    renderer.shadowMap.type = THREE.PCFShadowMap;
     mount.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
@@ -658,6 +1250,13 @@ export default function ActorModelPanel({ actorId }) {
     controls.enableDamping = true;
     controls.update();
     controlsRef.current = controls;
+
+    // GLBs coming off the pipeline (convert.py) are Draco-compressed. Every
+    // GLTFLoader in this file shares this one decoder instance rather than
+    // spinning up its own — same approach as MiniGlbViewer.jsx.
+    const dracoLoader = new DRACOLoader();
+    dracoLoader.setDecoderPath("https://www.gstatic.com/draco/versioned/decoders/1.5.6/");
+    dracoLoaderRef.current = dracoLoader;
 
     const fpvControls = new PointerLockControls(camera, renderer.domElement);
     fpvControls.addEventListener("lock", () => setLocked(true));
@@ -673,13 +1272,45 @@ export default function ActorModelPanel({ actorId }) {
     pmrem.dispose();
 
     // With an environment carrying most of the load, direct lights only shape.
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x444455, 0.25));
-    const key = new THREE.DirectionalLight(0xffffff, 0.9);
+    // Session 147 — held in refs (and initialized from the display settings
+    // rather than literals) so the Display sliders can adjust them live.
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x444455, displayRef.current.ambientIntensity);
+    scene.add(hemi);
+    hemiLightRef.current = hemi;
+    const key = new THREE.DirectionalLight(0xffffff, displayRef.current.keyIntensity);
     key.position.set(1.5, 2.5, 2.0);
+    // Session 147 — level 2: ONLY the key casts (a second shadow from
+    // the rim double-shadows everything and reads as a lighting bug).
+    // Frustum sized to a domestic room; 1024 map is the fps-friendly
+    // choice against an 11-SkinnedMesh 254-bone character re-rendering
+    // into it every frame. Small negative bias against acne on the
+    // flat archviz floors.
+    key.castShadow = true;
+    key.shadow.mapSize.set(1024, 1024);
+    key.shadow.camera.near = 0.1;
+    key.shadow.camera.far = 12;
+    // Session 147 — frustum tightened ±5 → ±4 after live testing: the
+    // room fits inside ±4 (furniture extends to ~±2.9), and the smaller
+    // box packs more shadow texels per cm.
+    key.shadow.camera.left = -4;
+    key.shadow.camera.right = 4;
+    key.shadow.camera.top = 4;
+    key.shadow.camera.bottom = -4;
+    // Session 147 — "stripes on the skin" reported live = shadow acne:
+    // a curved skinned surface self-shadows in bands at this map
+    // resolution, worst at grazing sun angles (now reachable via the
+    // direction slider). normalBias is the purpose-built fix for curved
+    // surfaces — offsets the lookup along the surface normal instead of
+    // toward the light — where plain bias alone either leaves acne or
+    // detaches the shadow (peter-panning).
+    key.shadow.bias = -0.0002;
+    key.shadow.normalBias = 0.03;
     scene.add(key);
-    const rim = new THREE.DirectionalLight(0xaaccff, 0.3);
+    keyLightRef.current = key;
+    const rim = new THREE.DirectionalLight(0xaaccff, displayRef.current.rimIntensity);
     rim.position.set(-2, 1.5, -2);
     scene.add(rim);
+    rimLightRef.current = rim;
 
     const placeholder = buildRoom();
     scene.add(placeholder);
@@ -716,7 +1347,11 @@ export default function ActorModelPanel({ actorId }) {
 
     const animate = () => {
       frameRef.current = requestAnimationFrame(animate);
-      const delta = clockRef.current.getDelta();
+      // Session 147 — Timer (unlike Clock) separates sampling from
+      // reading: update() once per frame, then getDelta().
+      if (!timerRef.current) timerRef.current = new THREE.Timer();
+      timerRef.current.update();
+      const delta = timerRef.current.getDelta();
 
       if (rulerRef.current?.visible && holderRef.current) {
         rulerRef.current.position.set(
@@ -729,7 +1364,10 @@ export default function ActorModelPanel({ actorId }) {
       stepPlayer(delta, camera);
       stepLocomotion(delta, camera, controls);
 
-      if (mixerRef.current) mixerRef.current.update(delta);
+      // Session 148, sixth pass — the live root has NO local mixer
+      // (mixerRef null while adopted; MiniGlbViewer animates it). This
+      // update only ever runs for drag-in test files.
+      if (mixerRef.current && modeRef.current === "explore") mixerRef.current.update(delta);
       if (vrmRef.current) vrmRef.current.update(delta);
 
       // Ease the feet on roughly the same curve as the crossfade blends the
@@ -780,6 +1418,9 @@ export default function ActorModelPanel({ actorId }) {
         setFps(Math.round(frames / acc));
         frames = 0;
         acc = 0;
+        if (holderRef.current) {
+          setHolderXZ({ x: holderRef.current.position.x, z: holderRef.current.position.z });
+        }
       }
     };
     animate();
@@ -806,6 +1447,7 @@ export default function ActorModelPanel({ actorId }) {
       if (rootRef.current) VRMUtils.deepDispose(rootRef.current);
       envRT.dispose();
       controls.dispose();
+      dracoLoader.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode === mount) {
         mount.removeChild(renderer.domElement);
@@ -887,7 +1529,7 @@ export default function ActorModelPanel({ actorId }) {
       const b = boundsRef.current;
       controls.target.set(
         (b.minX + b.maxX) / 2,
-        floorYRef.current + TARGET_HEIGHT * 0.6,
+        floorYRef.current + TARGET_HEIGHT * 0.85,
         (b.minZ + b.maxZ) / 2
       );
       controls.update();
@@ -899,9 +1541,102 @@ export default function ActorModelPanel({ actorId }) {
     if (skeletonHelperRef.current) skeletonHelperRef.current.visible = showSkeleton;
   }, [showSkeleton]);
 
+  // Session 147 — apply Display settings live. Exposure keeps its old
+  // wiring; environment intensity uses scene.environmentIntensity
+  // (three r163+; guarded and reported once if this build predates it,
+  // never silently ignored).
+  const envIntensityUnsupportedRef = useRef(false);
+  const shadowsWereRef = useRef(null);
   useEffect(() => {
-    if (rendererRef.current) rendererRef.current.toneMappingExposure = exposure;
-  }, [exposure]);
+    if (rendererRef.current) {
+      rendererRef.current.toneMappingExposure = display.exposure;
+      // Session 147 — flipping shadowMap.enabled alone leaves already-
+      // compiled materials on their old shader variant; three only
+      // recompiles on material.needsUpdate. Touch every material once
+      // per actual toggle (not per slider drag).
+      if (shadowsWereRef.current !== display.shadows) {
+        shadowsWereRef.current = display.shadows;
+        rendererRef.current.shadowMap.enabled = display.shadows;
+        const scene = sceneRef.current;
+        if (scene) scene.traverse((o) => {
+          if (!o.isMesh || !o.material) return;
+          (Array.isArray(o.material) ? o.material : [o.material]).forEach((m) => { m.needsUpdate = true; });
+        });
+      }
+    }
+    if (hemiLightRef.current) hemiLightRef.current.intensity = display.ambientIntensity;
+    if (keyLightRef.current) {
+      keyLightRef.current.intensity = display.keyIntensity;
+      // Session 147 — sun direction. Azimuth/elevation → position on a
+      // sphere of the original hardcoded radius (3.536; defaults 37°/45°
+      // reproduce the old (1.5, 2.5, 2.0) exactly, so untouched sliders
+      // change nothing). The directional light keeps its default target
+      // at origin; the shadow frustum travels with the light, so the
+      // ±5m box keeps covering the room from any angle.
+      const R = 3.536;
+      const az = (display.sunAzimuth * Math.PI) / 180;
+      const el = (display.sunElevation * Math.PI) / 180;
+      keyLightRef.current.position.set(
+        R * Math.cos(el) * Math.sin(az),
+        R * Math.sin(el),
+        R * Math.cos(el) * Math.cos(az),
+      );
+    }
+    if (rimLightRef.current) rimLightRef.current.intensity = display.rimIntensity;
+    const scene = sceneRef.current;
+    if (scene) {
+      if ("environmentIntensity" in scene) {
+        scene.environmentIntensity = display.envIntensity;
+      } else if (!envIntensityUnsupportedRef.current) {
+        envIntensityUnsupportedRef.current = true;
+        console.error("[ActorModelPanel] scene.environmentIntensity not supported by this three.js build — Environment slider inert. Upgrade three (r163+) or wire a PMREM re-render.");
+      }
+    }
+  }, [display]);
+
+  // Session 147 — persistence, two tiers: localStorage immediately
+  // (survives reload on this browser), DB preferences debounced 800ms
+  // (survives browser changes; exploreDisplay namespace, server merges
+  // top-level so other namespaces are untouched).
+  useEffect(() => {
+    try { localStorage.setItem("anima_explore_display", JSON.stringify(display)); }
+    catch (e) { console.warn("[ActorModelPanel] could not write display settings to localStorage:", e); }
+    if (displayPrefsSaveTimerRef.current) clearTimeout(displayPrefsSaveTimerRef.current);
+    displayPrefsSaveTimerRef.current = setTimeout(async () => {
+      try {
+        const resp = await fetch("/api/me/preferences", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ preferences: { exploreDisplay: display } }),
+        });
+        if (!resp.ok) throw new Error(`save failed (${resp.status})`);
+      } catch (e) {
+        console.error("[ActorModelPanel] display preferences DB save failed (localStorage copy still applied):", e);
+      }
+    }, 800);
+    return () => { if (displayPrefsSaveTimerRef.current) clearTimeout(displayPrefsSaveTimerRef.current); };
+  }, [display]);
+
+  // Session 147 — on mount, the DB copy wins over localStorage (it is
+  // the cross-browser truth; localStorage only bridges the fetch gap).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch("/api/me/preferences");
+        if (!resp.ok) throw new Error(`fetch failed (${resp.status})`);
+        const data = await resp.json();
+        const stored = data?.preferences?.exploreDisplay;
+        if (!cancelled && stored && typeof stored === "object") {
+          setDisplay({ ...EXPLORE_DISPLAY_DEFAULTS, ...stored });
+        }
+      } catch (e) {
+        console.warn("[ActorModelPanel] could not load display preferences from DB (using localStorage/defaults):", e);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Three honest readings of the same file rather than one "fixed" one.
   //   source — exactly what the exporter wrote
@@ -969,6 +1704,28 @@ export default function ActorModelPanel({ actorId }) {
     });
   }, [shading, matInfo]);
 
+  // Session 118 — leaving Explore via the Inspect tab button wasn't
+  // covered by the existing onBlur/onFocusIn key-clearing (a <button>
+  // isn't INPUT/TEXTAREA/SELECT, and the window never loses focus for
+  // an in-page tab click). Explicit and unambiguous instead of relying
+  // on focus-event tag matching: any key still "held" the moment she
+  // leaves Explore is stale, full stop.
+  useEffect(() => {
+    if (mode !== "explore") keysRef.current.clear();
+  }, [mode]);
+
+  // Session 107 — explore auto-engages locomotion the moment roles are
+  // known (embedded idle/walk clips detected on actor load); inspect
+  // returns to stillness and third person for calibration work.
+  useEffect(() => {
+    if (mode === "explore") {
+      if (roles?.idle || roles?.walk) setWalkMode(true);
+    } else {
+      setWalkMode(false);
+      setFpv(false);
+    }
+  }, [mode, roles]);
+
   useEffect(() => {
     walkRef.current.on = walkMode;
     walkRef.current.speed = walkSpeed;
@@ -985,6 +1742,17 @@ export default function ActorModelPanel({ actorId }) {
   // because matching stride to travel is the difference between walking and
   // skating, and it's a per-clip number nobody can guess.
   function switchClip(name) {
+    // Session 148, sixth pass — ONE DRIVER: on the adopted live root
+    // there are no local actions; the switch is a REQUEST to
+    // MiniGlbViewer's mixer via the activeAnimation prop (its own
+    // effect handles the crossfade). The local-action path remains for
+    // drag-in test files, which still load through loadModel with a
+    // local mixer.
+    if (liveCharRef.current && rootRef.current === liveCharRef.current.root) {
+      setExploreAnim(name);
+      setPlaying(name);
+      return;
+    }
     const action = actionsRef.current.get(name);
     if (!action) return;
     const previous = currentActionRef.current;
@@ -1026,15 +1794,19 @@ export default function ActorModelPanel({ actorId }) {
     if (move.lengthSq() < 1e-6) return;
 
     const running = keys.has("ShiftLeft") || keys.has("ShiftRight");
-    move.normalize().multiplyScalar(PLAYER_SPEED * (running ? 2 : 1) * delta);
+    const fpvSpeed = PLAYER_SPEED * (running ? 2 : 1);
+    move.normalize().multiplyScalar(fpvSpeed * delta);
 
-    const walls = probeWalls(
-      probePlayerRef.current,
-      camera.position,
-      performance.now()
-    );
-    slide(move, walls);
+    // Session 132 — move optimistically, then resolve, same pattern as
+    // stepLocomotion/stepWander.
+    const preResolveX = camera.position.x, preResolveZ = camera.position.z;
     camera.position.add(move);
+    const fpvResolveResult = resolveCapsule(camera.position);
+    const fpvCorrectionDist = Math.hypot(camera.position.x - preResolveX - move.x, camera.position.z - preResolveZ - move.z);
+    if (fpvCorrectionDist > 0.01 && performance.now() - correctionLogRef.current > 300) {
+      correctionLogRef.current = performance.now();
+      console.log(`[ActorModelPanel] (FPV camera) resolveCapsule corrected ${fpvCorrectionDist.toFixed(3)}m against [${fpvResolveResult.hitNames.join(", ")}].`);
+    }
 
     const b = boundsRef.current;
     camera.position.x = Math.max(b.minX, Math.min(b.maxX, camera.position.x));
@@ -1073,20 +1845,50 @@ export default function ActorModelPanel({ actorId }) {
 
     to.normalize();
 
+    // Session 132 — move optimistically, then resolve, same pattern as
+    // stepLocomotion.
     const step = to.clone().multiplyScalar(st.speed * delta);
-    const walls = probeWalls(probeActorRef.current, holder.position, now);
-    slide(step, walls);
+    const beforeX = holder.position.x, beforeZ = holder.position.z;
+    holder.position.add(step);
+    const preResolveX = holder.position.x, preResolveZ = holder.position.z;
+    const wanderResolveResult = resolveCapsule(holder.position);
+    const wanderCorrectionDist = Math.hypot(holder.position.x - preResolveX, holder.position.z - preResolveZ);
+    if (wanderCorrectionDist > 0.01 && performance.now() - correctionLogRef.current > 300) {
+      correctionLogRef.current = performance.now();
+      console.log(`[ActorModelPanel] (wander) resolveCapsule corrected ${wanderCorrectionDist.toFixed(3)}m against [${wanderResolveResult.hitNames.join(", ")}].`);
+    }
+    const netDx = holder.position.x - beforeX;
+    const netDz = holder.position.z - beforeZ;
 
-    // Pressed against a wall with nowhere to slide — pick somewhere else
-    // rather than grinding into it.
-    if (step.lengthSq() < 1e-8) {
+    // Pressed against something with nowhere to go — pick somewhere
+    // else rather than grinding into it.
+    if (netDx * netDx + netDz * netDz < step.lengthSq() * 0.05) {
       w.target = null;
       w.waitUntil = now + 500;
       return false;
     }
 
-    holder.position.add(step);
+    // Session 133 — Magnus: "swimming in the sofa... collision is not
+    // working." Removed the clampOutsideExclusions call that used to
+    // run here. resolveCapsule (above) now checks real geometry every
+    // frame — the exclusion-zone box this called was always an
+    // approximation from a grid scan, built specifically because the
+    // OLD raycast collision couldn't reliably catch a round table.
+    // That's no longer true. Running both every frame meant two
+    // independent systems correcting her position each frame, and
+    // when they disagreed about exactly where a boundary was (likely,
+    // since one checks actual triangles and the other checks a coarse
+    // scanned box), they fought each other — capsule pushes out based
+    // on real geometry, box clamp pulls back based on its own less
+    // precise boundary, repeat every frame. That's what "swimming"
+    // looks like. The exclusion-zone system itself stays intact for
+    // spawn-time placement (a one-time check, not a per-frame fight),
+    // just not run alongside resolveCapsule during movement anymore.
 
+    // Session 132 — this referenced an undefined `target` variable
+    // before (pre-existing, not from tonight's changes) — would have
+    // thrown ReferenceError any time this path actually ran. Computed
+    // properly now, same pattern as stepLocomotion's rotation code.
     const target = Math.atan2(to.x, to.z) + (st.flip ? Math.PI : 0);
     let diff = target - holder.rotation.y;
     while (diff > Math.PI) diff -= Math.PI * 2;
@@ -1123,6 +1925,7 @@ export default function ActorModelPanel({ actorId }) {
 
     const running = keys.has("ShiftLeft") || keys.has("ShiftRight");
     const moving = forward !== 0 || strafe !== 0;
+    if (!moving) stuckRef.current.since = 0;
 
     if (moving) {
       // Direction is camera-relative, so "forward" always means away from the
@@ -1140,11 +1943,60 @@ export default function ActorModelPanel({ actorId }) {
 
         const speed = st.speed * (running && st.roles.run ? 2.4 : 1);
         const step = dir.clone().multiplyScalar(speed * delta);
-        slide(
-          step,
-          probeWalls(probeActorRef.current, holder.position, performance.now())
-        );
+        const desiredLenSq = step.lengthSq();
+
+        // Session 132 — move optimistically, then resolve. resolveCapsule
+        // mutates holder.position in place, pushing it directly out of
+        // whatever it actually overlaps after the move — real geometric
+        // correction against actual triangles, not a pre-move distance
+        // check against a handful of sampled directions.
+        const beforeX = holder.position.x, beforeZ = holder.position.z;
         holder.position.add(step);
+        const preResolveX = holder.position.x, preResolveZ = holder.position.z;
+        const resolveResult = resolveCapsule(holder.position);
+        const correctionDist = Math.hypot(holder.position.x - preResolveX, holder.position.z - preResolveZ);
+        if (correctionDist > 0.01 && performance.now() - correctionLogRef.current > 300) {
+          correctionLogRef.current = performance.now();
+          console.log(`[ActorModelPanel] resolveCapsule corrected ${correctionDist.toFixed(3)}m against [${resolveResult.hitNames.join(", ")}] (merged BVH, ${colliderRef.current ? colliderRef.current.triangles.toFixed(0) : 0} triangles).`);
+        }
+        const netDx = holder.position.x - beforeX;
+        const netDz = holder.position.z - beforeZ;
+        const netMovedSq = netDx * netDx + netDz * netDz;
+
+        // Stuck now means exactly what it sounds like: real input, but
+        // she barely moved (net, after the full resolve) — no more
+        // reasoning about pre-move wall-distance readings. Threshold
+        // (5% of intended) is a reasonable starting point, not
+        // something validated against real data yet — if genuine
+        // sliding-along-a-surface movement ever mistakenly trips this,
+        // that's the number to revisit first.
+        if (desiredLenSq > 1e-6 && netMovedSq < desiredLenSq * 0.05) {
+          const now = performance.now();
+          if (stuckRef.current.since === 0) stuckRef.current.since = now;
+          const stuckFor = now - stuckRef.current.since;
+          if (now - stuckRef.current.lastLog > 500) {
+            stuckRef.current.lastLog = now;
+            console.log(`[ActorModelPanel] Blocked ${stuckFor.toFixed(0)}ms — intended step ${Math.sqrt(desiredLenSq).toFixed(3)}m, actual net movement ${Math.sqrt(netMovedSq).toFixed(3)}m.`);
+          }
+          if (stuckFor > 2000) {
+            // Genuinely stuck for 2 full seconds despite active input —
+            // same safety net as before: return to the last spot she
+            // was actually free to move from.
+            holder.position.copy(lastGoodPositionRef.current);
+            stuckRef.current.since = 0;
+            console.warn(`[ActorModelPanel] Stuck for ${stuckFor.toFixed(0)}ms with no real progress — returned to last free position (${lastGoodPositionRef.current.x.toFixed(2)}, ${lastGoodPositionRef.current.z.toFixed(2)}).`);
+          }
+        } else {
+          stuckRef.current.since = 0;
+          lastGoodPositionRef.current.copy(holder.position);
+        }
+
+        // Session 133 — removed clampOutsideExclusions here, same
+        // reasoning as stepWander above: resolveCapsule already
+        // checked real geometry a few lines up, running the
+        // approximate exclusion-zone box on top of it every frame was
+        // producing the "swimming" effect from the two systems
+        // disagreeing and fighting each other.
 
         const b = boundsRef.current;
         holder.position.x = Math.max(b.minX, Math.min(b.maxX, holder.position.x));
@@ -1178,7 +2030,7 @@ export default function ActorModelPanel({ actorId }) {
     controls.target.lerp(
       new THREE.Vector3(
         holder.position.x,
-        floorYRef.current + TARGET_HEIGHT * 0.6,
+        floorYRef.current + TARGET_HEIGHT * 0.85,
         holder.position.z
       ),
       ease
@@ -1192,52 +2044,181 @@ export default function ActorModelPanel({ actorId }) {
    * Crude compared with a real collider, and enough to stop either of you
    * walking through the bathroom.
    */
-  function probeWalls(cache, position, now) {
-    if (cache.d && now - cache.at < PROBE_EVERY) return cache.d;
+  // Session 132 — replaces probeWalls + slide + STOP_DISTANCE + the
+  // fan/height-probe system entirely. Established pattern, not another
+  // hand-rolled variant: three-mesh-bvh's own reference character-
+  // movement example. Represent her as a CAPSULE (a vertical line
+  // segment + radius, not a point firing rays in a few directions),
+  // and use shapecast to find the true closest-point distance from
+  // that segment to every nearby triangle. Where a triangle actually
+  // penetrates the capsule, push the capsule directly away from it by
+  // the exact penetration depth. This is real geometric collision, not
+  // an approximation built from sampled directions — no angle gaps
+  // (the round tables), no height gaps (any furniture height, all at
+  // once, continuously, not five sampled heights), and no manual
+  // distance-margin tuning to guess at tunneling risk, since this
+  // resolves actual overlap rather than "did a ray happen to hit
+  // something within some safety margin taken up to 70ms ago."
+  //
+  // Different call pattern from the old slide(): that checked distances
+  // BEFORE moving and zeroed components that would cross a threshold.
+  // This applies the full desired movement optimistically, then
+  // corrects — push the capsule out of whatever it actually ends up
+  // overlapping. That's what the reference pattern does, and it's what
+  // makes tunneling a non-issue: there's no "was the reading stale"
+  // window, because this checks real overlap at the actual final
+  // position, every frame, not a cached reading from up to 70ms ago.
+  //
+  // position: {x, z} — mutated in place with the resolved position.
+  // Returns the correction applied, {x, z}, so callers can tell how
+  // much (if any) she got pushed and detect a genuine stuck state from
+  // "intended movement vs. actual resulting movement" instead of wall-
+  // distance readings.
+  // Session 138 — Magnus: "can't access the hall... bathroom not
+  // accessible... got into the hall, can't get back." Direct
+  // consequence of the scale fix actually working: door frames and
+  // threshold geometry that were invisible to collision before are now
+  // properly detected, and doorways are the tightest passages in any
+  // room. At 0.3m radius (0.6m diameter), she had zero to minimal
+  // margin against a tight bathroom/hallway door — real interior doors
+  // in a compact studio apartment are often only 0.6-0.7m clear width.
+  // "Got in, can't get back" is a strong tell too: consistent with a
+  // passage that barely, inconsistently fits her one direction but not
+  // reliably both. Reduced to a closer match for actual shoulder width
+  // (~0.44m diameter), leaving real margin for tight doorways while
+  // still catching genuine wall/furniture overlap — the fix was never
+  // about needing a wide berth, just not clipping through anything.
+  const CAPSULE_RADIUS = 0.22; // metres — her rough body radius
+  // Session 140 — was 0.1, i.e. BELOW the radius: the capsule's bottom
+  // sphere reached 0.12m below floor level, permanently penetrating
+  // the floor slab. That's what the "60 corrections, all against
+  // floor_Material_#57_0, 1–3cm" log from Session 137 actually was —
+  // not benign contact resolution but a fight re-fought every frame
+  // (Y-corrections are discarded, so the capsule respawned inside the
+  // floor each call). Wasted work in open floor; at a doorway, floor
+  // triangles meeting the threshold push at oblique angles and pollute
+  // the resolution right where the passage is tightest. The reference
+  // example keeps the capsule fully above ground; the invariant is
+  // CAPSULE_BOTTOM >= CAPSULE_RADIUS. 0.25 leaves 3cm of ground
+  // clearance — thresholds and rugs are stepped over, anything taller
+  // than 3cm still collides.
+  const CAPSULE_BOTTOM = 0.25; // metres above floor — MUST be >= CAPSULE_RADIUS
+  const CAPSULE_TOP = 1.5;    // metres above floor — spans essentially her whole body
 
-    const room = roomRef.current;
-    const open = { px: 99, nx: 99, pz: 99, nz: 99 };
-    if (!room) {
-      cache.at = now;
-      cache.d = open;
-      return open;
+  const _capSegment = new THREE.Line3();
+  const _capBox = new THREE.Box3();
+  const _triPoint = new THREE.Vector3();
+  const _capPoint = new THREE.Vector3();
+  const _pushDir = new THREE.Vector3();
+
+  // Session 140 — rewritten to match the reference example exactly:
+  // ONE shapecast against ONE merged, world-space BVH (built at room
+  // load, see loadRoom). Everything below happens in world metres —
+  // no per-mesh matrix inversion, no local-space radius, no scale
+  // compensation (Session 137's fix is now unnecessary by
+  // construction: StaticGeometryGenerator bakes every matrixWorld,
+  // including that 0.0103 baked scale, into the merged vertices at
+  // build time). No RESOLVE_ITERATIONS either (Session 139's
+  // compensation): the oscillation it papered over came from fully
+  // resolving against mesh A before looking at mesh B — with one BVH
+  // there is no mesh ordering, the single traversal resolves the
+  // capsule cumulatively against every nearby triangle (a doorway's
+  // left frame AND right frame in the same pass), which is precisely
+  // why the reference merges in the first place.
+  //
+  // position: {x, z} — mutated in place with the resolved position.
+  // Y-corrections are computed (they keep push directions honest) but
+  // deliberately not written back — floor contact is owned by the
+  // existing grounding path, same division of labour as before.
+  function resolveCapsule(position) {
+    const collider = colliderRef.current;
+    if (!collider) return { x: 0, z: 0, hitNames: [] };
+
+    const startX = position.x, startZ = position.z;
+    _capSegment.start.set(position.x, floorYRef.current + CAPSULE_BOTTOM, position.z);
+    _capSegment.end.set(position.x, floorYRef.current + CAPSULE_TOP, position.z);
+
+    _capBox.makeEmpty();
+    _capBox.expandByPoint(_capSegment.start);
+    _capBox.expandByPoint(_capSegment.end);
+    _capBox.min.addScalar(-CAPSULE_RADIUS);
+    _capBox.max.addScalar(CAPSULE_RADIUS);
+
+    // Diagnostic only: hit points collected during the cast, matched
+    // to source-mesh names afterwards via their world boxes — the
+    // merged buffer itself is anonymous. Kept out of the hot callback
+    // beyond a cheap push.
+    const hitPoints = [];
+
+    collider.geometry.boundsTree.shapecast({
+      intersectsBounds: (box) => box.intersectsBox(_capBox),
+      intersectsTriangle: (tri) => {
+        const distance = tri.closestPointToSegment(_capSegment, _triPoint, _capPoint);
+        if (distance < CAPSULE_RADIUS) {
+          const depth = CAPSULE_RADIUS - distance;
+          _pushDir.copy(_capPoint).sub(_triPoint);
+          // Degenerate: centre-line exactly touches the triangle,
+          // push direction undefined — skip rather than push nowhere.
+          if (_pushDir.lengthSq() < 1e-10) return false;
+          _pushDir.normalize();
+          _capSegment.start.addScaledVector(_pushDir, depth);
+          _capSegment.end.addScaledVector(_pushDir, depth);
+          hitPoints.push(_triPoint.clone());
+        }
+        return false;
+      },
+    });
+
+    position.x = _capSegment.start.x;
+    position.z = _capSegment.start.z;
+
+    const hitNames = [];
+    if (hitPoints.length) {
+      const nameBoxes = collisionNameBoxesRef.current;
+      const seen = new Set();
+      for (const p of hitPoints) {
+        for (const nb of nameBoxes) {
+          if (!seen.has(nb.name) && nb.box.containsPoint(p)) {
+            seen.add(nb.name);
+            hitNames.push(nb.name);
+            break;
+          }
+        }
+      }
+      if (!hitNames.length) hitNames.push("(merged room geometry)");
     }
 
-    const ray = raycasterRef.current;
-    ray.far = 2;
-    const origin = new THREE.Vector3(
-      position.x,
-      floorYRef.current + 1.0,
-      position.z
-    );
-
-    const axes = {
-      px: new THREE.Vector3(1, 0, 0),
-      nx: new THREE.Vector3(-1, 0, 0),
-      pz: new THREE.Vector3(0, 0, 1),
-      nz: new THREE.Vector3(0, 0, -1),
-    };
-
-    const out = {};
-    for (const key of Object.keys(axes)) {
-      ray.set(origin, axes[key]);
-      const hits = ray.intersectObject(room, true);
-      out[key] = hits.length ? hits[0].distance : 99;
-    }
-
-    cache.at = now;
-    cache.d = out;
-    return out;
+    return { x: _capSegment.start.x - startX, z: _capSegment.start.z - startZ, hitNames };
   }
 
-  // Zero out any component of a move that would push through a wall, leaving
-  // the other axis free — so you slide along rather than stopping dead.
-  function slide(move, walls) {
-    if (move.x > 0 && walls.px < BODY_RADIUS) move.x = 0;
-    if (move.x < 0 && walls.nx < BODY_RADIUS) move.x = 0;
-    if (move.z > 0 && walls.pz < BODY_RADIUS) move.z = 0;
-    if (move.z < 0 && walls.nz < BODY_RADIUS) move.z = 0;
-    return move;
+  // Session 114 — the circle-from-one-assumed-centre-point approach
+  // (Session 113) missed the real edge: it assumed the room's
+  // geometric centre sits exactly ON the table and radiated outward
+  // from there. If the table's actual centre is even slightly offset
+  // from that point — near-certain, since "room bounding-box centre"
+  // and "where the coffee table sits" are two unrelated numbers that
+  // happen to be close — the circle is centred wrong and simply
+  // doesn't reach the true edge on that side. Replaced with axis-
+  // aligned boxes built from an actual grid scan (see room-load below)
+  // instead of a guessed radius from one point. Push out to the
+  // NEAREST box edge if she ends up inside one — same "doesn't care how
+  // she got there" backstop as before, just a shape that matches
+  // reality instead of an assumption.
+  function clampOutsideExclusions(position) {
+    for (const zone of furnitureExclusionsRef.current) {
+      if (position.x <= zone.minX || position.x >= zone.maxX) continue;
+      if (position.z <= zone.minZ || position.z >= zone.maxZ) continue;
+      const dLeft = position.x - zone.minX;
+      const dRight = zone.maxX - position.x;
+      const dBack = position.z - zone.minZ;
+      const dFront = zone.maxZ - position.z;
+      const minD = Math.min(dLeft, dRight, dBack, dFront);
+      if (minD === dLeft) position.x = zone.minX;
+      else if (minD === dRight) position.x = zone.maxX;
+      else if (minD === dBack) position.z = zone.minZ;
+      else position.z = zone.maxZ;
+    }
+    return position;
   }
 
   // A 1.7m post beside her. Nothing measures scale as reliably as putting a
@@ -1298,7 +2279,9 @@ export default function ActorModelPanel({ actorId }) {
     }
 
     try {
-      const gltf = await new GLTFLoader().loadAsync(trackUrl(file));
+      const roomLoader = new GLTFLoader();
+      if (dracoLoaderRef.current) roomLoader.setDRACOLoader(dracoLoaderRef.current);
+      const gltf = await roomLoader.loadAsync(trackUrl(file));
       const root = gltf.scene;
 
       root.updateMatrixWorld(true);
@@ -1314,17 +2297,163 @@ export default function ActorModelPanel({ actorId }) {
       const centre = grounded.getCenter(new THREE.Vector3());
 
       let triangles = 0;
+      // Session 147 — Option A (ruled by Magnus): archviz home GLBs ship
+      // every material as KHR_materials_unlit (studio_apartment.glb:
+      // 59/59 confirmed by direct JSON-chunk inspection), which three
+      // imports as MeshBasicMaterial — a material that ignores lights,
+      // ignores the environment, and CANNOT receive shadows. Rebuild
+      // each unlit material as MeshStandardMaterial carrying the baked
+      // texture/color forward (roughness 1, metalness 0: the baked map
+      // provides all shading, standard-material response only adds our
+      // key/env/ambient on top). Consequences accepted with the ruling:
+      // the room now responds to the Display sliders, and shadows land
+      // on floors and walls. Lit materials (future rooms) pass through
+      // untouched — this converts, never re-converts.
+      let convertedMats = 0;
+      const matCache = new Map(); // shared materials stay shared
       root.traverse((o) => {
         if (o.isMesh && o.geometry) {
           const g = o.geometry;
           triangles += g.index
             ? g.index.count / 3
             : (g.attributes.position?.count ?? 0) / 3;
+          const convert = (m) => {
+            if (!m || !m.isMeshBasicMaterial) return m;
+            if (matCache.has(m)) return matCache.get(m);
+            const std = new THREE.MeshStandardMaterial({
+              name: m.name,
+              map: m.map ?? null,
+              color: m.color.clone(),
+              roughness: 1,
+              metalness: 0,
+              transparent: m.transparent,
+              opacity: m.opacity,
+              alphaTest: m.alphaTest,
+              side: m.side,
+              depthWrite: m.depthWrite,
+            });
+            matCache.set(m, std);
+            convertedMats++;
+            return std;
+          };
+          o.material = Array.isArray(o.material) ? o.material.map(convert) : convert(o.material);
+          // Session 147 — level 3: room receives (her shadow on the
+          // floor) and casts (furniture shadows itself, table shades
+          // under itself). Static geometry, so the shadow-map cost is
+          // the character, not this. Inert while the Display toggle is
+          // off.
+          o.receiveShadow = true;
+          o.castShadow = true;
         }
       });
+      if (convertedMats > 0) {
+        console.log(`[ActorModelPanel] Room materials: ${convertedMats} unlit (MeshBasicMaterial) converted to lit MeshStandardMaterial — shadows and Display lighting now apply to the room.`);
+      }
 
       scene.add(root);
       roomRef.current = root;
+
+      // Session 140 — ONE merged world-space BVH via
+      // StaticGeometryGenerator, exactly like the reference example,
+      // replacing Session 132's one-BVH-per-mesh set (see the
+      // colliderRef declaration comment for the full why + the export
+      // confirmation that unblocked this). Built once here, not per
+      // frame. The generator bakes each mesh's full matrixWorld into
+      // the output vertices — the 0.0103 3ds-Max scale included — so
+      // the merged geometry is in true world metres and resolveCapsule
+      // runs entirely in world space with no per-mesh compensation.
+      // Build AFTER the grounding shift above (root.position.y already
+      // adjusted, matrixWorld already updated) — the baked transforms
+      // must match where the room actually renders.
+      //
+      // Session 134's skip-tiny-meshes filter kept, with a fix: it
+      // measured footprint in LOCAL space, which the Session 137 scale
+      // discovery retroactively broke — a 0.0103-scale mesh's local
+      // footprint is ~100x its real size, so scaled-down small clutter
+      // was never skipped and true-scale small items could be skipped
+      // wrongly. Measured in world space now (setFromObject accounts
+      // for matrixWorld).
+      //
+      // Session 136's skinned/morph/instanced warnings kept: those
+      // mesh types are excluded from the merge input (same behaviour
+      // as before — none exist in the current room, confirmed then).
+      const bvhStart = performance.now();
+      const collisionInputMeshes = [];
+      const collisionNameBoxes = [];
+      let skippedCount = 0;
+      const _meshBox = new THREE.Box3();
+      root.traverse((child) => {
+        if (child.isMesh && child.geometry?.attributes?.position) {
+          if (child.isSkinnedMesh || child.morphTargetInfluences?.length || child.isInstancedMesh) {
+            console.warn(`[ActorModelPanel] "${child.name || "(unnamed)"}" is skinned/morphed/instanced — excluded from static collision geometry.`);
+            return;
+          }
+          _meshBox.setFromObject(child);
+          const size = _meshBox.getSize(new THREE.Vector3());
+          const footprint = Math.max(size.x, size.z);
+          if (footprint < 0.15) {
+            skippedCount += 1;
+            return;
+          }
+          collisionInputMeshes.push(child);
+          // Diagnostic name index for resolveCapsule's correction log
+          // (the merged buffer has no names). Expanded slightly so a
+          // contact point ON a surface still tests as contained.
+          collisionNameBoxes.push({
+            name: child.name || "(unnamed mesh)",
+            box: _meshBox.clone().expandByScalar(0.02),
+          });
+        }
+      });
+      try {
+        const staticGenerator = new StaticGeometryGenerator(collisionInputMeshes);
+        staticGenerator.attributes = ["position"];
+        const mergedGeometry = staticGenerator.generate();
+        mergedGeometry.boundsTree = new MeshBVH(mergedGeometry);
+        colliderRef.current = {
+          geometry: mergedGeometry,
+          triangles: mergedGeometry.index
+            ? mergedGeometry.index.count / 3
+            : mergedGeometry.attributes.position.count / 3,
+        };
+        collisionNameBoxesRef.current = collisionNameBoxes;
+        const bvhMs = performance.now() - bvhStart;
+        console.log(`[ActorModelPanel] Built ONE merged collision BVH: ${collisionInputMeshes.length} mesh(es) merged (${skippedCount} skipped as too small to matter), ${colliderRef.current.triangles.toFixed(0)} triangles, in ${bvhMs.toFixed(0)}ms.`);
+        console.log(`[ActorModelPanel] Collision mesh names: ${collisionNameBoxes.map((nb) => nb.name).join(", ")}`);
+      } catch (e) {
+        // Crash loudly, not silently: no collider means Explore has NO
+        // collision at all. Make that impossible to miss.
+        colliderRef.current = null;
+        collisionNameBoxesRef.current = [];
+        console.error("[ActorModelPanel] FAILED to build merged collision BVH — Explore mode has NO collision:", e);
+      }
+
+      // Session 136 — the mesh IS present, built, and structurally
+      // normal (no skinning/morphs/instancing) — yet never triggers a
+      // correction. That rules out "missing geometry" and points at a
+      // coordinate mismatch instead: mesh.matrixWorld saying the
+      // geometry is somewhere different from where it's actually
+      // rendered. The mesh-name convention here (_Material_#52_0 style,
+      // hash-prefixed material IDs) is a strong 3ds Max signature — a
+      // very common source of exactly this kind of bug (pivot-point
+      // offsets, coordinate-system conversion during export). Log the
+      // TRUE world-space bounding box (setFromObject accounts for
+      // matrixWorld correctly) for furniture specifically, so it's
+      // directly comparable against the room centre (0.13, 0.23) and
+      // wherever she's actually ending up — if these don't line up
+      // with where the furniture visibly sits on screen, that confirms
+      // the mismatch directly rather than inferring it.
+      // (Session 140 — reads the world boxes already computed for the
+      // name index above; identical output to before.)
+      const furnitureKeywords = ["table", "divan", "armchair", "chair", "stul", "stolik"];
+      collisionNameBoxes.forEach((nb) => {
+        const lname = nb.name.toLowerCase();
+        if (furnitureKeywords.some((kw) => lname.includes(kw))) {
+          const c = nb.box.getCenter(new THREE.Vector3());
+          const s = nb.box.getSize(new THREE.Vector3());
+          console.log(`[ActorModelPanel] "${nb.name}" world bounds: centre=(${c.x.toFixed(2)}, ${c.y.toFixed(2)}, ${c.z.toFixed(2)}) size=(${s.x.toFixed(2)}, ${s.y.toFixed(2)}, ${s.z.toFixed(2)}).`);
+        }
+      });
 
       // Hide the placeholder box rather than dispose it, so unloading a room
       // leaves something to walk in.
@@ -1338,24 +2467,221 @@ export default function ActorModelPanel({ actorId }) {
       // underside of the slab, which is a floor thickness too low.
       const ray = raycasterRef.current;
       ray.far = 3;
-      ray.set(
-        new THREE.Vector3(centre.x, grounded.min.y + 1.3, centre.z),
-        new THREE.Vector3(0, -1, 0)
-      );
-      const downHits = ray.intersectObject(root, true);
-      floorYRef.current = downHits.length ? downHits[0].point.y : 0;
+
+      // Session 112 — SAD's own Open Thread #5: "holder seats at room
+      // centre = on the studio's coffee table; use measured clear
+      // floor." The room's geometric centre is exactly where a coffee
+      // table typically sits, so probing straight down from there hits
+      // the tabletop, not the floor — and both the floor-height
+      // calibration AND her spawn point inherited that wrong, elevated
+      // reading, standing her on the table. A real floor slab is a few
+      // cm thick; if the hit sits noticeably higher than the slab's
+      // measured underside, it's furniture, not floor. Ring-search
+      // outward from centre for a point that reads as genuine bare
+      // floor instead of trusting centre blindly.
+      function probeFloorAt(x, z) {
+        ray.set(new THREE.Vector3(x, grounded.min.y + 1.3, z), new THREE.Vector3(0, -1, 0));
+        const hits = ray.intersectObject(root, true);
+        return hits.length ? hits[0].point.y : null;
+      }
+
+      // Session 116 — was 0.3m. Console data from a real failed room:
+      // the coffee table read at 0.22m above the slab underside and
+      // was STILL classified as "clear floor" because 0.22 < 0.3 — the
+      // margin was simply too generous, letting a real obstacle read
+      // as floor. A genuine slab is a few cm thick; there was never a
+      // reason for 0.3m. Tightened to catch this exact case with room
+      // to spare.
+      const CLEAR_FLOOR_MARGIN = 0.12; // metres — is this point FURNITURE (exclusion zone)?
+      // Session 124 — Magnus: "she did start at the right position
+      // before you started to fix the table collision detection."
+      // Traced it: tightening CLEAR_FLOOR_MARGIN above was necessary
+      // to correctly flag the table (0.22 was slipping past the old
+      // 0.3), but that same tight number was ALSO gating the ring
+      // search's fallback spawn candidates below — so a rug edge, a
+      // threshold, a slight slope, anything with a little legitimate
+      // elevation that's completely fine to stand on, started failing
+      // that check too, when it used to pass under the looser 0.3.
+      // "Is this furniture?" and "is this an acceptable place to
+      // stand?" are different questions and never should have shared
+      // one number. This one is deliberately the old, looser value —
+      // only for judging spawn-candidate acceptability, never for
+      // furniture detection.
+      const SPAWN_ACCEPTABLE_MARGIN = 0.3; // metres — is this point OK TO STAND ON (spawn fallback)?
+      furnitureExclusionsRef.current = [];
+      let spawnX = centre.x;
+      let spawnZ = centre.z;
+      let floorY = probeFloorAt(spawnX, spawnZ);
+      const centreIsFurniture = floorY !== null && floorY - grounded.min.y > CLEAR_FLOOR_MARGIN;
+      console.log(`[ActorModelPanel] Room load: centre=(${centre.x.toFixed(2)}, ${centre.z.toFixed(2)}), slab underside=${grounded.min.y.toFixed(2)}, centre probe hit y=${floorY === null ? "none" : floorY.toFixed(2)} → centreIsFurniture=${centreIsFurniture}.`);
+
+      // Session 118 — known-good spawn point, if this room has one
+      // (see KNOWN_ROOM_SPAWNS above). This ONLY replaces where she
+      // starts — real detection below still always runs regardless,
+      // because it's also what builds the exclusion zone that protects
+      // her from walking INTO the table later, not just at spawn.
+      // Skipping detection entirely for known rooms would have quietly
+      // dropped that protection too.
+      const known = KNOWN_ROOM_SPAWNS[file.name];
+      if (known) {
+        spawnX = known.x;
+        spawnZ = known.z;
+        floorY = probeFloorAt(spawnX, spawnZ) ?? floorY;
+        console.log(`[ActorModelPanel] Room load: using known spawn point for "${file.name}": (${spawnX.toFixed(2)}, ${spawnZ.toFixed(2)}).`);
+      }
+
+      if (centreIsFurniture) {
+        // Session 123 — the registered box's edges landed EXACTLY on
+        // the old 1.6m scan boundary on all four sides (verified: box
+        // minus BODY_RADIUS matches the scan window to the metre). A
+        // real furniture edge doesn't coincidentally align with an
+        // arbitrary scan radius on every side at once — this meant the
+        // scan was hitting its own limit before ever finding genuine
+        // clear floor, not that the room is furniture everywhere.
+        // Extended both searches so they have a real chance of
+        // reaching past a large furniture cluster instead of giving up
+        // at an arbitrary distance.
+        const ringRadii = [0.8, 1.4, 2.0, 2.6, 3.2];
+        const ringAngles = [0, 45, 90, 135, 180, 225, 270, 315].map((d) => (d * Math.PI) / 180);
+        // Session 125 — Magnus: "she starts half ways into the wall on
+        // the opposite side." Real gap, distinct from every furniture
+        // fix so far: probeFloorAt only ever checks vertical floor
+        // elevation. Nothing about "is this point too close to a wall"
+        // was ever checked for ring-search candidates — the floor right
+        // at a wall's base usually reads perfectly flat, so a candidate
+        // could pass the elevation test while sitting half inside a
+        // wall. The 0.4m bounding-box inset only guards the room's
+        // OUTER perimeter; it has no idea an interior wall (like the
+        // one that TV is mounted on) exists at all. probeWalls already
+        // does real horizontal collision detection for movement — it
+        // was just never used to validate a spawn candidate. It needs
+        // floorYRef.current for its probe heights, which isn't finalized
+        // until after this whole block; seed it with a working estimate
+        // now so probeWalls behaves sanely here, and it gets overwritten
+        // with the real value below regardless.
+        floorYRef.current = grounded.min.y + 0.1;
+        let found = false;
+        for (const r of ringRadii) {
+          for (const a of ringAngles) {
+            const x = centre.x + Math.cos(a) * r;
+            const z = centre.z + Math.sin(a) * r;
+            if (x < grounded.min.x + 0.4 || x > grounded.max.x - 0.4) continue;
+            if (z < grounded.min.z + 0.4 || z > grounded.max.z - 0.4) continue;
+            const y = probeFloorAt(x, z);
+            if (y === null || y - grounded.min.y > SPAWN_ACCEPTABLE_MARGIN) continue;
+            // Session 132 — probeWalls no longer exists (replaced by
+            // resolveCapsule). Same idea: place a capsule at this
+            // candidate and see how far it needs pushing to clear real
+            // geometry. Near-zero correction means genuinely clear;
+            // anything more means it's overlapping something even
+            // though the floor read fine.
+            const candidatePos = { x, z };
+            const candidateCorrection = resolveCapsule(candidatePos);
+            const candidateCorrectionDist = Math.hypot(candidateCorrection.x, candidateCorrection.z);
+            if (candidateCorrectionDist > 0.05) continue; // flat floor, but overlapping something real
+            // Only actually adopt this as the spawn point if we don't
+            // already have a known-good one — the search still runs
+            // (cheap, and logged) so the console output stays useful
+            // for confirming/updating a KNOWN_ROOM_SPAWNS entry.
+            if (!known) { spawnX = x; spawnZ = z; floorY = y; }
+            found = true;
+            break;
+          }
+          if (found) break;
+        }
+        if (!found && !known) {
+          console.warn("[ActorModelPanel] No clear floor found near room centre (checked centre + a ring of fallback points) — spawning at centre anyway, she may appear on furniture.");
+          floorY = floorY ?? 0;
+        }
+
+        // Session 114 — the previous version (Session 113) radiated
+        // outward from centre.x/centre.z assuming that point sits
+        // exactly on the obstacle's own centre, and built a circle from
+        // that guessed radius. Found live: it missed the real edge —
+        // the room's geometric centre and the table's actual centre
+        // are two different points that only happen to be close, so a
+        // circle centred on the wrong point doesn't reach the true edge
+        // on whichever side is offset. Fixed properly: grid-scan the
+        // actual area, find every point that genuinely reads as
+        // furniture, and build the exclusion box from THAT extent —
+        // not a guessed shape from one point.
+        //
+        // Session 123 — SCAN_HALF widened 1.6 → 3.2m (see note above);
+        // also added the same room-bounds check the ring-search already
+        // had, which this scan was missing — without it, points beyond
+        // the room's actual walls could get sampled and misread as
+        // furniture (or as an inconclusive null, now correctly ignored
+        // either way, but still wasted a sample). One-time cost at room
+        // load only, never per-frame.
+        const SCAN_HALF = 3.2; // metres — half-width of the area to scan around centre
+        const SCAN_STEP = 0.2; // widened alongside SCAN_HALF to keep the ray count reasonable
+        let minFx = Infinity, maxFx = -Infinity, minFz = Infinity, maxFz = -Infinity;
+        let anyFurniture = false;
+        let scanHitOwnBoundary = false;
+        for (let dx = -SCAN_HALF; dx <= SCAN_HALF; dx += SCAN_STEP) {
+          for (let dz = -SCAN_HALF; dz <= SCAN_HALF; dz += SCAN_STEP) {
+            const x = centre.x + dx;
+            const z = centre.z + dz;
+            if (x < grounded.min.x + 0.4 || x > grounded.max.x - 0.4) continue;
+            if (z < grounded.min.z + 0.4 || z > grounded.max.z - 0.4) continue;
+            const y = probeFloorAt(x, z);
+            const isFurniture = y !== null && y - grounded.min.y > CLEAR_FLOOR_MARGIN;
+            if (isFurniture) {
+              anyFurniture = true;
+              if (x < minFx) minFx = x;
+              if (x > maxFx) maxFx = x;
+              if (z < minFz) minFz = z;
+              if (z > maxFz) maxFz = z;
+              if (Math.abs(dx) > SCAN_HALF - SCAN_STEP || Math.abs(dz) > SCAN_HALF - SCAN_STEP) {
+                scanHitOwnBoundary = true;
+              }
+            }
+          }
+        }
+        // Session 126 — Magnus: "she is back in the sofa again." The
+        // log showed exactly why: scanHitOwnBoundary=true, and the
+        // registered box was z[-3.29, 3.55] — a 6.84m span. Not
+        // plausible as real furniture in this room. My own self-check
+        // (added last round specifically to flag this) was firing
+        // correctly and I kept letting the code act on the number
+        // anyway — that was the actual mistake, not the room. If the
+        // scan can't confirm where furniture actually ends even at
+        // 3.2m, the measurement isn't trustworthy enough to build a
+        // hard exclusion zone from, and acting on it regardless is how
+        // spawn ended up worse than having no zone at all: pushed to
+        // the edge of a box that was never real. Ongoing collision
+        // during actual movement still has real, working protection —
+        // probeWalls' multi-height raycasting (Session 111) already
+        // catches the table directly against real geometry, entirely
+        // independent of this scan. Don't register a zone from a
+        // measurement that admits it isn't confirmed.
+        if (scanHitOwnBoundary) {
+          console.warn(`[ActorModelPanel] Grid scan hit its own boundary (SCAN_HALF=${SCAN_HALF}m) without finding a confirmed furniture edge — measurement not trustworthy, no exclusion zone registered. Ongoing collision still protected by probeWalls during movement.`);
+        } else if (anyFurniture) {
+          const zone = {
+            minX: minFx - BODY_RADIUS, maxX: maxFx + BODY_RADIUS,
+            minZ: minFz - BODY_RADIUS, maxZ: maxFz + BODY_RADIUS,
+          };
+          furnitureExclusionsRef.current.push(zone);
+          console.log(`[ActorModelPanel] Registered furniture exclusion from grid scan: x[${zone.minX.toFixed(2)}, ${zone.maxX.toFixed(2)}] z[${zone.minZ.toFixed(2)}, ${zone.maxZ.toFixed(2)}].`);
+        } else {
+          // Scanned the whole area and found nothing furniture-like
+          // outside the exact centre point — shouldn't happen given
+          // centreIsFurniture was true, but if it does, don't silently
+          // register an empty/wrong zone.
+          console.warn("[ActorModelPanel] centre read as furniture but the grid scan found no furniture extent around it — no exclusion zone registered, investigate.");
+        }
+      }
+      floorYRef.current = floorY;
 
       // The bounding box includes slab thickness top and bottom. What decides
       // whether a person looks right in here is the interior, so measure it.
       ray.set(
-        new THREE.Vector3(centre.x, floorYRef.current + 0.05, centre.z),
+        new THREE.Vector3(spawnX, floorYRef.current + 0.05, spawnZ),
         new THREE.Vector3(0, 1, 0)
       );
       const upHits = ray.intersectObject(root, true);
       const interiorHeight = upHits.length ? upHits[0].distance + 0.05 : size.y;
-
-      probeActorRef.current = { at: 0, d: null };
-      probePlayerRef.current = { at: 0, d: null };
 
       // Keep her off the skirting boards.
       const inset = 0.4;
@@ -1366,25 +2692,84 @@ export default function ActorModelPanel({ actorId }) {
         maxZ: grounded.max.z - inset,
       };
 
-      // Put her in the middle of it, and keep the camera from orbiting out
-      // through the walls.
+      // Put her at the verified-clear spawn point (not necessarily the
+      // room's geometric centre anymore — see above), and keep the
+      // camera from orbiting out through the walls.
       if (holderRef.current) {
-        holderRef.current.position.set(centre.x, floorYRef.current, centre.z);
+        holderRef.current.position.set(spawnX, floorYRef.current, spawnZ);
+        console.log(`[ActorModelPanel] Chosen spawn before clamp: (${spawnX.toFixed(2)}, ${spawnZ.toFixed(2)}), ${furnitureExclusionsRef.current.length} exclusion zone(s) registered.`);
+        clampOutsideExclusions(holderRef.current.position);
+
+        // Session 121 — real bug, not the exclusion zones themselves:
+        // the spawn point survived the exclusion-zone clamp (which only
+        // knows about the detected furniture box) but could still sit
+        // against OTHER real geometry the exclusion system never
+        // modeled — the sofa, here. Worse: lastGoodPositionRef was
+        // then seeded with that same bad spot below, so the "return to
+        // safety" escape (Session 119) just returned her to the same
+        // bad spot — fully stuck with no way out, which is exactly
+        // what happened. Verify the chosen spawn isn't itself
+        // overlapping real geometry before accepting it; if it is
+        // badly, fall back to whichever room corner is farthest from
+        // the detected furniture — far more likely to be genuinely
+        // open regardless of how the exclusion-zone math misjudged the
+        // furniture shape.
+        //
+        // Session 132 — probeWalls no longer exists (replaced by
+        // resolveCapsule). Calling it directly here is actually a
+        // small improvement over the old detect-then-maybe-fix
+        // pattern: resolveCapsule corrects minor overlap on its own as
+        // a side effect, so only a genuinely large correction (meaning
+        // the point was fundamentally bad, not just slightly close to
+        // something) falls through to the room-corner fallback.
+        const spawnCorrection = resolveCapsule(holderRef.current.position);
+        const spawnCorrectionDist = Math.hypot(spawnCorrection.x, spawnCorrection.z);
+        const spawnBoxedIn = spawnCorrectionDist > 0.3;
+        if (spawnBoxedIn) {
+          const b = boundsRef.current;
+          const corners = [
+            { x: b.minX + 0.6, z: b.minZ + 0.6 },
+            { x: b.minX + 0.6, z: b.maxZ - 0.6 },
+            { x: b.maxX - 0.6, z: b.minZ + 0.6 },
+            { x: b.maxX - 0.6, z: b.maxZ - 0.6 },
+          ];
+          const farthest = corners.reduce(
+            (best, c) => {
+              const d = Math.hypot(c.x - centre.x, c.z - centre.z);
+              return d > best.d ? { ...c, d } : best;
+            },
+            { ...corners[0], d: -1 }
+          );
+          console.warn(`[ActorModelPanel] Spawn point needed a ${spawnCorrectionDist.toFixed(2)}m correction — treating as fundamentally bad, falling back to room corner (${farthest.x.toFixed(2)}, ${farthest.z.toFixed(2)}).`);
+          holderRef.current.position.set(farthest.x, floorYRef.current, farthest.z);
+          clampOutsideExclusions(holderRef.current.position);
+          resolveCapsule(holderRef.current.position);
+        }
+
+        lastGoodPositionRef.current.copy(holderRef.current.position);
+        console.log(`[ActorModelPanel] Holder position after clamp: (${holderRef.current.position.x.toFixed(2)}, ${holderRef.current.position.z.toFixed(2)}).`);
       }
+      // Session 115 — small rooms (a compact kitchen/dining nook, say)
+      // put the camera too close under the old room-size-only formula,
+      // and the look-at target sat at chest height — combined, that's
+      // a face-cropped, chest-filling close-up on load, not a portrait.
+      // Minimum distance floor + aiming higher (shoulder/lower-face,
+      // not mid-torso) fixes the default framing regardless of room size.
+      const camDist = Math.max(2.4, Math.min(size.x, size.z) * 0.4);
       if (controlsRef.current) {
         controlsRef.current.target.set(
-          centre.x,
-          floorYRef.current + TARGET_HEIGHT * 0.6,
-          centre.z
+          spawnX,
+          floorYRef.current + TARGET_HEIGHT * 0.85,
+          spawnZ
         );
         controlsRef.current.maxDistance = Math.hypot(size.x, size.z);
         controlsRef.current.update();
       }
       if (cameraRef.current) {
         cameraRef.current.position.set(
-          centre.x,
+          spawnX,
           floorYRef.current + TARGET_HEIGHT * 0.9,
-          centre.z + Math.min(size.x, size.z) * 0.4
+          spawnZ + camDist
         );
       }
 
@@ -1413,12 +2798,20 @@ export default function ActorModelPanel({ actorId }) {
     }
     if (proceduralRoomRef.current) proceduralRoomRef.current.visible = true;
     floorYRef.current = 0;
-    probeActorRef.current = { at: 0, d: null };
-    probePlayerRef.current = { at: 0, d: null };
     if (holderRef.current) holderRef.current.position.y = 0;
     boundsRef.current = {
       minX: -ROOM / 2, maxX: ROOM / 2, minZ: -ROOM / 2, maxZ: ROOM / 2,
     };
+    furnitureExclusionsRef.current = [];
+    // Session 140 — the merged collider geometry is a real GPU-side
+    // buffer built by us, not part of the room GLB that deepDispose
+    // above already handled; dispose it explicitly or it leaks per
+    // room load.
+    if (colliderRef.current) {
+      colliderRef.current.geometry.dispose();
+      colliderRef.current = null;
+    }
+    collisionNameBoxesRef.current = [];
     if (controlsRef.current) controlsRef.current.maxDistance = Infinity;
     setRoomInfo(null);
   }
@@ -1486,6 +2879,11 @@ export default function ActorModelPanel({ actorId }) {
   }
 
   async function loadModel(file) {
+    // Session 148 — shared instance: if the live root is currently
+    // adopted, release it FIRST (back to MiniGlbViewer, undisposed) —
+    // the holder disposal below must only ever destroy test-file
+    // models, never the master character.
+    releaseCharacter();
     setBusy("Loading character…");
     setError(null);
     setReport(null);
@@ -1541,6 +2939,7 @@ export default function ActorModelPanel({ actorId }) {
         embedded = root.animations ?? [];
       } else {
         const loader = new GLTFLoader();
+        if (dracoLoaderRef.current) loader.setDRACOLoader(dracoLoaderRef.current);
         loader.register((parser) => new VRMLoaderPlugin(parser));
         const gltf = await loader.loadAsync(trackUrl(file));
         vrm = gltf.userData.vrm ?? null;
@@ -1559,9 +2958,22 @@ export default function ActorModelPanel({ actorId }) {
 
       holderRef.current = holder;
       rootRef.current = root;
+      // Session 147 — level 3, character side: she casts (the grounding
+      // shadow is the whole point) and receives (a window frame's shadow
+      // can fall across her). Inert while the Display toggle is off.
+      root.traverse((o) => {
+        if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; }
+      });
       vrmRef.current = vrm;
       mixerRef.current = new THREE.AnimationMixer(root);
       // If a room is already loaded, she belongs in it, not at world origin.
+      // Session 118 — this naive bounds-centre placement was bypassing every
+      // exclusion zone loadRoom builds: on the FIRST load the room isn't in
+      // yet, so this branch never fires and loadRoom's own spawn logic wins.
+      // But the wardrobe-refresh reload (Session 109) calls loadModel again
+      // AFTER the room is already loaded — so THIS branch fires, blindly
+      // resets her to the bounds midpoint, and nothing here knew the table
+      // existed. Same clamp every other position-setting path already uses.
       if (roomRef.current) {
         const b = boundsRef.current;
         holder.position.set(
@@ -1569,6 +2981,7 @@ export default function ActorModelPanel({ actorId }) {
           floorYRef.current,
           (b.minZ + b.maxZ) / 2
         );
+        clampOutsideExclusions(holder.position);
       }
 
       // Measure where she really is, rather than trusting that the grounding
@@ -1640,6 +3053,133 @@ export default function ActorModelPanel({ actorId }) {
     }
   }
 
+  // ---- actor-linked model (this editor's own character, not a test file) --
+  // Pulls the actor's canonical GLB (GET /api/actors/:id -> actor.glb_url,
+  // same column the drafts/asset system writes to) and hands it to loadModel
+  // as a real File — no changes to the load/parse/report/clip-binding path
+  // above, which is already proven against arbitrary GLBs.
+  async function loadActorModel(id) {
+    if (!id) return;
+    setBusy("Loading character…");
+    setError(null);
+    try {
+      const actorResp = await fetch(`/api/actors/${id}`);
+      if (!actorResp.ok) {
+        throw new Error(`actor fetch failed (${actorResp.status})`);
+      }
+      const actorData = await actorResp.json();
+
+      // Wardrobe state for Inspect — parsed here, ahead of the GLB fetch,
+      // so it's ready even if the 3D model itself fails to load. This is
+      // the SAME draft_state column CharacterWizard reads and writes —
+      // AccessoryEditor below is the SAME editing component the wizard
+      // uses, so there is exactly one implementation of "what does
+      // draft_state mean" between the two files, not two that can drift.
+      setActorStatus(actorData?.actor?.status ?? null);
+      // actorGlbUrl is set below, AFTER the GLB is fetched — see the
+      // blob: URL note there for why this can't just be actor.glb_url.
+      const draftStateRaw = actorData?.actor?.draft_state;
+      if (draftStateRaw) {
+        try {
+          const parsedDraft = JSON.parse(draftStateRaw);
+          fullDraftStateRef.current = parsedDraft;
+          setAccessories(parsedDraft.accessories || defaultAccessories());
+          setSelectedAccessoryGlbUrls(parsedDraft.selectedAccessoryGlbUrls || {});
+          setAccessoryScales(parsedDraft.accessoryScales || {});
+          setAccessoryOffsets(parsedDraft.accessoryOffsets || {});
+          setAccessoryRotations(parsedDraft.accessoryRotations || {});
+          setAccessoryParts(parsedDraft.accessoryParts || {});
+          setAccessoryTints(parsedDraft.accessoryTints || {});
+          setDraftStateUnparseable(false);
+          setWardrobeSaveError(null);
+        } catch (we) {
+          console.error("[ActorModelPanel] draft_state did not parse as JSON:", we);
+          fullDraftStateRef.current = {};
+          setAccessories(defaultAccessories());
+          setDraftStateUnparseable(true);
+          setWardrobeSaveError("wardrobe data is unreadable — draft_state is not valid JSON. Saving is disabled here until that record is fixed on the server, so this view can't silently overwrite it.");
+        }
+      } else {
+        fullDraftStateRef.current = {};
+        setAccessories(defaultAccessories());
+        setDraftStateUnparseable(false);
+      }
+
+      const glbUrl = actorData?.actor?.glb_url;
+      if (!glbUrl) {
+        throw new Error("this actor has no saved 3D model (glb_url is empty)");
+      }
+
+      // Session 107 — cache bust, versioned by the actor's updated_at.
+      // The server serves /media/**.glb with Cache-Control: immutable,
+      // max-age=1y, but the canonical actor GLB is OVERWRITTEN in place
+      // on every wizard re-export (it is NOT content-addressed, despite
+      // that route's comment) — so without a version parameter the
+      // browser can show a year-old body no matter how many times the
+      // wizard re-exports. updated_at changes on every save, giving
+      // correct caching: stable between edits, fresh after them.
+      const glbVersion = encodeURIComponent(actorData?.actor?.updated_at || Date.now());
+      const glbResp = await fetch(`${glbUrl}${glbUrl.includes("?") ? "&" : "?"}v=${glbVersion}`);
+      if (!glbResp.ok) {
+        throw new Error(`GLB fetch failed (${glbResp.status}) — ${glbUrl}`);
+      }
+      const blob = await glbResp.blob();
+      const filename = glbUrl.split("/").pop() || `${id}.glb`;
+      const file = new File([blob], filename, { type: "model/gltf-binary" });
+
+      // Session 109 — the Wardrobe preview's MiniGlbViewer must NOT be
+      // handed actor.glb_url directly. That raw server path goes straight
+      // into three.js's own GLTFLoader with no cache-bust stamp — found
+      // live: it hangs on "Loading character" forever, no error, nothing.
+      // CharacterWizard gets away with the raw-URL pattern (different page
+      // context); rather than chase why, reuse the SAME already-fetched,
+      // already-cache-busted blob the main viewer below loads from — one
+      // network request, and the preview inherits the exact path already
+      // proven to work.
+      setActorGlbUrl(trackUrl(blob));
+      // Session 148 — SHARED INSTANCE: the character is loaded ONCE, by
+      // MiniGlbViewer (from the blob URL just set), and Explore adopts
+      // the live root via onCharacterReady. The loadModel(file) call
+      // that used to live here — a second, independent parse of the
+      // same bytes into a second character — is gone with the rest of
+      // the copy machinery. loadModel itself remains for drag-in test
+      // files only.
+
+      // Session 107 — default home (re-applied; the Session 106 patch
+      // landed on an older copy of this file and never shipped). If the
+      // actor carries default_home_template_url, load it as the room
+      // through the SAME loadRoom path as a manual file: measured floor,
+      // bounds, and holder placement apply unchanged, and load order
+      // gives "actor standing in her home". In explore mode this is what
+      // makes the tab HER apartment rather than the placeholder stage.
+      // A missing or broken home reports but never blocks the character.
+      const homeUrl = actorData?.actor?.default_home_template_url;
+      if (homeUrl) {
+        try {
+          const homeResp = await fetch(homeUrl);
+          if (!homeResp.ok) throw new Error(`home GLB fetch failed (${homeResp.status})`);
+          const homeBlob = await homeResp.blob();
+          const homeName = homeUrl.split("/").pop() || "home.glb";
+          await loadRoom(new File([homeBlob], homeName, { type: "model/gltf-binary" }));
+        } catch (he) {
+          setError(`Character loaded, but her home did not: ${he?.message ?? String(he)}`);
+        }
+      }
+    } catch (e) {
+      setBusy(null);
+      setError(`Could not load actor's 3D model: ${e?.message ?? String(e)}`);
+    }
+  }
+
+  // Auto-load on mount / whenever a different actor is passed in. sceneRef is
+  // already populated by the time this runs — the scene-setup effect above is
+  // synchronous and fires first within the same effect-flush.
+  useEffect(() => {
+    if (!actorId) return;
+    loadActorModel(actorId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [actorId]);
+
   // ---- animations ---------------------------------------------------------
   async function loadClips(files) {
     const vrm = vrmRef.current;
@@ -1662,7 +3202,9 @@ export default function ActorModelPanel({ actorId }) {
       if (/\.fbx$/i.test(file.name)) {
         return new FBXLoader().loadAsync(trackUrl(file));
       }
-      const gltf = await new GLTFLoader().loadAsync(trackUrl(file));
+      const clipLoader = new GLTFLoader();
+      if (dracoLoaderRef.current) clipLoader.setDRACOLoader(dracoLoaderRef.current);
+      const gltf = await clipLoader.loadAsync(trackUrl(file));
       // GLTFLoader keeps clips beside the scene; put them on it so both asset
       // shapes look the same to the callers below.
       gltf.scene.animations = gltf.animations;
@@ -1719,6 +3261,12 @@ export default function ActorModelPanel({ actorId }) {
   }
 
   function play(name) {
+    // Session 148, sixth pass — request-shim, same as switchClip.
+    if (liveCharRef.current && rootRef.current === liveCharRef.current.root) {
+      setExploreAnim(name);
+      setPlaying(name);
+      return;
+    }
     const action = actionsRef.current.get(name);
     if (!action) return;
 
@@ -1806,6 +3354,14 @@ export default function ActorModelPanel({ actorId }) {
 
   const rigOk = report?.isVrm && report.missingBones.length === 0;
 
+  // Session 109 — shared by the main-stage Inspect viewer below. Was
+  // previously computed inside WardrobeCard for its own now-removed
+  // preview box; one live-dressed picture now, not two.
+  const previewAccessories = buildViewerAccessories({
+    selectedAccessoryGlbUrls, accessoryScales, accessoryOffsets, accessoryRotations,
+    accessoryParts, accessoryTints, activeSlot, dynamicAccessoryOptions,
+  });
+
   const findings = [];
   if (skinInfo?.meshes > 0) {
     findings.push(
@@ -1848,71 +3404,36 @@ export default function ActorModelPanel({ actorId }) {
   return (
     <div style={S.wrap}>
       <div style={S.controls}>
-        <label style={S.btn}>
-          Load character
-          <input
-            type="file"
-            accept=".vrm,.glb,.gltf,.fbx"
-            onChange={(e) => e.target.files?.[0] && loadModel(e.target.files[0])}
-            style={{ display: "none" }}
-          />
-        </label>
+        {/* Session 107 — mode tabs. Explore: her home, walking, first
+            person. Inspect: the original toolbar and diagnostics. */}
+        <div style={{ display: "flex", gap: 2, background: "#111", borderRadius: 8, padding: 3, marginRight: 8 }}>
+          {["explore", "inspect"].map((m) => (
+            <button
+              key={m}
+              onClick={() => setMode(m)}
+              style={{
+                ...S.btnGhost,
+                border: "none",
+                padding: "6px 16px",
+                borderRadius: 6,
+                background: mode === m ? "#2b2b2b" : "transparent",
+                color: mode === m ? "#fff" : "#888",
+                fontWeight: mode === m ? 600 : 400,
+              }}
+            >
+              {m === "explore" ? "Explore" : "Inspect"}
+            </button>
+          ))}
+        </div>
 
-        <label style={report ? S.btn : S.btnDisabled}>
-          Load animations
-          <input
-            type="file"
-            accept=".fbx,.glb,.gltf"
-            multiple
-            disabled={!report}
-            onChange={(e) =>
-              e.target.files?.length && loadClips([...e.target.files])
-            }
-            style={{ display: "none" }}
-          />
-        </label>
-
-        <label style={S.btn}>
-          Load room
-          <input
-            type="file"
-            accept=".glb,.gltf"
-            onChange={(e) => e.target.files?.[0] && loadRoom(e.target.files[0])}
-            style={{ display: "none" }}
-          />
-        </label>
-
-        {roomInfo && (
-          <button style={S.btnGhost} onClick={clearRoom}>
-            Clear room
+        {mode === "explore" && (
+          <button
+            style={fpv ? S.btn : S.btnGhost}
+            onClick={() => setFpv((v) => !v)}
+          >
+            {fpv ? "Leave first person" : "First person"}
           </button>
         )}
-
-        <button
-          style={fpv ? S.btn : S.btnGhost}
-          onClick={() => setFpv((v) => !v)}
-        >
-          {fpv ? "Leave first person" : "First person"}
-        </button>
-
-        <button
-          style={S.btnGhost}
-          onClick={() => setWideFrame((v) => !v)}
-        >
-          {wideFrame ? "9:16 frame" : "Wide frame"}
-        </button>
-
-        <label style={S.btnGhost}>
-          Load background
-          <input
-            type="file"
-            accept="image/*"
-            onChange={(e) =>
-              e.target.files?.[0] && setBgUrl(trackUrl(e.target.files[0]))
-            }
-            style={{ display: "none" }}
-          />
-        </label>
       </div>
 
       <div style={S.body}>
@@ -1925,18 +3446,55 @@ export default function ActorModelPanel({ actorId }) {
         >
           <div
             ref={mountRef}
-            style={S.canvasMount}
+            style={{ ...S.canvasMount, visibility: mode === "explore" ? "visible" : "hidden" }}
             onClick={() => {
               if (fpvRef.current) fpvControlsRef.current?.lock();
             }}
           />
-          {busy && <div style={S.overlay}>{busy}</div>}
-          {!busy && !report && !error && (
+          {actorGlbUrl && (
+            <div style={{ position: "absolute", inset: 0, visibility: mode === "inspect" ? "visible" : "hidden", pointerEvents: mode === "inspect" ? "auto" : "none" }}>
+              <MiniGlbViewer
+                glbUrl={actorGlbUrl}
+                accessories={previewAccessories}
+                activeAnimation={mode === "explore" ? exploreAnim : inspectActiveAnimation}
+                onAnimationsLoaded={setEmbeddedAnimations}
+                onAccessoryPartsLoaded={setAccessoryPartNames}
+                onExportReady={(fn) => { exportGlbRef.current = fn; }}
+                focusRegion={ACCESSORY_REGION_CAMERA[activeAccessoryRegion] || "fullBody"}
+                showSaveButton={false}
+                showMeasurements={mode === "inspect"}
+                fullscreenLoadingOverlay={false}
+                onCharacterReady={handleCharacterReady}
+              />
+            </div>
+          )}
+          {busy && ReactDOM.createPortal(
+            /* Session 147 — one spinner, whole screen (ruled by Magnus):
+               replaces the dark stage-only overlay. Same frost/gold
+               identity as MiniGlbViewer's Session 103 portal, whose own
+               instance is now suppressed here via the (finally
+               implemented) fullscreenLoadingOverlay={false} — so exactly
+               one loading treatment exists across the panel. */
+            <div style={{ position: "fixed", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999, background: "rgba(255,255,255,0.82)", backdropFilter: "blur(8px)" }}>
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
+                <style>{`@keyframes amp-spin { to { transform: rotate(360deg); } }`}</style>
+                <div style={{ width: 40, height: 40, border: "3px solid rgba(0,0,0,0.08)", borderTop: "3px solid #c9973a", borderRadius: "50%", animation: "amp-spin 0.9s linear infinite" }} />
+                <p style={{ fontFamily: "'DM Sans',system-ui,sans-serif", fontSize: 13, fontWeight: 500, color: "#1a1814", margin: 0 }}>{busy}</p>
+              </div>
+            </div>,
+            document.body,
+          )}
+          {mode === "explore" && !busy && !report && !error && (
             <div style={S.overlay}>
               Load a room, then a character, then animation clips.
             </div>
           )}
-          <div style={S.fps}>{fps} fps</div>
+          {mode === "explore" && <div style={S.fps}>{fps} fps</div>}
+          {mode === "explore" && holderXZ && (
+            <div style={{ ...S.fps, top: 26 }}>
+              x={holderXZ.x.toFixed(2)} z={holderXZ.z.toFixed(2)}
+            </div>
+          )}
           {fpv && !locked && (
             <div
               style={S.lockPrompt}
@@ -1948,471 +3506,296 @@ export default function ActorModelPanel({ actorId }) {
               </span>
             </div>
           )}
-          {playing && <div style={S.nowPlaying}>{playing}</div>}
+          {mode === "explore" && playing && <div style={S.nowPlaying}>{playing}</div>}
+          {mode === "explore" && !fpv && walkMode && (
+            <div style={{ position: "absolute", bottom: 10, left: "50%", transform: "translateX(-50%)", fontSize: 11, color: "#aaa", background: "rgba(0,0,0,0.55)", borderRadius: 999, padding: "4px 14px", whiteSpace: "nowrap", pointerEvents: "none" }}>
+              WASD move · shift run · drag to orbit · First person to step inside
+            </div>
+          )}
         </div>
 
-        <div style={S.panel}>
+        {mode === "explore" && (
+        <div style={{ ...LIGHT.panel, flex: "0 1 300px", minWidth: 240, maxWidth: 320 }}>
+          <div style={LIGHT.sectionLabel}>
+            <span>Display</span>
+            <button
+              style={LIGHT.btnGhostSmall}
+              onClick={() => setDisplay({ ...EXPLORE_DISPLAY_DEFAULTS })}
+            >
+              Reset
+            </button>
+          </div>
+          <div style={{ marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span style={{ fontSize: 12, color: "#6b6760" }}>Shadows</span>
+            <input
+              type="checkbox"
+              checked={display.shadows}
+              onChange={(e) => setDisplay((d) => ({ ...d, shadows: e.target.checked }))}
+              style={{ accentColor: "#b05c08", width: 16, height: 16, cursor: "pointer" }}
+            />
+          </div>
+          {[
+            { key: "exposure", label: "Exposure", min: 0.2, max: 2, step: 0.05 },
+            { key: "envIntensity", label: "Environment", min: 0, max: 2, step: 0.05 },
+            { key: "keyIntensity", label: "Key light", min: 0, max: 2, step: 0.05 },
+            { key: "sunAzimuth", label: "Sun direction", min: 0, max: 360, step: 1, fmt: (v) => `${v.toFixed(0)}\u00B0` },
+            { key: "sunElevation", label: "Sun height", min: 10, max: 80, step: 1, fmt: (v) => `${v.toFixed(0)}\u00B0` },
+            { key: "ambientIntensity", label: "Ambient", min: 0, max: 1, step: 0.05 },
+            { key: "rimIntensity", label: "Rim light", min: 0, max: 1, step: 0.05 },
+          ].map(({ key: k, label, min, max, step, fmt }) => (
+            <div key={k} style={{ marginBottom: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                <span style={{ fontSize: 12, color: "#6b6760" }}>{label}</span>
+                <span style={{ fontSize: 12, color: "#1a1814", fontFamily: "'DM Mono',monospace" }}>{(fmt ?? ((v) => v.toFixed(2)))(display[k])}</span>
+              </div>
+              <input
+                type="range"
+                min={min} max={max} step={step}
+                value={display[k]}
+                onChange={(e) => setDisplay((d) => ({ ...d, [k]: Number(e.target.value) }))}
+                style={{ width: "100%", accentColor: "#b05c08" }}
+              />
+            </div>
+          ))}
+        </div>
+        )}
+
+        {mode === "inspect" && (
+        <div style={LIGHT.panel}>
           {error && <pre style={S.error}>{error}</pre>}
-          {!report && !roomInfo && !error && (
-            <div style={S.hint}>
-              Load a room and a character. WASD walks her around it.
+          {!report && !error && (
+            <div style={LIGHT.hint}>
+              Load her to inspect animations and wardrobe.
             </div>
           )}
 
-          {roomInfo && (
-            <div style={S.roomBar}>
-              <span style={S.roomName}>{roomInfo.source}</span>
-              <span style={S.roomMeta}>
-                {roomInfo.width.toFixed(2)} × {roomInfo.depth.toFixed(2)} ×{" "}
-                {roomInfo.height.toFixed(2)} m · ceiling{" "}
-                <span
+          <div style={LIGHT.tabBar}>
+            {["animations", "wardrobe"].map((t) => (
+              <button
+                key={t}
+                onClick={() => setInspectTab(t)}
+                style={inspectTab === t ? LIGHT.tabBtnOn : LIGHT.tabBtn}
+              >
+                {t === "animations" ? "Animations" : "Wardrobe"}
+              </button>
+            ))}
+          </div>
+
+          {inspectTab === "animations" && actorGlbUrl && (
+            <div>
+              <div style={LIGHT.sectionLabel}>
+                <span>Animations{embeddedAnimations.length > 0 ? ` — ${embeddedAnimations.length} in file` : ""}</span>
+              </div>
+
+              {/* Session 109 — MiniGlbViewer only plays animations
+                  already embedded in the GLB (gltf.animations); no
+                  arbitrary FBX upload, no retargeting. That testing
+                  tool lived entirely in the bespoke engine, which
+                  Inspect no longer uses. */}
+              {embeddedAnimations.length === 0 && (
+                <div style={LIGHT.hint}>No animations embedded in this file.</div>
+              )}
+
+              {/* Session 143 — one clip per row (Magnus: inline chips
+                  with a floating trash can looked bad): full-width row,
+                  clip name selectable on the left, trash pinned right.
+                  idle/walk have no trash (protected server-side too). */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
+                {embeddedAnimations.map((name) => (
+                  <div key={name} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <button
+                      style={{ ...(inspectActiveAnimation === name ? LIGHT.clipOn : LIGHT.clipBtn), flex: 1, textAlign: "left" }}
+                      onClick={() => setInspectActiveAnimation(name)}
+                    >
+                      {name}
+                    </button>
+                    {name !== "idle" && name !== "walk" ? (
+                      <button
+                        title={`Remove "${name}" from the model`}
+                        disabled={!!animDeleting}
+                        onClick={() => handleAnimationDelete(name)}
+                        style={{ border: "none", background: "none", cursor: animDeleting ? "wait" : "pointer", fontSize: 14, padding: "2px 6px", opacity: animDeleting === name ? 0.4 : 0.7, flexShrink: 0 }}
+                      >
+                        {"\uD83D\uDDD1"}
+                      </button>
+                    ) : (
+                      /* spacer keeps every row's clip button the same width */
+                      <span style={{ width: 26, flexShrink: 0 }} />
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {/* Session 143 — upload-and-merge. Field order matters to
+                  the user flow: name the clip, THEN pick the file (the
+                  file picker fires the merge immediately). */}
+              <div style={{ ...LIGHT.sectionLabel, marginTop: 18 }}><span>Add animation</span></div>
+              <div style={LIGHT.hint}>
+                Merges a clip into this character's GLB. Accepts .duf (DAZ pose/animation preset — converted automatically), .blend, .glb, or .fbx.
+              </div>
+              <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8, flexWrap: "wrap" }}>
+                <input
+                  type="text"
+                  placeholder="clip name (e.g. sit)"
+                  value={animUploadClipName}
+                  onChange={(e) => setAnimUploadClipName(e.target.value)}
+                  disabled={animUploadBusy}
+                  style={{ padding: "6px 10px", fontFamily: "inherit", fontSize: 13, border: "1px solid #ccc", borderRadius: 6, width: 160 }}
+                />
+                <label style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 4 }}>
+                  <input type="checkbox" checked={animUploadLoop} onChange={(e) => setAnimUploadLoop(e.target.checked)} disabled={animUploadBusy} />
+                  looping clip
+                </label>
+                {/* Session 143 — native <label> pattern, NOT hidden
+                    input + JS click(): the programmatic-click route
+                    was confirmed broken live (console showed "opening
+                    file picker" with the change event NEVER firing
+                    after selection — a known Chrome/macOS quirk class
+                    with display:none inputs). A label wrapping the
+                    input makes the browser own the entire gesture; no
+                    ref, no click(), nothing for React re-renders to
+                    detach. Input is visually hidden but NOT
+                    display:none (also implicated in that quirk class).
+                    No accept attribute — macOS UTI mapping for
+                    third-party extensions like .duf is unreliable;
+                    validation is real in the handler and server. */}
+                <label
                   style={{
-                    color:
-                      roomInfo.interiorHeight < 2.2 ||
-                      roomInfo.interiorHeight > 3.2
-                        ? "#d97070"
-                        : "#8a8a92",
+                    ...(animUploadBusy || !/^[a-zA-Z0-9_-]{1,32}$/.test(animUploadClipName.trim()) ? LIGHT.clipBtn : LIGHT.clipOn),
+                    cursor: animUploadBusy || !/^[a-zA-Z0-9_-]{1,32}$/.test(animUploadClipName.trim()) ? "not-allowed" : "pointer",
+                    display: "inline-block",
                   }}
                 >
-                  {roomInfo.interiorHeight.toFixed(2)} m
-                </span>{" "}
-                · {roomInfo.triangles.toLocaleString()} tris
-              </span>
-            </div>
-          )}
-
-          {findings.length > 0 && (
-            <div style={S.findings}>
-              {findings.map((f, i) => (
-                <div key={i} style={{ ...S.finding, ...S.findingLevel[f.level] }}>
-                  {f.text}
-                </div>
-              ))}
-            </div>
-          )}
-
-          {report && (
-              <div style={S.panelGrid}>
-                <div style={S.col}>
-              <div style={S.reportHead}>{report.source}</div>
-
-              <Row
-                label="Format"
-                value={
-                  report.isVrm
-                    ? `VRM ${report.specVersion}`
-                    : report.isFbx
-                    ? "FBX — direct playback, no face"
-                    : "glTF — no VRM extension"
-                }
-                warn={!report.isVrm}
-              />
-              {report.name && <Row label="Model name" value={report.name} />}
-              {report.isVrm ? (
-                <>
-                  <Row
-                    label="Humanoid rig"
-                    value={`${report.bones.length}/${REQUIRED_BONES.length} bones${
-                      rigOk ? " — retarget viable" : ""
-                    }`}
-                    warn={!rigOk}
+                  {animUploadBusy ? "Merging..." : (/^[a-zA-Z0-9_-]{1,32}$/.test(animUploadClipName.trim()) ? "Choose file & merge" : "Enter clip name first")}
+                  <input
+                    type="file"
+                    disabled={animUploadBusy || !/^[a-zA-Z0-9_-]{1,32}$/.test(animUploadClipName.trim())}
+                    style={{ position: "absolute", width: 1, height: 1, opacity: 0, overflow: "hidden", clip: "rect(0 0 0 0)" }}
+                    onChange={(e) => { const f = e.target.files?.[0]; console.log(`[ActorModelPanel] file input change: ${f ? f.name + " (" + f.size + " bytes)" : "no file"}`); e.target.value = ""; if (f) handleAnimationUpload(f); }}
                   />
-                  {report.missingBones.length > 0 && (
-                    <Row label="Missing" value={report.missingBones.join(", ")} warn />
-                  )}
-                </>
-              ) : (
-                <Row
-                  label="Humanoid rig"
-                  value="none — clips must share this skeleton"
-                  warn
-                />
-              )}
-              <Row label="Spring bones" value={report.springBones} />
-              <Row label="Triangles" value={report.triangles.toLocaleString()} />
-              {walkDebug && (
-                <Row
-                  label="Walk state"
-                  value={`${walkDebug.moving ? "moving" : "still"}${
-                    walkDebug.running ? " + SHIFT" : ""
-                  } → ${walkDebug.want ?? "none"}`}
-                  warn={walkDebug.running && !walkDebug.moving}
-                />
-              )}              {fitInfo && (
-                <>
-                  <Row
-                    label="Scaled to 1.7m"
-                    value={`source ${fitInfo.rawHeight.toFixed(2)} → ×${fitInfo.scale.toFixed(3)}`}
-                  />
-                  {fitInfo.standHeight !== undefined && (
-                    <>
-                      <Row
-                        label="Bind height"
-                        value={`${fitInfo.standHeight.toFixed(3)} m`}
-                        warn={Math.abs(fitInfo.standHeight - TARGET_HEIGHT) > 0.02}
-                      />
-                      {posedInfo && (
-                        <Row
-                          label="Posed height"
-                          value={`${posedInfo.height.toFixed(3)} m · top ${posedInfo.topY.toFixed(3)}`}
-                          warn={Math.abs(posedInfo.height - TARGET_HEIGHT) > 0.02}
-                        />
-                      )}
-                      <Row
-                        label="Feet vs floor"
-                        value={
-                          posedInfo
-                            ? `${posedInfo.feetY.toFixed(3)} vs ${fitInfo.floorY.toFixed(3)} m`
-                            : `${fitInfo.feetY.toFixed(3)} vs ${fitInfo.floorY.toFixed(3)} m (bind)`
-                        }
-                        warn={
-                          Math.abs(
-                            (posedInfo ? posedInfo.feetY : fitInfo.feetY) - fitInfo.floorY
-                          ) > 0.01
-                        }
-                      />
-                      {posedInfo && (
-                        <Row
-                          label="Off floor"
-                          value={`${((posedInfo.feetY - fitInfo.floorY) * 100).toFixed(1)} cm`}
-                          warn={Math.abs(posedInfo.feetY - fitInfo.floorY) > 0.01}
-                        />
-                      )}
-                    </>
-                  )}
-                </>
-              )}
-              {matInfo && (
-                <>
-                  <Row
-                    label="Materials"
-                    value={`${matInfo.count}, ${matInfo.textured} textured`}
-                  />
-                  <Row
-                    label="PBR maps"
-                    value={
-                      matInfo.mapped
-                        ? Object.entries(matInfo.maps)
-                            .filter(([, n]) => n > 0)
-                            .map(([k]) => k)
-                            .join(", ")
-                        : "colour only — no normal or roughness map"
-                    }
-                    warn={!matInfo.mapped}
-                  />
-                  <Row
-                    label="Roughness"
-                    value={
-                      matInfo.maps.roughness
-                        ? `map × ${matInfo.maxR.toFixed(2)}`
-                        : `${matInfo.minR.toFixed(2)} – ${matInfo.maxR.toFixed(2)}`
-                    }
-                    warn={matInfo.maxR < 0.35 && !matInfo.maps.roughness}
-                  />
-                  <Row
-                    label="Metalness"
-                    value={
-                      matInfo.maps.metalness
-                        ? `map × ${matInfo.maxM.toFixed(2)}`
-                        : `${matInfo.minM.toFixed(2)} – ${matInfo.maxM.toFixed(2)}`
-                    }
-                    warn={matInfo.maxM > 0.1 && !matInfo.maps.metalness}
-                  />
-                </>
-              )}
-              {skinInfo && skinInfo.meshes > 0 && (
-                <>
-                  <Row
-                    label="Skinned meshes"
-                    value={`${skinInfo.meshes}, ${skinInfo.bones} bones`}
-                  />
-                  <Row
-                    label="Weight sums"
-                    value={
-                      skinInfo.short === 0
-                        ? `${skinInfo.minSum.toFixed(2)} – ${skinInfo.maxSum.toFixed(2)}, all complete`
-                        : `${skinInfo.short.toLocaleString()} of ${skinInfo.verts.toLocaleString()} short (min ${skinInfo.minSum.toFixed(2)})`
-                    }
-                    warn={skinInfo.short > 0}
-                  />
-                </>
-              )}
-              <Row
-                label="Expressions"
-                value={report.expressions.length}
-                warn={report.expressions.length === 0}
-              />
-
-                </div>
-
-                <div style={S.col}>
-              {clips.length > 0 && (
-                <div style={S.section}>
-                  <div style={S.sectionLabel}>
-                    <span>Animations — {clips.length} loaded</span>
-                    <label style={S.loopToggle}>
-                      <input
-                        type="checkbox"
-                        checked={loop}
-                        onChange={(e) => setLoop(e.target.checked)}
-                      />
-                      loop
-                    </label>
-                  </div>
-
-                  {clips.map((c) => (
-                    <div key={c.name} style={S.clipRow}>
-                      <button
-                        style={playing === c.name ? S.clipOn : S.clipBtn}
-                        onClick={() => play(c.name)}
-                      >
-                        {c.name}
-                      </button>
-                      <span
-                        style={{
-                          ...S.clipMeta,
-                          color:
-                            c.mapped < c.sourceTracks * 0.6 ? "#d97070" : "#8a8a92",
-                        }}
-                      >
-                        {c.mapped}/{c.sourceTracks} tracks · {c.duration.toFixed(1)}s
-                        {c.droppedScale > 0 && ` · ${c.droppedScale} scale dropped`}
-                        {clipGround.has(c.name) &&
-                          Math.abs(clipGround.get(c.name)) > 0.005 &&
-                          ` · ground ${(clipGround.get(c.name) * 100 > 0 ? "+" : "")}${(clipGround.get(c.name) * 100).toFixed(1)}cm`}
-                      </span>
-                    </div>
-                  ))}
-
-                  <button style={S.stopBtn} onClick={stop} disabled={!playing}>
-                    Stop
-                  </button>
-                </div>
-              )}
-
-                </div>
-
-                <div style={S.col}>
-              {matInfo && (
-                <div style={S.section}>
-                  <div style={S.sectionLabel}>
-                    <span>Surface and skinning</span>
-                    <select
-                      value={shading}
-                      onChange={(e) => setShading(e.target.value)}
-                      style={S.select}
-                    >
-                      <option value="source">as exported</option>
-                      <option value="lit">lit (PBR)</option>
-                      <option value="unlit">unlit (as painted)</option>
-                      <option value="normals">normals (debug)</option>
-                    </select>
-                  </div>
-                  {shading === "unlit" && (
-                    <div style={S.sliderRow}>
-                      <span style={S.rowLabel}>Room light</span>
-                      <input
-                        type="color"
-                        value={tint}
-                        onChange={(e) => setTint(e.target.value)}
-                        style={{ width: 44, height: 24, background: "none", border: "none" }}
-                      />
-                      {["#ffffff", "#ffd9a8", "#8fa6d9", "#4a4a58"].map((c) => (
-                        <button
-                          key={c}
-                          onClick={() => setTint(c)}
-                          title={c}
-                          style={{ ...S.swatch, background: c }}
-                        />
-                      ))}
-                    </div>
-                  )}
-                  <div style={S.sliderRow}>
-                    <span style={S.rowLabel}>Exposure</span>
-                    <input
-                      type="range"
-                      min="0.3"
-                      max="2"
-                      step="0.05"
-                      value={exposure}
-                      onChange={(e) => setExposure(parseFloat(e.target.value))}
-                      style={{ flex: 1 }}
-                    />
-                    <span style={S.clipMeta}>{exposure.toFixed(2)}</span>
-                  </div>
-                  <div style={S.hint}>
-                    {shading === "normals"
-                      ? "Each fragment coloured by its normal. Smooth gradients are correct; a patch that jumps to an unrelated colour is an inverted or broken normal, and that is what shades black under a light."
-                      : shading === "unlit"
-                      ? "Texture as painted, lighting ignored. Matches the source viewer exactly — and will look identical at midnight and at noon."
-                      : shading === "lit"
-                      ? "Metalness and emission neutralised so room lighting reaches her. Any shading baked into the texture stays baked."
-                      : shadingAuto
-                      ? "This file declares metalness 1.00 with the colour map also wired to emission — an unlit material in PBR clothing. Switched to lit automatically; pick as exported to see it raw."
-                      : "Exactly what the exporter wrote."}
-                  </div>
-                  <label style={{ ...S.loopToggle, marginTop: 8 }}>
-                    <input
-                      type="checkbox"
-                      checked={normalizeSkin}
-                      onChange={(e) => setNormalizeSkin(e.target.checked)}
-                    />
-                    renormalise skin weights
-                  </label>
-                  <div style={S.hint}>
-                    Toggle while she is posed. If the twisting comes back when
-                    off, influences were dropped on import.
-                  </div>
-                  <label style={{ ...S.loopToggle, marginTop: 8 }}>
-                    <input
-                      type="checkbox"
-                      checked={doubleSided}
-                      onChange={(e) => setDoubleSided(e.target.checked)}
-                    />
-                    force double-sided
-                  </label>
-                  <div style={S.hint}>
-                    If the dark patches clear, those faces are wound inside out
-                    and only their backs are visible.
-                  </div>
-                  <label style={{ ...S.loopToggle, marginTop: 8 }}>
-                    <input
-                      type="checkbox"
-                      checked={showRuler}
-                      onChange={(e) => setShowRuler(e.target.checked)}
-                    />
-                    1.7m ruler
-                  </label>
-                  <div style={S.hint}>
-                    Rings at 0.5m, 1.0m and 1.7m, centred on her. The red one is
-                    exactly her height — her scalp should touch it.
-                  </div>
-                  <label style={{ ...S.loopToggle, marginTop: 8 }}>
-                    <input
-                      type="checkbox"
-                      checked={showSkeleton}
-                      onChange={(e) => setShowSkeleton(e.target.checked)}
-                    />
-                    show skeleton
-                  </label>
-                  <div style={S.hint}>
-                    If the bones move cleanly while the mesh does not, the rig is
-                    fine and the weights are not.
-                  </div>
-                </div>
-              )}
-
-              {clips.length > 0 && (
-                <div style={S.section}>
-                  <div style={S.sectionLabel}>
-                    <span>Walk her around</span>
-                    <label style={S.loopToggle}>
-                      <input
-                        type="checkbox"
-                        checked={walkMode}
-                        onChange={(e) => setWalkMode(e.target.checked)}
-                      />
-                      enabled
-                    </label>
-                  </div>
-
-                  {walkMode ? (
-                    <>
-                      <div style={S.hint}>
-                        WASD or arrows to move, shift to run. Click the view
-                        first so it has focus.
-                      </div>
-                      <RoleSelect
-                        label="Idle clip"
-                        value={roles?.idle}
-                        clips={clips}
-                        onChange={(v) => setRoles((r) => ({ ...r, idle: v }))}
-                      />
-                      <RoleSelect
-                        label="Walk clip"
-                        value={roles?.walk}
-                        clips={clips}
-                        onChange={(v) => setRoles((r) => ({ ...r, walk: v }))}
-                      />
-                      <RoleSelect
-                        label="Run clip"
-                        value={roles?.run}
-                        clips={clips}
-                        onChange={(v) => setRoles((r) => ({ ...r, run: v }))}
-                      />
-                      <div style={S.hint}>
-                        Names come from the exporter and do not always match the
-                        motion. Pick by what you see.
-                      </div>
-                      <div style={S.sliderRow}>
-                        <span style={S.rowLabel}>Speed</span>
-                        <input
-                          type="range"
-                          min="0.4"
-                          max="3"
-                          step="0.05"
-                          value={walkSpeed}
-                          onChange={(e) => setWalkSpeed(parseFloat(e.target.value))}
-                          style={{ flex: 1 }}
-                        />
-                        <span style={S.clipMeta}>{walkSpeed.toFixed(2)} m/s</span>
-                      </div>
-                      <div style={S.hint}>
-                        Tune speed until her feet stop sliding. Stride length
-                        matched to travel.
-                      </div>
-                      <label style={{ ...S.loopToggle, marginTop: 8 }}>
-                        <input
-                          type="checkbox"
-                          checked={flipFacing}
-                          onChange={(e) => setFlipFacing(e.target.checked)}
-                        />
-                        flip facing (check if she walks backwards)
-                      </label>
-                    </>
-                  ) : (
-                    <div style={S.hint}>
-                      Turns the clip list into a state machine: idle when still,
-                      walk when moving.
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {report.expressions.length > 0 && (
-                <div style={S.section}>
-                  <div style={S.sectionLabel}>
-                    <span>Expressions — what DELTAS would drive</span>
-                  </div>
-                  <div style={S.chips}>
-                    <button
-                      style={expression === "" ? S.chipOn : S.chip}
-                      onClick={() => applyExpression("")}
-                    >
-                      neutral
-                    </button>
-                    {report.expressions.map((name) => (
-                      <button
-                        key={name}
-                        style={expression === name ? S.chipOn : S.chip}
-                        onClick={() => applyExpression(name)}
-                      >
-                        {name}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-                </div>
+                </label>
               </div>
+              {animUploadMsg && (
+                <div style={{ ...LIGHT.hint, marginTop: 6, color: animUploadMsg.err ? "#b3261e" : undefined }}>
+                  {animUploadMsg.text}
+                </div>
+              )}
+            </div>
           )}
 
-          {actorId && <div style={S.actorId}>actor {actorId}</div>}
+          {inspectTab === "wardrobe" && actorId && (
+            <WardrobeCard
+              actorId={actorId}
+              actorGlbUrl={actorGlbUrl}
+              actorStatus={actorStatus}
+              accessories={accessories} setAccessories={setAccessories}
+              dynamicAccessoryOptions={dynamicAccessoryOptions}
+              selectedAccessoryGlbUrls={selectedAccessoryGlbUrls} setSelectedAccessoryGlbUrls={setSelectedAccessoryGlbUrls}
+              accessoryScales={accessoryScales} setAccessoryScales={setAccessoryScales}
+              accessoryOffsets={accessoryOffsets} setAccessoryOffsets={setAccessoryOffsets}
+              accessoryRotations={accessoryRotations} setAccessoryRotations={setAccessoryRotations}
+              accessoryParts={accessoryParts} setAccessoryParts={setAccessoryParts}
+              accessoryTints={accessoryTints} setAccessoryTints={setAccessoryTints}
+              accessoryPartNames={accessoryPartNames}
+              activeSlot={activeSlot} setActiveSlot={setActiveSlot}
+              scaleDetailSlot={scaleDetailSlot} setScaleDetailSlot={setScaleDetailSlot}
+              activePart={activePart} setActivePart={setActivePart}
+              activeAccessoryRegion={activeAccessoryRegion} setActiveAccessoryRegion={setActiveAccessoryRegion}
+              saving={savingWardrobe}
+              saveError={wardrobeSaveError}
+              saveOk={wardrobeSaveOk}
+              draftStateUnparseable={draftStateUnparseable}
+            />
+          )}
+
+          {actorId && <div style={LIGHT.actorId}>actor {actorId}</div>}
         </div>
+        )}
       </div>
     </div>
   );
 }
+
+// Inspect's Wardrobe panel. Live dressing on the SAME editing component
+// CharacterWizard uses (AccessoryEditor, imported at the top of this file)
+// against a small dedicated MiniGlbViewer preview — not the main
+// Explore/Inspect viewport above, which stays the untouched, proven
+// baked-file viewer. Session 109, Magnus's explicit call: "share dressing
+// components with the character wizard, one place to change."
+//
+// MiniGlbViewer strips any already-baked isAccessoryMesh meshes from
+// actorGlbUrl on load (the same "body from file, garments from live list"
+// contract CharacterWizard's loadDraft relies on) — so feeding it the
+// actor's canonical, already-dressed glb_url and a live accessories array
+// re-dresses correctly rather than doubling garments.
+function WardrobeCard({
+  actorId, actorGlbUrl, actorStatus,
+  accessories, setAccessories,
+  dynamicAccessoryOptions,
+  selectedAccessoryGlbUrls, setSelectedAccessoryGlbUrls,
+  accessoryScales, setAccessoryScales,
+  accessoryOffsets, setAccessoryOffsets,
+  accessoryRotations, setAccessoryRotations,
+  accessoryParts, setAccessoryParts,
+  accessoryTints, setAccessoryTints,
+  accessoryPartNames,
+  activeSlot, setActiveSlot,
+  scaleDetailSlot, setScaleDetailSlot,
+  activePart, setActivePart,
+  activeAccessoryRegion, setActiveAccessoryRegion,
+  saving, saveError, saveOk, draftStateUnparseable,
+}) {
+  return (
+    <div>
+      <div style={LIGHT.sectionLabel}>
+        <span>Wardrobe</span>
+        <span style={{
+          fontFamily: "'DM Mono',monospace", fontSize: 10,
+          color: saving ? "#b05c08" : saveOk ? "#34c759" : "#c9c6c0",
+        }}>
+          {/* Session 147 — the third branch here ("not saved — status: X"
+              for any non-draft actor) was the DISPLAY twin of the
+              draft-only save gate removed earlier this session, missed
+              in that audit because it lives in this child panel. Saves
+              now work for every status, so the caption only reports
+              actual save activity. */}
+          {saving ? "saving…" : saveOk ? "saved" : ""}
+        </span>
+      </div>
+
+      {draftStateUnparseable && (
+        <div style={{ ...LIGHT.finding, ...LIGHT.findingLevel.bad }}>
+          This actor's draft_state didn't parse as JSON — fix the record on
+          the server before editing here, or changes can't be saved at all.
+        </div>
+      )}
+      {saveError && (
+        <div style={{ ...LIGHT.finding, ...LIGHT.findingLevel.bad }}>{saveError}</div>
+      )}
+
+      {!actorGlbUrl ? (
+        <div style={LIGHT.hint}>Load her before editing wardrobe.</div>
+      ) : (
+        <AccessoryEditor
+          accessories={accessories} setAccessories={setAccessories}
+          dynamicAccessoryOptions={dynamicAccessoryOptions}
+          selectedAccessoryGlbUrls={selectedAccessoryGlbUrls} setSelectedAccessoryGlbUrls={setSelectedAccessoryGlbUrls}
+          accessoryScales={accessoryScales} setAccessoryScales={setAccessoryScales}
+          accessoryOffsets={accessoryOffsets} setAccessoryOffsets={setAccessoryOffsets}
+          accessoryRotations={accessoryRotations} setAccessoryRotations={setAccessoryRotations}
+          accessoryParts={accessoryParts} setAccessoryParts={setAccessoryParts}
+          accessoryTints={accessoryTints} setAccessoryTints={setAccessoryTints}
+          accessoryPartNames={accessoryPartNames}
+          activeSlot={activeSlot} setActiveSlot={setActiveSlot}
+          scaleDetailSlot={scaleDetailSlot} setScaleDetailSlot={setScaleDetailSlot}
+          activePart={activePart} setActivePart={setActivePart}
+          activeAccessoryRegion={activeAccessoryRegion} setActiveAccessoryRegion={setActiveAccessoryRegion}
+        />
+      )}
+    </div>
+  );
+}
+
 
 function RoleSelect({ label, value, clips, onChange }) {
   return (
@@ -2445,6 +3828,43 @@ function Row({ label, value, warn }) {
 
 // Inline styles so the panel can't collide with any existing stylesheet while
 // it's still disposable. Move to ActorModelPanel.module.css if it stays.
+// Light theme for Inspect's right panel — matches the surrounding page
+// (sidebar, "3D character" header, EDIT button), not the dark diagnostic
+// panel this file used to be. Palette pulled directly from
+// CharacterWizard.jsx's own S object: same app, same design language,
+// so Wardrobe's AccessoryEditor content (already styled from that same
+// palette) stops looking trapped inside a mismatched dark box.
+const LIGHT = {
+  panel: {
+    background: "#faf9f7",
+    border: "1px solid rgba(0,0,0,0.08)",
+    borderRadius: 10,
+    padding: 18,
+    color: "#1a1814",
+    fontFamily: "'DM Sans',system-ui,sans-serif",
+    fontSize: 13,
+    maxHeight: "min(78vh, 940px)",
+    overflowY: "auto",
+    flex: "1 1 380px", minWidth: 300, maxWidth: 520,
+  },
+  tabBar: { display: "flex", gap: 2, background: "rgba(0,0,0,0.04)", borderRadius: 8, padding: 3, marginBottom: 18 },
+  tabBtn: { flex: 1, textAlign: "center", padding: "7px 14px", borderRadius: 6, border: "none", cursor: "pointer", fontFamily: "'DM Sans',system-ui,sans-serif", fontSize: 12, fontWeight: 400, background: "transparent", color: "#a8a5a0" },
+  tabBtnOn: { flex: 1, textAlign: "center", padding: "7px 14px", borderRadius: 6, border: "none", cursor: "pointer", fontFamily: "'DM Sans',system-ui,sans-serif", fontSize: 12, fontWeight: 600, background: "#fff", color: "#1a1814", boxShadow: "0 1px 3px rgba(0,0,0,0.08)" },
+  sectionLabel: { fontFamily: "'DM Sans',system-ui,sans-serif", fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", color: "#a8a5a0", marginBottom: 12, display: "flex", justifyContent: "space-between", alignItems: "center" },
+  hint: { color: "#a8a5a0", fontSize: 12, lineHeight: 1.5 },
+  clipBtn: { background: "transparent", border: "1px solid rgba(0,0,0,0.1)", color: "#1a1814", borderRadius: 6, padding: "8px 12px", fontSize: 12, cursor: "pointer", marginBottom: 6, display: "block", width: "100%", textAlign: "left" },
+  clipOn: { background: "rgba(176,92,8,0.1)", border: "1px solid #b05c08", color: "#b05c08", borderRadius: 6, padding: "8px 12px", fontSize: 12, cursor: "pointer", marginBottom: 6, display: "block", width: "100%", textAlign: "left", fontWeight: 500 },
+  btnGhostSmall: { background: "transparent", border: "1px solid rgba(0,0,0,0.14)", color: "#6b6760", borderRadius: 6, padding: "5px 11px", fontSize: 11, cursor: "pointer", fontFamily: "'DM Mono',monospace" },
+  btnGhostSmallDisabled: { background: "transparent", border: "1px solid rgba(0,0,0,0.06)", color: "#c9c6c0", borderRadius: 6, padding: "5px 11px", fontSize: 11, cursor: "not-allowed", fontFamily: "'DM Mono',monospace" },
+  finding: { borderRadius: 6, padding: "10px 12px", fontSize: 12, lineHeight: 1.5, marginBottom: 14, borderLeft: "3px solid" },
+  findingLevel: {
+    info: { background: "rgba(107,103,96,0.06)", color: "#6b6760", borderLeftColor: "#a8a5a0" },
+    bad: { background: "rgba(192,57,43,0.06)", color: "#c0392b", borderLeftColor: "#c0392b" },
+    good: { background: "rgba(52,199,89,0.08)", color: "#1f8a44", borderLeftColor: "#34c759" },
+  },
+  actorId: { marginTop: 16, color: "#c9c6c0", fontSize: 10, fontFamily: "'DM Mono',monospace" },
+};
+
 const S = {
   wrap: { display: "flex", flexDirection: "column", gap: 12 },
   controls: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" },
@@ -2459,6 +3879,14 @@ const S = {
   btnGhost: {
     background: "transparent", color: "#333", border: "1px solid #ccc",
     borderRadius: 6, padding: "7px 14px", fontSize: 13, cursor: "pointer",
+  },
+  btnGhostSmall: {
+    background: "transparent", color: "#c8c8d0", border: "1px solid #3a3a42",
+    borderRadius: 4, padding: "3px 9px", fontSize: 11, cursor: "pointer",
+  },
+  btnGhostSmallDisabled: {
+    background: "transparent", color: "#5a5a62", border: "1px solid #2a2a30",
+    borderRadius: 4, padding: "3px 9px", fontSize: 11, cursor: "not-allowed",
   },
   body: { display: "flex", gap: 16, alignItems: "flex-start" },
   stage: {

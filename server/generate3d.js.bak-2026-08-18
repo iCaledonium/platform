@@ -146,7 +146,7 @@ export function dufMaxFrame(buffer) {
 // The two halves of the presets-directory contract (see CFG above).
 async function discoverPosePresets(gender) {
   const prefix = gender === "male" ? "_man_" : "_woman_";
-  const pattern = `"${CFG.macMiniPresetsDir}/"${prefix}*_preset.duf`;
+  const pattern = `${CFG.macMiniPresetsDir}/${prefix}*_preset.duf`;
   let stdout = "";
   try {
     ({ stdout } = await execAsync(`ssh ${CFG.macMiniUser}@${CFG.macMiniHost} ${shellQuote(`ls -1 ${pattern} 2>/dev/null`)}`, { timeout: 30_000 }));
@@ -163,7 +163,7 @@ async function discoverPosePresets(gender) {
 }
 
 async function parseRemoteDufFrames(presetPath) {
-  const { stdout } = await execAsync(`ssh ${CFG.macMiniUser}@${CFG.macMiniHost} ${shellQuote(`base64 < "${presetPath}"`)}`, { timeout: 30_000, maxBuffer: 64 * 1024 * 1024 });
+  const { stdout } = await execAsync(`ssh ${CFG.macMiniUser}@${CFG.macMiniHost} ${shellQuote(`base64 < ${presetPath}`)}`, { timeout: 30_000, maxBuffer: 64 * 1024 * 1024 });
   return dufMaxFrame(Buffer.from(stdout, "base64"));
 }
 
