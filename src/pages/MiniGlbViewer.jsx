@@ -2231,13 +2231,41 @@ function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loade
 // generated character inside the wizard's own modal, safely. Full
 // ActorModelPanel remains the post-creation editor, per the original
 // architecture decision.
-export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLength = 0, bodyArmsLength = 0, bodyLegsLength = 0, bodyHeight = 0, extraMorphValues = {}, activeAnimation = "idle", onAnimationsLoaded, onLoadingChange, onAccessoryPartsLoaded, frontReferenceImageUrl = null, sideReferenceImageUrl = null, referenceCalibration = null, onExportReady = null, onSolveReady = null, poseValues = {}, focusRegion = "fullBody", perspectiveOnly = false, loadingPhotoUrl = null, fullscreenLoadingOverlay = true }) {
+export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLength = 0, bodyArmsLength = 0, bodyLegsLength = 0, bodyHeight = 0, extraMorphValues = {}, activeAnimation = "idle", onAnimationsLoaded, onLoadingChange, onAccessoryPartsLoaded, frontReferenceImageUrl = null, sideReferenceImageUrl = null, referenceCalibration = null, onExportReady = null, onSolveReady = null, poseValues = {}, focusRegion = "fullBody", perspectiveOnly = false, loadingPhotoUrl = null, fullscreenLoadingOverlay = true, onSceneReady = null }) {
   const mountRef = useRef(null);
   // Populated once per model load, in the load callback below. Kept as
   // a ref (not state) so the slider-effect further down can read it on
   // every drag without re-triggering the load effect, which only
   // depends on glbUrl.
   const morphMeshesRef = useRef([]);
+  // ── SESSION 148 MORPH PROBE (remove when the divergence is solved) ──
+  // Prints, every 5s, each morph-bearing mesh's influence state BY NAME
+  // (names via morphTargetDictionary — a scrambled order can fool a
+  // plain sum). Counterpart probe in ActorModelPanel prints the same
+  // format for Explore's displayed copy. Diff the lines.
+  useEffect(() => {
+    const t = setInterval(() => {
+      try {
+        const root = loadedRootRef.current;
+        if (!root) return;
+        const out = [];
+        root.traverse((o) => {
+          if (!o.isMesh || !o.morphTargetInfluences?.length || o.userData?.isAccessoryMesh) return;
+          const dict = o.morphTargetDictionary || {};
+          const inv = Object.fromEntries(Object.entries(dict).map(([k, v]) => [v, k]));
+          const pairs = [];
+          let sum = 0, nz = 0;
+          o.morphTargetInfluences.forEach((w, i) => {
+            if (Math.abs(w) > 1e-4) { nz++; sum += w; pairs.push([inv[i] || `#${i}`, w]); }
+          });
+          pairs.sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+          out.push(`${o.name}:${nz}/${o.morphTargetInfluences.length} sum=${sum.toFixed(3)} top=[${pairs.slice(0, 3).map(([n, w]) => `${n}:${w.toFixed(2)}`).join(",")}]`);
+        });
+        if (out.length) console.log(`[MORPH live] ${out.join(" | ")}`);
+      } catch { /* probe must never break the app */ }
+    }, 5000);
+    return () => clearInterval(t);
+  }, []);
   // Loaded accessory meshes, keyed by their URL, along with a saved
   // copy of each mesh's ORIGINAL (pre-scale) vertex positions — needed
   // so live scale updates below can always scale from the true
@@ -2393,6 +2421,14 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
     if (onLoadingChange) onLoadingChange(true);
 
     const scene = new THREE.Scene();
+    // Session 148 - COMPOSITED RENDER (final architecture, ruled by
+    // Magnus: reflect Inspect exactly): the parent may render THIS
+    // scene with its own camera as a second pass over its room,
+    // temporarily translating scene.position to place the character -
+    // restored within the same synchronous call, so this viewer's own
+    // render never sees the offset. The character is never exported,
+    // copied, or re-parented: what Explore draws IS this scene.
+    if (onSceneReady) onSceneReady(scene);
     // White background, deliberately explicit rather than relying on
     // the renderer's alpha:true transparency — makes it possible to
     // actually see whether an accessory rendered at all, since a
@@ -3557,6 +3593,27 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
       // would compound on top of it. Restored in every exit path from
       // the live accessories prop.
       const store = accessoryMeshesRef.current;
+      // Session 148 — EXPORT AT BIND POSE. GLTFExporter writes bones'
+      // CURRENT transforms as the file's rest pose; this export fires
+      // whenever the bridge fires, mid-idle, so the reimported copy's
+      // rest pose was a random animation frame — neck slightly flexed,
+      // head slightly turned, hair hanging from a wrongly-posed skull,
+      // permanently, varying per rebake. (Morphs were measured
+      // IDENTICAL both sides — this is the surviving mechanism for the
+      // Explore divergence, hair measured 7.9cm off.) Skeleton.pose()
+      // restores bind pose; the running mixer re-poses her next frame,
+      // so nothing needs manual restoring.
+      {
+        const posed = new Set();
+        loadedRootRef.current.traverse((o) => {
+          if (o.isSkinnedMesh && o.skeleton && !posed.has(o.skeleton)) {
+            posed.add(o.skeleton);
+            o.skeleton.pose();
+          }
+        });
+        loadedRootRef.current.updateMatrixWorld(true);
+        console.log(`[MiniGlbViewer] dressed export: ${posed.size} skeleton(s) restored to BIND POSE for serialization.`);
+      }
       const touched = [];
       for (const url of Object.keys(store)) {
         for (const entry of store[url]) {

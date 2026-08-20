@@ -255,12 +255,22 @@ function bindDirectClip(root, clipName, source) {
   const clip = source.clone();
   clip.name = clipName;
 
-  // Drop scale tracks. A walk cycle has no business resizing anyone, and an
-  // exporter that bakes them in will fight the normalisation that puts her at
-  // 1.7m — she grows the moment the clip plays and snaps back on idle.
+  // Session 148 — scale tracks are KEPT. The strip that lived here
+  // ("a walk cycle has no business resizing anyone") was written
+  // against foreign exporters baking unit-scales — but bindDirectClip
+  // only ever runs on SAME-SKELETON clips (embedded/merged exports; the
+  // FBX retarget path is separate), and DAZ rigs carry neck/spine
+  // PROPORTIONS in bone scale tracks. Stripping them compressed her
+  // neck in Explore all day (reported live, repeatedly) while Inspect —
+  // playing the identical clips RAW through MiniGlbViewer — stood at a
+  // correct 170.6cm the whole time: the proof these clips are safe with
+  // scale intact. If a future clip resurrects the original "she grows
+  // on play" incident, fix that clip at source (a root-node unit-scale
+  // track) rather than re-stripping proportions from every clip; the
+  // count is logged below so it can never fail silently.
   const scaled = clip.tracks.filter((t) => t.name.endsWith(".scale"));
   if (scaled.length) {
-    clip.tracks = clip.tracks.filter((t) => !t.name.endsWith(".scale"));
+    console.log(`[ActorModelPanel] bindDirectClip "${clipName}": ${scaled.length} scale track(s) KEPT (DAZ proportion carriers — see Session 148 note).`);
   }
 
   return {
@@ -268,7 +278,7 @@ function bindDirectClip(root, clipName, source) {
     mapped,
     sourceTracks: source.tracks.length,
     skipped: [],
-    droppedScale: scaled.length,
+    droppedScale: 0,
   };
 }
 
@@ -276,6 +286,9 @@ function bindDirectClip(root, clipName, source) {
 // generator felt like, so the character is normalised to TARGET_HEIGHT on load
 // and the room is built around that.
 const TARGET_HEIGHT = 1.7;
+// Scratch matrices for the composited character pass (no per-frame alloc).
+const _charW = new THREE.Matrix4();
+const _charWInv = new THREE.Matrix4();
 const ROOM = 12;         // floor is ROOM x ROOM, metres
 
 // Session 118 — Magnus: "how hard can it be to change her spawn
@@ -587,6 +600,40 @@ export default function ActorModelPanel({ actorId }) {
   const mountRef = useRef(null);
   const rendererRef = useRef(null);
   const sceneRef = useRef(null);
+  // Session 148 - COMPOSITED RENDER: MiniGlbViewer's live scene,
+  // rendered by Explore as a second pass (see animate). The character
+  // never leaves it - what Explore draws IS the Inspect character.
+  const miniSceneRef = useRef(null);
+  // Character-pass camera + scratch matrices (see the composited pass
+  // in animate): a camera with manual matrices, never in any scene.
+  const charCamRef = useRef((() => { const c = new THREE.PerspectiveCamera(); c.matrixAutoUpdate = false; c.matrixWorldAutoUpdate = false; return c; })());
+  // ── SESSION 148 MORPH PROBE (remove when the divergence is solved) ──
+  // Same format as [MORPH live] in MiniGlbViewer, on whatever Explore is
+  // displaying right now (the bridge's dressed re-export after rebake).
+  useEffect(() => {
+    const t = setInterval(() => {
+      try {
+        const root = rootRef.current;
+        if (!root) return;
+        const out = [];
+        root.traverse((o) => {
+          if (!o.isMesh || !o.morphTargetInfluences?.length || o.userData?.isAccessoryMesh) return;
+          const dict = o.morphTargetDictionary || {};
+          const inv = Object.fromEntries(Object.entries(dict).map(([k, v]) => [v, k]));
+          const pairs = [];
+          let sum = 0, nz = 0;
+          o.morphTargetInfluences.forEach((w, i) => {
+            if (Math.abs(w) > 1e-4) { nz++; sum += w; pairs.push([inv[i] || `#${i}`, w]); }
+          });
+          pairs.sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+          out.push(`${o.name}:${nz}/${o.morphTargetInfluences.length} sum=${sum.toFixed(3)} top=[${pairs.slice(0, 3).map(([n, w]) => `${n}:${w.toFixed(2)}`).join(",")}]`);
+        });
+        if (out.length) console.log(`[MORPH copy] ${out.join(" | ")}`);
+        else console.log("[MORPH copy] displayed root has NO morph-bearing body meshes — morphs did not survive the export at all");
+      } catch { /* probe must never break the app */ }
+    }, 5000);
+    return () => clearInterval(t);
+  }, []);
   // Session 147 — Display sliders reach the lights through these.
   const hemiLightRef = useRef(null);
   const keyLightRef = useRef(null);
@@ -893,6 +940,11 @@ export default function ActorModelPanel({ actorId }) {
     }
   }
   const [inspectActiveAnimation, setInspectActiveAnimation] = useState("idle");
+  // Session 148 - ONE DRIVER (proven design from the shared-instance
+  // attempt, applied to the composited architecture): MiniGlbViewer's
+  // mixer is the only animator; Explore requests clips by name.
+  const [exploreAnim, setExploreAnim] = useState("idle");
+  const [miniReady, setMiniReady] = useState(false);
   // Session 109 — Animations and Wardrobe are separate tabs within
   // Inspect's right panel, not stacked in one scroll.
   const [inspectTab, setInspectTab] = useState("animations");
@@ -1169,6 +1221,11 @@ export default function ActorModelPanel({ actorId }) {
   //      at 3 so a permanently failing garment logs loudly instead of
   //      spinning the export/reload loop forever.
   useEffect(() => {
+    // Session 148 - SUPERSEDED by the composited render: Explore never
+    // consumes an export, so there is nothing to rebake. Left in place
+    // as reference for the export path (Save GLB still uses it).
+    return;
+    // eslint-disable-next-line no-unreachable
     if (mode !== "explore") return;
     if (!wardrobeDirtyRef.current) return;
     if (exploreRebakeInFlightRef.current) return;
@@ -1285,7 +1342,10 @@ export default function ActorModelPanel({ actorId }) {
     rendererRef.current = renderer;
 
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(0, 1.0, 0);
+    // Session 148 — face-height pivot from the first frame (see the
+    // fpv-exit effect for the full rationale) + distance floor.
+    controls.target.set(0, 1.52, 0);
+    controls.minDistance = 1.1;
     controls.enableDamping = true;
     controls.update();
     controlsRef.current = controls;
@@ -1419,6 +1479,43 @@ export default function ActorModelPanel({ actorId }) {
       if (!fpvRef.current) controls.update();
 
       renderer.render(scene, camera);
+      // Session 148 - COMPOSITED CHARACTER PASS. Draw MiniGlbViewer's
+      // LIVE scene (character + her Inspect light rig) translated to
+      // the holder's logical position/heading, sharing this render's
+      // depth buffer so furniture occludes her correctly. The offset is
+      // applied and restored within this synchronous call - Inspect's
+      // own render (a separate RAF callback) never sees it. She is lit,
+      // posed, dressed, and animated identically to Inspect by
+      // construction: it is the same draw data. All movement/collision/
+      // camera logic above stays in logical space, untouched.
+      // Session 148, corrected same hour - the first version TRANSLATED
+      // THE SCENE, which re-triggered documented landmine #1: garments
+      // are bindMode "detached" (Session 100) and take a hierarchy
+      // translation TWICE while the attached body compensates - naked
+      // body at her position, ghost outfit at double (photographed;
+      // invisible while she spawned at x=0.00). Translating the CAMERA
+      // by the inverse transform is mathematically identical for every
+      // object REGARDLESS of bind mode: zero scene mutation.
+      {
+        const ms = miniSceneRef.current;
+        const h = holderRef.current;
+        if (ms && h) {
+          const savedBg = ms.background;
+          ms.background = null;
+          _charW.makeRotationY(h.rotation.y);
+          _charW.setPosition(h.position.x, floorYRef.current, h.position.z);
+          _charWInv.copy(_charW).invert();
+          charCamRef.current.projectionMatrix.copy(camera.projectionMatrix);
+          charCamRef.current.projectionMatrixInverse.copy(camera.projectionMatrixInverse);
+          charCamRef.current.matrixWorld.multiplyMatrices(_charWInv, camera.matrixWorld);
+          charCamRef.current.matrixWorldInverse.copy(charCamRef.current.matrixWorld).invert();
+          const savedAutoClear = renderer.autoClear;
+          renderer.autoClear = false;
+          renderer.render(ms, charCamRef.current);
+          renderer.autoClear = savedAutoClear;
+          ms.background = savedBg;
+        }
+      }
 
       // After render, so bones[].matrixWorld is current for this frame. Twice a
       // second is enough to read while a clip plays and cheap enough to leave on.
@@ -1555,11 +1652,20 @@ export default function ActorModelPanel({ actorId }) {
     } else {
       fpvControlsRef.current?.unlock();
       const b = boundsRef.current;
+      // Session 148 — orbit pivot raised chest (1.44m) → FACE height,
+      // and a distance floor added. The chest pivot meant every zoom-in
+      // dove the camera under her chin looking up — the persistent
+      // "short neck / bared forehead" reading of Explore close-ups
+      // (from below, the bang canopy is seen from underneath and the
+      // jaw occludes the throat). Inspect never does this because its
+      // framing pivots at the face. Same character demands the same
+      // pivot.
       controls.target.set(
         (b.minX + b.maxX) / 2,
-        floorYRef.current + TARGET_HEIGHT * 0.85,
+        floorYRef.current + 1.52,
         (b.minZ + b.maxZ) / 2
       );
+      controls.minDistance = 1.1;
       controls.update();
     }
   }, [fpv]);
@@ -1735,6 +1841,22 @@ export default function ActorModelPanel({ actorId }) {
   // Session 107 — explore auto-engages locomotion the moment roles are
   // known (embedded idle/walk clips detected on actor load); inspect
   // returns to stillness and third person for calibration work.
+  // Session 148 - composited render: the actor's clips never pass
+  // through loadModel, so roles/clip-list derive from MiniGlbViewer's
+  // own report (embeddedAnimations, already wired). Same detectRoles,
+  // same downstream state machine; the machine's clip SWITCHES go
+  // through the play()/switchClip() request-shims to MiniGlbViewer.
+  useEffect(() => {
+    if (!miniReady || embeddedAnimations.length === 0) return;
+    const detected = detectRoles(embeddedAnimations);
+    setRoles(detected);
+    setClips(embeddedAnimations.map((name) => ({ name, duration: 0, mapped: 0, sourceTracks: 0, skipped: [], droppedScale: 0 })));
+    const first = detected.idle ?? embeddedAnimations[0];
+    setExploreAnim(first);
+    setPlaying(first);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [miniReady, JSON.stringify(embeddedAnimations)]);
+
   useEffect(() => {
     if (mode === "explore") {
       if (roles?.idle || roles?.walk) setWalkMode(true);
@@ -1760,6 +1882,12 @@ export default function ActorModelPanel({ actorId }) {
   // because matching stride to travel is the difference between walking and
   // skating, and it's a per-clip number nobody can guess.
   function switchClip(name) {
+    // Session 148 - same request-shim as play().
+    if (miniSceneRef.current && actionsRef.current.size === 0) {
+      setExploreAnim(name);
+      setPlaying(name);
+      return;
+    }
     const action = actionsRef.current.get(name);
     if (!action) return;
     const previous = currentActionRef.current;
@@ -3137,13 +3265,16 @@ export default function ActorModelPanel({ actorId }) {
       // network request, and the preview inherits the exact path already
       // proven to work.
       setActorGlbUrl(trackUrl(blob));
-
-      await loadModel(file);
-      // Session 141 — canonical files are transform-baked (not identity),
-      // so this normally yields no index and live mirroring stays off
-      // until the first structural rebake produces an identity-baked
-      // copy. Logged either way so the state is never a mystery.
-      buildExploreWardrobeIndex();
+      // Session 148 - COMPOSITED RENDER: Explore never loads the
+      // character. MiniGlbViewer loads it (from the blob URL just set)
+      // and Explore draws MiniGlbViewer's scene as a second pass. A
+      // bare logical holder carries position/heading for movement,
+      // collision, and the composited pass's per-frame offset.
+      if (!holderRef.current) {
+        const hg = new THREE.Group();
+        sceneRef.current?.add(hg);
+        holderRef.current = hg;
+      }
 
       // Session 107 — default home (re-applied; the Session 106 patch
       // landed on an older copy of this file and never shipped). If the
@@ -3261,6 +3392,13 @@ export default function ActorModelPanel({ actorId }) {
   }
 
   function play(name) {
+    // Session 148 - composited render: no local character, no local
+    // actions - the request goes to MiniGlbViewer via activeAnimation.
+    if (miniSceneRef.current && actionsRef.current.size === 0) {
+      setExploreAnim(name);
+      setPlaying(name);
+      return;
+    }
     const action = actionsRef.current.get(name);
     if (!action) return;
 
@@ -3450,7 +3588,8 @@ export default function ActorModelPanel({ actorId }) {
               <MiniGlbViewer
                 glbUrl={actorGlbUrl}
                 accessories={previewAccessories}
-                activeAnimation={inspectActiveAnimation}
+                activeAnimation={mode === "explore" ? exploreAnim : inspectActiveAnimation}
+                onSceneReady={(sc) => { miniSceneRef.current = sc; setMiniReady(true); }}
                 onAnimationsLoaded={setEmbeddedAnimations}
                 onAccessoryPartsLoaded={setAccessoryPartNames}
                 onExportReady={(fn) => { exportGlbRef.current = fn; }}
@@ -3471,7 +3610,7 @@ export default function ActorModelPanel({ actorId }) {
             </div>,
             document.body,
           )}
-          {mode === "explore" && !busy && !report && !error && (
+          {mode === "explore" && !busy && !report && !error && !miniReady && (
             <div style={S.overlay}>
               Load a room, then a character, then animation clips.
             </div>
