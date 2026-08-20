@@ -607,6 +607,15 @@ export default function ActorModelPanel({ actorId }) {
   // Character-pass camera + scratch matrices (see the composited pass
   // in animate): a camera with manual matrices, never in any scene.
   const charCamRef = useRef((() => { const c = new THREE.PerspectiveCamera(); c.matrixAutoUpdate = false; c.matrixWorldAutoUpdate = false; return c; })());
+  // Session 148 - HER SHADOW, composited-architecture edition: a
+  // zero-intensity shadow-casting light + an invisible ShadowMaterial
+  // ground plane, installed ONCE into her scene. Zero intensity means
+  // her Inspect lighting is untouched (shadow factors are computed from
+  // the shadow map independent of intensity); ShadowMaterial renders
+  // nothing but received shadow. Both are inert in Inspect: its
+  // renderer has shadowMap disabled. The light re-aims per frame so the
+  // shadow direction matches the room's sun sliders as she turns.
+  const charShadowRigRef = useRef(null);
   // ── SESSION 148 MORPH PROBE (remove when the divergence is solved) ──
   // Same format as [MORPH live] in MiniGlbViewer, on whatever Explore is
   // displaying right now (the bridge's dressed re-export after rebake).
@@ -1505,6 +1514,20 @@ export default function ActorModelPanel({ actorId }) {
           _charW.makeRotationY(h.rotation.y);
           _charW.setPosition(h.position.x, floorYRef.current, h.position.z);
           _charWInv.copy(_charW).invert();
+          // Her shadow's sun matches the room sun, expressed in HER
+          // local (yaw-inverted) space so the shadow direction stays
+          // world-consistent as she turns.
+          if (charShadowRigRef.current) {
+            const d = displayRef.current;
+            const az = ((d.sunAzimuth ?? 37) * Math.PI) / 180 - h.rotation.y;
+            const el = ((d.sunElevation ?? 45) * Math.PI) / 180;
+            const R = 3.0;
+            charShadowRigRef.current.sun.position.set(
+              R * Math.cos(el) * Math.sin(az),
+              R * Math.sin(el),
+              R * Math.cos(el) * Math.cos(az),
+            );
+          }
           charCamRef.current.projectionMatrix.copy(camera.projectionMatrix);
           charCamRef.current.projectionMatrixInverse.copy(camera.projectionMatrixInverse);
           charCamRef.current.matrixWorld.multiplyMatrices(_charWInv, camera.matrixWorld);
@@ -1848,6 +1871,47 @@ export default function ActorModelPanel({ actorId }) {
   // through the play()/switchClip() request-shims to MiniGlbViewer.
   useEffect(() => {
     if (!miniReady || embeddedAnimations.length === 0) return;
+    // Session 148 - install the shadow rig + flag her meshes as casters
+    // (hair excluded - hair cards cast strand-silhouette slits, Session
+    // 147/148 rule). Flags are inert in Inspect (shadows disabled
+    // there); re-run on every model report so regenerated characters
+    // get re-flagged.
+    const ms = miniSceneRef.current;
+    if (ms) {
+      ms.traverse((o) => {
+        if (o.isMesh) {
+          const isHair = (o.userData?.accessoryUrl || "").includes("/hair/");
+          o.castShadow = !isHair && !o.isInstancedMesh;
+        }
+      });
+      if (!charShadowRigRef.current) {
+        const rig = new THREE.Group();
+        const sun = new THREE.DirectionalLight(0xffffff, 0.0001);
+        sun.castShadow = true;
+        sun.shadow.mapSize.set(1024, 1024);
+        sun.shadow.camera.near = 0.1;
+        sun.shadow.camera.far = 8;
+        sun.shadow.camera.left = -1.4;
+        sun.shadow.camera.right = 1.4;
+        sun.shadow.camera.top = 2.2;
+        sun.shadow.camera.bottom = -0.2;
+        sun.shadow.bias = -0.0002;
+        sun.shadow.normalBias = 0.03;
+        rig.add(sun);
+        rig.add(sun.target);
+        const ground = new THREE.Mesh(
+          new THREE.PlaneGeometry(5, 5),
+          new THREE.ShadowMaterial({ opacity: 0.32 }),
+        );
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.y = 0.004; // just above her scene's floor plane
+        ground.receiveShadow = true;
+        rig.add(ground);
+        ms.add(rig);
+        charShadowRigRef.current = { rig, sun };
+        console.log("[ActorModelPanel] Character shadow rig installed in her scene (zero-intensity caster + ShadowMaterial ground; inert in Inspect).");
+      }
+    }
     const detected = detectRoles(embeddedAnimations);
     setRoles(detected);
     setClips(embeddedAnimations.map((name) => ({ name, duration: 0, mapped: 0, sourceTracks: 0, skipped: [], droppedScale: 0 })));
