@@ -27,12 +27,13 @@ import { PointerLockControls } from "three/examples/jsm/controls/PointerLockCont
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { VRMLoaderPlugin, VRMUtils } from "@pixiv/three-vrm";
 import { MeshBVH, StaticGeometryGenerator } from "three-mesh-bvh";
-import MiniGlbViewer from "./MiniGlbViewer";
+import MiniGlbViewer, { applyAccessoryScale, effectiveTransform, applyAccessoryTint, capturePositions } from "./MiniGlbViewer";
 import AccessoryEditor, {
   defaultAccessories,
   fetchAccessoryOptions,
   buildViewerAccessories,
   ACCESSORY_REGION_CAMERA,
+  stripV,
 } from "./AccessoryEditor";
 
 // The bones that must resolve for retargeting to be viable at all.
@@ -310,12 +311,9 @@ const BODY_RADIUS = 0.32;   // how close either of you may get to a wall — sti
 // 30° is a portrait lens: correct proportions, but it flattens depth and makes
 // anything near the camera loom. First person wants something close to human
 // central vision.
-// Session 148 — was 35, while Inspect's MiniGlbViewer renders at 45.
-// With the shared instance making the character provably identical
-// (the [STATE] instrument: every part visible, geometry frozen to the
-// millimeter across modes), the remaining Explore/Inspect difference
-// was the LENS: two FOVs foreshorten the same head differently at
-// equal distance. One character, one lens.
+// Session 148 - was 35, while Inspect renders at 45: two FOVs
+// foreshorten the same head differently at equal distance. One
+// character, one lens.
 const FOV_ORBIT = 45;
 const FOV_FPV = 70;
 
@@ -698,19 +696,15 @@ export default function ActorModelPanel({ actorId }) {
   const clipGroundRef = useRef(new Map());
   const currentActionRef = useRef(null);
   const frameRef = useRef(null);
-  // Session 122 — attempted THREE.Clock → Timer migration, broke the
+  // Session 122 - attempted THREE.Clock -> Timer migration, broke the
   // build on a guessed addon import path; reverted with the demand that
   // any retry verify the real path from node_modules first.
-  // Session 147 — verified: at three 0.185 there IS no addon path
-  // (examples/jsm/misc/Timer.js does not exist); Timer was promoted to
-  // CORE (`typeof three.Timer === "function"`, update/getDelta
-  // confirmed via node against the installed package). So no new
-  // import at all — the existing THREE namespace carries it. Also
-  // fixed here: the old `useRef(new THREE.Clock())` constructed a new
-  // Clock on EVERY render (useRef's argument is evaluated each time
-  // even though the first is kept) — that was the wall of repeated
-  // deprecation warnings, one per render. Lazy construction in the
-  // animate loop: exactly one Timer, ever.
+  // Session 147 - verified: at three 0.185 there IS no addon path;
+  // Timer was promoted to CORE, update/getDelta confirmed via node
+  // against the installed package. No new import. Also fixed:
+  // useRef(new THREE.Clock()) constructed a new Clock on EVERY render
+  // - the wall of repeated deprecation warnings. Lazy construction in
+  // the animate loop: exactly one Timer, ever.
   const timerRef = useRef(null);
   const objectUrlsRef = useRef([]);
   const dracoLoaderRef = useRef(null);
@@ -842,9 +836,11 @@ export default function ActorModelPanel({ actorId }) {
       if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
       setAnimUploadMsg({ err: false, text: `Removed "${name}". Refreshing the model...` });
       // In-place refresh — same reasoning as the upload handler above.
-      // Session 148 — shared instance: no dirty flag, no rebake. The
-      // reload below hands MiniGlbViewer the fresh GLB; onCharacterReady
-      // fires with the new live root and Explore adopts it directly.
+      // Session 144 — the ledger re-derives the canonical GLB from the
+      // master, which is BODY-ONLY (composition direction): mark the
+      // wardrobe bridge dirty so Explore rebakes her dressed on next
+      // entry instead of showing the undressed derivation.
+      wardrobeDirtyRef.current = true;
       await loadActorModel(actorId);
       setAnimUploadMsg({ err: false, text: `Removed "${name}".` });
       setAnimDeleting(null);
@@ -883,9 +879,11 @@ export default function ActorModelPanel({ actorId }) {
       // does the honest refresh — re-fetches the actor (new updated_at
       // -> new cache-busted GLB), reloads BOTH viewers, and rebuilds
       // the wardrobe mirror index — without losing where you are.
-      // Session 148 — shared instance: no dirty flag, no rebake. The
-      // reload below hands MiniGlbViewer the fresh GLB; onCharacterReady
-      // fires with the new live root and Explore adopts it directly.
+      // Session 144 — the ledger re-derives the canonical GLB from the
+      // master, which is BODY-ONLY (composition direction): mark the
+      // wardrobe bridge dirty so Explore rebakes her dressed on next
+      // entry instead of showing the undressed derivation.
+      wardrobeDirtyRef.current = true;
       await loadActorModel(actorId);
       setAnimUploadMsg({ err: false, text: `Merged "${data.clip}"${data.detected_frames ? ` (${data.detected_frames} frames)` : ""}.` });
       setAnimUploadBusy(false);
@@ -895,14 +893,6 @@ export default function ActorModelPanel({ actorId }) {
     }
   }
   const [inspectActiveAnimation, setInspectActiveAnimation] = useState("idle");
-  // Session 148, SIXTH and final pass — ONE DRIVER. Explore no longer
-  // owns an AnimationMixer at all: two mixers on the shared root traded
-  // stale property-state snapshots (bones AND morph influences — the
-  // bared-forehead face in Explore was the master's facial morphs being
-  // fought over). MiniGlbViewer's mixer is the ONLY animator, always;
-  // Explore just names the clip it wants through the SAME activeAnimation
-  // prop Inspect uses. Inspect is the master — including for playback.
-  const [exploreAnim, setExploreAnim] = useState("idle");
   // Session 109 — Animations and Wardrobe are separate tabs within
   // Inspect's right panel, not stacked in one scroll.
   const [inspectTab, setInspectTab] = useState("animations");
@@ -917,7 +907,13 @@ export default function ActorModelPanel({ actorId }) {
   // switching back to it — the two engines don't share geometry, so a
   // tint change made in Inspect otherwise never reaches Explore's copy.
   const exportGlbRef = useRef(null);
-
+  const wardrobeDirtyRef = useRef(false);
+  // Session 147 — Plan A bridge state: one rebake at a time, and a
+  // bounded retry count so a garment that permanently fails to load in
+  // the hidden viewer can't spin the export/reload loop forever.
+  const exploreRebakeInFlightRef = useRef(false);
+  const exploreRebakeRetriesRef = useRef(0);
+  const [exploreRebakeTick, setExploreRebakeTick] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -1004,199 +1000,247 @@ export default function ActorModelPanel({ actorId }) {
       }
     };
   }, []);
-  // ── Session 148 — SHARED INSTANCE (ruled by Magnus: "Inspect is the
-  // master"). The export→reimport→re-apply pipeline that used to feed
-  // Explore produced a subtly DIFFERENT character every time (hair
-  // 7.9cm low by direct measurement, visibly shorter neck) and an
-  // evening of divergence bugs. Deleted wholesale — the bridge, the
-  // wardrobe index, the live mirror, the rebake cycle (~250 lines).
-  // Explore now ADOPTS MiniGlbViewer's live root on mode switch and
-  // releases it back: one character, two cameras, nothing to diverge.
-  // Wardrobe edits reflect instantly because there is only one set of
-  // meshes. The dressed export survives solely for Save GLB.
-  const liveCharRef = useRef(null); // { root, animations, originalParent, savedTransform }
-  const [charReadyTick, setCharReadyTick] = useState(0);
-  const modeRef = useRef(mode);
-  modeRef.current = mode;
 
-  function handleCharacterReady({ root, animations }) {
-    // A new root (glbUrl change / regeneration) replaces the old one —
-    // if the old was adopted, drop our refs; MiniGlbViewer disposes it.
-    if (liveCharRef.current && liveCharRef.current.root !== root && rootRef.current === liveCharRef.current.root) {
-      releaseCharacter({ reparent: false });
-    }
-    liveCharRef.current = { root, animations, originalParent: root.parent, savedTransform: null };
-    setCharReadyTick((t) => t + 1);
-  }
-
-  function adoptCharacter() {
-    const lc = liveCharRef.current;
-    const scene = sceneRef.current;
-    if (!lc || !scene || rootRef.current === lc.root) return;
-    const { root, animations } = lc;
-    lc.originalParent = root.parent || lc.originalParent;
-    lc.savedTransform = { p: root.position.clone(), r: root.rotation.clone(), s: root.scale.clone() };
-
-    const holder = new THREE.Group();
-    holder.add(root); // three re-parents automatically
-    scene.add(holder);
-    holderRef.current = holder;
-    rootRef.current = root;
-
-    // Ground WITHIN the holder without disturbing authored semantics —
-    // measured, offset locally, exact transform restored on release.
-    holder.updateMatrixWorld(true);
-    const box = new THREE.Box3().setFromObject(holder);
-    root.position.y -= box.min.y;
-
-    // Shadows (Session 147 level 3) — live meshes never pass through
-    // loadModel now; flag on every adoption so garments added since
-    // the last one are covered too.
-    // Session 148, second pass — AND the detached-bind correction: the
-    // garments are bound bindMode="detached" (Session 100), whose bind
-    // matrix is FROZEN at bind time. That's invisible while the root
-    // sits at MiniGlbViewer's origin, but the moment adoption
-    // translates the hierarchy, detached meshes get the offset TWICE
-    // (bones + uncompensated node transform) — confirmed live: naked
-    // body at spawn, ghost outfit floating beside her at exactly the
-    // adoption offset. While adopted, garments run "attached" (bind
-    // matrix auto-tracks the transform, same compensation the body
-    // uses); their Session 100 detached state is restored verbatim on
-    // release.
-    lc.savedBinds = [];
-    root.traverse((o) => {
-      if (o.isMesh) {
-        // Session 148, third pass — hair does NOT cast: semi-transparent
-        // hair cards throw their solid silhouettes onto the chest as
-        // strand-shaped dark slits (confirmed live; invisible in
-        // Inspect only because its renderer has no shadow map). Same
-        // hair-is-special judgment as ACCESSORY_INFLATE / SHRINKWRAP.
-        const isHair = (o.userData?.accessoryUrl || "").includes("/hair/");
-        o.castShadow = !isHair;
-        o.receiveShadow = true;
-      }
-      if (o.isSkinnedMesh && o.userData?.isAccessoryMesh) {
-        lc.savedBinds.push({ mesh: o, bindMode: o.bindMode, bindMatrix: o.bindMatrix.clone() });
-        o.bindMode = "attached";
-      }
-    });
-
-    // Session 148, sixth pass — ONE DRIVER (see exploreAnim above):
-    // Explore creates NO mixer, binds NO actions, applies NO grounding.
-    // MiniGlbViewer keeps animating the root exactly as in Inspect —
-    // the [STATE] numbers proved it grounds these clips at 0.0000 with
-    // correct proportions. Explore only lists the clips and requests
-    // idle; the walk state machine requests by name the same way.
-    mixerRef.current = null;
-    actionsRef.current.clear();
-    groundRef.current.target = 0;
-    groundRef.current.applied = 0;
-    const found = (animations || []).map((source, i) => ({
-      name: source.name || `clip ${i + 1}`,
-      duration: source.duration, mapped: source.tracks.length,
-      sourceTracks: source.tracks.length, skipped: 0, droppedScale: 0,
-    }));
-    setClips(found);
-    if (found.length) {
-      const detected = detectRoles(found.map((c) => c.name));
-      setRoles(detected);
-      setExploreAnim(detected.idle ?? found[0].name);
-      setPlaying(detected.idle ?? found[0].name);
-    }
-
-    // Placement — same roomRef-aware clamp path loadModel used.
-    if (roomRef.current) {
-      const b = boundsRef.current;
-      holder.position.set((b.minX + b.maxX) / 2, floorYRef.current, (b.minZ + b.maxZ) / 2);
-      clampOutsideExclusions(holder.position);
-      resolveCapsule(holder.position);
-    } else {
-      holder.position.y = floorYRef.current;
-    }
-    lastGoodPositionRef.current.copy(holder.position);
-    holder.updateMatrixWorld(true);
-    const world = new THREE.Box3().setFromObject(holder);
-    feetYRef.current = world.min.y;
-    setFitInfo({ standHeight: world.max.y - world.min.y, feetY: world.min.y, floorY: floorYRef.current });
-    setMatInfo(surveyMaterials(root));
-    setSkinInfo(surveySkinning(root));
-    // Session 148, third pass — the "Load a room, then a character..."
-    // empty-state keys on `report`, which only loadModel ever set;
-    // adoption is a full character arrival and must say so.
-    setReport({ ...inspect(null, root), source: "live character (shared instance)", isFbx: false });
-    console.log(`[ActorModelPanel] Adopted the LIVE character root (shared instance) — ${found.length} clip(s) bound, grounded, shadows flagged.`);
-  }
-
-  function releaseCharacter({ reparent = true } = {}) {
-    const lc = liveCharRef.current;
-    if (!lc || rootRef.current !== lc.root) return;
-    if (mixerRef.current) { mixerRef.current.stopAllAction(); mixerRef.current = null; }
-    actionsRef.current.clear();
-    currentActionRef.current = null;
-    walkRef.current.current = null;
-    const { root } = lc;
-    // Session 148, second pass — restore the Session 100 detached binds
-    // exactly as found (see the adoption-side comment).
-    for (const b of (lc.savedBinds || [])) {
-      b.mesh.bindMode = b.bindMode;
-      b.mesh.bindMatrix.copy(b.bindMatrix);
-      b.mesh.bindMatrixInverse.copy(b.bindMatrix).invert();
-    }
-    lc.savedBinds = null;
-    if (lc.savedTransform) {
-      root.position.copy(lc.savedTransform.p);
-      root.rotation.copy(lc.savedTransform.r);
-      root.scale.copy(lc.savedTransform.s);
-    }
-    if (reparent && lc.originalParent) lc.originalParent.add(root);
-    const scene = sceneRef.current;
-    if (holderRef.current && scene) scene.remove(holderRef.current);
-    holderRef.current = null;
-    rootRef.current = null;
-    console.log("[ActorModelPanel] Released the live character root back to Inspect.");
-  }
-
-  // Adopt on entering Explore (or when a fresh root arrives while
-  // there); release on leaving. Sixth pass: MiniGlbViewer's mixer NEVER
-  // yields — it is the sole animator in both modes.
-  // ── SESSION 148 PROBE (remove with the [STATE] instrument): the
-  // [STATE] numbers proved the whole character floats +0.2176m in
-  // Explore — the centre-probe FURNITURE height. This names which
-  // variable carries it.
+  // Session 110 — same dependency list as the auto-save effect above,
+  // separate concern: marks Explore's own separately-loaded mesh as
+  // stale relative to whatever's live in Inspect right now. Cheap sync
+  // set, no debounce needed (the actual refresh below IS debounced by
+  // only firing on the mode switch itself, not on every keystroke).
+  // Session 141 — STRUCTURAL changes only (garment added/removed/
+  // swapped): those genuinely need MiniGlbViewer's fitting pipeline
+  // and therefore a rebake. Tint/scale/offset/rotation/parts changes
+  // no longer touch this flag at all — they're mirrored onto Explore's
+  // meshes in place by the live-mirror effect below, the same way
+  // MiniGlbViewer applies them to its own copy.
   useEffect(() => {
-    const t = setInterval(() => {
-      if (holderRef.current) console.log(`[FLOOR] holderY=${holderRef.current.position.y.toFixed(4)} floorYRef=${floorYRef.current.toFixed(4)} feetYRef=${feetYRef.current.toFixed(4)} groundApplied=${groundRef.current.applied.toFixed(4)}`);
-    }, 4000);
-    return () => clearInterval(t);
-  }, []);
-  // Session 148, second pass — also re-runs when a garment finishes
-  // loading (accessoryPartNames): a mesh added to the ALREADY-adopted
-  // root arrives detached-bound and would ghost (see adoptCharacter's
-  // bind comment); flipNewAccessoryBinds picks it up.
-  function flipNewAccessoryBinds() {
-    const lc = liveCharRef.current;
-    if (!lc || rootRef.current !== lc.root || !lc.savedBinds) return;
-    const known = new Set(lc.savedBinds.map((b) => b.mesh));
-    let flipped = 0;
-    lc.root.traverse((o) => {
-      if (o.isSkinnedMesh && o.userData?.isAccessoryMesh && !known.has(o)) {
-        lc.savedBinds.push({ mesh: o, bindMode: o.bindMode, bindMatrix: o.bindMatrix.clone() });
-        o.bindMode = "attached";
-        o.castShadow = !(o.userData?.accessoryUrl || "").includes("/hair/");
-        o.receiveShadow = true;
-        flipped += 1;
-      }
-    });
-    if (flipped) console.log(`[ActorModelPanel] ${flipped} garment mesh(es) loaded while adopted — bind flipped to attached in place.`);
-  }
-  useEffect(() => {
-    if (mode === "explore") { adoptCharacter(); flipNewAccessoryBinds(); }
-    else releaseCharacter();
+    wardrobeDirtyRef.current = true;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, charReadyTick, JSON.stringify(accessoryPartNames)]);
+  }, [JSON.stringify(selectedAccessoryGlbUrls)]);
 
+  // Session 110 — Magnus: "if i change the color of an accessory in
+  // inspect and go back to explore that change shall be reflected in
+  // explore mode too." Explore and Inspect are two SEPARATE engines
+  // with two separate copies of her geometry (Explore never adopted
+  // MiniGlbViewer — no room/walk/FPV there, see the earlier decision).
+  // A tint/slot change made live in MiniGlbViewer only touches its own
+  // copy. Bridging them without merging the engines: on switching back
+  // to Explore, if wardrobe was touched, bake the CURRENT dressed state
+  // via MiniGlbViewer's own export function (the same one "Save GLB"
+  // used to call) and reload Explore's mesh from that fresh blob —
+  // same loadModel() path as a normal actor load, just fed a
+  // freshly-baked file instead of one fetched from the server.
+  //
+  // ── Session 141 — EXPLORE WARDROBE MIRROR ──────────────────────────
+  // Explore holds its own copy of her meshes (separate engine, separate
+  // scene). Historically ANY wardrobe edit forced the full bridge:
+  // serialize a GLB, reload, position reset. But almost nothing edited
+  // in the wardrobe needs the fitting pipeline — tint is a material
+  // color, and scale/offset/rotation are vertex rewrites from a stored
+  // baseline (MiniGlbViewer's own live-slider mechanism, its functions
+  // imported above). So: index Explore's garment meshes once per load,
+  // then mirror every non-structural edit onto them in place. Only
+  // works on a copy whose garments were exported at IDENTITY transform
+  // (userData.identityBaked — see exportMorphedGlbBlob's dressed path):
+  // capturing baselines from a transform-baked file would make every
+  // later edit compound. Legacy/canonical dressed files simply produce
+  // no index, and edits fall back to the old rebake path unchanged.
+  const exploreWardrobeIndexRef = useRef(null);
 
+  function buildExploreWardrobeIndex() {
+    exploreWardrobeIndexRef.current = null;
+    const root = rootRef.current;
+    if (!root) return;
+    const index = {};
+    const seenMaterialUuids = new Set();
+    let tagged = 0, identity = 0;
+    root.traverse((o) => {
+      if (!o.isMesh || !o.userData?.isAccessoryMesh) return;
+      tagged += 1;
+      if (!o.userData.identityBaked || !o.userData.accessoryUrl) return;
+      identity += 1;
+      // GLTFExporter dedupes identical materials, so two garments can
+      // arrive SHARING one material instance — tinting the shirt would
+      // tint the jeans. Guarantee per-mesh-unique materials up front.
+      if (Array.isArray(o.material)) {
+        o.material = o.material.map((m) => {
+          if (!m) return m;
+          if (seenMaterialUuids.has(m.uuid)) return m.clone();
+          seenMaterialUuids.add(m.uuid);
+          return m;
+        });
+      } else if (o.material) {
+        if (seenMaterialUuids.has(o.material.uuid)) o.material = o.material.clone();
+        else seenMaterialUuids.add(o.material.uuid);
+      }
+      o.geometry.computeBoundingBox();
+      const center = new THREE.Vector3();
+      o.geometry.boundingBox.getCenter(center);
+      const key = stripV(o.userData.accessoryUrl);
+      if (!index[key]) index[key] = [];
+      index[key].push({
+        mesh: o,
+        matName: o.userData.accessoryMatName || (Array.isArray(o.material) ? o.material[0] : o.material)?.name || o.name,
+        originalPositions: capturePositions(o.geometry.attributes.position),
+        center,
+      });
+    });
+    if (identity > 0) exploreWardrobeIndexRef.current = index;
+    console.log(`[ActorModelPanel] Explore wardrobe index: ${tagged} accessory mesh(es) in this copy, ${identity} identity-baked and mirrorable across ${Object.keys(index).length} garment(s).${identity === 0 && tagged > 0 ? " Legacy dressed file — live mirroring off, edits will rebake." : ""}`);
+  }
 
+  // Applies the CURRENT wardrobe config to Explore's indexed meshes in
+  // place — same operations, same imported functions, same whole/part
+  // rules as MiniGlbViewer's own live-update effect. Returns true if
+  // every configured garment was covered by the index (nothing
+  // structural pending); false means a garment was added/removed since
+  // this copy was baked, and only a rebake can fix that.
+  function applyExploreWardrobe() {
+    const index = exploreWardrobeIndexRef.current;
+    if (!index) return false;
+    const cfgs = buildViewerAccessories({
+      selectedAccessoryGlbUrls, accessoryScales, accessoryOffsets, accessoryRotations,
+      accessoryParts, accessoryTints, activeSlot: null, dynamicAccessoryOptions,
+    });
+    let allCovered = true;
+    const configured = new Set();
+    for (const cfg of cfgs) {
+      const key = stripV(cfg.url);
+      configured.add(key);
+      const entries = index[key];
+      if (!entries) { allCovered = false; continue; }
+      for (const entry of entries) {
+        entry.mesh.visible = cfg.parts?.[entry.matName]?.visible !== false;
+        const t = effectiveTransform(cfg.scale, cfg.offset, cfg.rotation, cfg.parts, entry.matName);
+        applyAccessoryScale(entry.mesh, entry.originalPositions, entry.center, t.scale, t.offset, t.rotation);
+        applyAccessoryTint(entry.mesh, cfg.parts?.[entry.matName]?.tint || cfg.tint);
+      }
+    }
+    // A garment removed from config but still in this copy: hide it
+    // immediately (honest visual now), and report uncovered so the
+    // structural rebake still happens and truly deletes it.
+    for (const key of Object.keys(index)) {
+      if (!configured.has(key)) {
+        for (const e of index[key]) e.mesh.visible = false;
+        allCovered = false;
+      }
+    }
+    return allCovered;
+  }
+
+  // The live mirror itself: every non-structural wardrobe edit lands
+  // here. Mirrorable copy -> applied in place, instantly, ZERO reload,
+  // and the dirty flag is left alone. No index (legacy copy) or a
+  // structural gap -> fall back to marking dirty exactly as before.
+  useEffect(() => {
+    if (!rootRef.current) return;
+    const covered = applyExploreWardrobe();
+    if (exploreWardrobeIndexRef.current && covered) return;
+    wardrobeDirtyRef.current = true;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [JSON.stringify(accessoryScales), JSON.stringify(accessoryOffsets), JSON.stringify(accessoryRotations), JSON.stringify(accessoryParts), JSON.stringify(accessoryTints)]);
+
+  // Real side effect, worth knowing: loadModel() resets walk state,
+  // current animation, and position — she'll be standing in idle again
+  // after this, not wherever she was walking. Accepted tradeoff: this
+  // only fires right after actually editing wardrobe, and re-dressing
+  // her mid-stride was never going to look right anyway.
+  //
+  // ── Session 147 — PLAN A: the wardrobe config is the dressed state ─
+  // The deployed GLB is now canonically BODY-ONLY (the animation-ledger
+  // pipeline re-derives it from the master .blend, which never contained
+  // platform accessories — Session 147's texture repair surfaced this).
+  // So Explore can no longer assume its loaded copy carries garments,
+  // and this bridge can no longer be edge-triggered on the mode toggle
+  // alone: Explore-first must dress her too. Three changes, same proven
+  // export/reload machinery underneath:
+  //   1. TRIGGERS — also re-runs when the (persistently mounted, hidden)
+  //      Inspect viewer finishes loading a garment (accessoryPartNames
+  //      changes) and on retry ticks, not only on mode switches.
+  //   2. SHORT-CIRCUITS — if the copy already on stage covers the full
+  //      config (applyExploreWardrobe() true), or the config is empty
+  //      and the copy has no garments, there is nothing to bake: clear
+  //      dirty and stop. A body-only GLB with an empty wardrobe IS the
+  //      correct dressed state.
+  //   3. VERIFY, DON'T ASSUME — the hidden viewer loads garments async,
+  //      so an export can race ahead of it and produce a partially
+  //      dressed file. After reloading, coverage is re-checked; not
+  //      covered leaves dirty set and schedules a bounded retry (the
+  //      next garment finishing also retriggers naturally). Retries cap
+  //      at 3 so a permanently failing garment logs loudly instead of
+  //      spinning the export/reload loop forever.
+  useEffect(() => {
+    if (mode !== "explore") return;
+    if (!wardrobeDirtyRef.current) return;
+    if (exploreRebakeInFlightRef.current) return;
+    if (!rootRef.current) return;
+    // Copy on stage already matches config — nothing structural pending.
+    if (applyExploreWardrobe()) { wardrobeDirtyRef.current = false; exploreRebakeRetriesRef.current = 0; return; }
+    const cfgs = buildViewerAccessories({
+      selectedAccessoryGlbUrls, accessoryScales, accessoryOffsets, accessoryRotations,
+      accessoryParts, accessoryTints, activeSlot: null, dynamicAccessoryOptions,
+    });
+    if (cfgs.length === 0 && !exploreWardrobeIndexRef.current) {
+      // Nothing configured, nothing baked in: body-only is correct.
+      wardrobeDirtyRef.current = false;
+      exploreRebakeRetriesRef.current = 0;
+      return;
+    }
+    if (!exportGlbRef.current) return; // hidden viewer not ready — a later trigger retries
+    if (exploreRebakeRetriesRef.current >= 3) {
+      console.error("[ActorModelPanel] Explore dressed-state bake: retry cap reached — a configured garment never became exportable from the hidden viewer. Explore stays on the current copy; check earlier accessory-load errors above.");
+      return;
+    }
+    let cancelled = false;
+    // 600ms settle: garment loads arrive in a burst on first mount —
+    // coalesce them into one export instead of one per garment.
+    const timer = setTimeout(async () => {
+      if (cancelled || exploreRebakeInFlightRef.current) return;
+      exploreRebakeInFlightRef.current = true;
+      const t0 = performance.now();
+      try {
+        // Session 141 — preserve where she is: the rebake is now rare
+        // (structural changes only), and losing her position for a
+        // garment swap was always collateral, never intent.
+        const savedPos = holderRef.current ? holderRef.current.position.clone() : null;
+        const savedRotY = holderRef.current ? holderRef.current.rotation.y : null;
+        const blob = await exportGlbRef.current({ includeAccessories: true });
+        const tExport = performance.now();
+        if (cancelled || !blob) return;
+        const file = new File([blob], "dressed.glb", { type: "model/gltf-binary" });
+        await loadModel(file);
+        // Session 141 — this copy came from the identity-baked dressed
+        // export: garments are at baseline transform and untinted-or-
+        // baked-color. Index them, then apply the CURRENT config so she
+        // arrives wearing exactly what Inspect shows.
+        buildExploreWardrobeIndex();
+        const covered2 = applyExploreWardrobe();
+        if (savedPos && holderRef.current && !cancelled) {
+          holderRef.current.position.set(savedPos.x, floorYRef.current, savedPos.z);
+          if (savedRotY !== null) holderRef.current.rotation.y = savedRotY;
+          resolveCapsule(holderRef.current.position);
+          lastGoodPositionRef.current.copy(holderRef.current.position);
+        }
+        const tReload = performance.now();
+        // Session 147 — verify, don't assume: a partial export (hidden
+        // viewer still loading) leaves dirty set and retries.
+        wardrobeDirtyRef.current = !covered2;
+        if (covered2) {
+          exploreRebakeRetriesRef.current = 0;
+        } else {
+          exploreRebakeRetriesRef.current += 1;
+          console.warn(`[ActorModelPanel] Explore dressed-state bake incomplete (attempt ${exploreRebakeRetriesRef.current}/3) — hidden viewer likely still loading garments; will retry.`);
+        }
+        console.log(`[ActorModelPanel] Explore wardrobe refresh: export ${(tExport - t0).toFixed(0)}ms (${(blob.size / 1e6).toFixed(1)}MB) + reload ${(tReload - tExport).toFixed(0)}ms = ${(tReload - t0).toFixed(0)}ms total, position preserved, covered=${covered2}.`);
+      } catch (e) {
+        console.error("[ActorModelPanel] Could not refresh Explore with live wardrobe edits:", e);
+      } finally {
+        exploreRebakeInFlightRef.current = false;
+        if (!cancelled && wardrobeDirtyRef.current) setExploreRebakeTick((t) => t + 1);
+      }
+    }, 600);
+    return () => { cancelled = true; clearTimeout(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, JSON.stringify(accessoryPartNames), exploreRebakeTick]);
 
   function trackUrl(file) {
     const url = URL.createObjectURL(file);
@@ -1231,16 +1275,11 @@ export default function ActorModelPanel({ actorId }) {
     // sheen, not the texture.
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.0;
-    // Session 147 — shadows are opt-in at three levels in three.js;
-    // this is level 1, the master switch. Toggled live by the Display
-    // card (shadowMap.enabled flips cheaply; the per-light/per-mesh
-    // flags below are set unconditionally and cost nothing while this
-    // is off). PCFSoft: the soft edge fights least with the baked
-    // lighting archviz rooms carry.
+    // Session 147 — shadows: level 1, the master switch, toggled live by
+    // the Display card. PCFShadowMap (PCFSoft deprecated at three 0.185;
+    // runtime warning states PCF is used instead — set the replacement
+    // explicitly rather than ride a deprecation fallback).
     renderer.shadowMap.enabled = displayRef.current.shadows;
-    // Session 147, same night — PCFSoftShadowMap is deprecated at three
-    // 0.185 (runtime warning states PCFShadowMap is used instead); set
-    // the replacement explicitly rather than ride a deprecation fallback.
     renderer.shadowMap.type = THREE.PCFShadowMap;
     mount.appendChild(renderer.domElement);
     rendererRef.current = renderer;
@@ -1282,27 +1321,19 @@ export default function ActorModelPanel({ actorId }) {
     // Session 147 — level 2: ONLY the key casts (a second shadow from
     // the rim double-shadows everything and reads as a lighting bug).
     // Frustum sized to a domestic room; 1024 map is the fps-friendly
-    // choice against an 11-SkinnedMesh 254-bone character re-rendering
-    // into it every frame. Small negative bias against acne on the
-    // flat archviz floors.
+    // choice. Session 147 same night: frustum tightened ±5 → ±4 (room
+    // fits inside ±4, more texels/cm) and normalBias added — "stripes
+    // on the skin" reported live = shadow acne on curved skinned
+    // surfaces, worst at grazing sun angles; normalBias is the
+    // purpose-built fix.
     key.castShadow = true;
     key.shadow.mapSize.set(1024, 1024);
     key.shadow.camera.near = 0.1;
     key.shadow.camera.far = 12;
-    // Session 147 — frustum tightened ±5 → ±4 after live testing: the
-    // room fits inside ±4 (furniture extends to ~±2.9), and the smaller
-    // box packs more shadow texels per cm.
     key.shadow.camera.left = -4;
     key.shadow.camera.right = 4;
     key.shadow.camera.top = 4;
     key.shadow.camera.bottom = -4;
-    // Session 147 — "stripes on the skin" reported live = shadow acne:
-    // a curved skinned surface self-shadows in bands at this map
-    // resolution, worst at grazing sun angles (now reachable via the
-    // direction slider). normalBias is the purpose-built fix for curved
-    // surfaces — offsets the lookup along the surface normal instead of
-    // toward the light — where plain bias alone either leaves acne or
-    // detaches the shadow (peter-panning).
     key.shadow.bias = -0.0002;
     key.shadow.normalBias = 0.03;
     scene.add(key);
@@ -1347,8 +1378,8 @@ export default function ActorModelPanel({ actorId }) {
 
     const animate = () => {
       frameRef.current = requestAnimationFrame(animate);
-      // Session 147 — Timer (unlike Clock) separates sampling from
-      // reading: update() once per frame, then getDelta().
+      // Session 147 - Timer separates sampling from reading: update()
+      // once per frame, then getDelta().
       if (!timerRef.current) timerRef.current = new THREE.Timer();
       timerRef.current.update();
       const delta = timerRef.current.getDelta();
@@ -1364,10 +1395,7 @@ export default function ActorModelPanel({ actorId }) {
       stepPlayer(delta, camera);
       stepLocomotion(delta, camera, controls);
 
-      // Session 148, sixth pass — the live root has NO local mixer
-      // (mixerRef null while adopted; MiniGlbViewer animates it). This
-      // update only ever runs for drag-in test files.
-      if (mixerRef.current && modeRef.current === "explore") mixerRef.current.update(delta);
+      if (mixerRef.current) mixerRef.current.update(delta);
       if (vrmRef.current) vrmRef.current.update(delta);
 
       // Ease the feet on roughly the same curve as the crossfade blends the
@@ -1541,24 +1569,22 @@ export default function ActorModelPanel({ actorId }) {
     if (skeletonHelperRef.current) skeletonHelperRef.current.visible = showSkeleton;
   }, [showSkeleton]);
 
-  // Session 147 — apply Display settings live. Exposure keeps its old
-  // wiring; environment intensity uses scene.environmentIntensity
-  // (three r163+; guarded and reported once if this build predates it,
-  // never silently ignored).
+  // Session 147 — apply Display settings live. Sun direction: azimuth/
+  // elevation → position on a sphere of the original hardcoded radius
+  // (3.536; defaults 37°/45° reproduce the old (1.5, 2.5, 2.0) exactly).
+  // environmentIntensity: three r163+ (0.185 here). Shadow flips touch
+  // every material once per toggle — three only recompiles on
+  // material.needsUpdate.
   const envIntensityUnsupportedRef = useRef(false);
   const shadowsWereRef = useRef(null);
   useEffect(() => {
     if (rendererRef.current) {
       rendererRef.current.toneMappingExposure = display.exposure;
-      // Session 147 — flipping shadowMap.enabled alone leaves already-
-      // compiled materials on their old shader variant; three only
-      // recompiles on material.needsUpdate. Touch every material once
-      // per actual toggle (not per slider drag).
       if (shadowsWereRef.current !== display.shadows) {
         shadowsWereRef.current = display.shadows;
         rendererRef.current.shadowMap.enabled = display.shadows;
-        const scene = sceneRef.current;
-        if (scene) scene.traverse((o) => {
+        const scene0 = sceneRef.current;
+        if (scene0) scene0.traverse((o) => {
           if (!o.isMesh || !o.material) return;
           (Array.isArray(o.material) ? o.material : [o.material]).forEach((m) => { m.needsUpdate = true; });
         });
@@ -1567,12 +1593,6 @@ export default function ActorModelPanel({ actorId }) {
     if (hemiLightRef.current) hemiLightRef.current.intensity = display.ambientIntensity;
     if (keyLightRef.current) {
       keyLightRef.current.intensity = display.keyIntensity;
-      // Session 147 — sun direction. Azimuth/elevation → position on a
-      // sphere of the original hardcoded radius (3.536; defaults 37°/45°
-      // reproduce the old (1.5, 2.5, 2.0) exactly, so untouched sliders
-      // change nothing). The directional light keeps its default target
-      // at origin; the shadow frustum travels with the light, so the
-      // ±5m box keeps covering the room from any angle.
       const R = 3.536;
       const az = (display.sunAzimuth * Math.PI) / 180;
       const el = (display.sunElevation * Math.PI) / 180;
@@ -1594,10 +1614,9 @@ export default function ActorModelPanel({ actorId }) {
     }
   }, [display]);
 
-  // Session 147 — persistence, two tiers: localStorage immediately
-  // (survives reload on this browser), DB preferences debounced 800ms
-  // (survives browser changes; exploreDisplay namespace, server merges
-  // top-level so other namespaces are untouched).
+  // Session 147 — persistence, two tiers: localStorage immediately,
+  // DB preferences debounced 800ms (exploreDisplay namespace; server
+  // merges top-level so other namespaces are untouched).
   useEffect(() => {
     try { localStorage.setItem("anima_explore_display", JSON.stringify(display)); }
     catch (e) { console.warn("[ActorModelPanel] could not write display settings to localStorage:", e); }
@@ -1617,8 +1636,7 @@ export default function ActorModelPanel({ actorId }) {
     return () => { if (displayPrefsSaveTimerRef.current) clearTimeout(displayPrefsSaveTimerRef.current); };
   }, [display]);
 
-  // Session 147 — on mount, the DB copy wins over localStorage (it is
-  // the cross-browser truth; localStorage only bridges the fetch gap).
+  // Session 147 — on mount, the DB copy wins over localStorage.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -1742,17 +1760,6 @@ export default function ActorModelPanel({ actorId }) {
   // because matching stride to travel is the difference between walking and
   // skating, and it's a per-clip number nobody can guess.
   function switchClip(name) {
-    // Session 148, sixth pass — ONE DRIVER: on the adopted live root
-    // there are no local actions; the switch is a REQUEST to
-    // MiniGlbViewer's mixer via the activeAnimation prop (its own
-    // effect handles the crossfade). The local-action path remains for
-    // drag-in test files, which still load through loadModel with a
-    // local mixer.
-    if (liveCharRef.current && rootRef.current === liveCharRef.current.root) {
-      setExploreAnim(name);
-      setPlaying(name);
-      return;
-    }
     const action = actionsRef.current.get(name);
     if (!action) return;
     const previous = currentActionRef.current;
@@ -2297,18 +2304,13 @@ export default function ActorModelPanel({ actorId }) {
       const centre = grounded.getCenter(new THREE.Vector3());
 
       let triangles = 0;
-      // Session 147 — Option A (ruled by Magnus): archviz home GLBs ship
+      // Session 147 - Option A (ruled by Magnus): archviz home GLBs ship
       // every material as KHR_materials_unlit (studio_apartment.glb:
       // 59/59 confirmed by direct JSON-chunk inspection), which three
-      // imports as MeshBasicMaterial — a material that ignores lights,
-      // ignores the environment, and CANNOT receive shadows. Rebuild
-      // each unlit material as MeshStandardMaterial carrying the baked
-      // texture/color forward (roughness 1, metalness 0: the baked map
-      // provides all shading, standard-material response only adds our
-      // key/env/ambient on top). Consequences accepted with the ruling:
-      // the room now responds to the Display sliders, and shadows land
-      // on floors and walls. Lit materials (future rooms) pass through
-      // untouched — this converts, never re-converts.
+      // imports as MeshBasicMaterial - ignores lights, ignores the
+      // environment, CANNOT receive shadows. Rebuild each unlit material
+      // as MeshStandardMaterial carrying the baked texture/color forward
+      // (roughness 1, metalness 0). Lit materials pass through.
       let convertedMats = 0;
       const matCache = new Map(); // shared materials stay shared
       root.traverse((o) => {
@@ -2337,17 +2339,14 @@ export default function ActorModelPanel({ actorId }) {
             return std;
           };
           o.material = Array.isArray(o.material) ? o.material.map(convert) : convert(o.material);
-          // Session 147 — level 3: room receives (her shadow on the
-          // floor) and casts (furniture shadows itself, table shades
-          // under itself). Static geometry, so the shadow-map cost is
-          // the character, not this. Inert while the Display toggle is
-          // off.
+          // Session 147 - level 3: room receives and casts. Inert while
+          // the Display toggle is off.
           o.receiveShadow = true;
           o.castShadow = true;
         }
       });
       if (convertedMats > 0) {
-        console.log(`[ActorModelPanel] Room materials: ${convertedMats} unlit (MeshBasicMaterial) converted to lit MeshStandardMaterial — shadows and Display lighting now apply to the room.`);
+        console.log(`[ActorModelPanel] Room materials: ${convertedMats} unlit (MeshBasicMaterial) converted to lit MeshStandardMaterial - shadows and Display lighting now apply to the room.`);
       }
 
       scene.add(root);
@@ -2879,11 +2878,6 @@ export default function ActorModelPanel({ actorId }) {
   }
 
   async function loadModel(file) {
-    // Session 148 — shared instance: if the live root is currently
-    // adopted, release it FIRST (back to MiniGlbViewer, undisposed) —
-    // the holder disposal below must only ever destroy test-file
-    // models, never the master character.
-    releaseCharacter();
     setBusy("Loading character…");
     setError(null);
     setReport(null);
@@ -2958,11 +2952,17 @@ export default function ActorModelPanel({ actorId }) {
 
       holderRef.current = holder;
       rootRef.current = root;
-      // Session 147 — level 3, character side: she casts (the grounding
-      // shadow is the whole point) and receives (a window frame's shadow
-      // can fall across her). Inert while the Display toggle is off.
+      // Session 147 - level 3, character side: she casts and receives.
+      // Session 148 - hair does NOT cast: semi-transparent hair cards
+      // throw solid silhouettes onto the chest as strand-shaped dark
+      // slits (confirmed live); same hair-is-special judgment as
+      // ACCESSORY_INFLATE / SHRINKWRAP.
       root.traverse((o) => {
-        if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; }
+        if (o.isMesh) {
+          const isHair = (o.userData?.accessoryUrl || "").includes("/hair/");
+          o.castShadow = !isHair;
+          o.receiveShadow = true;
+        }
       });
       vrmRef.current = vrm;
       mixerRef.current = new THREE.AnimationMixer(root);
@@ -3137,13 +3137,13 @@ export default function ActorModelPanel({ actorId }) {
       // network request, and the preview inherits the exact path already
       // proven to work.
       setActorGlbUrl(trackUrl(blob));
-      // Session 148 — SHARED INSTANCE: the character is loaded ONCE, by
-      // MiniGlbViewer (from the blob URL just set), and Explore adopts
-      // the live root via onCharacterReady. The loadModel(file) call
-      // that used to live here — a second, independent parse of the
-      // same bytes into a second character — is gone with the rest of
-      // the copy machinery. loadModel itself remains for drag-in test
-      // files only.
+
+      await loadModel(file);
+      // Session 141 — canonical files are transform-baked (not identity),
+      // so this normally yields no index and live mirroring stays off
+      // until the first structural rebake produces an identity-baked
+      // copy. Logged either way so the state is never a mystery.
+      buildExploreWardrobeIndex();
 
       // Session 107 — default home (re-applied; the Session 106 patch
       // landed on an older copy of this file and never shipped). If the
@@ -3261,12 +3261,6 @@ export default function ActorModelPanel({ actorId }) {
   }
 
   function play(name) {
-    // Session 148, sixth pass — request-shim, same as switchClip.
-    if (liveCharRef.current && rootRef.current === liveCharRef.current.root) {
-      setExploreAnim(name);
-      setPlaying(name);
-      return;
-    }
     const action = actionsRef.current.get(name);
     if (!action) return;
 
@@ -3456,7 +3450,7 @@ export default function ActorModelPanel({ actorId }) {
               <MiniGlbViewer
                 glbUrl={actorGlbUrl}
                 accessories={previewAccessories}
-                activeAnimation={mode === "explore" ? exploreAnim : inspectActiveAnimation}
+                activeAnimation={inspectActiveAnimation}
                 onAnimationsLoaded={setEmbeddedAnimations}
                 onAccessoryPartsLoaded={setAccessoryPartNames}
                 onExportReady={(fn) => { exportGlbRef.current = fn; }}
@@ -3464,17 +3458,10 @@ export default function ActorModelPanel({ actorId }) {
                 showSaveButton={false}
                 showMeasurements={mode === "inspect"}
                 fullscreenLoadingOverlay={false}
-                onCharacterReady={handleCharacterReady}
               />
             </div>
           )}
           {busy && ReactDOM.createPortal(
-            /* Session 147 — one spinner, whole screen (ruled by Magnus):
-               replaces the dark stage-only overlay. Same frost/gold
-               identity as MiniGlbViewer's Session 103 portal, whose own
-               instance is now suppressed here via the (finally
-               implemented) fullscreenLoadingOverlay={false} — so exactly
-               one loading treatment exists across the panel. */
             <div style={{ position: "fixed", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999, background: "rgba(255,255,255,0.82)", backdropFilter: "blur(8px)" }}>
               <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16 }}>
                 <style>{`@keyframes amp-spin { to { transform: rotate(360deg); } }`}</style>
@@ -3538,8 +3525,8 @@ export default function ActorModelPanel({ actorId }) {
             { key: "exposure", label: "Exposure", min: 0.2, max: 2, step: 0.05 },
             { key: "envIntensity", label: "Environment", min: 0, max: 2, step: 0.05 },
             { key: "keyIntensity", label: "Key light", min: 0, max: 2, step: 0.05 },
-            { key: "sunAzimuth", label: "Sun direction", min: 0, max: 360, step: 1, fmt: (v) => `${v.toFixed(0)}\u00B0` },
-            { key: "sunElevation", label: "Sun height", min: 10, max: 80, step: 1, fmt: (v) => `${v.toFixed(0)}\u00B0` },
+            { key: "sunAzimuth", label: "Sun direction", min: 0, max: 360, step: 1, fmt: (v) => `${v.toFixed(0)}°` },
+            { key: "sunElevation", label: "Sun height", min: 10, max: 80, step: 1, fmt: (v) => `${v.toFixed(0)}°` },
             { key: "ambientIntensity", label: "Ambient", min: 0, max: 1, step: 0.05 },
             { key: "rimIntensity", label: "Rim light", min: 0, max: 1, step: 0.05 },
           ].map(({ key: k, label, min, max, step, fmt }) => (
@@ -3753,12 +3740,9 @@ function WardrobeCard({
           fontFamily: "'DM Mono',monospace", fontSize: 10,
           color: saving ? "#b05c08" : saveOk ? "#34c759" : "#c9c6c0",
         }}>
-          {/* Session 147 — the third branch here ("not saved — status: X"
-              for any non-draft actor) was the DISPLAY twin of the
-              draft-only save gate removed earlier this session, missed
-              in that audit because it lives in this child panel. Saves
-              now work for every status, so the caption only reports
-              actual save activity. */}
+          {/* Session 147 - the third branch ("not saved - status: X") was
+              the DISPLAY twin of the removed draft-only save gate. Saves
+              work for every status; caption reports actual activity. */}
           {saving ? "saving…" : saveOk ? "saved" : ""}
         </span>
       </div>

@@ -2231,7 +2231,7 @@ function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loade
 // generated character inside the wizard's own modal, safely. Full
 // ActorModelPanel remains the post-creation editor, per the original
 // architecture decision.
-export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLength = 0, bodyArmsLength = 0, bodyLegsLength = 0, bodyHeight = 0, extraMorphValues = {}, activeAnimation = "idle", onAnimationsLoaded, onLoadingChange, onAccessoryPartsLoaded, frontReferenceImageUrl = null, sideReferenceImageUrl = null, referenceCalibration = null, onExportReady = null, onSolveReady = null, poseValues = {}, focusRegion = "fullBody", perspectiveOnly = false, loadingPhotoUrl = null, fullscreenLoadingOverlay = true, onCharacterReady = null, suspendMixer = false }) {
+export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLength = 0, bodyArmsLength = 0, bodyLegsLength = 0, bodyHeight = 0, extraMorphValues = {}, activeAnimation = "idle", onAnimationsLoaded, onLoadingChange, onAccessoryPartsLoaded, frontReferenceImageUrl = null, sideReferenceImageUrl = null, referenceCalibration = null, onExportReady = null, onSolveReady = null, poseValues = {}, focusRegion = "fullBody", perspectiveOnly = false, loadingPhotoUrl = null, fullscreenLoadingOverlay = true }) {
   const mountRef = useRef(null);
   // Populated once per model load, in the load callback below. Kept as
   // a ref (not state) so the slider-effect further down can read it on
@@ -2323,65 +2323,6 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
   };
   const focusRegionRef = useRef(focusRegion);
   focusRegionRef.current = focusRegion;
-  // Session 148 — shared instance: while the parent's Explore mode
-  // drives the adopted root with its own mixer, this one yields (two
-  // mixers on one skeleton fight per-frame). Ref so the render loop
-  // reads the current value without re-running its effect.
-  const suspendMixerRef = useRef(suspendMixer);
-  suspendMixerRef.current = suspendMixer;
-
-  // ── SESSION 148 INSTRUMENT (remove when Explore/Inspect parity is
-  // confirmed) — every 4s, one line with everything that could differ
-  // between the two views of the SHARED character: per-part visibility,
-  // first-vertex geometry Y per garment (fit applied or not), and the
-  // head bone's world quaternion (pose). Toggle modes and diff lines.
-  useEffect(() => {
-    const t = setInterval(() => {
-      try {
-        const store = accessoryMeshesRef.current || {};
-        const parts = [];
-        let headQ = "n/a";
-        for (const url of Object.keys(store)) {
-          for (const e of store[url]) {
-            const p = e.mesh.geometry.attributes.position;
-            parts.push(`${e.matName}:${e.mesh.visible ? "V" : "HIDDEN"}@${p.getY(0).toFixed(3)}`);
-          }
-        }
-        const root = loadedRootRef.current;
-        if (root) {
-          // v3 — v2 guessed bone names ("chest(drv)"/"neck(drv)") that
-          // don't exist in this rig, so the neck measurement silently
-          // vanished. Match the REAL chain by pattern, print whatever
-          // exists, plus hip as reference and standing height (world
-          // bbox) as sanity — head(drv)=1.7516 with standHeight 1.706
-          // would be anatomically impossible and is exactly the kind of
-          // number this must expose.
-          const v = new THREE.Vector3();
-          const found = [];
-          root.traverse((o) => {
-            if (o.isBone && /(hip|spine|chest|neck|head)/i.test(o.name) && /drv/.test(o.name) && found.length < 10) {
-              o.getWorldPosition(v);
-              found.push(`${o.name}=${v.y.toFixed(4)}`);
-            }
-          });
-          const bb = new THREE.Box3().setFromObject(root);
-          let hairY = "n/a";
-          for (const url of Object.keys(store)) {
-            if (!url.includes("/hair/")) continue;
-            const m = store[url][0]?.mesh;
-            if (m && typeof m.getVertexPosition === "function") {
-              m.getVertexPosition(0, v).applyMatrix4(m.matrixWorld);
-              hairY = v.y.toFixed(4);
-            }
-            break;
-          }
-          headQ = `standTop=${bb.max.y.toFixed(4)} standBot=${bb.min.y.toFixed(4)} ${found.join(" ")} hairV0worldY=${hairY}`;
-        }
-        if (parts.length) console.log(`[STATE] suspend=${suspendMixerRef.current} ${headQ}`);
-      } catch { /* instrument must never break the app */ }
-    }, 4000);
-    return () => clearInterval(t);
-  }, []);
   // Real feature (Session 101+) — tracks which region the camera is
   // currently transitioning TOWARD, separate from focusRegionRef
   // (which just holds the latest prop value). Comparing the two lets
@@ -2806,14 +2747,6 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
           animationsRef.current = byName;
           console.log(`[MiniGlbViewer] ${gltf.animations.length} animation(s) found: ${gltf.animations.map(c => c.name).join(", ")}`);
           if (onAnimationsLoaded) onAnimationsLoaded(Object.keys(byName));
-          // Session 148 — SHARED INSTANCE (ruled by Magnus: "Inspect is
-          // the master"). The parent may adopt this live root directly
-          // into another scene (Explore) instead of round-tripping a
-          // copy through glTF — the round trip was producing a subtly
-          // different character (hair 7.9cm low, shorter neck, both
-          // measured live). Hand out the REAL object and the REAL clips;
-          // there is nothing to diverge.
-          if (onCharacterReady) onCharacterReady({ root: loadedRoot, animations: gltf.animations });
 
           const initialClip = byName[activeAnimation] || gltf.animations[0];
           if (initialClip) {
@@ -2831,7 +2764,6 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
         } else {
           console.log("[MiniGlbViewer] no animations in this GLB");
           if (onAnimationsLoaded) onAnimationsLoaded([]);
-          if (onCharacterReady) onCharacterReady({ root: loadedRoot, animations: [] });
         }
 
         // Loading-complete signal deliberately NOT fired here anymore —
@@ -2960,7 +2892,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
       // freeze investigation (mixer state confirmed correct throughout),
       // but the safeguard itself is real and worth keeping regardless.
       try {
-        if (mixerRef.current && clockRef.current && !suspendMixerRef.current) {
+        if (mixerRef.current && clockRef.current) {
           clockRef.current.update();
           mixerRef.current.update(clockRef.current.getDelta());
         }
