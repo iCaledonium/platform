@@ -18,14 +18,13 @@ const MODULES_DEF = [
 
 // ── WorldCard ─────────────────────────────────────────────────────────────────
 function WorldCard({ world, onConfigure, onDeleted }) {
-  const navigate = useNavigate();
   const isRunning = world.status === "running";
 
   return (
     <div style={{background:"rgba(255,255,255,0.7)",borderRadius:20,overflow:"hidden",
       border:"1px solid rgba(0,0,0,0.07)",boxShadow:"0 2px 12px rgba(0,0,0,0.06)",
       display:"flex",flexDirection:"column",cursor:"pointer",transition:"box-shadow .15s"}}
-      onClick={() => navigate(`/worlds/${world.id}`)}
+      onClick={() => onConfigure(world)}
       onMouseEnter={e=>e.currentTarget.style.boxShadow="0 4px 24px rgba(0,0,0,.1)"}
       onMouseLeave={e=>e.currentTarget.style.boxShadow="0 2px 12px rgba(0,0,0,.06)"}>
       <div style={{padding:"20px 20px 14px"}}>

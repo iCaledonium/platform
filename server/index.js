@@ -459,11 +459,31 @@ app.delete("/api/worlds/:id", async (req, res) => {
       signal: AbortSignal.timeout(10000)
     });
   } catch {}
+  // Session 149 — capture who was actively deployed here BEFORE the hard
+  // delete below removes the only record of it. Same status-recalc rule
+  // as single-actor undeploy: drop to 'ready_to_deploy' only if this was
+  // their last active deployment anywhere, not just in this world.
+  const affectedActorIds = db.prepare(`SELECT DISTINCT platform_actor_id FROM actor_deployments WHERE world_id = ? AND undeployed_at IS NULL`).all(id).map(r => r.platform_actor_id);
   db.prepare(`DELETE FROM world_memberships WHERE world_id = ?`).run(id);
   db.prepare(`DELETE FROM actor_deployments WHERE world_id = ?`).run(id);
+  const nowStatus = new Date().toISOString();
+  for (const actorId of affectedActorIds) {
+    const stillDeployed = db.prepare(`SELECT 1 FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL LIMIT 1`).get(actorId);
+    if (!stillDeployed) {
+      db.prepare(`UPDATE actors SET status = 'ready_to_deploy', updated_at = ? WHERE id = ?`).run(nowStatus, actorId);
+    }
+  }
   // Clean up world media on platform disk
+  // Session 149 — this crashed every world delete: fs here is the plain
+  // callback-style node:fs (see `const fs = _require("fs")` above), whose
+  // .rm() doesn't return a Promise when called without a callback — it
+  // returns undefined, and .catch() on undefined throws synchronously,
+  // which Express never catches for an unwrapped async handler. res.json
+  // below never sent; client saw a 504, not the real failure. DB-side
+  // cleanup above this line is unaffected and already completed by the
+  // time this throws. fs.promises.rm is the actual Promise-returning API.
   const worldMediaDir = path.join(__dirname, "../public/media/worlds", id);
-  fs.rm(worldMediaDir, { recursive: true, force: true }).catch(() => {});
+  fs.promises.rm(worldMediaDir, { recursive: true, force: true }).catch(() => {});
   res.json({ ok: true });
 });
 
@@ -1463,6 +1483,15 @@ app.post("/api/actors/:id/undeploy", async (req, res) => {
   const now = new Date().toISOString();
   db.prepare(`UPDATE actor_deployments SET undeployed_at = ? WHERE id = ?`).run(now, deployment.id);
 
+  // Session 149 — actors.status was left at 'active' forever after
+  // undeploy; nothing ever moved it back. An actor still deployed
+  // elsewhere stays 'active' — only drop to 'ready_to_deploy' once no
+  // active deployment remains anywhere.
+  const stillDeployed = db.prepare(`SELECT 1 FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL LIMIT 1`).get(req.params.id);
+  if (!stillDeployed) {
+    db.prepare(`UPDATE actors SET status = 'ready_to_deploy', updated_at = ? WHERE id = ?`).run(now, req.params.id);
+  }
+
   res.json({ ok: true });
 });
 
@@ -1551,20 +1580,67 @@ app.post("/api/actors/:id/deploy", async (req, res) => {
     return { media_type: m.media_type, filename: m.filename, state_slug: m.state_slug, mime, url };
   });
 
+  // Session 149 — the actor's body GLB never reached the simulator at all.
+  // First pass sent it as a bare actor.glb_url passthrough string; on
+  // review that's inconsistent with how every other piece of media
+  // (photos, voice) actually gets to the simulator — downloaded to local
+  // disk and given a real actor_media row, not just referenced. Folding
+  // it into the same media array instead, media_type "model", so it goes
+  // through the identical transfer mechanism as everything else rather
+  // than being a special case.
+  if (actor.glb_url) {
+    const glbAbsUrl = actor.glb_url.startsWith("http") ? actor.glb_url : `${platformBase}${actor.glb_url}`;
+    mediaWithData.push({
+      media_type: "model",
+      filename: path.basename(actor.glb_url),
+      state_slug: "body",
+      mime: "model/gltf-binary",
+      url: glbAbsUrl,
+    });
+  }
+
+  // Session 149 — Plan A (Sessions 146-147) ruled draft_state's accessory
+  // fields ARE the canonical dressed state, but deploy never read
+  // draft_state at all. A null/absent draft_state is a normal, common
+  // state (actor never opened the wardrobe editor) and deploys with an
+  // empty wardrobe. Malformed JSON in an existing draft_state is a real
+  // data problem, not a normal state — crash loudly instead of silently
+  // deploying an actor whose wardrobe we failed to read.
+  let wardrobeConfig = null;
+  if (actor.draft_state) {
+    let parsedDraft;
+    try {
+      parsedDraft = JSON.parse(actor.draft_state);
+    } catch (e) {
+      return res.status(500).json({ error: `actor.draft_state is not valid JSON — refusing to deploy without wardrobe data: ${e.message}` });
+    }
+    wardrobeConfig = {
+      accessories:            parsedDraft.accessories || {},
+      selectedAccessoryGlbUrls: parsedDraft.selectedAccessoryGlbUrls || {},
+      accessoryScales:        parsedDraft.accessoryScales || {},
+      accessoryOffsets:       parsedDraft.accessoryOffsets || {},
+      accessoryRotations:     parsedDraft.accessoryRotations || {},
+      accessoryParts:         parsedDraft.accessoryParts || {},
+      accessoryTints:         parsedDraft.accessoryTints || {},
+    };
+  }
+
   const payload = {
     platform_actor_id: actorId,
     world_id:   world.id,
     actor: {
       first_name: actor.first_name, last_name: actor.last_name,
       name: actor.name, age: actor.age, gender: actor.gender,
+      nationality: actor.nationality || null,
       occupation: actor.occupation, appearance: actor.appearance,
-      media_folder: actor.media_folder
+      media_folder: actor.media_folder,
     },
     home, workplace: workplace || null, career: career || null,
     psychology: psych,
     relationships: resolvedRelationships,
     schedule, from_week: fromWeek || 1,
     media: mediaWithData,
+    wardrobe_config: wardrobeConfig,
   };
 
   // Save payload to disk for debugging

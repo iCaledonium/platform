@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import DeployWizardModal from "./DeployWizardModal.jsx";
 import ActorModelPanel from "./ActorModelPanel.jsx";
+import { NATIONALITIES, flagEmoji } from "./nationalities.js";
 
 const STYLE_COLOR = {
   fearful_avoidant:  { bg: "rgba(55,138,221,.10)",  border: "rgba(55,138,221,.2)",  text: "#185fa5", init: "rgba(55,138,221,.15)" },
@@ -153,6 +154,7 @@ function IdentityPanel({ d, editing, setEditData }) {
       <Field label="Last name"         value={a?.last_name} />
       <Field label="Age"               value={a?.age} />
       <Field label="Gender"            value={a?.gender} />
+      <Field label="Nationality"       value={a?.nationality ? `${flagEmoji(a.nationality)} ${(NATIONALITIES.find(n=>n[0]===a.nationality)||[,a.nationality])[1]}` : ""} />
       <Field label="Occupation"        value={a?.occupation} />
       <Field label="Orientation"       value={p?.orientation} />
       <Field label="Marital status"    value={p?.marital_status} />
@@ -166,6 +168,8 @@ function IdentityPanel({ d, editing, setEditData }) {
         <EField label="Last name"   value={a?.last_name}  onChange={v=>{upd("actor.last_name",v); upd("actor.name",((a?.first_name||"")+" "+v).trim());}} />
         <EField label="Age"         value={a?.age}        onChange={v=>upd("actor.age",v)} type="number" />
         <ESelect label="Gender" value={a?.gender} onChange={v=>upd("actor.gender",v)} options={["female","male","neutral"]} />
+        <ESelect label="Nationality" value={a?.nationality} onChange={v=>upd("actor.nationality",v)}
+          options={[{value:"",label:"— Optional —"}, ...NATIONALITIES.map(([code,label])=>({value:code, label:`${flagEmoji(code)} ${label}`}))]} />
         <EField label="Occupation" value={a?.occupation} onChange={v=>upd("actor.occupation",v)} />
         <ESelect label="Orientation" value={p?.orientation} onChange={v=>upd("psychology.orientation",v)}
           options={["straight","bisexual","gay","pansexual","asexual"]} />
