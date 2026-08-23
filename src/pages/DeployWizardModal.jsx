@@ -9,7 +9,7 @@ const S = {
   label:   { fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".16em", textTransform:"uppercase", color:"#a8a5a0" },
 };
 
-const STEPS = ["World", "Relationships", "Schedule", "Media", "Deploy"];
+const STEPS = ["World", "Relationships", "CV & Employment", "Schedule", "Media", "Deploy"];
 
 // ── Step bar ──────────────────────────────────────────────────────────────────
 function StepBar({ current }) {
@@ -41,13 +41,6 @@ const MAPS_KEY = "AIzaSyDy45Dov_WkN9FcxdVNYQEx23PjexI-Fxc";
 function StepWorld({ actor, state, setState }) {
   const [worlds,        setWorlds]        = useState([]);
   const [suggestions,   setSuggestions]   = useState([]);
-  const [workSuggestions, setWorkSuggestions] = useState([]);
-  const [careerSuggesting, setCareerSuggesting] = useState(false);
-  const [workSuggesting,  setWorkSuggesting]  = useState(false);
-  const [workQuery,       setWorkQuery]       = useState("");
-  const [workResults,     setWorkResults]     = useState([]);
-  const [workSearching,   setWorkSearching]   = useState(false);
-  const workTimer = useRef(null);
   const [suggesting,    setSuggesting]    = useState(false);
   const [searchQuery,   setSearchQuery]   = useState("");
   const [searchResults, setSearchResults] = useState([]);
@@ -56,9 +49,6 @@ function StepWorld({ actor, state, setState }) {
   const mapRef      = useRef(null);
   const mapInst     = useRef(null);
   const markerRef   = useRef(null);
-  const workMapRef  = useRef(null);
-  const workMapInst = useRef(null);
-  const workMarker  = useRef(null);
   const [mapReady,  setMapReady]  = useState(false);
 
   useEffect(() => {
@@ -69,7 +59,7 @@ function StepWorld({ actor, state, setState }) {
   useEffect(() => {
     if (window.google?.maps) { setMapReady(true); return; }
     if (document.getElementById("gmaps-script")) {
-      const timer = setInterval(() => { if (window.google?.maps) { setMapReady(true); clearInterval(t); } }, 200);
+      const timer = setInterval(() => { if (window.google?.maps) { setMapReady(true); clearInterval(timer); } }, 200);
       return;
     }
     const script = document.createElement("script");
@@ -109,11 +99,10 @@ function StepWorld({ actor, state, setState }) {
     return () => clearTimeout(timer);
   }, [mapReady, state.world]);
 
-  // Reset maps when world changes so they reinitialize centered on new city
+  // Reset map when world changes so it reinitializes centered on new city
   useEffect(() => {
     if (!state.world?.id) return;
     if (mapInst.current) { mapInst.current = null; }
-    if (workMapInst.current) { workMapInst.current = null; }
   }, [state.world?.id]);
 
   // Update marker when home changes
@@ -136,105 +125,21 @@ function StepWorld({ actor, state, setState }) {
   async function suggestNeighbourhood() {
     setSuggesting(true); setSuggestions([]);
     try {
-      const r = await fetch(`/api/actors/${actor.id}/suggest-home`, { method:"POST", headers:{"Content-Type":"application/json"} });
+      // Session 150 — this posted no body at all, so the handler's
+      // `const { world_id } = req.body || {}` always resolved undefined
+      // and fell straight through to its `city = "Stockholm"` default.
+      // Every neighbourhood suggestion was a Stockholm one regardless of
+      // which world was selected — confirmed by reading the handler in
+      // server/index.js, not inferred from the output.
+      const r = await fetch(`/api/actors/${actor.id}/suggest-home`, {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ world_id: state.world?.id }),
+      });
       if (r.ok) setSuggestions(await r.json());
     } catch {}
     setSuggesting(false);
   }
-
-  async function suggestCareer() {
-    setCareerSuggesting(true);
-    try {
-      const r = await fetch(`/api/actors/${actor.id}/suggest-career`, { method:"POST", headers:{"Content-Type":"application/json"} });
-      if (r.ok) {
-        const data = await r.json();
-        setState(prev => ({...prev, career: { career_level: data.career_level, career_ladder: data.career_ladder, employment_type: data.employment_type, reputation_score: data.reputation_score ?? 0.5 }}));
-      }
-    } catch {}
-    setCareerSuggesting(false);
-  }
-
-  async function suggestWorkplace() {
-    setWorkSuggesting(true); setWorkSuggestions([]);
-    try {
-      const r = await fetch(`/api/actors/${actor.id}/suggest-workplace`, { method:"POST", headers:{"Content-Type":"application/json"} });
-      if (r.ok) setWorkSuggestions(await r.json());
-    } catch {}
-    setWorkSuggesting(false);
-  }
-
-  function searchWork(q) {
-    setWorkQuery(q);
-    if (!q || q.length < 3) { setWorkResults([]); return; }
-    if (workTimer.current) clearTimeout(workTimer.current);
-    workTimer.current = setTimeout(async () => {
-      setWorkSearching(true);
-      try {
-        const country = state.world?.country || '';
-        const r = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(q)}${country ? '&country='+country : ''}`, { credentials: 'include' });
-        if (r.ok) { const data = await r.json(); setWorkResults(Array.isArray(data) ? data : []); }
-      } catch {}
-      setWorkSearching(false);
-    }, 400);
-  }
-
-  async function pickWorkPlace(p) {
-    setWorkResults([]);
-    setWorkQuery(p.description);
-    setState(prev => ({...prev, workplace: { place_id: p.place_id, address: p.description, name: p.description }}));
-    try {
-      const controller = new AbortController();
-      setTimeout(() => controller.abort(), 5000);
-      const r = await fetch(`/api/places/details?place_id=${p.place_id}`, { signal: controller.signal });
-      if (r.ok) {
-        const data = await r.json();
-        setState(prev => ({...prev, workplace: { ...prev.workplace, ...data }}));
-        setWorkQuery(data.name + " — " + data.address);
-      }
-    } catch {}
-  }
-
-  // Init work map
-  useEffect(() => {
-    if (!mapReady || !state.world) return;
-    const timer = setTimeout(() => {
-      if (!workMapRef.current || workMapInst.current) return;
-      workMapInst.current = new window.google.maps.Map(workMapRef.current, {
-        center: { lat: state.world?.lat || 59.3293, lng: state.world?.lng || 18.0686 },
-        zoom: 12,
-        disableDefaultUI: true,
-        zoomControl: true,
-        styles: [{ featureType:"poi", stylers:[{ visibility:"off" }] }],
-      });
-      setTimeout(() => window.google.maps.event.trigger(workMapInst.current, "resize"), 100);
-      workMapInst.current.addListener("click", async (e) => {
-        const lat = e.latLng.lat();
-        const lng = e.latLng.lng();
-        try {
-          const r = await fetch(`/api/places/reverse?lat=${lat}&lng=${lng}`);
-          if (r.ok) {
-            const data = await r.json();
-            setState(prev => ({...prev, workplace: { ...data }}));
-            setWorkQuery(data.address);
-          }
-        } catch {}
-      });
-    }, 150);
-    return () => clearTimeout(timer);
-  }, [mapReady, state.world]);
-
-  // Update work marker
-  useEffect(() => {
-    if (!workMapInst.current || !state.workplace?.lat || !state.workplace?.lng) return;
-    if (workMarker.current) workMarker.current.setMap(null);
-    workMarker.current = new window.google.maps.Marker({
-      position: { lat: state.workplace.lat, lng: state.workplace.lng },
-      map: workMapInst.current,
-      icon: { path: window.google.maps.SymbolPath.CIRCLE, scale: 10, fillColor:"#1a1814", fillOpacity:1, strokeColor:"#fff", strokeWeight:2 },
-    });
-    workMapInst.current.panTo({ lat: state.workplace.lat, lng: state.workplace.lng });
-    workMapInst.current.setZoom(15);
-  }, [state.workplace?.lat, state.workplace?.lng]);
 
   function searchPlaces(q) {
     setSearchQuery(q);
@@ -245,10 +150,8 @@ function StepWorld({ actor, state, setState }) {
       try {
         const country = state.world?.country || '';
         const url = `/api/places/autocomplete?q=${encodeURIComponent(q)}${country ? '&country='+country : ''}`;
-        console.log('[searchPlaces] fetching', url);
         const r = await fetch(url, { credentials: 'include' });
-        console.log('[searchPlaces] status', r.status);
-        if (r.ok) { const data = await r.json(); console.log('[searchPlaces] results', data.length); setSearchResults(Array.isArray(data) ? data : []); }
+        if (r.ok) { const data = await r.json(); setSearchResults(Array.isArray(data) ? data : []); }
       } catch(e) { console.error('[searchPlaces] error', e); }
       setSearching(false);
     }, 400);
@@ -366,114 +269,640 @@ function StepWorld({ actor, state, setState }) {
 
           </div>
         </div>
+        </>
+      )}
+    </div>
+  );
+}
 
-        {/* Career section */}
-        <div style={{ marginTop:20 }}>
-          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
-            <div style={{ ...S.label }}>Career</div>
-            <button onClick={suggestCareer} disabled={careerSuggesting} style={{ ...S.sans, fontSize:11, padding:"3px 10px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"none", color:"#6b6760", cursor:careerSuggesting?"default":"pointer", opacity:careerSuggesting?0.5:1 }}>
-              {careerSuggesting ? "Thinking…" : "✨ Suggest"}
+// ── Step: Employment ─────────────────────────────────────────────────────────
+// Session 150 — the fallback shape for a source with no hours configured.
+// Matches what the old global Work Hours block defaulted to, and what
+// generate-schedule still falls back to server-side, so a source left
+// untouched behaves exactly as it did before hours moved per-source.
+const DEFAULT_BLOCK = { start:"08:00", end:"17:00" };
+
+// Session 150 — which days a source is worked. Lowercase names match the
+// day_of_week vocabulary schedule slots already use, and the Mon-Fri default is
+// exactly what generate-schedule assumed for everyone before days existed — so
+// a source left untouched behaves as it always did.
+const WEEK = [
+  { key:"monday",    short:"M" }, { key:"tuesday",   short:"T" },
+  { key:"wednesday", short:"W" }, { key:"thursday",  short:"T" },
+  { key:"friday",    short:"F" }, { key:"saturday",  short:"S" },
+  { key:"sunday",    short:"S" },
+];
+const DEFAULT_WORK_DAYS = ["monday","tuesday","wednesday","thursday","friday"];
+// Session 150 — paid leave ENTITLEMENT, not booked dates. How much a job grants
+// is a term of employment; whether it gets taken is the world's decision.
+// 25 is the Swedish statutory minimum and is shown as an editable starting
+// value, never applied silently — jurisdictions differ sharply and the US has
+// no federal minimum at all. Contract and independent work grant none by
+// default: there is nobody to ask.
+function leaveDaysOf(src) {
+  if (src.leave_days_per_year !== undefined && src.leave_days_per_year !== null) return src.leave_days_per_year;
+  return src.source_type === "employment" ? 25 : 0;
+}
+// Same fallback StepEmployment renders from, hoisted so the deploy payload can
+// resolve it too rather than sending whatever happens to be stored.
+function blocksOfSource(src) {
+  const b = src.work_blocks;
+  return Array.isArray(b) && b.length > 0 ? b : [{...DEFAULT_BLOCK}];
+}
+function daysOf(src) {
+  // An explicit empty array means "never worked" and is NOT the same as unset.
+  // Collapsing the two would make the UI lie: deselecting every day warns the
+  // source will never be worked, while the schedule quietly ran it Mon-Fri.
+  return Array.isArray(src.work_days) ? src.work_days : DEFAULT_WORK_DAYS;
+}
+
+// Loose name comparison, shared by the CV-employer staleness check and the
+// workplace auto-pick. The CV writes an employer as bare prose while Google
+// Places returns a fuller description of the same business.
+const normName = s => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+// Session 150 — career level and reputation moved onto each revenue source
+// too. They aren't properties of a person: someone can be senior in the
+// field one source belongs to and junior in another's, and the simulator's
+// own reputation model is career reputation (it drives work-offer fee bands
+// and international eligibility), which is inherently field-specific rather
+// than general social regard.
+//
+// The two can't be split from each other — the simulator promotes career
+// level when reputation crosses a threshold band, so a reputation per source
+// implies a level per source by construction. Both move together or neither.
+//
+// Ordered low → high. Must stay in sync with WorkOfferGenerator's
+// @standard_levels on the simulator, which indexes this exact list to pick
+// fee bands (junior 5–20k, established 15–50k, senior 40–100k,
+// independent 80–250k SEK).
+// Session 150 — how each source type pays. The three types exist precisely
+// because they pay differently: employment pays for your TIME (same figure
+// monthly), contract pays for a JOB (one sum, once, on completion), and
+// independent is the MARKET paying for OUTPUT (monthly, moving with demand).
+// Mirrors default_basis/1 in ScheduledPaymentProcess on the simulator.
+function srcBasis(src) {
+  if (src.amount_basis) return src.amount_basis;
+  if (src.source_type === "contract")    return "per_contract";
+  if (src.source_type === "independent") return "variable";
+  return "monthly";
+}
+function incomeLabel(src) {
+  const b = srcBasis(src);
+  return b === "per_contract" ? "Contract fee" : b === "variable" ? "Expected income" : "Salary";
+}
+
+const CAREER_LEVELS = ["junior","established","senior","independent"];
+
+// Session 150 — career level is DERIVED from reputation, never set by hand.
+// ReputationEngine already owns this relationship: it promotes and demotes as
+// reputation crosses a band, so anything the operator typed here would be
+// overruled the first time reputation moved. One input, one derived output.
+//
+// Bands collapse the engine's five ladder thresholds onto the four-tier
+// standard scale WorkOfferGenerator actually indexes. If the simulator's
+// bands are retuned, retune these to match — a starting level that disagrees
+// with what the engine computes would show up as an immediate,
+// unexplained promotion or demotion on the actor's first reputation change.
+const LEVEL_BANDS = [
+  { min: 0.82, level: "independent" },
+  { min: 0.60, level: "senior"      },
+  { min: 0.35, level: "established" },
+  { min: 0.00, level: "junior"      },
+];
+function levelFromReputation(score) {
+  // null and undefined both mean "not set" and must land on the same 0.5 the
+  // slider displays for them. Number(null) is 0, not NaN — left to coerce, a
+  // null would show as 50% in the UI and deploy as junior.
+  const n = (score === null || score === undefined) ? NaN : Number(score);
+  const s = Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 0.5;
+  return (LEVEL_BANDS.find(b => s >= b.min) || LEVEL_BANDS[LEVEL_BANDS.length - 1]).level;
+}
+
+// The simulator's actors table still carries one career_level and one
+// reputation_score, read by ReputationEngine, WorkOfferGenerator and the
+// LiveView career tab. Roll the per-source values up to a single figure for
+// those: MAX, not mean. Being well-regarded in one field makes a person
+// well-regarded; a modest side hustle shouldn't drag that down.
+function rollupCareerLevel(sources) {
+  // Derived from the rolled-up reputation, so the actor row's level and score
+  // can never disagree with each other or with the engine's own bands.
+  if (!sources || sources.length === 0) return null;
+  return levelFromReputation(rollupReputation(sources));
+}
+function rollupReputation(sources) {
+  const scores = (sources || [])
+    .map(s => Number(s.reputation_score))
+    .filter(n => Number.isFinite(n));
+  return scores.length > 0 ? Math.max(...scores) : 0.5;
+}
+
+function StepEmployment({ actor, state, setState }) {
+  // Session 149 — was a single workQuery/workResults/workplace keyed off
+  // one global workplace. Now keyed by source id, since each revenue
+  // source can have its own optional workplace search. Dropped the
+  // interactive click-to-pin map from this rewrite — genuinely complex
+  // to run N independent map instances well, and the search box was
+  // always the primary way this got used anyway. Flagged clearly, not
+  // silently dropped.
+  const [queries,   setQueries]   = useState({});
+  const [results,   setResults]   = useState({});
+  const [searching, setSearching] = useState({});
+  const timers = useRef({});
+
+  const sources = state.career?.revenue_sources || [];
+  // Currency comes from the world's own city (cities.currency on the simulator,
+  // surfaced through /internal/worlds). Labelling amounts in the world's money
+  // is the point — the SAD's "85,000 SEK incident" was a figure produced with
+  // no currency context at all.
+  const worldCurrency = state.world?.currency || "";
+  // Recurring income only — a one-off contract fee is not monthly runway.
+  const monthlyTotal = sources
+    .filter(x => srcBasis(x) !== "per_contract")
+    .reduce((sum, x) => sum + (Number(x.monthly_amount) || 0), 0);
+
+  function addSource() {
+    const id = `rs-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
+    setState(p => ({...p, career: {...(p.career||{}), revenue_sources: [...(p.career?.revenue_sources||[]), { id, source_type:"employment", name:"", reputation_score:0.5, work_blocks:[{...DEFAULT_BLOCK}] }]}}));
+  }
+
+  // Session 150 — work hours are per-source now. A source that predates
+  // this (restored draft, or the CV auto-create below) may have none, so
+  // reads go through blocksOf rather than touching src.work_blocks raw.
+  function blocksOf(src) {
+    const b = src.work_blocks;
+    return Array.isArray(b) && b.length > 0 ? b : [{...DEFAULT_BLOCK}];
+  }
+  function updateBlock(src, i, patch) {
+    const next = blocksOf(src).map((b, idx) => idx === i ? {...b, ...patch} : b);
+    updateSource(src.id, { work_blocks: next });
+  }
+  function addBlock(src) {
+    updateSource(src.id, { work_blocks: [...blocksOf(src), { start:"09:00", end:"12:00" }] });
+  }
+  function toggleDay(src, dayKey) {
+    const cur = daysOf(src);
+    const next = cur.includes(dayKey) ? cur.filter(d => d !== dayKey) : [...cur, dayKey];
+    // Ordered by the week, not by click order, so the stored value reads
+    // sensibly and the schedule generator sees a predictable list.
+    updateSource(src.id, { work_days: WEEK.map(w => w.key).filter(k => next.includes(k)) });
+  }
+
+  function removeBlock(src, i) {
+    const next = blocksOf(src).filter((_, idx) => idx !== i);
+    updateSource(src.id, { work_blocks: next.length > 0 ? next : [{...DEFAULT_BLOCK}] });
+  }
+  function updateSource(id, patch) {
+    setState(p => ({...p, career: {...(p.career||{}), revenue_sources: (p.career?.revenue_sources||[]).map(s => s.id===id ? {...s, ...patch} : s)}}));
+  }
+  function removeSource(id) {
+    setState(p => ({...p, career: {...(p.career||{}), revenue_sources: (p.career?.revenue_sources||[]).filter(s => s.id!==id)}}));
+    setQueries(p => { const n={...p}; delete n[id]; return n; });
+    setResults(p => { const n={...p}; delete n[id]; return n; });
+  }
+
+  // Session 150 — opts.autoPick resolves the top match without waiting for a
+  // click. Typing here is a person browsing, so it stays manual; but when the
+  // employer arrives from the CV the search was only ever kicked off and then
+  // abandoned — nothing selected a result, so work_place_id/work_address were
+  // never set, and the box was showing transient query text that vanished the
+  // moment this step unmounted. The actor then deployed with a named employer
+  // and no actual location.
+  function searchFor(id, q, opts = {}) {
+    setQueries(p => ({...p, [id]: q}));
+    if (!q || q.length < 3) { setResults(p => ({...p, [id]: []})); return; }
+    if (timers.current[id]) clearTimeout(timers.current[id]);
+    timers.current[id] = setTimeout(async () => {
+      setSearching(p => ({...p, [id]: true}));
+      try {
+        const country = state.world?.country || '';
+        // Session 150 — types=establishment. The endpoint defaults to "address",
+        // which cannot match a company name at all: "Mannheimer Swartling" came
+        // back ZERO_RESULTS and the picker settled for the nearest street.
+        // A workplace is a business, so ask for businesses.
+        const r = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(q)}&types=establishment${country ? '&country='+country : ''}`, { credentials:'include' });
+        if (r.ok) {
+          const data = await r.json();
+          const list = Array.isArray(data) ? data : [];
+          setResults(p => ({...p, [id]: list}));
+          if (opts.autoPick && list.length > 0) {
+            // Prefer a result that actually carries the employer's name over
+            // whatever Places ranked first — a bare top result can be a
+            // street or district that merely sits near the query.
+            // Among results that actually carry the employer's name, prefer the
+            // SHORTEST description. Google returns "Mannheimer Swartling New
+            // York AdvokatAB, Kaptensgatan…" above "Mannheimer Swartling AB,
+            // Norrlandsgatan…", and taking its first match would seat her at
+            // the New York desk. Extra qualifiers mean a satellite; the plain
+            // name is the main office.
+            // Narrow in order: results carrying the employer's name, then those
+            // in the world's own city, then the shortest of what remains.
+            // City has to come before length — Google returns "Mannheimer
+            // Swartling AB, Gothenburg" (shorter) alongside "…AB,
+            // Norrlandsgatan, Stockholm", so shortest-wins alone seats a
+            // Stockholm lawyer in the Gothenburg office. Among offices in the
+            // right city, extra qualifiers still mean a satellite: the plain
+            // name is the main one, so shortest breaks that tie correctly.
+            const want = normName(q);
+            const city = normName(state.world?.city);
+            const shortest = xs => xs.reduce((a, b) => (b.description.length < a.description.length ? b : a));
+
+            const named   = list.filter(x => { const d = normName(x.description); return d && want && d.includes(want); });
+            const inCity  = city ? named.filter(x => normName(x.description).includes(city)) : [];
+            const best    = inCity.length ? shortest(inCity)
+                          : named.length  ? shortest(named)
+                          : list[0];
+            await pickPlace(id, best);
+          }
+        }
+      } catch {}
+      setSearching(p => ({...p, [id]: false}));
+    }, 400);
+  }
+
+  async function pickPlace(id, p) {
+    setResults(prev => ({...prev, [id]: []}));
+    setQueries(prev => ({...prev, [id]: p.description}));
+    updateSource(id, { work_place_id: p.place_id, work_address: p.description });
+    try {
+      const controller = new AbortController();
+      setTimeout(()=>controller.abort(), 5000);
+      const r = await fetch(`/api/places/details?place_id=${p.place_id}`, { signal: controller.signal });
+      if (r.ok) {
+        const data = await r.json();
+        updateSource(id, { work_place_id: p.place_id, work_address: data.address, work_lat: data.lat, work_lng: data.lng });
+        setQueries(prev => ({...prev, [id]: data.name + " — " + data.address}));
+      }
+    } catch {}
+  }
+
+  // Session 149 — CV comes before Employment in the wizard order and
+  // already names a specific current employer. If no revenue source
+  // exists yet, auto-create one (employment type) from the CV's own
+  // structured format (COMPANY – Title, followed by a "...Present"
+  // line) and kick off its search — still requires picking the real
+  // Google Places match. Only fires once, never overrides anything
+  // already there.
+  // Session 150 — the parse is shared now: the auto-create below uses it, and
+  // so does the staleness check further down.
+  const cvEmployer = (() => {
+    if (!state.cv?.notes) return null;
+    const lines = state.cv.notes.split("\n").map(l => l.trim());
+    for (let i = 0; i < lines.length - 1; i++) {
+      if (/ – | - /.test(lines[i]) && lines[i].length < 90 && /present/i.test(lines[i+1] || "")) {
+        return lines[i].split(/ – | - /)[0].trim();
+      }
+    }
+    return null;
+  })();
+
+  useEffect(() => {
+    if (!cvEmployer || sources.length > 0) return;
+    const id = `rs-${Date.now()}-cv`;
+    setState(p => ({...p, career: {...(p.career||{}), revenue_sources: [{ id, source_type:"employment", name: cvEmployer, reputation_score:0.5, work_blocks:[{...DEFAULT_BLOCK}] }]}}));
+    setQueries(p => ({...p, [id]: cvEmployer}));
+    searchFor(id, cvEmployer, { autoPick: true });
+  }, [cvEmployer]);
+
+  // Session 150 — the auto-create above fires only while no source exists, so
+  // once one did, the CV could be regenerated or re-uploaded freely and this
+  // step quietly stopped tracking it. A source created from an early draft
+  // stayed pinned to that draft's employer while the CV moved on — and the
+  // stale name is what got deployed and searched against Google Places, so an
+  // actor could end up employed by a company that appears nowhere in their own
+  // CV. Still never overwritten silently (the name may have been edited by
+  // hand on purpose); the mismatch is surfaced for a one-click apply instead.
+  // Compared loosely: the CV writes the employer as prose, while the field may
+  // hold a fuller Google Places description of the same company.
+  const cvEmployerMatched = !cvEmployer || sources.some(s => {
+    const a = normName(s.name), b = normName(cvEmployer);
+    return a && b && (a.includes(b) || b.includes(a));
+  });
+
+  function applyCvEmployer() {
+    if (!cvEmployer) return;
+    const target = sources.find(s => s.source_type === "employment") || sources[0];
+    if (!target) return;
+    // Drop the resolved workplace along with the name — it belongs to the
+    // company being replaced, and a work_place_id pointing at the wrong
+    // business is worse than none at all.
+    updateSource(target.id, { name: cvEmployer, work_place_id: null, work_address: null, work_lat: null, work_lng: null });
+    setQueries(p => ({...p, [target.id]: cvEmployer}));
+    searchFor(target.id, cvEmployer, { autoPick: true });
+  }
+
+  return (
+    <div>
+
+      {/* Revenue sources — one or more, each its own type/name/workplace/hours */}
+      <div style={{ marginTop:20 }}>
+        <div style={{ ...S.label, marginBottom:6 }}>Revenue sources</div>
+        {/* Session 150 — work hours moved here from a single global block
+            under Career. They were never a property of the person: a day
+            job runs 09:00–17:00 at an office while a freelance source runs
+            two evening sessions from home, and one shared list couldn't
+            express that. generate-schedule said as much in its own comment
+            — it couldn't vary location per block "the way it ideally would
+            for someone like Frida" precisely because hours weren't tied to
+            a source. Now they are, and each block inherits its own
+            source's location. */}
+        <p style={{ ...S.sans, fontSize:11, color:"#a8a5a0", marginBottom:10 }}>
+          Each source carries its own hours — one block for regular work (e.g. 08:00–17:00), or several for session-based work spread across the day.
+        </p>
+
+        {/* CV names an employer no source matches — offer it rather than
+            overwrite, since the field may have been edited deliberately. */}
+        {cvEmployer && !cvEmployerMatched && sources.length > 0 && (
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:12, marginBottom:10, padding:"8px 11px", borderRadius:9, background:"rgba(176,92,8,.06)", border:"1px solid rgba(176,92,8,.25)" }}>
+            <span style={{ ...S.sans, fontSize:11.5, color:"#b05c08", lineHeight:1.5 }}>
+              The CV gives the current employer as <strong>{cvEmployer}</strong>, which no revenue source below matches.
+            </span>
+            <button onClick={applyCvEmployer} style={{ ...S.sans, fontSize:11, padding:"4px 10px", borderRadius:7, border:"1px solid rgba(176,92,8,.35)", background:"none", color:"#b05c08", cursor:"pointer", flexShrink:0, whiteSpace:"nowrap" }}>
+              Use it
             </button>
           </div>
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-            {[["career_level","Career level",["junior","established","senior","independent"]],
-              ["employment_type","Employment",["employed","freelance"]]].map(([key,label,opts]) => (
-              <div key={key}>
-                <div style={{ ...S.label, marginBottom:4 }}>{label}</div>
+        )}
+        {sources.length === 0 && (
+          <p style={{ ...S.sans, fontSize:12, color:"#a8a5a0", marginBottom:10 }}>No revenue sources yet — add at least one.</p>
+        )}
+        {/* Session 150 — this step is now gated, so say why Next is
+            disabled rather than leaving a dead button. The name is
+            written straight into actor_revenue_sources.name on the
+            simulator; a blank one is useless once it's over there. */}
+        {sources.length > 0 && sources.some(s => !(s.name || "").trim()) && (
+          <p style={{ ...S.sans, fontSize:12, color:"#b05c08", marginBottom:10 }}>
+            Every revenue source needs a name before you can continue.
+          </p>
+        )}
+        <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+          {sources.map(src => (
+            <div key={src.id} style={{ padding:"12px 14px", borderRadius:12, border:"1px solid rgba(0,0,0,.08)", background:"rgba(255,255,255,.5)" }}>
+              <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", marginBottom:8 }}>
                 <div style={{ display:"flex", gap:5, flexWrap:"wrap" }}>
-                  {opts.map(o => (
-                    <span key={o} onClick={() => setState(p => ({...p, career:{...(p.career||{}), [key]:o}}))}
-                      style={{ padding:"4px 10px", borderRadius:20, fontSize:12, cursor:"pointer", border:`1px solid ${state.career?.[key]===o?"#1a1814":"rgba(0,0,0,.1)"}`, background:state.career?.[key]===o?"#1a1814":"rgba(255,255,255,.5)", color:state.career?.[key]===o?"#faf8f4":"#6b6760" }}>
-                      {o}
+                  {["employment","contract","independent"].map(t => (
+                    <span key={t} onClick={() => updateSource(src.id, { source_type:t })}
+                      style={{ padding:"4px 10px", borderRadius:20, fontSize:12, cursor:"pointer", border:`1px solid ${src.source_type===t?"#1a1814":"rgba(0,0,0,.1)"}`, background:src.source_type===t?"#1a1814":"rgba(255,255,255,.6)", color:src.source_type===t?"#faf8f4":"#6b6760" }}>
+                      {t}
                     </span>
                   ))}
                 </div>
+                <button onClick={()=>removeSource(src.id)} style={{ background:"none", border:"none", cursor:"pointer", color:"#a8a5a0", fontSize:16, padding:"0 4px" }}>×</button>
               </div>
-            ))}
-            <div>
-              <div style={{ ...S.label, marginBottom:4 }}>Career ladder</div>
-              <input value={state.career?.career_ladder||""} onChange={e=>setState(p=>({...p,career:{...(p.career||{}),career_ladder:e.target.value}}))}
-                placeholder="e.g. medical_specialist" style={{ width:"100%", fontSize:12, padding:"6px 8px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", boxSizing:"border-box" }} />
-            </div>
-            <div>
-              <div style={{ display:"flex", justifyContent:"space-between", marginBottom:4 }}>
-                <div style={{ ...S.label }}>Reputation</div>
-                <span style={{ ...S.mono, fontSize:11, color:"#6b6760" }}>{((state.career?.reputation_score||0.5)*100).toFixed(0)}%</span>
-              </div>
-              <input type="range" min={0} max={1} step={0.01} value={state.career?.reputation_score||0.5}
-                onChange={e=>setState(p=>({...p,career:{...(p.career||{}),reputation_score:parseFloat(e.target.value)}}))}
-                style={{ width:"100%", accentColor:"#1a1814" }} />
-            </div>
-          </div>
-        </div>
-
-        {/* Workplace section */}
-        <div style={{ marginTop:20 }}>
-          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
-            <div style={{ display:"flex", alignItems:"center", gap:12 }}>
-              <div style={{ ...S.label }}>Workplace</div>
-              <label style={{ display:"flex", alignItems:"center", gap:5, cursor:"pointer" }}>
-                <input type="checkbox" checked={state.workFromHome||false}
+              <input value={src.name||""} onChange={e=>updateSource(src.id, {name:e.target.value})} placeholder="Name — company, platform, client…"
+                style={{ width:"100%", fontSize:13, padding:"7px 10px", borderRadius:8, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", boxSizing:"border-box", marginBottom:8 }} />
+              <label style={{ display:"flex", alignItems:"center", gap:5, cursor:"pointer", marginBottom:8 }}>
+                <input type="checkbox" checked={src.work_from_home||false}
                   onChange={e => {
                     const wfh = e.target.checked;
-                    setState(p => {
-                      const home = p.home || {};
-                      return { ...p, workFromHome: wfh, workplace: wfh && home.address
-                        ? { place_id: home.place_id, address: home.address, name: home.address, lat: home.lat, lng: home.lng }
-                        : wfh ? {} : p.workplace };
-                    });
+                    const home = state.home || {};
+                    updateSource(src.id, wfh
+                      ? { work_from_home:true, work_place_id: home.place_id, work_address: home.address, work_lat: home.lat, work_lng: home.lng }
+                      : { work_from_home:false });
                   }}
                   style={{ accentColor:"#1a1814" }} />
                 <span style={{ ...S.sans, fontSize:11, color:"#6b6760" }}>Work from home</span>
               </label>
-            </div>
-            <button onClick={suggestWorkplace} disabled={workSuggesting} style={{ ...S.sans, fontSize:11, padding:"3px 10px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"none", color:"#6b6760", cursor:workSuggesting?"default":"pointer", opacity:workSuggesting?0.5:1 }}>
-              {workSuggesting ? "Thinking…" : "✨ Suggest"}
-            </button>
-          </div>
-          <div style={{ display:"flex", gap:16 }}>
-            <div style={{ flex:"0 0 320px", display:"flex", flexDirection:"column", gap:8 }}>
-              {workSuggestions.length > 0 && workSuggestions.map((s,i) => (
-                <div key={i} onClick={() => { setWorkQuery(s.name + " Stockholm"); searchWork(s.name + " Stockholm"); }}
-                  style={{ padding:"8px 10px", borderRadius:9, border:"1px solid rgba(0,0,0,.07)", background:"rgba(255,255,255,.6)", cursor:"pointer" }}
-                  onMouseEnter={e=>e.currentTarget.style.background="#f5f2ef"}
-                  onMouseLeave={e=>e.currentTarget.style.background="rgba(255,255,255,.6)"}>
-                  <div style={{ ...S.sans, fontSize:12, fontWeight:500, color:"#1a1814" }}>{s.name}</div>
-                  <div style={{ ...S.sans, fontSize:11, color:"#a8a5a0", marginTop:2 }}>{s.reason}</div>
+              {!src.work_from_home && (
+                <div style={{ position:"relative" }}>
+                  <input value={queries[src.id] ?? src.work_address ?? ""} onChange={e=>searchFor(src.id, e.target.value)} placeholder="Search workplace address (optional)…"
+                    style={{ width:"100%", fontSize:13, padding:"7px 10px", borderRadius:8, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", boxSizing:"border-box" }} />
+                  {searching[src.id] && <span style={{ ...S.sans, position:"absolute", right:8, top:8, fontSize:11, color:"#a8a5a0" }}>…</span>}
+                  {(results[src.id]||[]).length > 0 && (
+                    <div style={{ position:"absolute", top:"calc(100% + 4px)", left:0, right:0, background:"#fff", border:"1px solid rgba(0,0,0,.1)", borderRadius:9, zIndex:20, overflow:"hidden", boxShadow:"0 4px 20px rgba(0,0,0,.1)" }}>
+                      {results[src.id].map(p => (
+                        <div key={p.place_id} onClick={() => pickPlace(src.id, p)} style={{ padding:"8px 10px", cursor:"pointer", fontSize:12 }}
+                          onMouseEnter={e=>e.currentTarget.style.background="#f5f2ef"}
+                          onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                          <div style={{ ...S.sans, color:"#1a1814" }}>{p.description}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {/* Session 150 — nothing previously distinguished "typed
+                      some text into the search box" from "resolved to a real
+                      place". Only a work_place_id makes this a location the
+                      simulator can actually put someone at; without one the
+                      source deploys with a name and nowhere to be. */}
+                  {src.work_place_id ? (
+                    <div style={{ ...S.sans, fontSize:10.5, color:"#0f6e56", marginTop:4, lineHeight:1.4 }}>
+                      ✓ {src.work_address || "matched"}
+                      {src.work_lat != null && src.work_lng != null && (
+                        <span style={{ ...S.mono, color:"#a8a5a0" }}> · {Number(src.work_lat).toFixed(5)}, {Number(src.work_lng).toFixed(5)}</span>
+                      )}
+                    </div>
+                  ) : (
+                    <div style={{ ...S.sans, fontSize:10.5, color:"#a8a5a0", marginTop:4 }}>
+                      No location matched yet — pick one from the list to place {src.name ? src.name : "this source"} on the map.
+                    </div>
+                  )}
                 </div>
-              ))}
-              <div style={{ position:"relative" }}>
-                <input value={workQuery} onChange={e=>searchWork(e.target.value)} placeholder="Search hospital, clinic, office…"
-                  style={{ width:"100%", fontSize:13, padding:"8px 10px", borderRadius:9, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", boxSizing:"border-box" }} />
-                {workSearching && <span style={{ ...S.sans, position:"absolute", right:8, top:9, fontSize:11, color:"#a8a5a0" }}>…</span>}
-                {workResults.length > 0 && (
-                  <div style={{ position:"absolute", top:"calc(100% + 4px)", left:0, right:0, background:"#fff", border:"1px solid rgba(0,0,0,.1)", borderRadius:9, zIndex:20, overflow:"hidden", boxShadow:"0 4px 20px rgba(0,0,0,.1)" }}>
-                    {workResults.map(p => (
-                      <div key={p.place_id} onClick={() => pickWorkPlace(p)} style={{ padding:"8px 10px", cursor:"pointer", fontSize:12 }}
-                        onMouseEnter={e=>e.currentTarget.style.background="#f5f2ef"}
-                        onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-                        <div style={{ ...S.sans, color:"#1a1814" }}>{p.description}</div>
+              )}
+
+              {/* Standing in THIS source's field.
+                  Session 150 — the career-level pills were removed from here.
+                  Career level was never independent data: ReputationEngine
+                  derives it, promoting and demoting as reputation crosses a
+                  threshold band. Offering both invited a contradiction the
+                  engine would silently overrule — "junior" set by hand
+                  alongside 90% reputation. Reputation is now the single input
+                  and the level is computed from it, by the same bands the
+                  engine uses, so the starting value already agrees with what
+                  the world would work out for itself. */}
+              <div style={{ marginTop:10, paddingTop:10, borderTop:"1px solid rgba(0,0,0,.06)" }}>
+                <div>
+                  <div style={{ display:"flex", justifyContent:"space-between", marginBottom:4 }}>
+                    <div style={{ ...S.label }}>Starting reputation</div>
+                    <span style={{ ...S.mono, fontSize:11, color:"#6b6760" }}>{(((src.reputation_score ?? 0.5))*100).toFixed(0)}%</span>
+                  </div>
+                  <input type="range" min={0} max={1} step={0.01} value={src.reputation_score ?? 0.5}
+                    onChange={e => updateSource(src.id, { reputation_score: parseFloat(e.target.value) })}
+                    style={{ width:"100%", accentColor:"#1a1814" }} />
+                  <div style={{ ...S.sans, fontSize:10, color:"#a8a5a0", marginTop:2 }}>Starting point — the world moves it from here</div>
+                </div>
+              </div>
+
+              {/* Income — shaped by how THIS source actually pays.
+                  Session 150 — feeds the simulator's existing ledger
+                  (bank_accounts + financial_transactions). ScheduledPaymentProcess
+                  reads these terms each tick and credits the actor on the right
+                  day, so a figure entered here becomes money the character can
+                  actually spend, and its absence means the source simply doesn't
+                  pay — not that it pays zero. */}
+              <div style={{ marginTop:10, paddingTop:10, borderTop:"1px solid rgba(0,0,0,.06)" }}>
+                <div style={{ ...S.label, marginBottom:6 }}>{incomeLabel(src)}</div>
+
+                {srcBasis(src) === "per_contract" ? (
+                  /* A contract pays once, when the engagement completes. */
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
+                    <div>
+                      <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                        <input type="number" min={0} step={1000}
+                          value={src.gross_amount ?? ""}
+                          onChange={e => updateSource(src.id, { gross_amount: e.target.value === "" ? null : parseInt(e.target.value, 10) })}
+                          placeholder="Total fee"
+                          style={{ flex:1, minWidth:0, fontSize:13, padding:"7px 10px", borderRadius:8, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", boxSizing:"border-box" }} />
+                        <span style={{ ...S.mono, fontSize:12, color:"#6b6760", flexShrink:0 }}>{worldCurrency}</span>
                       </div>
-                    ))}
+                      <div style={{ ...S.sans, fontSize:10, color:"#a8a5a0", marginTop:2 }}>Paid in full on completion</div>
+                    </div>
+                    <div>
+                      <input type="date"
+                        value={src.ends_on ?? ""}
+                        onChange={e => updateSource(src.id, { ends_on: e.target.value || null })}
+                        style={{ width:"100%", fontSize:13, padding:"6px 10px", borderRadius:8, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", boxSizing:"border-box" }} />
+                      <div style={{ ...S.sans, fontSize:10, color:"#a8a5a0", marginTop:2 }}>Completion date</div>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
+                    <div>
+                      <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                        <input type="number" min={0} step={1000}
+                          value={src.monthly_amount ?? ""}
+                          onChange={e => updateSource(src.id, { monthly_amount: e.target.value === "" ? null : parseInt(e.target.value, 10) })}
+                          placeholder={srcBasis(src) === "variable" ? "Typical month" : "Per month"}
+                          style={{ flex:1, minWidth:0, fontSize:13, padding:"7px 10px", borderRadius:8, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", boxSizing:"border-box" }} />
+                        <span style={{ ...S.mono, fontSize:12, color:"#6b6760", flexShrink:0 }}>{worldCurrency}</span>
+                      </div>
+                      <div style={{ ...S.sans, fontSize:10, color:"#a8a5a0", marginTop:2 }}>
+                        {srcBasis(src) === "variable" ? "What a normal month brings in" : "Same figure every month"}
+                      </div>
+                    </div>
+                    {srcBasis(src) === "variable" ? (
+                      /* Independent income moves with demand — a fixed monthly
+                         figure would make it indistinguishable from a salary. */
+                      <div>
+                        <div style={{ display:"flex", justifyContent:"space-between" }}>
+                          <span style={{ ...S.sans, fontSize:11, color:"#6b6760" }}>Swing</span>
+                          <span style={{ ...S.mono, fontSize:11, color:"#6b6760" }}>±{Math.round((src.variability ?? 0.25)*100)}%</span>
+                        </div>
+                        <input type="range" min={0} max={1} step={0.05}
+                          value={src.variability ?? 0.25}
+                          onChange={e => updateSource(src.id, { variability: parseFloat(e.target.value) })}
+                          style={{ width:"100%", accentColor:"#1a1814" }} />
+                        <div style={{ ...S.sans, fontSize:10, color:"#a8a5a0", marginTop:2 }}>
+                          {src.monthly_amount
+                            ? `Ranges ${Math.round(src.monthly_amount * (1 - (src.variability ?? 0.25)))}–${Math.round(src.monthly_amount * (1 + (src.variability ?? 0.25)))}`
+                            : "How much month to month varies"}
+                        </div>
+                      </div>
+                    ) : (
+                      <div>
+                        <input type="number" min={1} max={28}
+                          value={src.pay_day ?? 25}
+                          onChange={e => updateSource(src.id, { pay_day: Math.max(1, Math.min(28, parseInt(e.target.value, 10) || 25)) })}
+                          style={{ width:"100%", fontSize:13, padding:"7px 10px", borderRadius:8, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", boxSizing:"border-box" }} />
+                        <div style={{ ...S.sans, fontSize:10, color:"#a8a5a0", marginTop:2 }}>Pay day — capped at 28 so it lands every month</div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
-              {state.workplace?.place_id && (
-                <div style={{ padding:"8px 10px", borderRadius:9, border:"1.5px solid #1a1814", background:"rgba(26,24,20,.03)" }}>
-                  <div style={{ ...S.sans, fontSize:12, fontWeight:500, color:"#1a1814" }}>{state.workplace.name}</div>
-                  <div style={{ ...S.sans, fontSize:11, color:"#a8a5a0" }}>{state.workplace.address}</div>
+
+              {/* Work days for THIS source */}
+              <div style={{ marginTop:10, paddingTop:10, borderTop:"1px solid rgba(0,0,0,.06)" }}>
+                <div style={{ ...S.label, marginBottom:6 }}>Work days</div>
+                <div style={{ display:"flex", gap:4 }}>
+                  {WEEK.map((w, i) => {
+                    const on = daysOf(src).includes(w.key);
+                    return (
+                      <span key={w.key} onClick={() => toggleDay(src, w.key)} title={w.key}
+                        style={{ width:26, height:26, borderRadius:"50%", display:"inline-flex", alignItems:"center", justifyContent:"center",
+                          fontSize:11, cursor:"pointer", userSelect:"none",
+                          border:`1px solid ${on ? "#1a1814" : "rgba(0,0,0,.12)"}`,
+                          background: on ? "#1a1814" : "rgba(255,255,255,.6)",
+                          color: on ? "#faf8f4" : (i >= 5 ? "#c8c5c0" : "#6b6760") }}>
+                        {w.short}
+                      </span>
+                    );
+                  })}
                 </div>
-              )}
+                {daysOf(src).length === 0 && (
+                  <div style={{ ...S.sans, fontSize:10, color:"#b05c08", marginTop:3 }}>No days selected — this source will never be worked.</div>
+                )}
+
+                <div style={{ marginTop:10, display:"flex", alignItems:"center", gap:10 }}>
+                  <div style={{ ...S.label, whiteSpace:"nowrap" }}>Paid leave</div>
+                  <input type="number" min={0} max={365}
+                    value={leaveDaysOf(src)}
+                    onChange={e => updateSource(src.id, { leave_days_per_year: e.target.value === "" ? null : Math.max(0, Math.min(365, parseInt(e.target.value, 10) || 0)) })}
+                    style={{ width:64, fontSize:13, padding:"5px 8px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)" }} />
+                  <span style={{ ...S.sans, fontSize:11, color:"#a8a5a0" }}>
+                    days/year — what this job grants. Taking it is {actor?.first_name || "her"} decision, made in the world.
+                  </span>
+                </div>
+              </div>
+
+              {/* Work hours for THIS source */}
+              <div style={{ marginTop:10, paddingTop:10, borderTop:"1px solid rgba(0,0,0,.06)" }}>
+                <div style={{ ...S.label, marginBottom:6 }}>Work hours</div>
+                <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+                  {blocksOf(src).map((wb, i) => (
+                    <div key={i} style={{ display:"flex", alignItems:"center", gap:8 }}>
+                      <input type="time" value={wb.start}
+                        onChange={e => updateBlock(src, i, { start: e.target.value })}
+                        style={{ fontSize:12, padding:"5px 8px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)" }} />
+                      <span style={{ ...S.sans, fontSize:12, color:"#a8a5a0" }}>to</span>
+                      <input type="time" value={wb.end}
+                        onChange={e => updateBlock(src, i, { end: e.target.value })}
+                        style={{ fontSize:12, padding:"5px 8px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)" }} />
+                      {wb.start >= wb.end && (
+                        <span style={{ ...S.sans, fontSize:11, color:"#b05c08" }}>end must be after start</span>
+                      )}
+                      {blocksOf(src).length > 1 && (
+                        <button onClick={() => removeBlock(src, i)} style={{ background:"none", border:"none", cursor:"pointer", color:"#a8a5a0", fontSize:16, padding:"0 4px" }}>×</button>
+                      )}
+                    </div>
+                  ))}
+                  <button onClick={() => addBlock(src)} style={{ ...S.sans, fontSize:11, padding:"5px 10px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"none", color:"#6b6760", cursor:"pointer", alignSelf:"flex-start" }}>
+                    + Add work block
+                  </button>
+                </div>
+              </div>
             </div>
-            <div style={{ flex:1, borderRadius:12, overflow:"hidden", border:"1px solid rgba(0,0,0,.08)", height:240, background:"#f0ede8", position:"relative" }}>
-              <div ref={workMapRef} style={{ width:"100%", height:240 }} />
-              {!mapReady && <div style={{ position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", ...S.sans, fontSize:12, color:"#a8a5a0" }}>Loading map…</div>}
-              <div style={{ position:"absolute", bottom:8, left:8, ...S.sans, fontSize:10, color:"rgba(0,0,0,.4)", background:"rgba(255,255,255,.7)", padding:"3px 6px", borderRadius:4 }}>Click map to pin location</div>
-            </div>
-          </div>
+          ))}
         </div>
-        </>
-      )}
+        <button onClick={addSource} style={{ ...S.sans, fontSize:11, padding:"5px 10px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"none", color:"#6b6760", cursor:"pointer", marginTop:10 }}>
+          + Add revenue source
+        </button>
+      </div>
+
+      {/* Opening balance — per ACTOR, not per source, so it sits outside the
+          sources list. Session 150: deploy now creates a bank_accounts row, and
+          it opened at zero. That is not neutral — rent debits on the 1st while
+          salary credits on the 25th, so a character starting at zero goes
+          overdrawn before her first payday, and financial_anxiety recomputes
+          from live balance, which makes it real stress rather than a rounding
+          detail. What she has in the bank on day one is a fact about the
+          character, so it is set here rather than guessed at. */}
+      <div style={{ marginTop:20 }}>
+        <div style={{ ...S.label, marginBottom:6 }}>Opening balance</div>
+        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+          <input type="number" min={0} step={1000}
+            value={state.career?.opening_balance ?? ""}
+            onChange={e => setState(p => ({...p, career: {...(p.career||{}),
+              opening_balance: e.target.value === "" ? null : Math.max(0, parseInt(e.target.value, 10) || 0)}}))}
+            placeholder="0"
+            style={{ width:160, fontSize:13, padding:"7px 10px", borderRadius:8, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)" }} />
+          <span style={{ ...S.mono, fontSize:12, color:"#6b6760" }}>{worldCurrency}</span>
+          {monthlyTotal > 0 && (
+            <div style={{ display:"flex", gap:5 }}>
+              {[1, 3, 6].map(m => (
+                <span key={m} onClick={() => setState(p => ({...p, career: {...(p.career||{}), opening_balance: monthlyTotal * m}}))}
+                  style={{ ...S.sans, fontSize:11, padding:"4px 9px", borderRadius:20, cursor:"pointer",
+                    border:"1px solid rgba(0,0,0,.12)", background:"rgba(255,255,255,.6)", color:"#6b6760" }}>
+                  {m} mo
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+        <div style={{ ...S.sans, fontSize:10, color:"#a8a5a0", marginTop:3 }}>
+          {monthlyTotal > 0
+            ? `What she has in the bank on day one. ${monthlyTotal.toLocaleString()} ${worldCurrency}/month across her sources — the shortcuts set that many months of runway.`
+            : "What she has in the bank on day one. Rent is debited before the first salary lands, so zero means starting overdrawn."}
+        </div>
+      </div>
     </div>
   );
 }
@@ -486,14 +915,30 @@ function StepRelationships({ actor, state, setState }) {
   const [relTypes,    setRelTypes]    = useState([]);
   const [picked,      setPicked]      = useState(null);
   const [dropOpen,    setDropOpen]    = useState(false);
-  const [selType,     setSelType]     = useState(null);
-  const [description, setDescription] = useState("");
-  const [context,     setContext]     = useState("");
-  const [scores,      setScores]      = useState({ warmth:0.5, trust:0.5, respect:0.5, tension:0.1, attraction:0.0, pull:0.4 });
+  const [selTypes,    setSelTypes]    = useState([]);
+  // Session 149 — was single shared description/context/scores across
+  // the whole batch being added, so "Professional: competitor" and
+  // "Social: acquaintance" for the same person got identical text even
+  // though actor_relationships stores description/context/scores per
+  // ROW, one per dimension. Keyed by type id so each selected dimension
+  // gets its own actual data, matching what's actually stored.
+  const [perTypeData, setPerTypeData] = useState({});
   const [inspiring,   setInspiring]   = useState(false);
+  const [suggestingRel, setSuggestingRel] = useState(false);
   const [editingIdx,  setEditingIdx]  = useState(null);
-  const [customInputs, setCustomInputs] = useState({ "dim-family":"", "dim-professional":"", "dim-social":"", "dim-intimate":"", "dim-legal":"" });
-  const [customTypes,  setCustomTypes]  = useState({ "dim-family":[], "dim-professional":[], "dim-social":[], "dim-intimate":[], "dim-legal":[] });
+  const [error,       setError]       = useState("");
+  // Session 150 — kept separate from `error` (which is form-validation
+  // feedback, cleared on every add). This one describes the step being
+  // unable to trust its own data and has to survive until reload.
+  const [rosterError, setRosterError] = useState("");
+  // Session 149 — removed the custom-type "+Add" state entirely. Any
+  // type added that way lived only in this component's React state,
+  // never in the relationship_types table — selecting and deploying it
+  // would write a rel_type_id pointing at a row that doesn't exist
+  // anywhere, and RelationshipEngine's joins against relationship_types
+  // would silently find nothing for it. No safe handling existed for
+  // that path, so removing the ability to create it rather than leave
+  // a trap that looks like it works.
 
   const dimConfig = {
     "dim-family":       { label:"Family",       bg:"#FEF9EC", color:"#92400E", selBg:"#92400E", selColor:"#FEF9EC", border:"#F59E0B" },
@@ -509,72 +954,252 @@ function StepRelationships({ actor, state, setState }) {
     "dim-intimate":     { warmth:0.70, trust:0.60, respect:0.60, tension:0.10, attraction:0.60, pull:0.65 },
     "dim-legal":        { warmth:0.50, trust:0.55, respect:0.55, tension:0.10, attraction:0.00, pull:0.30 },
   };
-  const dimOrder = ["dim-family","dim-professional","dim-social","dim-intimate","dim-legal"];
+  // "none" means no real connection in that dimension — sharing the same
+  // mid-range defaults as an actual relationship type (e.g. legal's
+  // 0.50 warmth, same as domestic_partner would start at) implied more
+  // closeness than "no relationship" should. Low across the board,
+  // zero tension/attraction/pull — there's nothing here to have
+  // friction or draw in.
+  const NONE_SCORES = { warmth:0.15, trust:0.15, respect:0.20, tension:0.0, attraction:0.0, pull:0.05 };
+  function scoresFor(t) { return t.name === "none" ? NONE_SCORES : (defaultScores[t.dimension_id] || defaultScores["dim-social"]); }
+  const dimOrder = ["dim-legal","dim-family","dim-professional","dim-social","dim-intimate"];
+  // Session 149 — the one relationship-type combination that's always
+  // nonsensical regardless of how dark/complex the fiction gets: a
+  // current-or-former spouse cannot also be a parent/child/grandparent
+  // to the same person. Deliberately narrow — this platform models
+  // plenty of other complicated, uncomfortable, or taboo dynamics on
+  // purpose (see "entanglement", "on-off fuck friend" already in the
+  // taxonomy), so nothing broader than this one biologically/logically
+  // absolute pair gets blocked.
+  const MARITAL_LEGAL = new Set(["spouse","ex_spouse","ex_husband","ex_wife","domestic_partner","engaged"]);
+  const GENERATIONAL_FAMILY = new Set(["child","parent","grandparent"]);
+  // "entanglement" and custom intimate types deliberately excluded —
+  // those imply something undefined/casual, not real commitment, so
+  // they don't carry the "should be close socially too" expectation.
+  const INTIMATE_COMMITTED = new Set(["partner","exclusive","lover","open_relationship"]);
+  // Session 149 — was just acquaintance/casual_friend (merely distant).
+  // Missed the actively-adversarial branch entirely (frenemy/rival/cold/
+  // distant/hostile/estranged) — same problem, just a wider one: none of
+  // these fit alongside a committed intimate connection either, matching
+  // the deterioration branch RelationshipEngine's own @rel_adjacency
+  // models (acquaintance -> cold -> distant/hostile -> estranged,
+  // frenemy -> rival/hostile). Not exhaustive forever, but covers the
+  // real adversarial/distant spectrum now instead of one narrow slice.
+  const SOCIAL_DISTANT = new Set(["acquaintance","casual_friend","cold","distant","hostile","estranged","frenemy","rival"]);
   const SCORE_FIELDS = [["warmth","Warmth"],["trust","Trust"],["respect","Respect"],["tension","Tension"],["attraction","Attraction"],["pull","Pull"]];
 
   useEffect(() => {
     if (!state.world) return;
-    fetch(`/api/worlds/${state.world.id}/actors`).then(r=>r.ok?r.json():[]).then(d=>setCharacters(d.filter(c=>c.id!==actor?.id))).catch(()=>{});
-    fetch(`/api/worlds/${state.world.id}/members`).then(r=>r.ok?r.json():[]).then(d=>setUsers(Array.isArray(d)?d:[])).catch(()=>{});
+    let cancelled = false;
+    setRosterError("");
+    setState(p => ({...p, worldRosterLoaded: false}));
+
+    // Session 150 — these were two independent fetches, each mapping a
+    // non-ok response to `[]` and each swallowing network failure in a
+    // bare .catch. Either way the parent's missingRelationships() saw an
+    // empty roster, concluded nobody needed covering, and let Next
+    // through — a failed load was indistinguishable from a genuinely
+    // empty world, so the gate silently didn't run at exactly the moment
+    // it mattered. Now the roster only counts as loaded when both calls
+    // actually succeed, and the failure is shown rather than absorbed.
+    Promise.all([
+      fetch(`/api/worlds/${state.world.id}/actors`).then(r => { if (!r.ok) throw new Error(`actors ${r.status}`); return r.json(); }),
+      fetch(`/api/worlds/${state.world.id}/members`).then(r => { if (!r.ok) throw new Error(`members ${r.status}`); return r.json(); }),
+    ]).then(([chars, members]) => {
+      if (cancelled) return;
+      const filtered = (Array.isArray(chars) ? chars : []).filter(c => c.id !== actor?.id);
+      const arr = Array.isArray(members) ? members : [];
+      setCharacters(filtered);
+      setUsers(arr);
+      setState(p => ({...p, worldCharacters: filtered, worldUsers: arr, worldRosterLoaded: true}));
+    }).catch(e => {
+      if (cancelled) return;
+      setRosterError(`Couldn't load who's already in this world (${e.message}) — relationships can't be checked against the real cast. Fix the connection and reopen this step before deploying.`);
+      setState(p => ({...p, worldRosterLoaded: false}));
+    });
+
     fetch(`/api/relationship-types`).then(r=>r.ok?r.json():null).then(data=>{
       if (!Array.isArray(data)) return;
-      setRelTypes(data.filter(t => t.id.startsWith("rt-") || t.id.startsWith("custom-")));
+      // Session 149 — was filtering by id PREFIX ("rt-"/"custom-"),
+      // which silently dropped any legitimately-seeded type whose id
+      // happened to be a raw hash instead of that convention (confirmed
+      // live: cold/distant/estranged/frenemy/hostile/rival all real,
+      // real names, real dimension_id — just excluded by this check).
+      // The actual requirement is just that the row is well-formed
+      // enough to render and be selected, not what shape its id is.
+      setRelTypes(data.filter(t => t.id && t.name && t.dimension_id));
     }).catch(()=>{});
+
+    return () => { cancelled = true; };
   }, [state.world]);
 
   const grouped = relTypes.reduce((acc,t)=>{ (acc[t.dimension_id]||(acc[t.dimension_id]=[])).push(t); return acc; }, {});
   const initials = name => (name||"").split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase();
 
   function selectType(t) {
-    if (selType?.id === t.id) { setSelType(null); return; }
-    const dimName = dimConfig[t.dimension_id]?.label?.toLowerCase() || t.dimension_id.replace("dim-","");
-    setSelType({...t, dimension_name: dimName});
-    setScores(defaultScores[t.dimension_id] || defaultScores["dim-social"]);
+    // Session 149 — was a single global selType, so selecting a pill in
+    // a different dimension silently dropped whatever was selected
+    // before it. Confirmed as a real bug, not intended behavior: several
+    // dimensions should be selectable together and added as one batch,
+    // sharing the same description/context/scores. Still exclusive
+    // WITHIN a dimension — can't be both sibling and parent to the same
+    // person at once — but selecting a new dimension no longer clears
+    // any other dimension's selection.
+    setSelTypes(prev => {
+      if (prev.some(st => st.id === t.id)) {
+        setPerTypeData(pd => { const next = {...pd}; delete next[t.id]; return next; });
+        return prev.filter(st => st.id !== t.id);
+      }
+      const dimName = dimConfig[t.dimension_id]?.label?.toLowerCase() || t.dimension_id.replace("dim-","");
+      const replaced = prev.find(st => st.dimension_id === t.dimension_id);
+      const withoutSameDim = prev.filter(st => st.dimension_id !== t.dimension_id);
+      setPerTypeData(pd => {
+        const next = {...pd};
+        if (replaced) delete next[replaced.id];
+        next[t.id] = next[t.id] || { description:"", context:"", scores: scoresFor(t) };
+        return next;
+      });
+      return [...withoutSameDim, {...t, dimension_name: dimName}];
+    });
   }
 
-  function addCustomType(dim) {
-    const val = customInputs[dim].trim();
-    if (!val) return;
-    const timer = { id:`custom-${dim}-${val.replace(/\s+/g,"-").toLowerCase()}`, name:val.replace(/\s+/g,"_"), dimension_id:dim, dimension_name:dimConfig[dim]?.label?.toLowerCase()||dim.replace("dim-",""), _custom:true };
-    setCustomTypes(p => ({...p, [dim]:[...p[dim], t]}));
-    setCustomInputs(p => ({...p, [dim]:""}));
-    selectType(t);
+  async function suggestRelationship() {
+    if (!picked) return;
+    setSuggestingRel(true); setError("");
+    try {
+      const dimensionsPayload = {};
+      dimOrder.forEach(dim => {
+        const names = (grouped[dim]||[]).map(t => t.name);
+        if (names.length > 0) dimensionsPayload[dim] = names;
+      });
+      const r = await fetch(`/api/actors/${actor.id}/suggest-relationship`, {
+        method: "POST", headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({
+          target_name: picked.first_name || picked.name,
+          target_occupation: picked._isUser ? null : picked.occupation,
+          target_is_user: !!picked._isUser,
+          cv_notes: state.cv?.notes || null,
+          dimensions: dimensionsPayload,
+        })
+      });
+      if (r.ok) {
+        const data = await r.json();
+        const resolved = [];
+        for (const dim of dimOrder) {
+          const suggestedName = data[dim];
+          if (!suggestedName) continue;
+          const allTypes = (grouped[dim]||[]);
+          const match = allTypes.find(t => t.name === suggestedName);
+          if (match) {
+            const dimName = dimConfig[dim]?.label?.toLowerCase() || dim.replace("dim-","");
+            resolved.push({...match, dimension_name: dimName});
+          }
+        }
+        if (resolved.length > 0) {
+          setSelTypes(resolved);
+          const initData = {};
+          resolved.forEach(t => {
+            initData[t.id] = { description:"", context:"", scores: scoresFor(t) };
+          });
+          setPerTypeData(initData);
+        } else {
+          setError("Suggestion didn't match any known types — try again.");
+        }
+      } else {
+        setError("Suggestion failed — try again.");
+      }
+    } catch (e) {
+      setError(e.message);
+    }
+    setSuggestingRel(false);
   }
 
-  async function inspire() {
-    if (!picked || !selType) return;
-    setInspiring(true);
+  async function inspire(typeId) {
+    const target = selTypes.find(st => st.id === typeId);
+    if (!picked || !target) return;
+    setInspiring(typeId);
     try {
       const r = await fetch(`/api/actors/${actor.id}/inspire-relationship`, {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({
-          rel_type_id:   selType.id,
-          rel_type_name: selType.name,
-          dimension_name: selType.dimension_name,
+          rel_type_id:   target.id,
+          rel_type_name: target.name,
+          dimension_name: target.dimension_name,
           target_type:   picked._isUser ? "user" : "actor",
           target_id:     picked.id,
         })
       });
       if (r.ok) {
         const data = await r.json();
-        if (data.description) setDescription(data.description);
-        if (data.context)     setContext(data.context);
-        if (data.scores)      setScores(p => ({...p, ...data.scores}));
+        setPerTypeData(pd => ({...pd, [typeId]: {
+          description: data.description || pd[typeId]?.description || "",
+          context: data.context || pd[typeId]?.context || "",
+          scores: data.scores ? {...(pd[typeId]?.scores||{}), ...data.scores} : (pd[typeId]?.scores || {}),
+        }}));
       }
     } catch {}
     setInspiring(false);
   }
 
-  function clearForm() { setPicked(null); setSelType(null); setDescription(""); setContext(""); setScores({ warmth:0.5, trust:0.5, respect:0.5, tension:0.1, attraction:0.0, pull:0.4 }); setEditingIdx(null); }
+  // Session 149 — this used to reset `picked` too, meaning every
+  // successful add wiped the selected target along with the type/scores.
+  // Adding a second relationship dimension to the SAME person (the
+  // obvious next action, not an edge case) required re-picking them
+  // first — "+ Add relationship" stays disabled with no target selected,
+  // so subsequent adds silently did nothing until that happened. Keeping
+  // the target selected lets several dimensions get added to one person
+  // in a row, which is what "add relationship" actually means here.
+  function clearForm() { setSelTypes([]); setPerTypeData({}); setEditingIdx(null); }
 
   function addOrUpdate() {
-    if (!picked || !selType) return;
-    const rel = { character:picked, rel_type_id:selType.id, rel_type_name:selType.name, dimension_id:selType.dimension_id, dimension_name:selType.dimension_name, description, context, scores:{...scores} };
+    if (!picked || selTypes.length === 0) return;
+    setError("");
+    // Session 149 — narrower than the earlier version, which blocked
+    // even a single standalone "none" (e.g. just "Professional: none"
+    // alone) and caused real friction. A partial set is fine. The only
+    // genuinely meaningless case is all five dimensions recorded AND
+    // every one of them "none" — that's identical to no relationship
+    // existing at all, and is the one thing worth blocking, clearly.
+    const ALL_DIMS = ["dim-family","dim-professional","dim-social","dim-intimate","dim-legal"];
+
     if (editingIdx !== null) {
+      // Editing an existing single entry — selTypes holds exactly the
+      // one type being edited (set by editRel below).
+      const t = selTypes[0];
+      if (!t) return;
+      const others = (state.relationships||[]).filter((r, i) => r.character.id === picked.id && i !== editingIdx);
+      const withNew = [...others, { dimension_id: t.dimension_id, rel_type_name: t.name }];
+      if (t.name === "none") {
+        const coversAllDims = ALL_DIMS.every(d => withNew.some(r => r.dimension_id === d));
+        const allNone = withNew.every(r => r.rel_type_name === "none");
+        if (coversAllDims && allNone) {
+          setError("Every dimension can't be \"none\" — that's the same as having no relationship with this person at all.");
+          return;
+        }
+      }
+      const data = perTypeData[t.id] || { description:"", context:"", scores: scoresFor(t) };
+      const rel = { character:picked, rel_type_id:t.id, rel_type_name:t.name, dimension_id:t.dimension_id, dimension_name:t.dimension_name, description: data.description, context: data.context, scores:{...data.scores} };
       setState(p => { const r=[...(p.relationships||[])]; r[editingIdx]=rel; return {...p,relationships:r}; });
-    } else {
-      setState(p => ({...p, relationships:[...(p.relationships||[]), rel]}));
+      clearForm();
+      return;
     }
+
+    // Adding fresh — one entry per selected dimension, each pulling its
+    // own description/context/scores from perTypeData.
+    const others = (state.relationships||[]).filter(r => r.character.id === picked.id);
+    const withNew = [...others, ...selTypes.map(t => ({ dimension_id: t.dimension_id, rel_type_name: t.name }))];
+    const coversAllDims = ALL_DIMS.every(d => withNew.some(r => r.dimension_id === d));
+    const allNone = withNew.every(r => r.rel_type_name === "none");
+    if (coversAllDims && allNone) {
+      setError("Every dimension can't be \"none\" — that's the same as having no relationship with this person at all.");
+      return;
+    }
+
+    const newRels = selTypes.map(t => {
+      const data = perTypeData[t.id] || { description:"", context:"", scores: scoresFor(t) };
+      return { character:picked, rel_type_id:t.id, rel_type_name:t.name, dimension_id:t.dimension_id, dimension_name:t.dimension_name, description: data.description, context: data.context, scores:{...data.scores} };
+    });
+    setState(p => ({...p, relationships:[...(p.relationships||[]), ...newRels]}));
     clearForm();
   }
 
@@ -586,19 +1211,32 @@ function StepRelationships({ actor, state, setState }) {
   function editRel(i) {
     const rel = (state.relationships||[])[i];
     setPicked(rel.character);
-    setSelType({ id:rel.rel_type_id, name:rel.rel_type_name, dimension_id:rel.dimension_id, dimension_name:rel.dimension_name });
-    setDescription(rel.description||"");
-    setContext(rel.context||"");
-    setScores(rel.scores || defaultScores[rel.dimension_id] || defaultScores["dim-social"]);
+    const t = { id:rel.rel_type_id, name:rel.rel_type_name, dimension_id:rel.dimension_id, dimension_name:rel.dimension_name };
+    setSelTypes([t]);
+    setPerTypeData({ [t.id]: {
+      description: rel.description||"",
+      context: rel.context||"",
+      scores: rel.scores || scoresFor(t),
+    }});
     setEditingIdx(i);
   }
 
-  const canAdd  = picked && selType;
-  const dimCfg  = selType ? (dimConfig[selType.dimension_id] || dimConfig["dim-social"]) : null;
+  const canAdd  = picked && selTypes.length > 0;
+
+  const missing = [...characters, ...users.map(u => ({...u, _isUser:true}))]
+    .filter(p => !(state.relationships||[]).some(r => r.character.id === p.id));
 
   return (
     <div>
       <p style={{ ...S.sans, fontSize:13, color:"#a8a5a0", marginBottom:16 }}>Define who {actor?.first_name||actor?.name} already knows</p>
+      {rosterError && (
+        <p style={{ ...S.sans, fontSize:12, color:"#c0392b", marginTop:-10, marginBottom:16, lineHeight:1.5 }}>{rosterError}</p>
+      )}
+      {missing.length > 0 && (
+        <p style={{ ...S.sans, fontSize:12, color:"#b05c08", marginTop:-10, marginBottom:16 }}>
+          Still need a relationship for: {missing.map(p => p.first_name||p.name).join(", ")}
+        </p>
+      )}
 
       {/* ── Dropdown ─────────────────────────────────────────────────── */}
       <div style={{ ...S.label, marginBottom:6 }}>Character or user</div>
@@ -638,67 +1276,134 @@ function StepRelationships({ actor, state, setState }) {
       </div>
 
       {/* ── Relationship type chips ───────────────────────────────────── */}
-      <div style={{ ...S.label, marginBottom:8 }}>Relationship type</div>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 }}>
+        <div style={{ ...S.label }}>Relationship type</div>
+        <button onClick={suggestRelationship} disabled={!picked || suggestingRel} style={{ ...S.sans, fontSize:11, padding:"3px 10px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"none", color: !picked ? "#c8c5c0" : "#6b6760", cursor:(!picked||suggestingRel)?"default":"pointer", opacity:suggestingRel?0.5:1 }}>
+          {suggestingRel ? "Thinking…" : "✨ Suggest"}
+        </button>
+      </div>
+      {!picked ? (
+        <p style={{ ...S.sans, fontSize:13, color:"#a8a5a0" }}>Pick a character or user above first.</p>
+      ) : (
+      <>
       {relTypes.length === 0 && <p style={{ ...S.sans, fontSize:12, color:"#a8a5a0", marginBottom:12 }}>Loading…</p>}
-      {dimOrder.map(dim => {
+      {(() => {
+        // Session 149 — pills only ever reflected selType, the single
+        // in-progress selection. Once a relationship was added and the
+        // form cleared, its pill reverted to plain default with zero
+        // trace it had been added — looked like clicking a pill "didn't
+        // stick" when moving to another dimension, even though the add
+        // itself had genuinely succeeded. This tracks which types are
+        // already saved for whichever person is currently picked, kept
+        // separate from selType's own highlight (which still means
+        // "currently being edited/previewed", not "already added").
+        const addedTypeIds = new Set(
+          (state.relationships||[]).filter(r => picked && r.character.id === picked.id).map(r => r.rel_type_id)
+        );
+        const addedTypeNames = new Set(
+          (state.relationships||[]).filter(r => picked && r.character.id === picked.id).map(r => r.rel_type_name)
+        );
+        // Session 149 — these used to only check already-saved entries,
+        // never the batch currently mid-selection. Barely mattered
+        // before multi-select existed (only one thing could ever be
+        // "in progress" at once); now that several dimensions can be
+        // selected together before a single Add, checking only saved
+        // entries misses the exact same-batch case this exists to
+        // catch — e.g. Intimate:partner and Social:acquaintance picked
+        // together, neither saved yet. Combine both scopes.
+        const activeTypeNames = new Set([...addedTypeNames, ...selTypes.map(st => st.name)]);
+        const hasMarital = [...activeTypeNames].some(n => MARITAL_LEGAL.has(n));
+        const hasGenerational = [...activeTypeNames].some(n => GENERATIONAL_FAMILY.has(n));
+        // Committed intimate types imply real closeness — pairing one
+        // with a distant social pick reads backwards (a real "partner"
+        // isn't merely a social "acquaintance"). Casual/undefined
+        // intimate types (entanglement, custom ones) don't carry this.
+        const hasCommittedIntimate = [...activeTypeNames].some(n => INTIMATE_COMMITTED.has(n));
+        const hasDistantSocial = [...activeTypeNames].some(n => SOCIAL_DISTANT.has(n));
+        return dimOrder.map(dim => {
         const cfg = dimConfig[dim];
-        const allTypes = [...(grouped[dim]||[]), ...(customTypes[dim]||[])];
+        const allTypes = (grouped[dim]||[]).slice().sort((a,b) => (a.name==="none"?-1:0) - (b.name==="none"?-1:0));
         if (allTypes.length === 0 && relTypes.length > 0) return null;
+        const selectedInDim = selTypes.find(st => st.dimension_id === dim);
         return (
-          <div key={dim} style={{ marginBottom:12 }}>
+          <div key={dim} style={{ marginBottom:16, padding:"12px 14px", background:cfg.bg, borderRadius:12, border:`1px solid ${cfg.border}` }}>
             <div style={{ ...S.label, color:cfg.color, marginBottom:5 }}>{cfg.label}</div>
             <div style={{ display:"flex", flexWrap:"wrap", gap:5, marginBottom:6 }}>
               {allTypes.map(t => {
-                const sel = selType?.id === t.id;
-                return <span key={t.id} onClick={() => selectType(t)} style={{ padding:"4px 10px", borderRadius:20, fontSize:12, cursor:"pointer", border:`1px solid ${sel?cfg.selBg:cfg.border}`, background:sel?cfg.selBg:cfg.bg, color:sel?cfg.selColor:cfg.color }}>{t.name.replace(/_/g," ")}</span>;
+                const sel = selTypes.some(st => st.id === t.id);
+                const added = !sel && addedTypeIds.has(t.id);
+                const blocked = !added && !sel && (
+                  (MARITAL_LEGAL.has(t.name) && hasGenerational) || (GENERATIONAL_FAMILY.has(t.name) && hasMarital) ||
+                  (SOCIAL_DISTANT.has(t.name) && t.dimension_id === "dim-social" && hasCommittedIntimate) ||
+                  (INTIMATE_COMMITTED.has(t.name) && t.dimension_id === "dim-intimate" && hasDistantSocial)
+                );
+                const blockReason = (MARITAL_LEGAL.has(t.name) && hasGenerational) || (GENERATIONAL_FAMILY.has(t.name) && hasMarital)
+                  ? "Already has a spouse/parent-child relationship set with this person — the two can't coexist"
+                  : ((SOCIAL_DISTANT.has(t.name) && t.dimension_id === "dim-social" && hasCommittedIntimate) || (INTIMATE_COMMITTED.has(t.name) && t.dimension_id === "dim-intimate" && hasDistantSocial))
+                  ? "A committed intimate relationship (partner/exclusive/lover/open relationship) doesn't fit with a distant or adversarial social dynamic — the two can't coexist"
+                  : undefined;
+                return <span key={t.id} onClick={() => { if (!blocked) selectType(t); }}
+                  title={blockReason}
+                  style={{ padding:"4px 10px", borderRadius:20, fontSize:12, cursor:blocked?"not-allowed":"pointer", display:"inline-flex", alignItems:"center", gap:4,
+                    border:`1px solid ${sel?cfg.selBg:added?cfg.color:"rgba(255,255,255,.6)"}`,
+                    background:sel?cfg.selBg:added?"rgba(255,255,255,.6)":"rgba(255,255,255,.5)",
+                    color:sel?cfg.selColor:cfg.color,
+                    opacity: blocked ? 0.35 : (added ? 1 : (sel ? 1 : 0.85)),
+                    textDecoration: blocked ? "line-through" : "none",
+                    boxShadow: added ? `inset 0 0 0 1px ${cfg.color}` : "none" }}>
+                  {added && <span style={{ fontSize:10 }}>✓</span>}
+                  {t.name.replace(/_/g," ")}
+                </span>;
               })}
             </div>
-            <div style={{ display:"flex", gap:6 }}>
-              <input value={customInputs[dim]} onChange={e=>setCustomInputs(p=>({...p,[dim]:e.target.value}))} onKeyDown={e=>e.key==="Enter"&&addCustomType(dim)} placeholder={`New ${cfg.label.toLowerCase()} type…`} style={{ flex:1, fontSize:12, padding:"4px 8px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)" }} />
-              <button onClick={()=>addCustomType(dim)} style={{ ...S.sans, fontSize:11, padding:"4px 10px", borderRadius:7, border:`1px solid ${cfg.border}`, background:cfg.bg, color:cfg.color, cursor:"pointer" }}>+ Add</button>
-            </div>
+            {selectedInDim && selectedInDim.name !== "none" && (() => {
+              const t = selectedInDim;
+              const data = perTypeData[t.id] || { description:"", context:"", scores: scoresFor(t) };
+              return (
+                <div style={{ marginTop:10, paddingTop:10, borderTop:`1px solid ${cfg.border}` }}>
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
+                    <div style={{ ...S.label, color:cfg.color }}>{t.name.replace(/_/g," ")}</div>
+                    {t.name !== "none" && (
+                      <button onClick={()=>inspire(t.id)} disabled={inspiring===t.id} style={{ ...S.sans, fontSize:11, padding:"3px 10px", borderRadius:7, border:`1px solid ${cfg.border}`, background:"none", color:cfg.color, cursor:inspiring===t.id?"default":"pointer", opacity:inspiring===t.id?0.5:1 }}>
+                        {inspiring===t.id ? "Thinking…" : "✨ Inspire me"}
+                      </button>
+                    )}
+                  </div>
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"8px 20px", marginBottom:12 }}>
+                    {SCORE_FIELDS.map(([key,label]) => (
+                      <div key={key}>
+                        <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
+                          <span style={{ ...S.sans, fontSize:11, color:"#6b6760" }}>{label}</span>
+                          <span style={{ ...S.mono, fontSize:11, color:cfg.color }}>{(data.scores[key]||0).toFixed(2)}</span>
+                        </div>
+                        <input type="range" min={0} max={1} step={0.01} value={data.scores[key]||0}
+                          onChange={e => { const v = parseFloat(e.target.value); setPerTypeData(pd => ({...pd, [t.id]: {...data, scores:{...data.scores, [key]:v}}})); }}
+                          style={{ width:"100%", accentColor:cfg.selBg }} />
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ ...S.label, marginBottom:6, color:cfg.color }}>Describe the relationship</div>
+                  <textarea value={data.description} onChange={e => setPerTypeData(pd => ({...pd, [t.id]: {...data, description:e.target.value}}))} placeholder="Backstory — how this relationship came to be…" style={{ width:"100%", minHeight:56, fontSize:13, padding:"8px 10px", borderRadius:10, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", resize:"vertical", boxSizing:"border-box", marginBottom:8 }} />
+                  <div style={{ ...S.label, marginBottom:6, color:cfg.color }}>Current dynamic</div>
+                  <textarea value={data.context} onChange={e => setPerTypeData(pd => ({...pd, [t.id]: {...data, context:e.target.value}}))} placeholder="Context — what is happening between them right now…" style={{ width:"100%", minHeight:48, fontSize:13, padding:"8px 10px", borderRadius:10, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", resize:"vertical", boxSizing:"border-box" }} />
+                </div>
+              );
+            })()}
           </div>
         );
-      })}
-
-      {/* ── Score sliders ─────────────────────────────────────────────── */}
-      {selType && (
-        <div style={{ marginBottom:14, padding:"12px 14px", background:dimCfg.bg, borderRadius:12, border:`1px solid ${dimCfg.border}` }}>
-          <div style={{ ...S.label, color:dimCfg.color, marginBottom:10 }}>Initial scores</div>
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"8px 20px" }}>
-            {SCORE_FIELDS.map(([key,label]) => (
-              <div key={key}>
-                <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
-                  <span style={{ ...S.sans, fontSize:11, color:"#6b6760" }}>{label}</span>
-                  <span style={{ ...S.mono, fontSize:11, color:dimCfg.color }}>{(scores[key]||0).toFixed(2)}</span>
-                </div>
-                <input type="range" min={0} max={1} step={0.01} value={scores[key]||0}
-                  onChange={e => setScores(p => ({...p, [key]:parseFloat(e.target.value)}))}
-                  style={{ width:"100%", accentColor:dimCfg.selBg }} />
-              </div>
-            ))}
-          </div>
-        </div>
+        });
+      })()}
+      </>
       )}
 
-      {/* ── Description + Inspire me ─────────────────────────────────── */}
-      <div style={{ marginBottom:14 }}>
-        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:6 }}>
-          <div style={{ ...S.label }}>Describe the relationship</div>
-          {canAdd && (
-            <button onClick={inspire} disabled={inspiring} style={{ ...S.sans, fontSize:11, padding:"3px 10px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"none", color:"#6b6760", cursor: inspiring?"default":"pointer", opacity:inspiring?0.5:1 }}>
-              {inspiring ? "Thinking…" : "✨ Inspire me"}
-            </button>
-          )}
-        </div>
-        <textarea value={description} onChange={e=>setDescription(e.target.value)} placeholder="Backstory — how this relationship came to be…" style={{ width:"100%", minHeight:56, fontSize:13, padding:"8px 10px", borderRadius:10, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", resize:"vertical", boxSizing:"border-box", marginBottom:8 }} />
-        <div style={{ ...S.label, marginBottom:6 }}>Current dynamic</div>
-        <textarea value={context} onChange={e=>setContext(e.target.value)} placeholder="Context — what is happening between them right now…" style={{ width:"100%", minHeight:48, fontSize:13, padding:"8px 10px", borderRadius:10, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", resize:"vertical", boxSizing:"border-box" }} />
-      </div>
+      {picked && !canAdd && (
+        <p style={{ ...S.sans, fontSize:12, color:"#c8c5c0", marginBottom:14 }}>Pick a relationship type above first</p>
+      )}
 
       <button onClick={addOrUpdate} disabled={!canAdd} style={{ ...S.sans, fontSize:12, padding:"6px 14px", borderRadius:8, border:"1px solid rgba(0,0,0,.12)", background:canAdd?"#1a1814":"none", color:canAdd?"#faf8f4":"#c8c5c0", cursor:canAdd?"pointer":"default", marginBottom:16 }}>
-        {editingIdx !== null ? "Update relationship" : "+ Add relationship"}
+        {editingIdx !== null ? "Update relationship" : selTypes.length > 1 ? `+ Add ${selTypes.length} relationships` : "+ Add relationship"}
       </button>
+      {error && <p style={{ ...S.sans, fontSize:12, color:"#c0392b", marginTop:-10, marginBottom:16 }}>{error}</p>}
 
       {/* ── Added list ───────────────────────────────────────────────── */}
       {(state.relationships||[]).length > 0 && (
@@ -732,8 +1437,22 @@ function StepRelationships({ actor, state, setState }) {
 function StepSchedule({ actor, state, setState }) {
   const [generating,  setGenerating]  = useState(false);
   const [error,       setError]       = useState("");
-  const currentWeek = Math.ceil((new Date() - new Date(new Date().getFullYear(),0,1)) / 604800000);
-  const [fromWeek,   setFromWeek]    = useState(currentWeek);
+  // Session 150 — in the last days of December this expression lands on
+  // 53, and the dropdown below builds `52 - currentWeek + 1` options,
+  // i.e. zero: no week selectable at all, so a schedule generated then
+  // could never be rolled out. Clamped so the final week is always
+  // pickable. The week arithmetic itself is left as-is — it's an
+  // approximation, but the roll-out semantics ("from week N through 52")
+  // don't change.
+  const rawWeek = Math.ceil((new Date() - new Date(new Date().getFullYear(),0,1)) / 604800000);
+  const currentWeek = Math.min(Math.max(rawWeek, 1), 52);
+  // Session 150 — was unconditionally `useState(currentWeek)`, which
+  // overwrote a restored draft's saved week the moment this step
+  // remounted. Honour the persisted value when it's still reachable.
+  const [fromWeek,   setFromWeek]    = useState(() => {
+    const saved = Number(state.fromWeek);
+    return Number.isFinite(saved) && saved >= currentWeek && saved <= 52 ? saved : currentWeek;
+  });
 
   useEffect(() => { setState(p => ({...p, fromWeek})); }, [fromWeek]);
 
@@ -747,7 +1466,11 @@ function StepSchedule({ actor, state, setState }) {
     if (slug.startsWith("work_") || ["admin","planning","pitching","negotiating","script_reading","rehearsing","filming","editing","recording","composing","storyboarding","studying","coaching"].includes(slug)) return { bg:"#FEF3C7", border:"#F59E0B", text:"#92400E" };
     if (["exercise","running","cycling","yoga","stretching","swimming","hiking","sport","foam_rolling"].includes(slug)) return { bg:"#DCFCE7", border:"#4ADE80", text:"#166534" };
     if (["social_dinner","social_bar","social_cafe","social_drinks","social_late_night","party","networking","dining","brunch","coffee"].includes(slug)) return { bg:"#E1F5EE", border:"#5DCAA5", text:"#0F6E56" };
-    if (["eating","cooking","meal_prep","snacking","drinking_coffee","drinking_wine","drinking_alcohol"].includes(slug)) return { bg:"#FEF9EC", border:"#F59E0B", text:"#78350F" };
+    // Session 150 — was bg #FEF9EC with border #F59E0B: a paler shade of the
+    // work colour, sharing work's exact border. A lunch break between two work
+    // blocks was a 15px band of near-identical colour, indistinguishable from
+    // the work either side of it. Clay reads as food, and reads as NOT work.
+    if (["eating","cooking","meal_prep","snacking","drinking_coffee","drinking_wine","drinking_alcohol"].includes(slug)) return { bg:"#F6E0D2", border:"#C2703F", text:"#7C3A16" };
     if (["morning_routine","waking","bath","skincare","grooming","laundry","cleaning","errands","shopping","medical","therapy","childcare"].includes(slug)) return { bg:"#F5F3FF", border:"#A78BFA", text:"#5B21B6" };
     if (["relaxing","decompressing","reading","watching_tv","scrolling","gaming","listening","daydreaming","meditating","journaling","reflection","creative","writing","sketching","painting","withdrawing"].includes(slug)) return { bg:"#FFF7ED", border:"#FB923C", text:"#9A3412" };
     if (["transit","taxi","travel","walking","waiting"].includes(slug))     return { bg:"#F1F5F9", border:"#94A3B8", text:"#475569" };
@@ -768,8 +1491,13 @@ function StepSchedule({ actor, state, setState }) {
         headers: { "Content-Type":"application/json" },
         body: JSON.stringify({
           home_address: state.home?.address,
-          employment_type: state.career?.employment_type,
-          career_level: state.career?.career_level,
+          // Session 150 — each source now carries its own work_blocks, so
+          // the server reads hours off the sources rather than off a
+          // separate top-level list. The old global `work_blocks` field is
+          // deliberately no longer sent: it no longer exists in state, and
+          // sending a stale duplicate would silently win over the real
+          // per-source hours in the handler's fallback.
+          revenue_sources: state.career?.revenue_sources,
           world_id: state.world?.id,
         })
       });
@@ -826,11 +1554,30 @@ function StepSchedule({ actor, state, setState }) {
                       const top    = (startM / TOTAL_MINS) * 360;
                       const height = Math.max(((endM - startM) / TOTAL_MINS) * 360, 4);
                       const c      = slotColor(s.activity_slug);
+                      // Display label only — activity_slug itself stays
+                      // "relaxing" (unchanged data value, in case anything
+                      // downstream validates against the existing slug
+                      // taxonomy); "Free time" reads better to a person
+                      // looking at the calendar than the raw slug does.
+                      // Session 150 — state_note carries the real meaning for
+                      // breaks ("Break", "Between work"), while the slug stays
+                      // "eating" so nothing downstream that validates against the
+                      // activity taxonomy breaks. Prefer the note when it says
+                      // more than the slug does.
+                      const isBreak = s.activity_slug === "eating" && /break|between work/i.test(s.state_note || "");
+                      const label  = isBreak ? s.state_note.toLowerCase()
+                                   : s.activity_slug === "relaxing" ? "free time"
+                                   : s.activity_slug.replace(/_/g," ");
                       return (
-                        <div key={i} title={`${s.start_time}–${s.end_time} ${s.activity_slug}${s.state_note ? ` · ${s.state_note}` : ""}`}
+                        <div key={i} title={`${s.start_time}–${s.end_time} ${label}${s.state_note ? ` · ${s.state_note}` : ""}`}
                           style={{ position:"absolute", left:0, right:0, top, height, background:c.bg, borderTop:`1.5px solid ${c.border}`, overflow:"hidden", display:"flex", alignItems:"center", padding:"0 4px" }}>
-                          {height > 18 && <span style={{ ...S.sans, fontSize:9, color:c.text, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", lineHeight:1.2 }}>
-                            {s.activity_slug.replace(/_/g," ")}
+                          {/* Session 150 — threshold was 18px, but an hour on a
+                              360px/24h grid is only 15px, so every one-hour slot
+                              rendered with no text at all. A lunch break is
+                              exactly one hour. 9px type at 1.2 line-height needs
+                              ~11px, which fits. */}
+                          {height > 11 && <span style={{ ...S.sans, fontSize:9, color:c.text, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", lineHeight:1.2 }}>
+                            {label}
                           </span>}
                         </div>
                       );
@@ -864,33 +1611,154 @@ function StepSchedule({ actor, state, setState }) {
   );
 }
 
-// ── Step 4: Media ─────────────────────────────────────────────────────────────
+// ── Step 5: CV ────────────────────────────────────────────────────────────────
+// Session 149 — structure still not fully defined beyond free-text
+// narrative, but now genuinely generatable via Haiku using real data:
+// nationality (real column) and the wizard's own live workplace/career
+// state (not yet persisted at this point, so passed in the request body
+// rather than queried from the actor row). Still not sent in the deploy
+// payload yet — that's a separate step once the data shape is settled.
+function StepCV({ actor, state, setState }) {
+  const [generating, setGenerating] = useState(false);
+  const [uploading,  setUploading]  = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [error,      setError]      = useState("");
+
+  async function generate() {
+    setGenerating(true); setError("");
+    try {
+      const r = await fetch(`/api/actors/${actor.id}/generate-cv`, {
+        method: "POST",
+        headers: { "Content-Type":"application/json" },
+        body: JSON.stringify({
+          revenue_sources: state.career?.revenue_sources || [],
+          // Session 150 — career level lives per revenue source now. The CV
+          // describes one person, so it takes the rolled-up figure (highest
+          // across sources); the handler uses it only to size the number of
+          // roles it writes.
+          career_level: rollupCareerLevel(state.career?.revenue_sources),
+          world_id: state.world?.id,
+        })
+      });
+      if (r.ok) {
+        const data = await r.json();
+        setState(p => ({...p, cv: { ...(p.cv||{}), notes: data.notes }}));
+      } else {
+        setError("Generation failed — try again.");
+      }
+    } catch (e) {
+      setError(e.message);
+    }
+    setGenerating(false);
+  }
+
+  async function uploadCV(file) {
+    setUploading(true); setError("");
+    try {
+      const fd = new FormData();
+      fd.append("cv_file", file);
+      const r = await fetch(`/api/actors/${actor.id}/upload-cv`, { method:"POST", body:fd });
+      const data = await r.json();
+      if (r.ok) {
+        setState(p => ({...p, cv: { ...(p.cv||{}), notes: data.notes }}));
+      } else {
+        setError(data.error || "Couldn't read that file — try .pdf, .docx, or .txt");
+      }
+    } catch (e) {
+      setError(e.message);
+    }
+    setUploading(false);
+  }
+
+  async function downloadPDF() {
+    setDownloading(true); setError("");
+    try {
+      const r = await fetch(`/api/actors/${actor.id}/cv-pdf`, {
+        method: "POST",
+        headers: { "Content-Type":"application/json" },
+        body: JSON.stringify({ notes: state.cv?.notes || "" }),
+      });
+      if (!r.ok) { const data = await r.json().catch(()=>({})); throw new Error(data.error || "PDF generation failed"); }
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${(actor?.first_name||actor?.name||"CV").replace(/[^a-z0-9]/gi,"_")}_CV.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(e.message);
+    }
+    setDownloading(false);
+  }
+
+  return (
+    <div>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16 }}>
+        <p style={{ ...S.sans, fontSize:13, color:"#a8a5a0", margin:0 }}>
+          Full CV — generate from scratch or upload a real document to adapt.
+        </p>
+        <div style={{ display:"flex", gap:8, flexShrink:0 }}>
+          <label style={{ ...S.sans, fontSize:11, padding:"3px 10px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"none", color:"#6b6760", cursor:uploading?"default":"pointer", opacity:uploading?0.5:1 }}>
+            {uploading ? "Reading…" : "📄 Upload CV"}
+            <input type="file" accept=".pdf,.docx,.txt" style={{ display:"none" }} disabled={uploading}
+              onChange={e => { if (e.target.files[0]) uploadCV(e.target.files[0]); e.target.value=""; }} />
+          </label>
+          <button onClick={generate} disabled={generating} style={{ ...S.sans, fontSize:11, padding:"3px 10px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"none", color:"#6b6760", cursor:generating?"default":"pointer", opacity:generating?0.5:1 }}>
+            {generating ? "Thinking…" : "✨ Generate"}
+          </button>
+          <button onClick={downloadPDF} disabled={downloading || !state.cv?.notes} style={{ ...S.sans, fontSize:11, padding:"3px 10px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"none", color: !state.cv?.notes ? "#c8c5c0" : "#6b6760", cursor:(downloading||!state.cv?.notes)?"default":"pointer", opacity:downloading?0.5:1 }}>
+            {downloading ? "Rendering…" : "⬇ Download PDF"}
+          </button>
+        </div>
+      </div>
+      <div style={{ display:"flex", gap:16, alignItems:"flex-start" }}>
+        <textarea
+          value={state.cv?.notes || ""}
+          onChange={e => setState(p => ({...p, cv: { ...(p.cv||{}), notes: e.target.value }}))}
+          placeholder={"SUMMARY\n\nEXPERIENCE\n\nEDUCATION\n\nCOURSES\n\nINTERESTS\n\nLANGUAGES"}
+          style={{ flex:1, minWidth:0, minHeight:480, fontSize:13, lineHeight:1.6, padding:"10px 12px", borderRadius:9, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", boxSizing:"border-box", resize:"vertical", whiteSpace:"pre-wrap", ...S.sans }}
+        />
+        {actor?.photo_url ? (
+          <img src={actor.photo_url} style={{ width:96, height:96, borderRadius:8, objectFit:"cover", flexShrink:0, border:"1px solid rgba(0,0,0,.1)" }} />
+        ) : (
+          <div style={{ width:96, height:96, borderRadius:8, background:"rgba(0,0,0,.06)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:24, fontWeight:500, color:"#a8a5a0", flexShrink:0 }}>
+            {(actor?.first_name||actor?.name||"?")[0]}
+          </div>
+        )}
+      </div>
+      {error && <p style={{ ...S.sans, fontSize:12, color:"#c0392b", marginTop:8 }}>{error}</p>}
+    </div>
+  );
+}
+
+// ── Step 6: Media ────────────────────────────────────────────────────────────
 function StepMedia({ actor, state, setState }) {
   const [profilePhoto, setProfilePhoto] = useState(null); // {url} existing
-  const [archives,     setArchives]     = useState([]);
   const [uploading,    setUploading]    = useState(false);
   const [voiceFile,    setVoiceFile]    = useState(null);
   const [voiceUploading, setVoiceUploading] = useState(false);
-  const [voiceDone,    setVoiceDone]    = useState(false);
+  // Session 150 — was a bare boolean, which threw away the one thing needed to
+  // play the file back. The media rows already carry a url; keep the row.
+  const [voiceMedia,   setVoiceMedia]   = useState(null);
   const fileRef = useRef(null);
-  const videoRef = useRef(null);
 
   useEffect(() => {
     fetch(`/api/actors/${actor.id}/media`).then(r=>r.ok?r.json():[]).then(d => {
       const photo = d.find(m => m.media_type==="photo" && m.state_slug==="profile");
       if (photo) setProfilePhoto(photo);
-      if (d.some(m=>m.media_type==="voice_reference")) setVoiceDone(true);
-    }).catch(()=>{});
-  }, [actor.id]);
-
-  useEffect(() => {
-    fetch(`/api/actors/${actor.id}/archived-media`).then(r=>r.ok?r.json():[]).then(d => {
-      const groups = {};
-      (Array.isArray(d)?d:[]).forEach(m => {
-        if (!groups[m.world_id]) groups[m.world_id] = { world_name: m.world_name, world_id: m.world_id, count: 0 };
-        groups[m.world_id].count++;
-      });
-      setArchives(Object.values(groups));
+      // Session 149 — CharacterWizard.jsx uploads the voice sample as
+      // media_type:"audio", state_slug:"voice_sample" (established since
+      // Session 103). This step only ever checked its own convention
+      // (media_type==="voice_reference", used by uploadVoice below) — so
+      // a voice set during character creation was always invisible here,
+      // showing "Upload a voice reference MP3" even when one already
+      // existed. Recognize both; don't change either upload path, both
+      // are legitimately in use.
+      const voice = d.find(m => m.media_type==="voice_reference" || (m.media_type==="audio" && m.state_slug==="voice_sample"));
+      if (voice) setVoiceMedia(voice);
     }).catch(()=>{});
   }, [actor.id]);
 
@@ -906,16 +1774,6 @@ function StepMedia({ actor, state, setState }) {
     setUploading(false);
   }
 
-  async function uploadVideo(file) {
-    setUploading(true);
-    const fd = new FormData();
-    fd.append("video", file);
-    fd.append("world_id", state.world?.id);
-    fd.append("actor_id", actor.id);
-    await fetch(`/api/actors/${actor.id}/upload-video`, { method:"POST", body:fd }).catch(()=>{});
-    setUploading(false);
-  }
-
   async function uploadVoice(file) {
     setVoiceUploading(true);
     const fd = new FormData();
@@ -923,7 +1781,7 @@ function StepMedia({ actor, state, setState }) {
     fd.append("media_type", "voice_reference");
     fd.append("state_slug", "voice_reference");
     const r = await fetch(`/api/actors/${actor.id}/media`, { method:"POST", body:fd });
-    if (r.ok) setVoiceDone(true);
+    if (r.ok) { const data = await r.json(); setVoiceMedia(data); }
     setVoiceUploading(false);
   }
 
@@ -941,7 +1799,7 @@ function StepMedia({ actor, state, setState }) {
           <div>
             <label style={{ ...S.sans, fontSize:12, padding:"6px 14px", borderRadius:8, border:"1px solid rgba(0,0,0,.12)", background:"#1a1814", color:"#faf8f4", cursor:"pointer", opacity:uploading?0.6:1 }}>
               {uploading ? "Uploading…" : profilePhoto ? "Replace" : "Upload photo"}
-              <input ref={fileRef} type="file" accept="image/*" style={{ display:"none" }} onChange={e=>{ if(e.target.files[0]) uploadPhoto(e.target.files[0]); }} />
+              <input ref={fileRef} type="file" accept="image/*" style={{ display:"none" }} onChange={e=>{ if(e.target.files[0]) uploadPhoto(e.target.files[0]); e.target.value=""; }} />
             </label>
             <div style={{ ...S.sans, fontSize:11, color:"#a8a5a0", marginTop:4 }}>World-specific profile image</div>
           </div>
@@ -951,60 +1809,32 @@ function StepMedia({ actor, state, setState }) {
       {/* Voice reference */}
       <div>
         <div style={{ ...S.label, marginBottom:8 }}>Voice reference</div>
-        <div style={{ padding:"12px 14px", borderRadius:10, border:`1px ${voiceDone?"solid":"dashed"} ${voiceDone?"rgba(29,158,117,.3)":"rgba(0,0,0,.1)"}`, background:voiceDone?"rgba(29,158,117,.05)":"rgba(0,0,0,.02)", display:"flex", alignItems:"center", gap:12 }}>
-          <span style={{ fontSize:18 }}>🎙️</span>
-          <div style={{ flex:1 }}>
-            <div style={{ ...S.sans, fontSize:13, fontWeight:500, color:voiceDone?"#0f6e56":"#1a1814" }}>{voiceDone?"Voice reference uploaded":"Upload a voice reference MP3"}</div>
-            <div style={{ ...S.sans, fontSize:11, color:"#a8a5a0" }}>10–30 seconds of clear speech, no background noise</div>
-          </div>
-          <label style={{ ...S.sans, fontSize:11, padding:"4px 10px", borderRadius:7, border:"1px solid rgba(0,0,0,.12)", background: voiceDone?"none":"#1a1814", color:voiceDone?"#6b6760":"#faf8f4", cursor:"pointer", opacity:voiceUploading?0.6:1 }}>
-            {voiceUploading?"Uploading…":voiceDone?"Replace":"Upload MP3"}
-            <input type="file" accept="audio/mp3,audio/mpeg,.mp3" style={{ display:"none" }} onChange={e=>{ if(e.target.files[0]) uploadVoice(e.target.files[0]); }} disabled={voiceUploading} />
-          </label>
-        </div>
-      </div>
-
-      {/* Archive transfer */}
-      <div>
-        <div style={{ ...S.label, marginBottom:8 }}>Transfer animations from archive</div>
-        <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
-          <div onClick={() => setState(s => ({ ...s, archiveWorldId: null }))}
-            style={{ padding:"10px 14px", borderRadius:9, cursor:"pointer",
-              border:`1px solid ${!state.archiveWorldId?"rgba(29,158,117,.4)":"rgba(0,0,0,.1)"}`,
-              background:!state.archiveWorldId?"rgba(29,158,117,.06)":"rgba(0,0,0,.02)",
-              display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-            <span style={{ ...S.sans, fontSize:13, color:"#1a1814" }}>No transfer — start fresh</span>
-            {!state.archiveWorldId && <span style={{ color:"#1D9E75" }}>✓</span>}
-          </div>
-          {archives.map(a => (
-            <div key={a.world_id} onClick={() => setState(s => ({ ...s, archiveWorldId: a.world_id }))}
-              style={{ padding:"10px 14px", borderRadius:9, cursor:"pointer",
-                border:`1px solid ${state.archiveWorldId===a.world_id?"rgba(29,158,117,.4)":"rgba(0,0,0,.1)"}`,
-                background:state.archiveWorldId===a.world_id?"rgba(29,158,117,.06)":"rgba(0,0,0,.02)",
-                display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-              <div>
-                <div style={{ ...S.sans, fontSize:13, color:"#1a1814", fontWeight:500 }}>{a.world_name || a.world_id.slice(0,8)}</div>
-                <div style={{ ...S.sans, fontSize:11, color:"#a8a5a0" }}>{a.count} animations</div>
+        <div style={{ padding:"12px 14px", borderRadius:10, border:`1px ${voiceMedia?"solid":"dashed"} ${voiceMedia?"rgba(29,158,117,.3)":"rgba(0,0,0,.1)"}`, background:voiceMedia?"rgba(29,158,117,.05)":"rgba(0,0,0,.02)" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+            <span style={{ fontSize:18 }}>🎙️</span>
+            <div style={{ flex:1, minWidth:0 }}>
+              <div style={{ ...S.sans, fontSize:13, fontWeight:500, color:voiceMedia?"#0f6e56":"#1a1814" }}>{voiceMedia?"Voice reference uploaded":"Upload a voice reference MP3"}</div>
+              <div style={{ ...S.sans, fontSize:11, color:"#a8a5a0", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                {voiceMedia?.filename || "10–30 seconds of clear speech, no background noise"}
               </div>
-              {state.archiveWorldId===a.world_id && <span style={{ color:"#1D9E75" }}>✓</span>}
             </div>
-          ))}
-          {archives.length === 0 && <p style={{ ...S.sans, fontSize:12, color:"#a8a5a0" }}>No archived animation sets found.</p>}
-        </div>
-      </div>
+            <label style={{ ...S.sans, fontSize:11, padding:"4px 10px", borderRadius:7, border:"1px solid rgba(0,0,0,.12)", background: voiceMedia?"none":"#1a1814", color:voiceMedia?"#6b6760":"#faf8f4", cursor:"pointer", opacity:voiceUploading?0.6:1, flexShrink:0 }}>
+              {voiceUploading?"Uploading…":voiceMedia?"Replace":"Upload MP3"}
+              <input type="file" accept="audio/mp3,audio/mpeg,.mp3" style={{ display:"none" }} onChange={e=>{ if(e.target.files[0]) uploadVoice(e.target.files[0]); e.target.value=""; }} disabled={voiceUploading} />
+            </label>
+          </div>
 
-      {/* Upload animations */}
-      <div>
-        <div style={{ ...S.label, marginBottom:4 }}>Upload animations</div>
-        <div style={{ ...S.sans, fontSize:11, color:"#a8a5a0", marginBottom:8 }}>Green screen standing clips recommended as a starting point. Multiple files accepted.</div>
-        <label style={{ ...S.sans, fontSize:12, padding:"8px 16px", borderRadius:8, border:"1px dashed rgba(0,0,0,.15)", background:"rgba(0,0,0,.02)", color:"#6b6760", cursor:"pointer", display:"inline-block" }}>
-          + Add video files (.mp4)
-          <input ref={videoRef} type="file" accept="video/mp4,.mp4" multiple style={{ display:"none" }}
-            onChange={async e => {
-              for (const f of Array.from(e.target.files)) { await uploadVideo(f); }
-              e.target.value = "";
-            }} />
-        </label>
+          {/* Session 150 — the file could be uploaded and replaced but never
+              heard. This voice is what the character will sound like in every
+              encounter; confirming it before deploy should not require digging
+              the file out of actor_media by hand. `key` on the url so replacing
+              the sample reloads the element instead of replaying the old one
+              from cache. */}
+          {voiceMedia?.url && (
+            <audio key={voiceMedia.url} controls preload="none" src={voiceMedia.url}
+              style={{ width:"100%", height:32, marginTop:10, display:"block" }} />
+          )}
+        </div>
       </div>
     </div>
   );
@@ -1013,11 +1843,91 @@ function StepMedia({ actor, state, setState }) {
 
 // ── Step 5: Review ────────────────────────────────────────────────────────────
 function StepDeploy({ actor, state }) {
+  function relLabel(r) {
+    const raw = (r.rel_type_name || r.label || "").replace(/_/g, " ").trim();
+    if (!raw || raw === "none") return "no relationship set";
+    return raw;
+  }
+  // Session 150 — hours are per revenue source now, so this reports them
+  // that way instead of as one figure for the whole person. Previously it
+  // also asserted "Mon–Fri … weekends free" as though it had read the
+  // schedule; it hadn't — it only ever saw the configured blocks. The
+  // weekday/weekend split is generate-schedule's behaviour, so it's stated
+  // once, plainly, rather than repeated per line as if derived.
+  // Session 150 — compact day summary. Contiguous runs collapse ("Mon–Fri"),
+  // scattered days list out ("Sat, Sun"), so weekend-only work is visible at a
+  // glance rather than hidden behind a generic "work week" line.
+  function daysLabel(src) {
+    const keys = WEEK.map(w => w.key);
+    const abbr = { monday:"Mon", tuesday:"Tue", wednesday:"Wed", thursday:"Thu", friday:"Fri", saturday:"Sat", sunday:"Sun" };
+    const on = daysOf(src);
+    if (on.length === 0) return "never";
+    if (on.length === 7) return "every day";
+    const idx = keys.map((k, i) => on.includes(k) ? i : -1).filter(i => i >= 0);
+    const runs = [];
+    for (const i of idx) {
+      const last = runs[runs.length - 1];
+      if (last && i === last[last.length - 1] + 1) last.push(i);
+      else runs.push([i]);
+    }
+    return runs.map(r => r.length >= 3 ? `${abbr[keys[r[0]]]}–${abbr[keys[r[r.length-1]]]}` : r.map(i => abbr[keys[i]]).join(", ")).join(", ");
+  }
+
+  function workHoursLabel(state) {
+    const sources = state.career?.revenue_sources || [];
+    if (sources.length === 0) return "No revenue sources — 08:00–17:00 default";
+    return sources.map(s => {
+      const blocks = (Array.isArray(s.work_blocks) && s.work_blocks.length > 0)
+        ? s.work_blocks : [{ start:"08:00", end:"17:00" }];
+      const where = (s.work_from_home || s.source_type === "independent") ? "home" : "work";
+      const hours = blocks.map(b => `${b.start}–${b.end}`).join(", ");
+      const leave = leaveDaysOf(s);
+      return `${s.name || "(unnamed)"}: ${daysLabel(s)} ${hours} (${where}), ${leave > 0 ? `${leave} days leave` : "no paid leave"}`;
+    }).join(" · ");
+  }
+  // Session 150 — level and reputation are per source, so the review shows
+  // them per source, plus the rolled-up figure the simulator's actor row
+  // actually receives.
+  function sourcesLabel(state) {
+    const sources = state.career?.revenue_sources || [];
+    if (sources.length === 0) return "None";
+    const cur = state.world?.currency || "";
+    const per = sources.map(s => {
+      const b = srcBasis(s);
+      // Session 150 — say what each source actually pays, or say plainly that
+      // it pays nothing yet. An unpriced source deploys fine but the ledger
+      // will never credit it, and that should be visible before deploying.
+      const money =
+        b === "per_contract"
+          ? (s.gross_amount ? `${s.gross_amount} ${cur} on ${s.ends_on || "completion (no date set)"}` : "no fee set")
+          : (s.monthly_amount
+              ? `${s.monthly_amount} ${cur}/mo${b === "variable" ? ` ±${Math.round((s.variability ?? 0.25)*100)}%` : ` on the ${s.pay_day ?? 25}th`}`
+              : "no income set");
+      return `${s.name || "(unnamed)"} — ${s.source_type}, ${Math.round((s.reputation_score ?? 0.5)*100)}% (${levelFromReputation(s.reputation_score)}), ${money}`;
+    }).join(" · ");
+    return sources.length > 1
+      ? `${per}  →  actor record: ${rollupCareerLevel(sources) || "junior"}, ${Math.round(rollupReputation(sources)*100)}%`
+      : per;
+  }
+  // Read off the generated schedule itself rather than asserted. The old
+  // label claimed "weekends free" unconditionally without ever looking.
+  function workWeekLabel(state) {
+    const slots = Array.isArray(state.schedule) ? state.schedule : [];
+    if (slots.length === 0) return "—";
+    const WEEKEND = new Set(["saturday","sunday"]);
+    const worksWeekend = slots.some(s =>
+      WEEKEND.has((s.day_of_week||"").toLowerCase()) && (s.activity_slug||"").startsWith("work_"));
+    return worksWeekend ? "Mon–Sun, weekend work scheduled" : "Mon–Fri, weekends free";
+  }
   const rows = [
     ["Character",    actor?.name],
     ["World",        state.world?.name],
-    ["Relationships",(state.relationships||[]).map(r=>`${r.character.first_name||r.character.name} · ${(r.rel_type_name||r.label||"").replace(/_/g," ")}`).join(", ")||"None"],
-    ["Schedule",     state.schedule?`${state.schedule.length} blocks · week ${state.fromWeek} → 52`:"Not set"],
+    ["Relationships",(state.relationships||[]).map(r=>`${r.character.first_name||r.character.name} — ${relLabel(r)}`).join(", ")||"None seeded"],
+    ["Revenue sources", sourcesLabel(state)],
+    ["Opening balance", `${(Number(state.career?.opening_balance) || 0).toLocaleString()} ${state.world?.currency || ""}`.trim()],
+    ["Work hours",   state.schedule ? workHoursLabel(state) : "Not set"],
+    ["Work week",    workWeekLabel(state)],
+    ["Deploy starts", `Week ${state.fromWeek}`],
     ["Starting location","Home"],
   ];
   return (
@@ -1038,12 +1948,83 @@ function StepDeploy({ actor, state }) {
   );
 }
 
+// ── Draft persistence ─────────────────────────────────────────────────────────
+// Session 150 — the wizard held everything in memory only, so closing the
+// modal or reloading the tab discarded the world/home pick, every
+// relationship configured by hand, the generated CV and the generated
+// schedule — several minutes of Haiku round-trips, gone, with only a
+// "Progress will be lost" confirm as warning.
+//
+// Stored in localStorage rather than server-side on purpose: actor.draft_state
+// is already the wardrobe's canonical store (Plan A, Sessions 146–147), and
+// deploy deliberately REFUSES to run when that blob won't parse. Putting
+// unrelated wizard state behind that contract would mean a stale or truncated
+// draft could block deploying the actor entirely. This is operator-local
+// convenience state; it has no business gating deploys.
+// v3 (Session 150) — career_level and reputation_score joined work hours in
+// moving onto each revenue source. As with v2, an older draft's single
+// person-level value can't be attributed to any particular source after the
+// fact, so those drafts are dropped on load rather than restored into a
+// shape that would silently lose them.
+const DRAFT_VERSION = 3;
+const draftKey = actorId => `deploy-wizard-draft:${actorId}`;
+
+function clampStep(n) {
+  const s = Number(n);
+  return Number.isFinite(s) && s >= 1 && s <= STEPS.length ? s : 1;
+}
+
+function loadDraft(actorId) {
+  if (!actorId) return null;
+  try {
+    const raw = localStorage.getItem(draftKey(actorId));
+    if (!raw) return null;
+    const d = JSON.parse(raw);
+    // A version bump means the shape changed — drop the old draft rather
+    // than restoring fields the current wizard would misread.
+    if (!d || d.v !== DRAFT_VERSION || !d.state) return null;
+    return d;
+  } catch { return null; }
+}
+
+function saveDraft(actorId, step, state) {
+  if (!actorId) return;
+  try {
+    // worldCharacters / worldUsers / worldRosterLoaded are NOT persisted.
+    // They're refetched from the world whenever step 2 mounts, and a
+    // restored copy would let the relationship gate pass against a cast
+    // list that no longer matches the world.
+    const { worldCharacters, worldUsers, worldRosterLoaded, ...persistable } = state;
+    localStorage.setItem(draftKey(actorId), JSON.stringify({ v: DRAFT_VERSION, step, state: persistable, savedAt: Date.now() }));
+  } catch { /* quota or private mode — persistence is a convenience, never a requirement */ }
+}
+
+function clearDraft(actorId) {
+  if (!actorId) return;
+  try { localStorage.removeItem(draftKey(actorId)); } catch {}
+}
+
+function savedAgo(ts) {
+  if (!ts) return "";
+  const mins = Math.floor((Date.now() - ts) / 60000);
+  if (mins < 1)   return "just now";
+  if (mins < 60)  return `${mins} min ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24)   return `${hrs} h ago`;
+  return `${Math.floor(hrs / 24)} d ago`;
+}
+
 // ── Main modal ────────────────────────────────────────────────────────────────
 export default function DeployWizardModal({ actor, onClose, onDeployed }) {
-  const [step, setStep]   = useState(1);
-  const [state, setState] = useState({ world:null, relationships:[], schedule:null, fromWeek:1, stateImages:[] });
+  // Session 150 — restored draft, read once on mount. `stateImages` was
+  // dropped from the initial shape: it was declared here and never read
+  // or written anywhere in the file.
+  const [draft] = useState(() => loadDraft(actor?.id));
+  const [step, setStep]   = useState(() => clampStep(draft?.step));
+  const [state, setState] = useState(() => draft?.state || { world:null, relationships:[], schedule:null, fromWeek:1 });
   const [deploying, setDeploying] = useState(false);
   const [error, setError] = useState("");
+  const [draftNotice, setDraftNotice] = useState(!!draft);
 
   useEffect(() => {
     const prev = document.body.style.overflow;
@@ -1051,9 +2032,53 @@ export default function DeployWizardModal({ actor, onClose, onDeployed }) {
     return () => { document.body.style.overflow = prev; };
   }, []);
 
+  // Session 150 — persist on every change. The roster fields are
+  // deliberately excluded (see saveDraft) so a stale cast list can never
+  // be restored into the step-2 gate.
+  useEffect(() => { saveDraft(actor?.id, step, state); }, [actor?.id, step, state]);
+
+  function startFresh() {
+    if (!window.confirm("Discard the saved draft and start this wizard over?")) return;
+    clearDraft(actor?.id);
+    setState({ world:null, relationships:[], schedule:null, fromWeek:1 });
+    setStep(1);
+    setDraftNotice(false);
+    setError("");
+  }
+
+  // Session 149 — everyone in the world (every deployed character, every
+  // player) needs at least one relationship dimension defined before
+  // moving on, not just whoever was picked and configured. Returns the
+  // list of people still missing one, used both to gate Next and to
+  // show who's still outstanding directly in the step.
+  function missingRelationships() {
+    const all = [...(state.worldCharacters||[]), ...(state.worldUsers||[]).map(u => ({...u, _isUser:true}))];
+    const covered = new Set((state.relationships||[]).map(r => r.character.id));
+    return all.filter(p => !covered.has(p.id));
+  }
+
   function canNext() {
     if (step===1) return !!state.world && !!state.home?.place_id && !!state.home?.home_type;
-    if (step===3) return !!state.schedule;
+    // Session 150 — added the worldRosterLoaded requirement. Without it a
+    // failed roster fetch produced an empty missing-list and waved the
+    // step through; see the Promise.all in StepRelationships.
+    if (step===2) return !!state.worldRosterLoaded && missingRelationships().length === 0;
+    // Session 150 — step 3 (CV & Employment) had no gate at all, even
+    // though the step itself prints "No revenue sources yet — add at
+    // least one". Deploying with none reaches the simulator and inserts
+    // zero actor_revenue_sources rows, leaving the actor with no income
+    // and nothing for the schedule generator to anchor work against. A
+    // source with a blank name is equally useless downstream — it's
+    // written straight into actor_revenue_sources.name.
+    if (step===3) {
+      const sources = state.career?.revenue_sources || [];
+      return sources.length > 0 && sources.every(s => (s.name || "").trim());
+    }
+    // Session 150 — was `!!state.schedule`, and [] is truthy. A
+    // generation that came back empty walked all the way to Deploy and
+    // failed there against the server's own `!schedule?.length` check
+    // with the generic "missing required deploy fields". Gate on content.
+    if (step===4) return Array.isArray(state.schedule) && state.schedule.length > 0;
     return true;
   }
 
@@ -1061,20 +2086,69 @@ export default function DeployWizardModal({ actor, onClose, onDeployed }) {
     setDeploying(true);
     setError("");
     try {
+      // Session 150 — career level and reputation are per revenue source
+      // now, but the simulator's actors row still carries one of each
+      // (ReputationEngine, WorkOfferGenerator and the LiveView career tab
+      // all read them there). Send the rolled-up figure alongside the
+      // per-source values so both models stay populated and nothing that
+      // reads the actor row starts seeing nulls.
+      // Session 150 — career_level is derived at send time rather than stored
+      // on the source. The reputation slider is the only thing the operator
+      // sets; actor_revenue_sources.career_level exists for the simulator to
+      // read, so it's computed here from that source's own reputation.
+      const sourcesForDeploy = (state.career?.revenue_sources || []).map(s => ({
+        ...s,
+        career_level: levelFromReputation(s.reputation_score),
+        // Session 150 — send the payout shape explicitly rather than leaving the
+        // simulator to infer it from source_type. It infers the same thing by
+        // default, but a source whose type is later edited without its terms
+        // being revisited would otherwise silently change how it pays.
+        amount_basis: srcBasis(s),
+        currency:     s.currency || state.world?.currency || null,
+        // Session 150 — resolved HERE, not left to a default on either side, so
+        // what deploys is exactly what the operator saw. pay_day and work_days
+        // were rendered from fallbacks (`src.pay_day ?? 25`, `daysOf(src)`) but
+        // only WRITTEN when the control was actually touched — so a source left
+        // at its displayed defaults deployed with both null. Lindsey's first
+        // deploy landed with no pay day and no work days despite the wizard
+        // showing 25 and Mon-Fri.
+        leave_days_per_year: leaveDaysOf(s),
+        pay_day:   srcBasis(s) === "per_contract" ? null : (s.pay_day ?? 25),
+        work_days: daysOf(s),
+        work_blocks: blocksOfSource(s),
+      }));
       const payload = {
         world:         state.world,
         home:          state.home,
-        workplace:     state.workplace || null,
-        career:        state.career || null,
+        career:        {
+          ...(state.career || {}),
+          revenue_sources:  sourcesForDeploy,
+          // Explicit 0 rather than null when unset — the simulator opens the
+          // account at whatever arrives, and "not stated" and "nothing" are the
+          // same thing for a starting balance.
+          opening_balance:  Math.max(0, Number(state.career?.opening_balance) || 0),
+          career_level:     rollupCareerLevel(sourcesForDeploy),
+          reputation_score: rollupReputation(sourcesForDeploy),
+        },
         relationships: state.relationships || [],
         schedule:      state.schedule || [],
         fromWeek:      state.fromWeek || 1,
+        // Session 150 — the CV was collected here, generated by Haiku,
+        // editable, and exportable as a PDF, then dropped on the floor:
+        // it appeared nowhere in this payload, server/index.js never
+        // forwarded one, and deploy_actor/2 on the simulator had no
+        // params["cv"] to read. Every deployed actor carried an empty
+        // history. Wired end to end this session.
+        cv:            state.cv?.notes?.trim() || null,
       };
       const res = await fetch(`/api/actors/${actor.id}/deploy`, {
         method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload),
       });
       const data = await res.json();
       if (res.ok && data.ok) {
+        // Deployed — the draft has served its purpose and would otherwise
+        // be restored the next time this actor's wizard is opened.
+        clearDraft(actor?.id);
         onDeployed({ platform_actor_id: actor.id, world_id: state.world.id, world_name: state.world.name, simulator_actor_id: data.simulator_actor_id });
       } else {
         setError(data.error || "Deploy failed.");
@@ -1083,7 +2157,7 @@ export default function DeployWizardModal({ actor, onClose, onDeployed }) {
     } catch(e) { setError("Network error: " + e.message); setDeploying(false); }
   }
 
-  const nextLabels = ["","Next →","Next →","Next →","Next →","Deploy"];
+  const nextLabels = ["","Next →","Next →","Next →","Next →","Next →","Deploy"];
 
   return (
     <div style={S.overlay}>
@@ -1093,7 +2167,19 @@ export default function DeployWizardModal({ actor, onClose, onDeployed }) {
           <div style={{ position:"absolute", inset:0, zIndex:10, borderRadius:24, background:"rgba(255,255,255,0.85)", backdropFilter:"blur(8px)", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:16 }}>
             <div style={{ width:40, height:40, border:"3px solid rgba(0,0,0,0.08)", borderTop:"3px solid #1a1814", borderRadius:"50%", animation:"spin 0.9s linear infinite" }} />
             <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, color:"#1a1814", fontWeight:500 }}>Deploying character…</div>
-            <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#a8a5a0" }}>This may take a minute — Dolphin is thinking</div>
+            {/* Session 150 — this used to say "Dolphin is thinking" for every
+                deploy. Dolphin is only called to write reverse relationship
+                descriptions for CHARACTER targets; deploy_actor skips it
+                outright for relationships with users ("users — skip Dolphin,
+                nil description is correct"). An actor whose only connections
+                are players — which is the common case for the first character
+                in a world — never touches it, so the message named a step that
+                was not running. Say what is actually happening. */}
+            <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#a8a5a0" }}>
+              {(state.relationships || []).some(r => !r.character?._isUser)
+                ? "Writing relationship context for each character — this can take a minute"
+                : "Creating places, psychology, schedule and media"}
+            </div>
             <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
           </div>
         )}
@@ -1103,25 +2189,49 @@ export default function DeployWizardModal({ actor, onClose, onDeployed }) {
             <div style={{ ...S.serif, fontSize:21, fontWeight:500, color:"#1a1814" }}>Deploy {actor?.first_name||actor?.name}</div>
             <div style={{ ...S.sans, fontSize:12, color:"#a8a5a0", marginTop:2 }}>Step {step} of {STEPS.length} — {STEPS[step-1]}</div>
           </div>
-          <button onClick={()=>{ if(window.confirm("Close? Progress will be lost.")) onClose(); }} style={{ background:"none", border:"1px solid rgba(0,0,0,.08)", borderRadius:8, padding:"6px 12px", cursor:"pointer", ...S.sans, fontSize:12, color:"#a8a5a0" }}>✕</button>
+          {/* Session 150 — no longer warns that progress will be lost,
+              because it isn't: everything is saved per-actor and restored
+              on reopen. Discarding is now the explicit action, not the
+              accidental one. */}
+          <button onClick={onClose} title="Close — your progress is saved" style={{ background:"none", border:"1px solid rgba(0,0,0,.08)", borderRadius:8, padding:"6px 12px", cursor:"pointer", ...S.sans, fontSize:12, color:"#a8a5a0" }}>✕</button>
         </div>
+
+        {/* Restored-draft notice */}
+        {draftNotice && (
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:12, margin:"0.75rem 1.5rem -0.25rem", padding:"7px 11px", borderRadius:9, background:"rgba(29,158,117,.07)", border:"1px solid rgba(29,158,117,.25)" }}>
+            <span style={{ ...S.sans, fontSize:11.5, color:"#0f6e56" }}>
+              Picked up where you left off — saved {savedAgo(draft?.savedAt)}.
+            </span>
+            <div style={{ display:"flex", gap:6, flexShrink:0 }}>
+              <button onClick={startFresh} style={{ ...S.sans, fontSize:11, padding:"3px 9px", borderRadius:7, border:"1px solid rgba(29,158,117,.35)", background:"none", color:"#0f6e56", cursor:"pointer" }}>Start fresh</button>
+              <button onClick={()=>setDraftNotice(false)} style={{ ...S.sans, fontSize:11, padding:"3px 7px", borderRadius:7, border:"none", background:"none", color:"#0f6e56", cursor:"pointer", opacity:.7 }}>✕</button>
+            </div>
+          </div>
+        )}
 
         <StepBar current={step} />
 
         {/* Body */}
         <div style={{ flex:1, overflowY:"auto", padding:"1.25rem 1.5rem" }}>
-          {step===1 && <StepWorld actor={actor} state={state} setState={setState} />}
+          {step===1 && <StepWorld      actor={actor} state={state} setState={setState} />}
           {step===2 && <StepRelationships actor={actor} state={state} setState={setState} />}
-          {step===3 && <StepSchedule    actor={actor} state={state} setState={setState} />}
-          {step===4 && <StepMedia       actor={actor} state={state} setState={setState} />}
-          {step===5 && <StepDeploy      actor={actor} state={state} />}
+          {step===3 && (
+            <>
+              <StepCV         actor={actor} state={state} setState={setState} />
+              <div style={{ height:28, borderTop:"1px solid rgba(0,0,0,.06)", marginTop:20 }} />
+              <StepEmployment actor={actor} state={state} setState={setState} />
+            </>
+          )}
+          {step===4 && <StepSchedule   actor={actor} state={state} setState={setState} />}
+          {step===5 && <StepMedia      actor={actor} state={state} setState={setState} />}
+          {step===6 && <StepDeploy     actor={actor} state={state} />}
           {error && <p style={{ ...S.sans, fontSize:12, color:"#c0392b", marginTop:12 }}>{error}</p>}
         </div>
 
         {/* Footer */}
         <div style={{ display:"flex", justifyContent:"space-between", padding:"1rem 1.5rem", borderTop:"1px solid rgba(0,0,0,.06)", flexShrink:0 }}>
           <button onClick={()=>setStep(p=>Math.max(1,p-1))} disabled={step===1} style={{ ...S.sans, fontSize:13, padding:"8px 18px", borderRadius:9, border:"1px solid rgba(0,0,0,.1)", background:"none", color:"#6b6760", cursor:"pointer", opacity:step===1?.4:1 }}>← Back</button>
-          <button onClick={()=>{ if(!canNext()) return; if(step===5) handleDeploy(); else setStep(p=>p+1); }} disabled={deploying||!canNext()} style={{ ...S.sans, fontSize:13, padding:"8px 24px", borderRadius:9, border:"none", background:"#1a1814", color:"#faf8f4", cursor:"pointer", opacity:(!canNext()||deploying)?.5:1 }}>
+          <button onClick={()=>{ if(!canNext()) return; if(step===6) handleDeploy(); else setStep(p=>p+1); }} disabled={deploying||!canNext()} style={{ ...S.sans, fontSize:13, padding:"8px 24px", borderRadius:9, border:"none", background:"#1a1814", color:"#faf8f4", cursor:"pointer", opacity:(!canNext()||deploying)?.5:1 }}>
             {deploying?"Deploying…":nextLabels[step]}
           </button>
         </div>

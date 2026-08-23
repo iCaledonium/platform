@@ -414,7 +414,10 @@ function EconomicPanel({ d, editing, setEditData }) {
           <Field label="Attitude to wealth"  value={e.attitude_to_wealth} />
           <Field label="Savings habit"       value={e.savings_habit} />
           <Field label="Financial anxiety"   value={e.financial_anxiety != null ? Number(e.financial_anxiety).toFixed(2) : null} />
-          <Field label="Monthly income"      value={e.monthly_income_sek ? `${Number(e.monthly_income_sek).toLocaleString()} SEK` : null} />
+          {/* Session 150 — read-only. The amount is world data, set at
+              world-deploy from the actor's revenue sources; editing it here
+              contradicted that and was one of three writers to one column. */}
+          <Field label="Monthly income"      value={e.monthly_income ? Number(e.monthly_income).toLocaleString() : "Set at deployment"} />
           <Field label="Behavior note"       value={e.behavior_note} full tall />
         </div>
       )}
@@ -446,7 +449,6 @@ function EconomicPanel({ d, editing, setEditData }) {
           options={["indifferent","practical","aspirational","anxious"]} />
         <ESelect label="Savings habit" value={e?.savings_habit} onChange={v=>upd("savings_habit",v)}
           options={["none","minimal","moderate","disciplined"]} />
-        <EField label="Monthly income (SEK)" value={e?.monthly_income_sek} onChange={v=>upd("monthly_income_sek",v)} type="number" />
       </div>
       <ESlider label={`Financial anxiety — ${Math.round((e?.financial_anxiety||0)*100)}%`}
         value={Math.round((e?.financial_anxiety||0)*100)} onChange={v=>upd("financial_anxiety",v/100)} />

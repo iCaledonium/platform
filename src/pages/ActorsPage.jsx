@@ -259,7 +259,7 @@ function EconomicPanel({ data }) {
         <Field label="Attitude to wealth"  value={economic.attitude_to_wealth} />
         <Field label="Savings habit"       value={economic.savings_habit} />
         <Field label="Financial anxiety"   value={economic.financial_anxiety != null ? Number(economic.financial_anxiety).toFixed(2) : null} />
-        <Field label="Monthly income"      value={economic.monthly_income_sek ? `${economic.monthly_income_sek.toLocaleString()} SEK` : null} />
+        <Field label="Monthly income"      value={economic.monthly_income ? economic.monthly_income.toLocaleString() : "Set at deployment"} />
         <Field label="Behavior note"       value={economic.behavior_note} full tall />
       </>}
       {expenses?.length > 0 && (

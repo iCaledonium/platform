@@ -12,6 +12,7 @@ import multer from "multer";
 import db from "./db.js";
 import { registerGenerate3DRoutes, deleteActorTmpFolder } from "./generate3d.js";
 import { mergeAnimationIntoActorGlb, removeAnimationFromActorGlb, parseDufFrames } from "./animations.js";
+import { educationFromCv } from "./cv_edu.mjs";
 
 // Session 102 — drafts carry their wizard adjustment state (all morph
 // slider values, the named body sliders, pose values, reference URLs,
@@ -105,6 +106,36 @@ async function callDirtyMuse(system, userContent, maxTokens = 600) {
   // Strip any preamble before first { or [
   const match = raw.match(/[{\[].*/s);
   return match ? match[0] : raw;
+}
+
+// Session 149 — this didn't exist as a reusable function; the only real
+// Anthropic Haiku call in the whole file was inlined directly inside
+// /api/generate/profile. Every OTHER "suggest"/"generate" route in this
+// file — despite several of their own comments literally saying "Haiku"
+// — actually calls callDirtyMuse (the local Ollama model on .60), a
+// mistake that has already happened and been fixed once before on this
+// exact profile route (see the Session 103 comment below). Extracting
+// this makes it trivial to actually use real Haiku instead of repeating
+// that same mistake on every future generation endpoint.
+async function callHaiku(system, userContent, maxTokens = 1000) {
+  const key = process.env.CLAUDE_API_KEY;
+  if (!key) throw new Error("no CLAUDE_API_KEY set");
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: maxTokens,
+      ...(system ? { system } : {}),
+      messages: [{ role: "user", content: userContent }],
+    }),
+    signal: AbortSignal.timeout(120_000),
+  });
+  if (!r.ok) { const body = await r.text().catch(() => ""); throw new Error(`anthropic ${r.status}: ${body.slice(0, 200)}`); }
+  const data = await r.json();
+  const text = (data.content || []).map(c => c.text || "").join("");
+  if (!text) throw new Error("anthropic returned empty content");
+  return text;
 }
 
 const app = express();
@@ -495,7 +526,7 @@ app.post("/api/worlds", async (req, res) => {
   const {
     name, city, lat, lng, timezone,
     news_feed_url, modules = [], scenario_seed, visibility = "private",
-    invitees = [], home_address
+    invitees = [], home_address, llm_capabilities = {}, xtts_url
   } = req.body;
 
   if (!name) return res.status(400).json({ error: "name required" });
@@ -524,7 +555,12 @@ app.post("/api/worlds", async (req, res) => {
         id: world_id, name, city, lat, lng, timezone,
         news_feed_url, modules, scenario_seed,
         members: members.map((m, i) => ({ ...m, role: i === 0 ? "owner" : "member" })),
-        home_address: home_address || undefined
+        home_address: home_address || undefined,
+        llm_capabilities,
+        // Session 150 — per-world XTTS endpoint. The voice server runs on a GPU
+        // box that is started and stopped by hand, so its address is not a
+        // constant the simulator can compile in.
+        xtts_url: (typeof xtts_url === "string" && xtts_url.trim()) ? xtts_url.trim() : undefined
       }),
       signal: AbortSignal.timeout(15000)
     });
@@ -642,6 +678,22 @@ app.patch("/api/worlds/:id/modules", async (req, res) => {
   } catch { res.status(502).json({ error: "simulator unreachable" }); }
 });
 
+// ── GET /api/llm-config/available — for the create-world wizard, before any
+// world_id exists. Reuses the same simulator endpoint as the per-world
+// route below with a placeholder world_id — get_llm_config/2 only uses
+// world_id to look up saved overrides (none exist yet for a new world, so
+// an empty result there is correct) and the `available` list itself is
+// independent of any world. ────────────────────────────────────────────────
+app.get("/api/llm-config/available", async (req, res) => {
+  try {
+    const simRes = await fetch(`${SIMULATOR_URL}/internal/config/llm?world_id=__new_world__`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN },
+    });
+    const data = await simRes.json();
+    res.json({ available: data.available || [] });
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
 // ── GET /api/worlds/:id/llm-config ───────────────────────────────────────────
 app.get("/api/worlds/:id/llm-config", async (req, res) => {
   try {
@@ -678,9 +730,42 @@ app.delete("/api/worlds/:id/llm-config", async (req, res) => {
 
 // ── POST /api/worlds/:id/llm-config/providers ─────────────────────────────────
 app.post("/api/worlds/:id/llm-config/providers", async (req, res) => {
-  // Provider URLs are runtime-only for now — stored in ETS via LlmConfig
-  // Future: persist to DB. For now just acknowledge.
-  res.json({ ok: true });
+  // Session 150 — this used to return {ok:true} and store NOTHING, while the
+  // panel reported "Provider URLs saved". xtts_url is now genuinely persisted,
+  // to worlds.xtts_url on the simulator.
+  //
+  // nevoria_url and dirty_muse_url still are not: they are LLM provider bases
+  // held in the simulator's ETS at runtime, and persisting them is a larger
+  // change than this. They keep the previous behaviour rather than being
+  // silently dropped — but the panel now says which of the three actually
+  // survives a restart, instead of implying all of them do.
+  const { xtts_url } = req.body || {};
+  let xttsSaved = false;
+
+  if (typeof xtts_url === "string") {
+    try {
+      const simRes = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.id}/xtts`, {
+        method: "POST",
+        headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+        body: JSON.stringify({ xtts_url }),
+      });
+      xttsSaved = simRes.ok;
+    } catch {
+      return res.status(502).json({ error: "simulator unreachable" });
+    }
+  }
+
+  res.json({ ok: true, xtts_saved: xttsSaved });
+});
+
+// ── GET /api/worlds/:id/xtts ─────────────────────────────────────────────────
+app.get("/api/worlds/:id/xtts", async (req, res) => {
+  try {
+    const simRes = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.id}/xtts`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN },
+    });
+    res.json(await simRes.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
 });
 
 // ── GET /api/keys ─────────────────────────────────────────────────────────────
@@ -1304,7 +1389,7 @@ app.get("/api/worlds/:id/actors", (req, res) => {
            ) as photo_url
     FROM actors a
     JOIN actor_deployments d ON d.platform_actor_id = a.id
-    WHERE d.world_id = ?
+    WHERE d.world_id = ? AND d.undeployed_at IS NULL
     ORDER BY a.name
   `).all(req.params.id);
   res.json(actors);
@@ -1456,6 +1541,42 @@ async function archiveWorldMedia(platformActorId, worldId, worldName, mediaFolde
   return archived;
 }
 
+// Media that belongs to a deployment rather than to the character template.
+// Deliberately an explicit list: state_image / animation rows are build-time
+// assets of the character herself and stay live no matter which world she is
+// or is not in.
+const ARCHIVABLE_MEDIA_TYPES = ["photo", "video", "voice_reference", "audio"];
+
+// Stamps archived_at on everything the actor holds for one world.
+//
+// Session 151 — this is the half archiveWorldMedia() above does not do. That
+// function copies video FILES down off the simulator and only stamps the rows
+// it managed to fetch; it returns early when the simulator is unreachable or
+// lists no videos. So an undeployed actor kept photos, her voice reference and
+// audio at archived_at NULL, still naming a world she is no longer deployed to
+// — and videos the simulator had already dropped were missed the same way.
+//
+// The marker records that the deployment ended, which is true whether or not
+// the file copy succeeded, so this runs unconditionally and independently.
+// Rows already archived are left at their original timestamp.
+function markWorldMediaArchived(platformActorId, worldId, worldName, archivedAt) {
+  if (!worldId) return 0;
+  const now = archivedAt || new Date().toISOString();
+  const slots = ARCHIVABLE_MEDIA_TYPES.map(() => "?").join(",");
+  const info = db.prepare(
+    `UPDATE actor_media
+        SET archived_at = ?,
+            world_name  = COALESCE(world_name, ?),
+            updated_at  = ?
+      WHERE actor_id    = ?
+        AND world_id    = ?
+        AND archived_at IS NULL
+        AND media_type IN (${slots})`
+  ).run(now, worldName || null, now, platformActorId, worldId, ...ARCHIVABLE_MEDIA_TYPES);
+  console.log(`[archive] Marked ${info.changes} actor_media row(s) archived for actor ${platformActorId} world ${worldId}`);
+  return info.changes;
+}
+
 // ── POST /api/actors/:id/undeploy ────────────────────────────────────────────
 app.post("/api/actors/:id/undeploy", async (req, res) => {
   const user = authUser(req);
@@ -1467,11 +1588,28 @@ app.post("/api/actors/:id/undeploy", async (req, res) => {
   const deployment = db.prepare(`SELECT * FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL ORDER BY deployed_at DESC LIMIT 1`).get(req.params.id);
   if (!deployment) return res.status(400).json({ error: "not deployed" });
 
-  // Archive media before undeploying
+  // Stamped on the archive rows, the deployment row and the status change
+  // alike, so an archived row can be read straight back to the undeploy that
+  // caused it.
+  const now = new Date().toISOString();
+
+  // Archive her media before undeploying — two steps, not one. Copy the video
+  // files down off the simulator while they still exist...
   try {
     await archiveWorldMedia(req.params.id, deployment.world_id, deployment.world_name, actor.media_folder, deployment.simulator_actor_id);
   } catch (e) {
     console.warn("[undeploy] archive failed:", e.message);
+  }
+
+  // ...then mark ALL of her media for this world archived. Separate from the
+  // copy above on purpose: the copy is best-effort and video-only, while the
+  // marker has to hold even when the simulator never answered. Without it
+  // actor_media keeps photos, voice references and audio at archived_at NULL
+  // against a world she is no longer deployed to.
+  try {
+    markWorldMediaArchived(req.params.id, deployment.world_id, deployment.world_name, now);
+  } catch (e) {
+    console.warn("[undeploy] archive marking failed:", e.message);
   }
 
   try {
@@ -1480,7 +1618,6 @@ app.post("/api/actors/:id/undeploy", async (req, res) => {
     console.warn("[undeploy] simulator call failed:", e.message);
   }
 
-  const now = new Date().toISOString();
   db.prepare(`UPDATE actor_deployments SET undeployed_at = ? WHERE id = ?`).run(now, deployment.id);
 
   // Session 149 — actors.status was left at 'active' forever after
@@ -1531,7 +1668,7 @@ app.post("/api/actors/:id/deploy", async (req, res) => {
   if (!user) return res.status(401).json({ error: "unauthorized" });
 
   const actorId = req.params.id;
-  const { world, home, workplace, career, relationships, schedule, fromWeek } = req.body;
+  const { world, home, career, relationships, schedule, fromWeek, cv } = req.body;
 
   if (!world?.id || !home?.place_id || !schedule?.length) {
     return res.status(400).json({ error: "missing required deploy fields" });
@@ -1556,6 +1693,38 @@ app.post("/api/actors/:id/deploy", async (req, res) => {
     actor_hds:           getPsychTable("actor_hds", actorId),
     actor_diagnoses:     getPsychTable("actor_diagnoses", actorId),
   };
+
+  // Session 150 — education from the CV.
+  //
+  // actor_education is almost always empty: the character wizard has no
+  // education step, so the only way to populate it was the character editor by
+  // hand, and virtually nobody does. Meanwhile the CV — generated or uploaded —
+  // states it plainly under its own EDUCATION heading. Parsing it there means a
+  // deployed actor knows where she studied without anyone typing it twice.
+  //
+  // A real actor_education row always wins; this only fills a gap. Parsed
+  // deterministically rather than by LLM: the CV layout is this system's own
+  // structured output, so a regex answers it exactly and cannot invent a
+  // university that does not exist.
+  if (!psych.actor_education && typeof cv === "string" && cv.trim()) {
+    const parsed = educationFromCv(cv);
+    if (parsed) {
+      psych.actor_education = parsed;
+      console.log(`[deploy] education from CV: ${parsed.level || "?"} / ${parsed.field || "?"} / ${parsed.institution}`);
+    }
+  }
+
+  // Session 150 — the simulator owns the amount outright. actor_economic on
+  // this side is keyed by actor_id alone (one row per actor), so it structurally
+  // cannot hold a figure that differs per world; the simulator's row is keyed
+  // (actor_id, world_id) and derives the total from that actor's own revenue
+  // sources. Strip the platform's copy so a stale value can't ride along in the
+  // psych blob and overwrite what the world worked out — the simulator's psych
+  // ingest skips nil keys, so omitting it leaves its column untouched.
+  if (psych.actor_economic) {
+    delete psych.actor_economic.monthly_income;
+    delete psych.actor_economic.monthly_income_sek;  // pre-rename spelling
+  }
 
   // Resolve simulator actor IDs for relationships
   const resolvedRelationships = (relationships || []).map(rel => {
@@ -1635,7 +1804,14 @@ app.post("/api/actors/:id/deploy", async (req, res) => {
       occupation: actor.occupation, appearance: actor.appearance,
       media_folder: actor.media_folder,
     },
-    home, workplace: workplace || null, career: career || null,
+    home, career: career || null,
+    revenue_sources: career?.revenue_sources || [],
+    // Session 150 — the wizard has collected a full CV since Session 149
+    // (Haiku-generated, hand-editable, PDF-exportable) and it was never
+    // forwarded: not destructured off req.body here, not present in this
+    // payload, and no params["cv"] on the simulator side to receive it.
+    // Every actor deployed so far reached the world with no history.
+    cv: (typeof cv === "string" && cv.trim()) ? cv.trim() : null,
     psychology: psych,
     relationships: resolvedRelationships,
     schedule, from_week: fromWeek || 1,
@@ -1694,8 +1870,8 @@ app.post("/api/actors/:id/suggest-home", async (req, res) => {
       SELECT a.first_name, a.name, a.occupation, a.age,
              ap.attachment_style,
              b.openness, b.conscientiousness, b.extraversion, b.neuroticism,
-             e.income_level, e.financial_situation, e.lifestyle_tier,
-             l.neighbourhood_pref, l.housing_type
+             e.financial_situation, e.monthly_income, e.income_stability,
+             l.lifestyle_note, l.social_frequency
       FROM actors a
       LEFT JOIN actor_psychology ap ON ap.actor_id = a.id
       LEFT JOIN actor_big5 b ON b.actor_id = a.id
@@ -1712,8 +1888,8 @@ app.post("/api/actors/:id/suggest-home", async (req, res) => {
   const prompt = `Character: ${name}, ${actor.age || "unknown age"}, ${actor.occupation || "unknown occupation"}
 Attachment: ${actor.attachment_style || "unknown"}
 Big5: O:${b5[0]} C:${b5[1]} E:${b5[2]} N:${b5[3]}
-Economic: ${[actor.income_level, actor.financial_situation, actor.lifestyle_tier].filter(Boolean).join(", ") || "unknown"}
-Housing preference: ${[actor.neighbourhood_pref, actor.housing_type].filter(Boolean).join(", ") || "unknown"}
+Economic: ${[actor.financial_situation, actor.monthly_income ? `${actor.monthly_income}/month` : null, actor.income_stability].filter(Boolean).join(", ") || "unknown"}
+Lifestyle: ${[actor.lifestyle_note, actor.social_frequency].filter(Boolean).join(", ") || "unknown"}
 
 Suggest 3 ${city} neighbourhoods where this person would realistically live given their occupation, psychology, income and lifestyle. Be specific and grounded.
 
@@ -1926,7 +2102,16 @@ app.get("/api/places/autocomplete", async (req, res) => {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
-    const r = await fetch(`https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(q)}&types=address${components}&language=en&key=${MAPS_KEY}`, { signal: controller.signal });
+    // Session 150 — `types` is a parameter now. It was hardcoded to "address",
+    // which restricts autocomplete to street addresses and structurally cannot
+    // return a business: searching "Mannheimer Swartling" gave ZERO_RESULTS,
+    // and the workplace picker then fell through to whatever street name came
+    // closest. Verified against the API directly — types=establishment returns
+    // the firm's actual offices. Home search still wants addresses, so that
+    // stays the default; the workplace field asks for establishments.
+    const typesRaw = String(req.query.types || "address");
+    const types = ["address", "establishment", "geocode", "(cities)", "(regions)"].includes(typesRaw) ? typesRaw : "address";
+    const r = await fetch(`https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(q)}&types=${encodeURIComponent(types)}${components}&language=en&key=${MAPS_KEY}`, { signal: controller.signal });
     clearTimeout(timeout);
     const data = await r.json();
     const results = (data.predictions || []).slice(0, 5).map(p => ({
@@ -2024,16 +2209,394 @@ Income: ${actor.income_level || "unknown"}
 Suggest realistic career details for this person. Use ONLY these values:
 - career_level: junior | established | senior | independent
 - employment_type: employed | freelance
-- career_ladder: a short slug like "medical_specialist", "performer", "sound_engineer", "sales", "technical" etc — derive from occupation
 - reputation_score: 0.0–1.0 (how well known and respected in their field)
 
 Respond with JSON only:
-{"career_level":"...","career_ladder":"...","employment_type":"...","reputation_score":0.0}`;
+{"career_level":"...","employment_type":"...","reputation_score":0.0}`;
 
   try {
     const text = await callDirtyMuse("You suggest career details. Respond in JSON only.", prompt, 150);
     res.json(JSON.parse(text.replace(/```json|```/g,"").trim()));
   } catch(e) { res.status(500).json({ error:e.message }); }
+});
+
+// ── POST /api/actors/:id/generate-cv — Haiku CV generation ─────────────────────
+// Session 149 — CV step is new, structure not yet defined; this generates
+// free-form narrative text (matching the textarea's own placeholder
+// shape: "Work history, qualifications, notable credits, career
+// narrative…"), not structured JSON fields. nationality is real and
+// populated (Session 148, ISO alpha-2); there is no separate birthplace
+// field anywhere in the schema, so nationality is what "born" maps to —
+// not inventing a field that doesn't exist. revenue_sources/career_level
+// come from the request body since they're live deploy-wizard state at
+// this point, not yet persisted to the actor row.
+app.post("/api/actors/:id/generate-cv", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+
+  let actor;
+  try {
+    actor = db.prepare(`
+      SELECT a.first_name, a.last_name, a.name, a.occupation, a.age, a.nationality,
+             ap.attachment_style, b.conscientiousness, b.openness,
+             e.financial_situation, e.spending_style, e.attitude_to_wealth
+      FROM actors a
+      LEFT JOIN actor_psychology ap ON ap.actor_id = a.id
+      LEFT JOIN actor_big5 b ON b.actor_id = a.id
+      LEFT JOIN actor_economic e ON e.actor_id = a.id
+      WHERE a.id = ?
+    `).get(req.params.id);
+  } catch { actor = db.prepare(`SELECT * FROM actors WHERE id = ?`).get(req.params.id); }
+  if (!actor) return res.status(404).json({ error: "not found" });
+
+  const { revenue_sources, career_level, world_id } = req.body;
+  const primarySource = (revenue_sources || [])[0] || null;
+  // Session 150 — was `first_name || name`, so every generated CV was headed
+  // with a bare first name ("LINDSEY"). Harmless-looking alone, but this CV is
+  // exportable to PDF and re-importable through upload-cv, and on the way back
+  // in the absent surname was a blank the model filled by inventing one
+  // ("Lindsey Ashford" for Lindsey Vaughn). Emit the real full name.
+  const name = [actor.first_name, actor.last_name].filter(Boolean).join(" ").trim() || actor.name;
+  let city = "";
+  if (world_id) {
+    try {
+      const ww = await simFetch(`/internal/worlds?ids=${world_id}`);
+      city = ww?.[0]?.city || "";
+    } catch {}
+  }
+  const workplaceLine = primarySource?.name
+    ? `Current workplace: ${primarySource.name}${primarySource.work_address ? `, ${primarySource.work_address}` : ""} (${primarySource.source_type || "employment"})`
+    : `Current workplace: not yet set — invent one as part of this CV (see instruction below)`;
+  // No dedicated birthplace field exists anywhere in the schema — only
+  // age (real) and nationality (real). Birth year is computed for real
+  // from age rather than left to the model to guess; birthplace has to
+  // be invented, but grounded specifically in nationality rather than
+  // left as vague "somewhere in [country]" — one specific real-sounding
+  // city, not a placeholder.
+  const birthYear = actor.age ? new Date().getFullYear() - actor.age : null;
+  const currentYear = new Date().getFullYear();
+  // Rough guide for how many prior roles a realistic career at this
+  // level/age would actually have — not enforced strictly, just steers
+  // the model away from either a one-line history or an implausibly
+  // long one for a 28-year-old.
+  const roleCountHint = career_level === "independent" || career_level === "senior" ? "5-7" : career_level === "established" ? "4-5" : "1-2";
+
+  const prompt = `Character: ${name}, ${actor.age || "unknown age"}, ${actor.occupation || "unknown occupation"}
+${birthYear ? `Birth year: ${birthYear} (age ${actor.age} in ${currentYear} — use this exactly)` : ""}
+Nationality (ISO code): ${actor.nationality || "unknown"} — invent ONE specific, real, plausible city of birth consistent with this nationality (an actual city, not the country in general)
+${workplaceLine}
+Career level: ${career_level || "established"}
+Attachment: ${actor.attachment_style || "unknown"}
+Conscientiousness: ${actor.conscientiousness || "?"} | Openness: ${actor.openness || "?"}
+${[actor.financial_situation, actor.spending_style, actor.attitude_to_wealth].filter(Boolean).join(", ") ? `Relationship to money: ${[actor.financial_situation, actor.spending_style, actor.attitude_to_wealth].filter(Boolean).join(", ")}` : ""}
+
+Write a full, properly structured CV for this fictional character — a real CV a real person in their field would actually have, not a narrative summary. Use this exact section layout and plain-text formatting (no markdown symbols, but keep the section headers in capitals and blank lines between sections, matching a real CV document):
+
+${(name||"").toUpperCase()}
+[one line: current title at current workplace]
+
+SUMMARY
+[2-3 sentences: professional profile, strengths, what they're known for in their field]
+
+EXPERIENCE
+[${roleCountHint} prior roles, most recent first, ending with their CURRENT role at the workplace given above. For EACH role, this exact shape:
+COMPANY NAME – Job Title
+start_year – end_year (or "Present" for the current role)
+3-5 sentences of real substance, matching the density of an actual senior professional's CV — org structure (how many people/teams they led or reported into), scale (budget, caseload, client roster, deal size — whatever fits the field), specific initiatives or transformations they drove, and concrete outcomes. Not a job description — what THIS person specifically did and changed.
+
+Every company named must be a REAL, ACTUAL, currently-existing business you can actually recall — never one you construct. Do NOT build firm names by combining surnames or generic corporate words; a name you assembled rather than recalled is wrong however convincing it sounds. If no real organisation comes to mind for a role, use a real one from an adjacent city or market rather than inventing one. Use real companies you actually know of, appropriately matched to the occupation, seniority, and industry.${
+  city && !primarySource?.name
+    ? ` The CURRENT role especially matters here — this character will be placed in ${city}, so its company must be a genuine, real business you know actually exists in or near ${city}, findable on a real map, not merely a realistic-sounding invention. Prior roles can be real companies from anywhere consistent with their career history.`
+    : ""
+}]
+
+EDUCATION
+[years] [Degree and field], [Institution name — a real, specific school]
+
+COURSES
+[1-3 relevant professional courses, certifications, or executive programs — real-sounding names and years, the kind a serious professional in this field would actually list]
+
+INTERESTS
+[2-4 personal interests that fit their Big5/attachment profile above — specific, not generic]
+
+LANGUAGES
+[their native language] (Native)
+${actor.nationality && actor.nationality !== "US" && actor.nationality !== "GB" ? "English (Professional)" : ""}
+
+Ground every stage in real specifics — institution names, company names, cities. Vague filler like "a prestigious university" or "a well-known firm" is not acceptable anywhere in the document. This should read as dense and substantive as a real senior professional's CV, not an abbreviated summary — don't hold back on detail per role.
+
+Respond with the CV text only, in the exact layout above — no preamble, no markdown formatting symbols, no commentary before or after.`;
+
+  try {
+    const text = await callHaiku("You write realistic, fully-structured character CVs matching real professional resume formatting. Respond with the CV text only, no commentary, no markdown symbols.", prompt, 2000);
+    res.json({ notes: text.trim() });
+  } catch(e) { res.status(500).json({ error:e.message }); }
+});
+
+// ── POST /api/actors/:id/upload-cv — parse + interpret an uploaded CV ──────────
+// Session 149 — the second of two CV paths: generate from scratch (above)
+// or upload a real document and have it interpreted into the same
+// narrative-prose shape. Needs mammoth (.docx) and pdf-parse (.pdf);
+// both are installed and in package.json as of Session 149 — mammoth
+// ^1.12.1, pdf-parse ^2.4.5. Mind that major: the pdf branch below
+// targets pdf-parse v2's PDFParse class, NOT v1's default-export
+// function. .txt needs no library at all, just reads the buffer.
+app.post("/api/actors/:id/upload-cv", upload.single("cv_file"), async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  if (!req.file) return res.status(400).json({ error: "no file uploaded (multipart field: cv_file)" });
+
+  // Session 150 — was `SELECT first_name, name` only, so the adaptation ran
+  // blind to who it was adapting FOR: no age, no nationality, no occupation.
+  // The model had nothing to anchor to except the source document, so it
+  // kept the source's own timeline, jurisdiction and field wholesale — a US
+  // character came back with a Stockholm practice filing Swedish, Danish and
+  // Norwegian regulatory paperwork. Same context generate-cv already pulls.
+  let actor;
+  try {
+    actor = db.prepare(`
+      SELECT a.first_name, a.last_name, a.name, a.occupation, a.age, a.nationality,
+             ap.attachment_style, b.conscientiousness, b.openness,
+             e.financial_situation, e.spending_style, e.attitude_to_wealth
+      FROM actors a
+      LEFT JOIN actor_psychology ap ON ap.actor_id = a.id
+      LEFT JOIN actor_big5 b ON b.actor_id = a.id
+      LEFT JOIN actor_economic e ON e.actor_id = a.id
+      WHERE a.id = ?
+    `).get(req.params.id);
+  } catch { actor = db.prepare(`SELECT first_name, last_name, name FROM actors WHERE id = ?`).get(req.params.id); }
+  if (!actor) return res.status(404).json({ error: "not found" });
+
+  const ext = (req.file.originalname.split(".").pop() || "").toLowerCase();
+  let rawText;
+  try {
+    if (ext === "txt") {
+      rawText = req.file.buffer.toString("utf8");
+    } else if (ext === "pdf") {
+      // Session 150 — this was written against pdf-parse v1, whose entry
+      // point was `module.exports = fn`, so `.default` gave you the parser
+      // function directly. package.json pulls in ^2.4.5, and v2 is a
+      // different library: no default export at all, just named exports
+      // (PDFParse, Table, VerbosityLevel, ...). `.default` was therefore
+      // undefined and every .pdf upload died on
+      // "couldn't read the file: pdfParse is not a function".
+      //
+      // That settles the question left open in Session 149 — it was
+      // neither a missing dependency (all three are installed) nor
+      // cv-pdf's own output being unreadable: a pdfkit-generated PDF
+      // round-trips back through v2 with its text intact, verified.
+      // Using v2's real API rather than pinning back to v1.
+      const { PDFParse } = await import("pdf-parse");
+      const parsed = await new PDFParse({ data: req.file.buffer }).getText();
+      // v2 injects a "-- 1 of 3 --" marker between pages. Harmless to a
+      // human, but this text goes straight into a Haiku prompt as source
+      // material, so strip it rather than let it read as CV content.
+      rawText = (parsed.text || "")
+        .replace(/^\s*--\s*\d+\s+of\s+\d+\s*--\s*$/gm, "")
+        .replace(/\n{3,}/g, "\n\n");
+    } else if (ext === "docx") {
+      const mammoth = (await import("mammoth")).default;
+      rawText = (await mammoth.extractRawText({ buffer: req.file.buffer })).value;
+    } else {
+      return res.status(400).json({ error: `unsupported file type ".${ext}" — use .pdf, .docx, or .txt` });
+    }
+  } catch (e) {
+    return res.status(500).json({ error: `couldn't read the file: ${e.message}` });
+  }
+
+  rawText = (rawText || "").trim();
+  if (!rawText) return res.status(400).json({ error: "no text could be extracted from that file" });
+
+  // Cap what goes to the model — a full multi-page real CV can run long;
+  // this is plenty of source material without risking the context window.
+  const truncated = rawText.slice(0, 12000);
+  // Session 150 — was `first_name || name`, i.e. just "Lindsey", so the model
+  // invented a surname for a character who already has one ("Lindsey Ashford"
+  // for Lindsey Vaughn). Use the real full name.
+  const name = [actor.first_name, actor.last_name].filter(Boolean).join(" ").trim() || actor.name;
+  const birthYear = actor.age ? new Date().getFullYear() - actor.age : null;
+  const currentYear = new Date().getFullYear();
+
+  const prompt = `Here is a CV document. Render it as ${name}'s CV, in the exact layout given below.
+
+"""
+${truncated}
+"""
+
+Whose CV this is: ${name}, ${actor.age || "unknown age"}, ${actor.occupation || "unknown occupation"}
+${birthYear ? `Birth year: ${birthYear} (age ${actor.age} in ${currentYear})` : ""}
+Nationality (ISO code): ${actor.nationality || "unknown"} — background context only. Do NOT relocate this person's career to their country of nationality; where they work is set by the document, not by their passport.
+${[actor.financial_situation, actor.spending_style, actor.attitude_to_wealth].filter(Boolean).join(", ") ? `Relationship to money: ${[actor.financial_situation, actor.spending_style, actor.attitude_to_wealth].filter(Boolean).join(", ")}` : ""}
+
+PRESERVE — the document is the source of truth for this career:
+- Every organisation it names, EXACTLY as written, so long as that organisation genuinely exists. Real employers, universities, certifying bodies and course providers all stay. Do NOT rename them, do NOT swap in alternatives, do NOT "adapt" them into something similar-sounding.
+- The roles, their order, their dates and the seniority progression.
+- The substance and density of each role — org structure, scale, specific initiatives, concrete outcomes — including the source's own figures.
+- Education, courses, interests and languages as given.
+- The section structure.
+
+THE ONLY ORGANISATION YOU MAY CHANGE is one that does not actually exist. Replace such a name with a real organisation that fits the same field and city. Never invent one: do not construct names by combining surnames or generic corporate words — a name you assembled rather than recalled is wrong however convincing it sounds.
+
+FIT TO THE CHARACTER — identity, and nothing else:
+- The header must read exactly: ${(name||"").toUpperCase()}. Wherever the source carries a person's name, it becomes ${name}'s.
+- Leave every date as it stands, UNLESS a date is impossible for someone born in ${birthYear || "their birth year"} — then shift the timeline by the smallest amount that makes it plausible.
+- Drop any personal contact details (address, phone, email) the source carries.
+
+Do NOT rewrite prose for its own sake. Where a sentence in the source already reads well, keep it. This is not a paraphrasing exercise: it is the same career, presented as ${name}'s, in the house layout. A CV this system generated earlier and exported to PDF must come back essentially unchanged apart from the name.
+
+Translate to English if the source isn't already in English. Use this exact plain-text layout (capitalized section headers, blank lines between sections, no markdown symbols):
+
+${(name||"").toUpperCase()}
+[one line: current title at current workplace]
+
+SUMMARY
+[the source's own summary, kept as written — only the person's name changes]
+
+EXPERIENCE
+[one entry per role in the source, most recent first, in this shape:
+COMPANY NAME – Job Title
+start_year – end_year (or "Present" for the current role)
+3-5 sentences carried over from the source with its substance and figures intact — org structure, scale, specific initiatives, concrete outcomes]
+
+EDUCATION
+[years] [Degree and field], [Institution name]
+
+COURSES
+[the source's own courses, certifications and programmes, kept as written — omit this section entirely if the source has none]
+
+INTERESTS
+[the source's own interests, kept as written — if it lists none, 2-4 that fit ${name}]
+
+LANGUAGES
+[the source's own languages, kept as written — if it lists none, infer from ${name}'s nationality and career]
+
+Match the source exactly — same number of roles, same richness per role, no compressing several roles into one. If the source has 12 roles, produce 12 roles. Every institution, company and city named must be a real one; vague filler like "a prestigious university" or "a well-known firm" is not acceptable anywhere, and neither is a plausible-sounding name you made up.
+
+Respond with the CV text only, in the exact layout above — no preamble, no markdown symbols, no commentary.`;
+
+  try {
+    const text = await callHaiku("You adapt real CV documents into fictional character CVs, preserving full structure and depth. Respond with the CV text only, no commentary, no markdown symbols.", prompt, 2500);
+    res.json({ notes: text.trim() });
+  } catch(e) { res.status(500).json({ error:e.message }); }
+});
+
+// ── POST /api/actors/:id/cv-pdf — render the CV text as a formatted PDF ────────
+// Session 149 — works directly off whatever text is passed in, not a
+// DB read: the CV step doesn't persist yet (separate gap, not blocking
+// this), and this way it works on hand-edited text too, before deploy.
+// Needs `pdfkit` — nothing in this codebase rendered PDFs server-side
+// before now; run `npm install pdfkit`.
+//
+// Parses the structured layout the generate/upload prompts produce
+// (NAME header, then CAPITALIZED section headers, blank-line-separated
+// blocks) rather than dumping raw text — but degrades gracefully if the
+// text has been hand-edited and doesn't perfectly match: anything that
+// doesn't look like a header or a "COMPANY – Title" / date-range line
+// just renders as a normal paragraph under whichever section it's in.
+app.post("/api/actors/:id/cv-pdf", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+
+  const { notes } = req.body;
+  if (!notes || !notes.trim()) return res.status(400).json({ error: "no CV text provided" });
+
+  const actor = db.prepare(`
+    SELECT first_name, name,
+           (SELECT url FROM actor_media WHERE actor_id = actors.id AND media_type = 'photo' AND state_slug IN ('photo_close','profile') LIMIT 1) as photo_url
+    FROM actors WHERE id = ?
+  `).get(req.params.id);
+  const name = actor ? (actor.first_name || actor.name) : "CV";
+
+  // Session 149 — same local-file resolution pattern already used in
+  // inspire-relationship for user photos. Failure here (missing file,
+  // unsupported format like webp — pdfkit only natively handles JPEG/PNG)
+  // shouldn't take down PDF generation entirely, so this is deliberately
+  // isolated and logged rather than thrown.
+  let photoBuf = null;
+  if (actor?.photo_url) {
+    try {
+      const { readFileSync } = await import("fs");
+      const filePath = path.join(__dirname, "../public", actor.photo_url);
+      photoBuf = readFileSync(filePath);
+    } catch (e) {
+      console.warn("[cv-pdf] couldn't load photo, continuing without it:", e.message);
+    }
+  }
+
+  const SECTION_NAMES = new Set(["SUMMARY", "EXPERIENCE", "EDUCATION", "COURSES", "INTERESTS", "LANGUAGES"]);
+  const isDateRangeLine = s => /\b\d{4}\b.{0,4}(–|-|to)\s*(present|\d{4})/i.test(s.trim());
+  const isRoleTitleLine = s => / – | - /.test(s) && s.trim().length < 90 && !isDateRangeLine(s);
+
+  const lines = notes.split("\n").map(l => l.trim());
+
+  try {
+    const PDFDocument = (await import("pdfkit")).default;
+    const doc = new PDFDocument({ size: "A4", margins: { top: 56, bottom: 56, left: 56, right: 56 } });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${name.replace(/[^a-z0-9]/gi, "_")}_CV.pdf"`);
+    doc.pipe(res);
+
+    const PHOTO_SIZE = 72;
+    const PHOTO_GAP = 16;
+    if (photoBuf) {
+      try {
+        const photoX = doc.page.width - doc.page.margins.right - PHOTO_SIZE;
+        doc.image(photoBuf, photoX, doc.page.margins.top, { width: PHOTO_SIZE, height: PHOTO_SIZE, fit: [PHOTO_SIZE, PHOTO_SIZE] });
+        doc.rect(photoX, doc.page.margins.top, PHOTO_SIZE, PHOTO_SIZE).strokeColor("#d4cfc9").lineWidth(0.75).stroke();
+      } catch (e) {
+        console.warn("[cv-pdf] pdfkit couldn't embed photo (likely unsupported format — needs jpeg/png), continuing without it:", e.message);
+        photoBuf = null;
+      }
+    }
+    const fullWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+    const headerWidth = photoBuf ? fullWidth - PHOTO_SIZE - PHOTO_GAP : fullWidth;
+
+    let inHeader = true;
+    let firstHeaderLine = true;
+
+    for (const raw of lines) {
+      const line = raw;
+      if (!line) { doc.moveDown(0.4); continue; }
+
+      const upper = line.toUpperCase();
+      if (SECTION_NAMES.has(upper)) {
+        inHeader = false;
+        doc.moveDown(0.6);
+        doc.font("Helvetica-Bold").fontSize(12).fillColor("#1a1814").text(upper, { characterSpacing: 1, width: fullWidth });
+        doc.moveTo(doc.x, doc.y + 2).lineTo(doc.page.width - doc.page.margins.right, doc.y + 2)
+          .strokeColor("#d4cfc9").lineWidth(0.75).stroke();
+        doc.moveDown(0.5);
+        continue;
+      }
+
+      if (inHeader) {
+        if (firstHeaderLine) {
+          doc.font("Helvetica-Bold").fontSize(20).fillColor("#1a1814").text(line, { width: headerWidth });
+          firstHeaderLine = false;
+        } else {
+          doc.font("Helvetica").fontSize(11).fillColor("#6b6760").text(line, { width: headerWidth });
+        }
+        continue;
+      }
+
+      if (isRoleTitleLine(line)) {
+        doc.moveDown(0.3);
+        doc.font("Helvetica-Bold").fontSize(11).fillColor("#1a1814").text(line);
+        continue;
+      }
+      if (isDateRangeLine(line)) {
+        doc.font("Helvetica-Oblique").fontSize(9.5).fillColor("#a8a5a0").text(line);
+        doc.moveDown(0.2);
+        continue;
+      }
+      doc.font("Helvetica").fontSize(10.5).fillColor("#3a3733").text(line, { align: "left", lineGap: 2 });
+    }
+
+    doc.end();
+  } catch (e) {
+    console.error("[cv-pdf] error:", e.message);
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+  }
 });
 
 // ── POST /api/actors/:id/suggest-workplace — Haiku workplace suggestions ────────
@@ -2071,128 +2634,191 @@ Respond with JSON only:
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
 
-// ── POST /api/actors/:id/generate-schedule — Haiku schedule generation ─────────
+// ── POST /api/actors/:id/generate-schedule — working hours only ────────────────
+// Session 149 — was a 7-call Haiku/dirty-muse generation forcing a full,
+// gapless 24h/day simulated life (sleep, meals, grooming, hobbies, social
+// life — every hour of every day, by explicit prompt design: "Cover ALL
+// 7 days... NO gaps"). Re-scoped per direct instruction: the deploy-time
+// schedule's job is working hours only. Vacation/PTO is explicitly out of
+// scope for now (rescheduled-later work). The actual appointment layer
+// (calendar_events / planned_meetings / promises) is a separate system
+// that fills in dynamically through play — this endpoint was never
+// supposed to be simulating a whole fictional life, just blocking work.
+//
+// Non-working time gets one honest "private" block rather than a true
+// gap — schedule_process.ex (the actor's own tick-time slot cache) is a
+// passive stub with no enforcement either way, but TimeHelper.current_slot
+// (the actual "what slot am I in right now" resolver) wasn't available to
+// verify gap-handling is safe everywhere downstream. A real, recognized
+// slot with an honest "not modeled" meaning is the safe choice until that
+// can be confirmed — a true gap can be revisited once it is.
 app.post("/api/actors/:id/generate-schedule", async (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
 
-  let actor;
-  try {
-    actor = db.prepare(`
-      SELECT a.first_name, a.name, a.occupation, a.age, a.gender,
-             ap.attachment_style, ap.core_wound,
-             b.openness, b.conscientiousness, b.extraversion, b.agreeableness, b.neuroticism,
-             e.income_level, e.financial_situation, e.lifestyle_tier,
-             l.housing_type, l.morning_person, l.social_frequency
-      FROM actors a
-      LEFT JOIN actor_psychology ap ON ap.actor_id = a.id
-      LEFT JOIN actor_big5 b ON b.actor_id = a.id
-      LEFT JOIN actor_economic e ON e.actor_id = a.id
-      LEFT JOIN actor_lifestyle l ON l.actor_id = a.id
-      WHERE a.id = ?
-    `).get(req.params.id);
-  } catch { actor = db.prepare(`SELECT * FROM actors WHERE id = ?`).get(req.params.id); }
-
+  const actor = db.prepare(`SELECT first_name, name, occupation FROM actors WHERE id = ?`).get(req.params.id);
   if (!actor) return res.status(404).json({ error: "not found" });
 
-  const { home_address, employment_type, career_level, world_id, day_only } = req.body;
-  const name = actor.first_name || actor.name;
-  const b5 = [actor.openness, actor.conscientiousness, actor.extraversion, actor.agreeableness, actor.neuroticism].map(v => v != null ? Math.round(v) : "?");
+  const { revenue_sources, work_blocks, day_only } = req.body;
+  // Session 149 — was a straight employment_type === "freelance" check.
+  // Superseded by revenue_sources (a list, not one type), and work_blocks
+  // aren't linked to which specific source they belong to, so this can't
+  // correctly vary location per block by source the way it ideally would
+  // for someone like Frida (one contract source at a studio, one
+  // independent one from home). Reasonable approximation: home only if
+  // every source is either explicitly work-from-home or independent
+  // (no fixed workplace); otherwise work. Flagged as a known limitation,
+  // not silently treated as fully solved.
+  const sources = revenue_sources || [];
+  const occupationLabel = actor.occupation || "work";
 
-  // Get city for schedule context
-  let city = "Stockholm";
-  if (world_id) {
-    try {
-      const ww = await simFetch(`/internal/worlds?ids=${world_id}`);
-      city = ww?.[0]?.city || "Stockholm";
-    } catch {}
+  // Session 149 — was a single hardcoded 09:00-18:00 for everyone. Real
+  // occupations don't all fit one continuous block — session-based work
+  // (e.g. Frida: shoots spread across the day) needs several discrete
+  // blocks, not one. Comes from the wizard's Work Hours section; falls
+  // back to a single 09:00-18:00 block if nothing was configured there.
+  // Malformed entries (missing/inverted times) are quietly dropped rather
+  // than crashing — this is operator-entered data, not adversarial input.
+  // Session 150 — work hours are a property of each revenue source now,
+  // not of the person. That closes the limitation this handler flagged in
+  // its own comment above: hours weren't linked to a source, so location
+  // couldn't vary per block "the way it ideally would for someone like
+  // Frida (one contract source at a studio, one independent one from
+  // home)". Each block now inherits its own source's location — home when
+  // the source says work-from-home or is independent (no fixed
+  // workplace), on-site otherwise — and carries that source's name as the
+  // slot's state_note instead of one occupation label for everything.
+  const sourceBlocks = [];
+  for (const src of sources) {
+    const locationType = (src.work_from_home || src.source_type === "independent") ? "home" : "work";
+    const label = (src.name || "").trim() || occupationLabel;
+    // A source left with no hours configured falls back to the same
+    // 08:00-17:00 the old global block defaulted to, so it behaves
+    // exactly as it did before hours moved per-source.
+    const raw = (Array.isArray(src.work_blocks) && src.work_blocks.length > 0)
+      ? src.work_blocks
+      : [{ start: "08:00", end: "17:00" }];
+    // Session 150 — which days this source is worked. Defaults to Mon-Fri,
+    // which is what the handler used to hardcode for everyone.
+    // An explicit empty array means "never worked"; only an absent value falls
+    // back to Mon-Fri. Treating [] as the default would contradict the wizard,
+    // which warns that deselecting every day means the source is never worked.
+    const days = Array.isArray(src.work_days)
+      ? src.work_days.map(d => String(d).toLowerCase().trim())
+      : ["monday","tuesday","wednesday","thursday","friday"];
+    for (const b of raw) {
+      // Malformed entries (missing or inverted times) are quietly dropped
+      // rather than crashing — operator-entered data, not adversarial input.
+      if (b && b.start && b.end && b.start < b.end) {
+        sourceBlocks.push({ start: b.start, end: b.end, location_type: locationType, label, days });
+      }
+    }
   }
 
-  const isFreelance = employment_type === "freelance";
-  const employmentNote = isFreelance
-    ? `Employment: freelance / self-employed — no fixed office, variable hours, works from home/cafes/client sites. Work activities include: pitching, negotiating, work_deep, admin, networking, script_reading, rehearsing, filming, editing, recording, composing.`
-    : `Employment: employed — regular office hours, commute to workplace.`;
+  // Back-compat: a caller still posting a flat top-level work_blocks list
+  // and no per-source hours is honoured rather than silently ignored.
+  if (sourceBlocks.length === 0) {
+    const isFreelance = sources.length > 0 && sources.every(s => s.work_from_home || s.source_type === "independent");
+    const flat = (Array.isArray(work_blocks) ? work_blocks : [])
+      .filter(b => b && b.start && b.end && b.start < b.end);
+    for (const b of (flat.length > 0 ? flat : [{ start: "08:00", end: "17:00" }])) {
+      sourceBlocks.push({ start: b.start, end: b.end, location_type: isFreelance ? "home" : "work", label: occupationLabel, days: ["monday","tuesday","wednesday","thursday","friday"] });
+    }
+  }
 
-  const SLUGS = "sleeping, morning_routine, waking, bath, skincare, grooming, eating, cooking, meal_prep, brunch, coffee, drinking_coffee, snacking, exercise, running, cycling, yoga, stretching, foam_rolling, swimming, hiking, sport, work_deep, work_admin, work_meetings, work_audition, work_casting, work_onset, work_reviewing, work_mainstream_audition, script_reading, rehearsing, filming, editing, recording, composing, mixing, storyboarding, admin, planning, errands, laundry, cleaning, childcare, shopping, medical, therapy, coaching, studying, reading, writing, journaling, sketching, painting, creative, reflection, daydreaming, meditating, praying, decompressing, relaxing, napping, watching_tv, scrolling, gaming, listening, social_dinner, social_bar, social_cafe, social_drinks, social_late_night, party, networking, exhibition, gallery, cinema, concert, ceremony, volunteering, walking, transit, taxi, travel, waiting, withdrawing, philosophical, pitching, negotiating, dining, drinking_wine, drinking_alcohol, sunbathing, sauna, spa, massage, people_watching, window_watching, flirting, hooking_up";
+  sourceBlocks.sort((a, b) => a.start.localeCompare(b.start) || a.end.localeCompare(b.end));
 
-  const prompt = `Character: ${name}, ${actor.age || "unknown age"}, ${actor.occupation || "unknown occupation"}
-Attachment: ${actor.attachment_style || "unknown"}${actor.core_wound ? ` | Wound: ${actor.core_wound}` : ""}
-Big5: O:${b5[0]} C:${b5[1]} E:${b5[2]} A:${b5[3]} N:${b5[4]}
-${actor.income_level ? `Economic: ${actor.income_level} income` : ""}
-${actor.morning_person ? `Morning person: ${actor.morning_person}` : ""}
-${actor.social_frequency ? `Social frequency: ${actor.social_frequency}` : ""}
-Home: ${home_address || city}
-City: ${city}
-${employmentNote}
+  // Session 150 — de-conflict blocks whose hours genuinely overlap across
+  // sources. Left explicitly open at the end of Session 149 ("not
+  // de-conflicted across sources if two sources' hours genuinely overlap in
+  // time"). Earliest start wins; a later block is clipped to resume where the
+  // previous one ended, and dropped outright if fully swallowed.
+  //
+  // Resolved PER DAY rather than once globally: now that each source carries
+  // its own work_days, two sources can overlap in clock time while never
+  // sharing a day — a weekday job and a Saturday shoot both running 09:00-17:00
+  // do not collide, and resolving them together would silently delete the
+  // Saturday one. What was clipped is logged; a silently truncated schedule
+  // reads as a correct one.
+  let clipped = 0;
+  function blocksForDay(day) {
+    const out = [];
+    let cursor = "00:00";
+    for (const b of sourceBlocks.filter(x => x.days.includes(day))) {
+      const start = b.start > cursor ? b.start : cursor;
+      if (b.end <= start) { clipped++; continue; }
+      if (start !== b.start) clipped++;
+      out.push({ ...b, start });
+      cursor = b.end;
+    }
+    return out;
+  }
 
-Generate a realistic weekly schedule that reflects this person's psychology, occupation and lifestyle.
-Rules:
-- Cover ALL 7 days: monday tuesday wednesday thursday friday saturday sunday
-- Each day MUST cover exactly 00:00 to 24:00 with NO gaps and NO overlaps
-- TARGET exactly 10-11 slots per day — no more
-- MINIMUM slot duration: 1 hour. Never create slots shorter than 1 hour.
-- Sleep = ONE block of 6-9 hours. Morning routine = ONE block of 1-2 hours. Do NOT fragment these.
-- Merge consecutive similar activities into one block — do NOT split work_deep into two separate slots on the same day
-- Use ONLY these activity slugs: ${SLUGS}
-- location_type must be one of: home, work, hospital, clinic, gym, cafe, restaurant, bar, outdoor, transit, other
-- state_note: short label (2-5 words), specific to this character
-- Vary the schedule realistically — weekdays differ from weekends
-- Reflect the psychology: attachment style and Big5 should shape social activity, routine rigidity, and leisure choices
-
-Respond with a compact JSON array only — no preamble, no markdown, no extra whitespace:
-[{"day_of_week":"monday","start_time":"00:00","end_time":"06:30","activity_slug":"sleeping","state_note":"deep sleep","location_type":"home"},...]`;
+  // "HH:MM" -> minutes. Needed to measure gap length; everything else here
+  // compares zero-padded time strings directly, which sorts correctly.
+  const timeToMins = t => { const [h, m] = String(t).split(":").map(Number); return h * 60 + (m || 0); };
 
   const DAYS = day_only ? [day_only] : ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"];
 
-  try {
-    // Generate sequentially — Ollama NUM_PARALLEL=2, parallel would queue anyway
-    const allSlots = [];
-    for (const day of DAYS) {
-      const isWeekend = day === "saturday" || day === "sunday";
-      const dayPrompt = `Character: ${name}, ${actor.age || "unknown age"}, ${actor.occupation || "unknown occupation"}
-Attachment: ${actor.attachment_style || "unknown"}
-Big5: O:${b5[0]} C:${b5[1]} E:${b5[2]} A:${b5[3]} N:${b5[4]}
-${employmentNote}
-${isWeekend ? "This is a WEEKEND day — no regular work, more leisure and social activities." : "This is a WEEKDAY."}
-
-Generate a realistic schedule for ${day.toUpperCase()} ONLY.
-Rules:
-- Cover exactly 00:00 to 24:00 with NO gaps and NO overlaps
-- Exactly 10-11 slots — no more, no less
-- Sleep = ONE block 6-9 hours. Morning routine = ONE block 1-2 hours.
-- MINIMUM slot duration: 1 hour
-- Use ONLY these slugs: ${SLUGS}
-- location_type: home, work, gym, cafe, restaurant, bar, outdoor, transit, other
-- state_note: 2-5 words specific to this character
-
-Return a JSON array for ${day} only — no preamble, no markdown:
-[{"day_of_week":"${day}","start_time":"00:00","end_time":"HH:MM","activity_slug":"...","state_note":"...","location_type":"..."},...]`;
-
-      const r = await fetch(DIRTY_MUSE_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: DIRTY_MUSE_MODEL, stream: false, keep_alive: -1,
-          options: { num_ctx: 4096, num_predict: 1024 }, messages: [
-            { role: "system", content: "You generate daily schedules as compact JSON arrays. Respond with JSON only — no preamble, no markdown." },
-            { role: "user", content: dayPrompt }
-          ]
-        }),
-        signal: AbortSignal.timeout(120_000)
-      });
-      const d = await r.json();
-      const text = d.message?.content || "";
-      const clean = text.replace(/```json|```/g, "").trim();
-      const parsed = JSON.parse(clean.match(/\[.*/s)?.[0] || clean);
-      allSlots.push(...parsed);
+  function daySlots(day) {
+    // Session 150 — the hardcoded weekend is gone. Saturday and Sunday used to
+    // return a single 24h "Private time" block for everyone regardless of what
+    // they actually did, so a weekend shoot or a Saturday shift could not be
+    // expressed at all. A day nobody works now produces exactly that same block
+    // by construction, from the tail below — same output, no special case, and
+    // weekend work is finally possible.
+    const workBlocks = blocksForDay(day);
+    const slots = [];
+    let cursor = "00:00";
+    // Session 150 — a gap BETWEEN two work blocks is a break, not time at home.
+    // Every gap used to emit an identical "relaxing @home" slot, so an actor
+    // with an 08:00-12:00 / 13:00-17:00 day was sent home for lunch and back
+    // again inside the hour — a round trip across Stockholm, twice a day, every
+    // weekday. Only the gap before the first block and the one after the last
+    // are genuinely at home. A mid-day break also stays wherever that work
+    // happens, so a work-from-home source breaks at home and an on-site one
+    // doesn't.
+    let lastLocation = null;
+    for (const b of workBlocks) {
+      // workBlocks is already sorted and de-conflicted above, so no
+      // overlap guard is needed here any more.
+      if (b.start > cursor) {
+        if (lastLocation) {
+          const gapMins = timeToMins(b.start) - timeToMins(cursor);
+          slots.push({
+            day_of_week: day, start_time: cursor, end_time: b.start,
+            // A short gap reads as a meal break; a long one is genuine downtime
+            // between engagements, but still not a trip home.
+            activity_slug: gapMins <= 90 ? "eating" : "relaxing",
+            state_note:    gapMins <= 90 ? "Break" : "Between work",
+            location_type: lastLocation,
+          });
+        } else {
+          slots.push({ day_of_week: day, start_time: cursor, end_time: b.start, activity_slug: "relaxing", state_note: "Private time", location_type: "home" });
+        }
+      }
+      slots.push({ day_of_week: day, start_time: b.start, end_time: b.end, activity_slug: "work_deep", state_note: b.label, location_type: b.location_type });
+      cursor = b.end;
+      lastLocation = b.location_type;
     }
-
-    const slots = allSlots;
-    console.log("[generate-schedule] total slots:", slots.length);
-    res.json(slots);
-  } catch (e) {
-    console.error("[generate-schedule] error:", e.message);
-    res.status(500).json({ error: e.message, stack: e.stack?.split("\n").slice(0,3) });
+    if (cursor < "24:00") {
+      slots.push({ day_of_week: day, start_time: cursor, end_time: "24:00", activity_slug: "relaxing", state_note: "Private time", location_type: "home" });
+    }
+    return slots;
   }
+
+  const slots = DAYS.flatMap(daySlots);
+  if (clipped > 0) {
+    console.warn(`[generate-schedule] ${clipped} work block(s) overlapped another source on the same day — clipped or dropped (earliest start wins)`);
+  }
+  // Session 150 — was reporting workBlocks.length, which moved inside daySlots
+  // when de-confliction went per-day; the reference survived here and threw
+  // ReferenceError on every call the moment work_days shipped. Report from
+  // sourceBlocks, which is genuinely in scope, and say something now true:
+  // blocks are no longer uniform across weekdays.
+  const distinctDays = new Set(sourceBlocks.flatMap(b => b.days || []));
+  console.log(`[generate-schedule] total slots: ${slots.length} over ${DAYS.length} day(s) — ${sourceBlocks.length} work block(s) across ${distinctDays.size} worked day(s)`);
+  res.json(slots);
 });
 
 // ── POST /api/actors/:id/inspire-relationship — Haiku relationship description ─
@@ -2298,13 +2924,17 @@ Respond in JSON only — no preamble, no markdown fences.`;
 
   try {
     const lastMsg = messages[messages.length - 1]?.content;
-    const userMsg = Array.isArray(lastMsg)
-      ? lastMsg.find(b => b.type === "text")?.text || ""
-      : lastMsg || "";
-    console.log("[inspire-relationship] calling dirty-muse, prompt length:", userMsg.length);
+    console.log("[inspire-relationship] calling Haiku");
     const t0 = Date.now();
-    const text = await callDirtyMuse(systemPrompt, userMsg, 600);
-    console.log("[inspire-relationship] dirty-muse responded in", Date.now()-t0, "ms");
+    // Session 149 — was callDirtyMuse, extracting only the text block
+    // and discarding any image block first (the target user's photo
+    // was fetched and base64-encoded above specifically to inform the
+    // dynamic, then thrown away before the call ever happened). Real
+    // Haiku supports vision — passing the actual content (string or
+    // array, whichever this branch built) through directly means that
+    // photo now actually gets used instead of being wasted work.
+    const text = await callHaiku(systemPrompt, lastMsg, 600);
+    console.log("[inspire-relationship] Haiku responded in", Date.now()-t0, "ms");
     const clean = text.replace(/```json|```/g, "").trim();
     const start = clean.indexOf("{");
     const end   = clean.lastIndexOf("}");
@@ -2313,6 +2943,72 @@ Respond in JSON only — no preamble, no markdown fences.`;
   } catch (e) {
     console.error("[inspire-relationship] error:", e.message);
     res.status(500).json({ error: "inspire failed", detail: e.message });
+  }
+});
+
+// ── POST /api/actors/:id/suggest-relationship — one type per dimension ─────────
+// Session 149 — proposes a coherent set across all five dimensions in
+// one call, grounded in whatever's already established (the actor's own
+// CV/backstory if one exists, psychology, occupation) rather than
+// picking types in isolation. Client sends the actual type names it has
+// loaded per dimension (already fetched from /api/relationship-types)
+// so this only ever proposes real, valid options — never invents a slug
+// that doesn't exist in the taxonomy.
+app.post("/api/actors/:id/suggest-relationship", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+
+  const { target_name, target_occupation, target_is_user, cv_notes, dimensions } = req.body;
+  if (!target_name || !dimensions) return res.status(400).json({ error: "missing target_name or dimensions" });
+
+  let actor;
+  try {
+    actor = db.prepare(`
+      SELECT a.first_name, a.name, a.occupation, a.age,
+             ap.attachment_style, ap.core_wound,
+             b.openness, b.conscientiousness, b.extraversion, b.agreeableness, b.neuroticism
+      FROM actors a
+      LEFT JOIN actor_psychology ap ON ap.actor_id = a.id
+      LEFT JOIN actor_big5 b ON b.actor_id = a.id
+      WHERE a.id = ?
+    `).get(req.params.id);
+  } catch { actor = db.prepare(`SELECT * FROM actors WHERE id = ?`).get(req.params.id); }
+  if (!actor) return res.status(404).json({ error: "not found" });
+
+  const name = actor.first_name || actor.name;
+  const b5 = [actor.openness, actor.conscientiousness, actor.extraversion, actor.agreeableness, actor.neuroticism]
+    .map(v => v != null ? Math.round(v) : "?");
+
+  const dimList = Object.entries(dimensions)
+    .map(([dim, names]) => `${dim}: ${(names||[]).join(" | ")}`)
+    .join("\n");
+
+  const prompt = `Character A: ${name}, ${actor.age || "unknown age"}, ${actor.occupation || "unknown occupation"}
+Attachment: ${actor.attachment_style || "unknown"}${actor.core_wound ? ` | Wound: ${actor.core_wound}` : ""}
+Big5: O:${b5[0]} C:${b5[1]} E:${b5[2]} A:${b5[3]} N:${b5[4]}
+${cv_notes ? `${name}'s CV / background:\n${cv_notes.slice(0, 3000)}\n` : ""}
+Character B (the other person): ${target_name}${target_occupation ? `, ${target_occupation}` : ""}${target_is_user ? " (the player)" : ""}
+
+For EACH dimension below, pick the single best-fitting type from the options listed for that dimension only — never a type from a different dimension's list, never a type not listed. Use "none" wherever no real connection in that dimension makes sense — most dimensions should usually be "none"; picking a real type in more than one or two dimensions needs to be genuinely justified by who these two people are.
+
+The dimensions aren't independent — check the set makes sense together, not just each pick in isolation. In particular: social closeness should never fall below what the intimate dimension implies. A committed intimate type (e.g. "partner", "exclusive") paired with a distant social type (e.g. "acquaintance") is backwards — real committed partners are close socially too, not barely acquainted. If intimate is anything beyond "none", social should generally be "close_friend" or nearer, not "acquaintance" or "casual_friend". Casual/uncommitted intimate types (e.g. "friends with benefits", "entanglement") don't carry this requirement as strongly, but should still not contradict the social pick outright.
+${cv_notes ? `If ${name}'s CV/background above already establishes something about this specific person by name, use that directly rather than inventing a new dynamic.` : ""}
+
+${dimList}
+
+Respond with JSON only, one type per dimension, using the dimension keys exactly as given:
+{${Object.keys(dimensions).map(d => `"${d}":"..."`).join(",")}}`;
+
+  try {
+    const text = await callHaiku("You choose realistic relationship types between two characters, one per dimension, from constrained option lists. Respond with JSON only, no markdown, no preamble.", prompt, 500);
+    const clean = text.replace(/```json|```/g, "").trim();
+    const start = clean.indexOf("{");
+    const end   = clean.lastIndexOf("}");
+    const jsonStr = start >= 0 && end > start ? clean.slice(start, end + 1) : clean;
+    res.json(JSON.parse(jsonStr));
+  } catch (e) {
+    console.error("[suggest-relationship] error:", e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -3539,8 +4235,12 @@ app.post("/api/actors", (req, res) => {
       db.prepare(`UPDATE actor_lifestyle SET alcohol_relationship=?, drug_use=?, substance_context=?, sleep_pattern=?, sleep_quality=?, exercise_habit=?, exercise_type=?, social_frequency=?, diet=?, lifestyle_note=?, updated_at=? WHERE actor_id=?`)
         .run(l.alcohol_relationship||null, l.drug_use||"none", l.substance_context||null, l.sleep_pattern||"normal", l.sleep_quality||"good", l.exercise_habit||null, l.exercise_type||null, l.social_frequency||null, l.diet||null, l.lifestyle_note||null, now, id);
       const e = economy||{};
-      db.prepare(`UPDATE actor_economic SET financial_situation=?, income_stability=?, monthly_income_sek=?, spending_style=?, savings_habit=?, attitude_to_wealth=?, financial_anxiety=?, behavior_note=?, updated_at=? WHERE actor_id=?`)
-        .run(e.financial_situation||"stable", e.income_stability||"stable", e.monthly_income_sek?parseInt(e.monthly_income_sek):null, e.spending_style||"balanced", e.savings_habit||"moderate", e.attitude_to_wealth||"practical", e.financial_anxiety||0.3, e.behavior_note||null, now, id);
+      // Session 150 — monthly_income is no longer written from this side.
+      // The amount is world data, derived at deploy from the actor's revenue
+      // sources and owned by the simulator. Set to NULL here so an actor
+      // carrying a pre-Session-103 value sheds it on their next save.
+      db.prepare(`UPDATE actor_economic SET financial_situation=?, income_stability=?, monthly_income=NULL, spending_style=?, savings_habit=?, attitude_to_wealth=?, financial_anxiety=?, behavior_note=?, updated_at=? WHERE actor_id=?`)
+        .run(e.financial_situation||"stable", e.income_stability||"stable", e.spending_style||"balanced", e.savings_habit||"moderate", e.attitude_to_wealth||"practical", e.financial_anxiety||0.3, e.behavior_note||null, now, id);
     });
     run();
     // Session 148 — "the Save-to-registry button doesn't delete the tmp
@@ -3575,8 +4275,8 @@ app.post("/api/actors", (req, res) => {
     db.prepare(`INSERT INTO actor_lifestyle (actor_id, alcohol_relationship, drug_use, substance_context, sleep_pattern, sleep_quality, exercise_habit, exercise_type, social_frequency, diet, lifestyle_note, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(id, l.alcohol_relationship||null, l.drug_use||"none", l.substance_context||null, l.sleep_pattern||"normal", l.sleep_quality||"good", l.exercise_habit||null, l.exercise_type||null, l.social_frequency||null, l.diet||null, l.lifestyle_note||null, now, now);
     const e = economy||{};
-    db.prepare(`INSERT INTO actor_economic (actor_id, financial_situation, income_stability, monthly_income_sek, spending_style, savings_habit, attitude_to_wealth, financial_anxiety, behavior_note, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(id, e.financial_situation||"stable", e.income_stability||"stable", e.monthly_income_sek?parseInt(e.monthly_income_sek):null, e.spending_style||"balanced", e.savings_habit||"moderate", e.attitude_to_wealth||"practical", e.financial_anxiety||0.3, e.behavior_note||null, now, now);
+    db.prepare(`INSERT INTO actor_economic (actor_id, financial_situation, income_stability, spending_style, savings_habit, attitude_to_wealth, financial_anxiety, behavior_note, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, e.financial_situation||"stable", e.income_stability||"stable", e.spending_style||"balanced", e.savings_habit||"moderate", e.attitude_to_wealth||"practical", e.financial_anxiety||0.3, e.behavior_note||null, now, now);
   });
   run();
   // Session 148 — same finalize-time scratch cleanup as the UPDATE

@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { CAPABILITIES, LlmCapabilityGrid } from "./LlmConfigPanel.jsx";
 
 const CITIES = [
   {n:"Stockholm",    lat:59.33, lng:18.07,  tz:"Europe/Stockholm",               x:528,y:85},
@@ -152,8 +153,14 @@ function WorldMap({ selected, onSelect }) {
 
 export default function WorldWizard({ onClose, onCreated }) {
   const [step, setStep]       = useState(0);
-  const [residences,   setResidences]   = useState([]);
-  const [createdWorld, setCreatedWorld] = useState(null); // triggers residence picker after creation
+  // No post-creation state needed — creation and everything about it
+  // happens in one shot at submit().
+  const [llmCapabilities, setLlmCapabilities] = useState({}); // {capability_key: llm_id}, only entries the user actually changed
+  const [availableLlms, setAvailableLlms] = useState([]);
+  // Session 150 — XTTS endpoint for this world. Blank means the simulator's
+  // built-in default, which is a compiled-in address that has already drifted
+  // out of step with where the GPU box actually runs.
+  const [xttsUrl, setXttsUrl] = useState("");
   const [saving, setSaving]   = useState(false);
   const [error, setError]     = useState(null);
   const [name, setName]       = useState("");
@@ -168,8 +175,8 @@ export default function WorldWizard({ onClose, onCreated }) {
   const [homeSuggestions, setHomeSuggestions] = useState([]);
   const [modules, setModules] = useState(() => Object.fromEntries(MODULES_DEF.map(m => [m.key, m.on])));
 
-  const canNext = [name.trim().length > 0, city !== null, true  ];
-  const TITLES = ["Identity","Location","Modules"];
+  const canNext = [name.trim().length > 0, city !== null, true, true  ];
+  const TITLES = ["Identity","Location","Modules","LLM"];
 
 
 
@@ -180,6 +187,15 @@ export default function WorldWizard({ onClose, onCreated }) {
     ]).then(([all, me]) => {
       setUsers(all.map(u => me && u.id === me.id ? {...u, _isMe: true} : u));
     }).catch(() => {});
+  }, []);
+
+  // Available LLM options for the LLM step — world-independent, fetchable
+  // on mount.
+  useEffect(() => {
+    fetch("/api/llm-config/available")
+      .then(r => r.ok ? r.json() : { available: [] })
+      .then(data => setAvailableLlms(data.available || []))
+      .catch(() => setAvailableLlms([]));
   }, []);
 
   async function submit() {
@@ -196,13 +212,15 @@ export default function WorldWizard({ onClose, onCreated }) {
           modules: enabledModules,
           invitees: invitees.map(u => u.id),
           home_address: homeAddress || undefined,
+          llm_capabilities: llmCapabilities,
+          xtts_url: xttsUrl.trim() || undefined,
         }),
       });
-      const data = await r.json();
-      if (!r.ok) { setError(d.error || "Failed to create world"); setSaving(false); return; }
+      const data = await resp.json();
+      if (!resp.ok) { setError(data.error || "Failed to create world"); setSaving(false); return; }
 
       // Upload portraits — custom overrides or signal to use platform default
-      const actorIds = d.actor_ids || {};
+      const actorIds = data.actor_ids || {};
       const memberIds = Object.keys(actorIds);
       await Promise.all(memberIds.map(async userId => {
         const actorId = actorIds[userId];
@@ -214,12 +232,13 @@ export default function WorldWizard({ onClose, onCreated }) {
         } else {
           fd.append("use_default", "true");
         }
-        await fetch(`/api/worlds/${d.world_id}/actors/${actorId}/portrait`, {
+        await fetch(`/api/worlds/${data.world_id}/actors/${actorId}/portrait`, {
           method: "POST", body: fd,
         }).catch(() => {});
       }));
 
-      onCreated && onCreated(d);
+      setSaving(false);
+      onCreated && onCreated(data);
     } catch(e) { setError(e.message); setSaving(false); }
   }
 
@@ -230,27 +249,27 @@ export default function WorldWizard({ onClose, onCreated }) {
     <>
     <div style={{position:"fixed",inset:0,zIndex:1000,background:"rgba(0,0,0,0.55)",
       display:"flex",alignItems:"center",justifyContent:"center",padding:"1rem"}}>
-      <div style={{background:"#faf8f4",borderRadius:16,width:"100%",maxWidth:800,
+      <div style={{background:"#faf8f4",borderRadius:16,width:"100%",maxWidth:1040,
         boxShadow:"0 24px 64px rgba(0,0,0,0.2)",overflow:"hidden",...F}}>
 
         <div style={{padding:"22px 24px 0"}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14}}>
             <div>
-              <p style={{fontSize:11,color:"#a8a5a0",margin:"0 0 3px",letterSpacing:".06em",textTransform:"uppercase"}}>New world · Step {step+1} of 3</p>
+              <p style={{fontSize:11,color:"#a8a5a0",margin:"0 0 3px",letterSpacing:".06em",textTransform:"uppercase"}}>New world · Step {step+1} of {TITLES.length}</p>
               <h2 style={{...serif,fontSize:26,fontWeight:500,margin:0,color:"#1a1814"}}>{TITLES[step]}</h2>
             </div>
             <button onClick={onClose} style={{background:"none",border:"none",cursor:"pointer",
               color:"#a8a5a0",fontSize:18,lineHeight:1,padding:4,marginTop:4}}>✕</button>
           </div>
           <div style={{display:"flex",gap:5,marginBottom:20}}>
-            {[0,1,2].map(i => (
+            {TITLES.map((_,i) => (
               <div key={i} style={{height:2,flex:1,borderRadius:2,
                 background: i<=step ? "#1a1814" : "rgba(0,0,0,0.1)"}}/>
             ))}
           </div>
         </div>
 
-        <div style={{padding:"0 24px 24px",minHeight:360}}>
+        <div style={{padding:"0 24px 24px",minHeight:460}}>
 
           {step===0 && (
             <div style={{display:"flex",flexDirection:"column",gap:14}}>
@@ -377,11 +396,11 @@ export default function WorldWizard({ onClose, onCreated }) {
                       value={homeQuery}
                       onChange={async e => {
                         const query = e.target.value;
-                        setHomeQuery(q);
+                        setHomeQuery(query);
                         setHomeAddress(null);
-                        if (q.length < 3) { setHomeSuggestions([]); return; }
-                        const resp = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(q)}`).then(r=>r.ok?r.json():[]);
-                        setHomeSuggestions(Array.isArray(r)?r:[]);
+                        if (query.length < 3) { setHomeSuggestions([]); return; }
+                        const resp = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(query)}`).then(r=>r.ok?r.json():[]);
+                        setHomeSuggestions(Array.isArray(resp)?resp:[]);
                       }}
                       placeholder={`Search your address in ${city.n}…`}
                       style={{width:"100%",boxSizing:"border-box",padding:"9px 12px",borderRadius:9,border:"1px solid rgba(0,0,0,.12)",fontSize:13,fontFamily:"'DM Sans',system-ui,sans-serif",background:"#fff",outline:"none"}}
@@ -415,30 +434,59 @@ export default function WorldWizard({ onClose, onCreated }) {
           )}
 
           {step===2 && (
-            <div style={{display:"flex",flexDirection:"column",gap:16}}>
-              <div style={{display:"flex",flexDirection:"column",gap:8}}>
-                {MODULES_DEF.map(m => (
-                  <div key={m.key} onClick={()=>setModules(p=>({...p,[m.key]:!p[m.key]}))}
-                    style={{display:"flex",alignItems:"center",justifyContent:"space-between",
-                      padding:"10px 14px",border:"1px solid rgba(0,0,0,0.08)",borderRadius:10,cursor:"pointer",
-                      background:modules[m.key]?"rgba(26,20,14,0.03)":"transparent"}}>
-                    <div>
-                      <p style={{fontSize:13,fontWeight:500,margin:0,color:"#1a1814"}}>{m.label}</p>
-                      <p style={{fontSize:11,margin:"2px 0 0",color:"#a8a5a0"}}>{m.desc}</p>
-                    </div>
-                    <div style={{width:36,height:20,borderRadius:10,flexShrink:0,position:"relative",
-                      background:modules[m.key]?"#1a1814":"rgba(0,0,0,0.15)"}}>
-                      <div style={{position:"absolute",top:3,width:14,height:14,borderRadius:"50%",
-                        background:"#faf8f4",left:modules[m.key]?19:3,transition:"left 0.12s"}}/>
-                    </div>
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              {MODULES_DEF.map(m => (
+                <div key={m.key} onClick={()=>setModules(p=>({...p,[m.key]:!p[m.key]}))}
+                  style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+                    padding:"10px 14px",border:"1px solid rgba(0,0,0,0.08)",borderRadius:10,cursor:"pointer",
+                    background:modules[m.key]?"rgba(26,20,14,0.03)":"transparent"}}>
+                  <div>
+                    <p style={{fontSize:13,fontWeight:500,margin:0,color:"#1a1814"}}>{m.label}</p>
+                    <p style={{fontSize:11,margin:"2px 0 0",color:"#a8a5a0"}}>{m.desc}</p>
                   </div>
-                ))}
+                  <div style={{width:36,height:20,borderRadius:10,flexShrink:0,position:"relative",
+                    background:modules[m.key]?"#1a1814":"rgba(0,0,0,0.15)"}}>
+                    <div style={{position:"absolute",top:3,width:14,height:14,borderRadius:"50%",
+                      background:"#faf8f4",left:modules[m.key]?19:3,transition:"left 0.12s"}}/>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {step===3 && (
+            <div style={{display:"flex",flexDirection:"column",gap:16}}>
+              <p style={{fontSize:12,color:"#6b6760",margin:0}}>
+                Assign a model per capability now, or leave everything on default — this can be changed anytime from Configure.
+              </p>
+              <LlmCapabilityGrid
+                availableLlms={availableLlms}
+                value={llmCapabilities}
+                onChange={(cap, llmId) => setLlmCapabilities(prev => ({ ...prev, [cap]: llmId }))}
+              />
+              <div>
+                <p style={{fontSize:10,color:"#a8a5a0",margin:"0 0 6px",letterSpacing:".06em",textTransform:"uppercase"}}>Voice server (XTTS)</p>
+                <input
+                  value={xttsUrl}
+                  onChange={e => setXttsUrl(e.target.value)}
+                  placeholder="http://212.147.242.29:8005/upload_reference"
+                  style={{width:"100%",fontSize:13,padding:"8px 10px",borderRadius:8,
+                    border:"1px solid rgba(0,0,0,.1)",background:"rgba(255,255,255,.7)",boxSizing:"border-box"}} />
+                <p style={{fontSize:11,color:"#a8a5a0",margin:"4px 0 0",lineHeight:1.5}}>
+                  Where voice references are sent so characters can speak. Leave blank to use the
+                  simulator default. The GPU box is started by hand, so this address changes — if it
+                  is wrong or the server is down, the sample is still saved and the failure is
+                  recorded against the actor rather than lost.
+                </p>
               </div>
+
               <div style={{padding:"12px 14px",background:"rgba(0,0,0,0.03)",
                 border:"1px solid rgba(0,0,0,0.07)",borderRadius:10}}>
                 <p style={{fontSize:10,color:"#a8a5a0",margin:"0 0 8px",letterSpacing:".06em",textTransform:"uppercase"}}>Review</p>
                 {[["Name",name],["City",city?.n||"—"],["Timezone",city?.tz||"—"],["Visibility",visibility],
                   ["Modules",Object.entries(modules).filter(([,v])=>v).map(([k])=>MODULES_DEF.find(m=>m.key===k)?.label).join(", ")||"none"],
+                  ["LLM overrides",Object.entries(llmCapabilities).filter(([,v])=>v).map(([k])=>CAPABILITIES.find(c=>c.key===k)?.label).join(", ")||"none (all default)"],
+                  ["Voice server", xttsUrl.trim() || "simulator default"],
                 ].map(([k,v])=>(
                   <div key={k} style={{display:"flex",justifyContent:"space-between",gap:12,marginBottom:3}}>
                     <span style={{fontSize:12,color:"#a8a5a0"}}>{k}</span>
@@ -459,66 +507,17 @@ export default function WorldWizard({ onClose, onCreated }) {
               textTransform:"uppercase",cursor:"pointer"}}>
             {step===0?"Cancel":"← Back"}
           </button>
-          <button onClick={step<2?()=>setStep(s=>s+1):submit}
+          <button onClick={step<TITLES.length-1?()=>setStep(s=>s+1):submit}
             disabled={!canNext[step]||saving}
             style={{background:canNext[step]&&!saving?"#1a1814":"rgba(0,0,0,0.15)",
               color:canNext[step]&&!saving?"#faf8f4":"#a8a5a0",border:"none",
               borderRadius:8,padding:"9px 22px",fontSize:12,letterSpacing:".05em",
               textTransform:"uppercase",cursor:canNext[step]&&!saving?"pointer":"not-allowed"}}>
-            {saving?"Creating...":step<2?"Next →":"Create world"}
+            {saving?"Creating...":step<TITLES.length-1?"Next →":"Create world"}
           </button>
         </div>
       </div>
     </div>
-
-    {/* ── Post-creation residence picker ── */}
-    {createdWorld && (
-      <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1001 }}>
-        <div style={{ background:"#faf8f4", borderRadius:18, padding:36, width:520, maxWidth:"92vw", maxHeight:"80vh", display:"flex", flexDirection:"column" }}>
-          <div style={{...serif, fontSize:24, fontWeight:500, color:"#1a1814", marginBottom:6}}>Pick your home</div>
-          <p style={{...sans, fontSize:13, color:"#6b6760", marginBottom:20}}>
-            Choose your address in {city?.n}. Actors who know your address can visit you here.
-          </p>
-          <div style={{ flex:1, overflowY:"auto", display:"flex", flexDirection:"column", gap:8, marginBottom:20 }}>
-            {residences.length === 0 && <p style={{...sans, fontSize:13, color:"#a8a5a0"}}>No residential places found.</p>}
-            {residences.map(r => (
-              <div key={r.id} onClick={() => setHomePlaceId(r.id)}
-                style={{ padding:"12px 14px", borderRadius:9, cursor:"pointer",
-                  border:`1px solid ${homePlaceId===r.id ? "rgba(29,158,117,.5)" : "rgba(0,0,0,.1)"}`,
-                  background: homePlaceId===r.id ? "rgba(29,158,117,.06)" : "rgba(0,0,0,.02)",
-                  display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-                <div>
-                  <div style={{...sans, fontSize:13, fontWeight:500, color:"#1a1814"}}>{r.name}</div>
-                  <div style={{...sans, fontSize:11, color:"#a8a5a0"}}>{r.formatted_address}</div>
-                </div>
-                {homePlaceId===r.id && <span style={{color:"#1D9E75", fontSize:16}}>✓</span>}
-              </div>
-            ))}
-          </div>
-          <div style={{ display:"flex", gap:10, justifyContent:"flex-end" }}>
-            <button onClick={() => { setCreatedWorld(null); onCreated && onCreated(createdWorld); }}
-              style={{...sans, fontSize:13, padding:"8px 18px", borderRadius:9, border:"1px solid rgba(0,0,0,.12)", background:"transparent", color:"#6b6760", cursor:"pointer"}}>
-              Skip for now
-            </button>
-            <button disabled={!homePlaceId} onClick={async () => {
-              const ownerActorId = createdWorld.actor_ids?.[null] || Object.values(createdWorld.actor_ids || {})[0];
-              if (ownerActorId && homePlaceId) {
-                await fetch(`/api/worlds/${createdWorld.world_id}/actors/${ownerActorId}/home`, {
-                  method:"POST", headers:{"Content-Type":"application/json"},
-                  body: JSON.stringify({ home_place_id: homePlaceId }),
-                }).catch(() => {});
-              }
-              setCreatedWorld(null);
-              onCreated && onCreated(createdWorld);
-            }} style={{...sans, fontSize:13, padding:"8px 24px", borderRadius:9, border:"none",
-              background: homePlaceId ? "#1a1814" : "rgba(0,0,0,.15)",
-              color: homePlaceId ? "#faf8f4" : "#a8a5a0", cursor: homePlaceId ? "pointer" : "not-allowed"}}>
-              Set as home →
-            </button>
-          </div>
-        </div>
-      </div>
-    )}
     </>
   );
 }

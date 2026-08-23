@@ -174,7 +174,7 @@ function ActorCard({ actor, shared, owned, onShare, onDelete, onDeploy, onUndepl
             <ShareIcon />
           </div>
           {!deployed && (
-            <div onClick={e => { e.stopPropagation(); if(confirm(`Permanently delete ${actor.name}? This cannot be undone.`)) onDelete(actor.id); }}
+            <div onClick={e => { e.stopPropagation(); onDelete(actor); }}
               style={{ position:"absolute", top:10, right:10, width:26, height:26, borderRadius:"50%", background:"rgba(255,255,255,.8)", border:"1px solid rgba(0,0,0,.08)", display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", zIndex:1, fontSize:12, color:"#c0392b" }}
               onMouseEnter={e => { e.currentTarget.style.background="#fff2f2"; e.currentTarget.style.borderColor="rgba(192,57,43,.3)"; }}
               onMouseLeave={e => { e.currentTarget.style.background="rgba(255,255,255,.8)"; e.currentTarget.style.borderColor="rgba(0,0,0,.08)"; }}>
@@ -188,7 +188,7 @@ function ActorCard({ actor, shared, owned, onShare, onDelete, onDeploy, onUndepl
             </div>
           )}
           {deployed && onUndeploy && (
-            <div onClick={e => { e.stopPropagation(); if(confirm(`Undeploy ${actor.name} from this world?`)) onUndeploy(actor.id); }}
+            <div onClick={e => { e.stopPropagation(); onUndeploy(actor); }}
               style={{ position:"absolute", top:10, right:10, width:26, height:26, borderRadius:"50%", background:"rgba(255,255,255,.8)", border:"1px solid rgba(0,0,0,.08)", display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", zIndex:1, fontSize:9, color:"#a8a5a0", fontFamily:"'DM Sans',system-ui,sans-serif", letterSpacing:".04em", textTransform:"uppercase" }}
               title="Undeploy"
               onMouseEnter={e => { e.currentTarget.style.background="#fff"; e.currentTarget.style.borderColor="rgba(0,0,0,.18)"; e.currentTarget.style.color="#6b6760"; }}
@@ -263,11 +263,51 @@ export default function ActorsGalleryPage() {
     setOwned(p => p.filter(a => a.id !== id));
   };
 
+  // Session 150 — window.confirm() is SUPPRESSED in some embedded browser
+  // contexts: it returns false without ever showing a dialog. Every control
+  // gated on `if (confirm(...))` therefore did nothing at all when clicked, with
+  // no error and no network request — which is exactly how the undeploy arrow
+  // presented. alert() is unreliable in the same way, so failures were invisible
+  // too. Both are replaced with in-page UI, which also works in every context.
+  const [confirmAction, setConfirmAction] = useState(null);  // {title, body, label, danger, run}
+  const [actionError,   setActionError]   = useState(null);
+
   const undeployActor = async (id) => {
-    await fetch(`/api/actors/${id}/undeploy`, { method: "POST" });
-    setDeployedIds(p => { const next = new Set(p); next.delete(id); return next; });
-    setDeployments(p => p.filter(d => d.platform_actor_id !== id));
+    // Session 150 — this used to fire and update local state unconditionally,
+    // never looking at the response. A failed undeploy therefore LOOKED like it
+    // worked: the card vanished from "In play" and came back on the next
+    // reload, because the actor was still deployed the whole time. Check the
+    // result, and only drop her from the list if the server agrees.
+    try {
+      const res  = await fetch(`/api/actors/${id}/undeploy`, { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) {
+        setActionError(`Undeploy failed: ${data.error || `HTTP ${res.status}`}`);
+        return;
+      }
+      setActionError(null);
+      setDeployedIds(p => { const next = new Set(p); next.delete(id); return next; });
+      setDeployments(p => p.filter(d => d.platform_actor_id !== id));
+    } catch (e) {
+      setActionError(`Undeploy failed: ${e.message}`);
+    }
   };
+
+  const askUndeploy = (actor) => setConfirmAction({
+    title: `Remove ${actor.name} from this world?`,
+    body: "Her world-side instance is erased — relationships, memories, schedule, bank account. The character herself is kept and can be deployed again.",
+    label: "Remove from world",
+    danger: false,
+    run: () => undeployActor(actor.id),
+  });
+
+  const askDelete = (actor) => setConfirmAction({
+    title: `Permanently delete ${actor.name}?`,
+    body: "This cannot be undone. The character and everything belonging to her are removed.",
+    label: "Delete permanently",
+    danger: true,
+    run: () => deleteActor(actor.id),
+  });
 
   const inPlay    = owned.filter(a => deployedIds.has(a.id));
   // Session 103 (user law) — "Not in play" is the shelf for FINISHED
@@ -316,7 +356,7 @@ export default function ActorsGalleryPage() {
                 {worldActors.map(a => {
             const worldPhoto = worldPhotoMap[`${worldName}|${a.id}`];
             const actorWithPhoto = worldPhoto ? { ...a, photo_url: worldPhoto } : a;
-            return <ActorCard key={a.id} actor={actorWithPhoto} owned deployed onShare={setShareActor} onDelete={deleteActor} onUndeploy={undeployActor} onClick={() => navigate(`/actors/${a.id}`)} />;
+            return <ActorCard key={a.id} actor={actorWithPhoto} owned deployed onShare={setShareActor} onDelete={askDelete} onUndeploy={askUndeploy} onClick={() => navigate(`/actors/${a.id}`)} />;
           })}
               </div>
             </SectionLabel>
@@ -328,9 +368,9 @@ export default function ActorsGalleryPage() {
             <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(170px,1fr))", gap:12, marginBottom:"2.5rem" }}>
               {notInPlay.map(a => {
                 const isDeployed = deployedIds.has(a.id);
-                return <ActorCard key={a.id} actor={a} owned deployed={isDeployed} onShare={setShareActor} onDelete={deleteActor}
+                return <ActorCard key={a.id} actor={a} owned deployed={isDeployed} onShare={setShareActor} onDelete={askDelete}
                   onDeploy={!isDeployed ? (id => setDeployActor(owned.find(x => x.id === id))) : undefined}
-                  onUndeploy={isDeployed ? undeployActor : undefined}
+                  onUndeploy={isDeployed ? askUndeploy : undefined}
                   onClick={() => navigate(`/actors/${a.id}`)} />;
               })}
             </div>
@@ -370,6 +410,53 @@ export default function ActorsGalleryPage() {
       </div>
 
       {shareActor && <ShareModal actor={shareActor} onClose={() => setShareActor(null)} />}
+
+      {/* Session 150 — an in-page confirmation, replacing window.confirm(),
+          which is silently suppressed in embedded browser contexts: it returns
+          false without showing anything, so the control it gated simply did
+          nothing when clicked. */}
+      {confirmAction && (
+        <div onClick={() => setConfirmAction(null)}
+          style={{ position:"fixed", inset:0, zIndex:2000, background:"rgba(238,236,234,.72)",
+            backdropFilter:"blur(10px)", WebkitBackdropFilter:"blur(10px)",
+            display:"flex", alignItems:"center", justifyContent:"center", padding:"1.5rem" }}>
+          <div onClick={e => e.stopPropagation()}
+            style={{ background:"rgba(255,255,255,.96)", border:"1px solid rgba(255,255,255,.95)",
+              boxShadow:"0 8px 64px rgba(0,0,0,.14)", borderRadius:18, maxWidth:440, width:"100%", padding:"22px 24px" }}>
+            <div style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", fontSize:19, fontWeight:500, color:"#1a1814", marginBottom:8 }}>
+              {confirmAction.title}
+            </div>
+            <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, color:"#6b6760", lineHeight:1.55, marginBottom:18 }}>
+              {confirmAction.body}
+            </div>
+            <div style={{ display:"flex", gap:8, justifyContent:"flex-end" }}>
+              <button onClick={() => setConfirmAction(null)}
+                style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, padding:"8px 16px", borderRadius:9,
+                  border:"1px solid rgba(0,0,0,.12)", background:"none", color:"#6b6760", cursor:"pointer" }}>
+                Cancel
+              </button>
+              <button onClick={() => { const a = confirmAction; setConfirmAction(null); a.run(); }}
+                style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, padding:"8px 16px", borderRadius:9,
+                  border:"none", background: confirmAction.danger ? "#c0392b" : "#1a1814", color:"#faf8f4", cursor:"pointer" }}>
+                {confirmAction.label}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Failures were going to alert(), which is suppressed in the same
+          contexts — so an undeploy that 500'd looked identical to one that
+          worked. */}
+      {actionError && (
+        <div style={{ position:"fixed", bottom:20, left:"50%", transform:"translateX(-50%)", zIndex:2001,
+          background:"rgba(255,255,255,.97)", border:"1px solid rgba(192,57,43,.35)", borderRadius:10,
+          boxShadow:"0 4px 28px rgba(0,0,0,.12)", padding:"10px 14px", display:"flex", alignItems:"center", gap:12 }}>
+          <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12.5, color:"#993c1d" }}>{actionError}</span>
+          <span onClick={() => setActionError(null)}
+            style={{ cursor:"pointer", color:"#a8a5a0", fontSize:14, lineHeight:1 }}>✕</span>
+        </div>
+      )}
 
       {deployActor && (
         <DeployWizardModal

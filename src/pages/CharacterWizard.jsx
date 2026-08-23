@@ -962,7 +962,27 @@ export default function CharacterWizard({ user, worlds }) {
       hds:{ bold:30, cautious:30, colorful:30, diligent:30, dutiful:30, excitable:30, imaginative:30, leisurely:30, mischievous:30, reserved:30, skeptical:30 },
     });
     setLifestyle(st.lifestyle || { alcohol_relationship:"rare", drug_use:"none", substance_context:"", sleep_pattern:"normal", sleep_quality:"good", exercise_habit:"regular", exercise_type:"", social_frequency:"weekly", diet:"", lifestyle_note:"" });
-    setEconomy(st.economy || { financial_situation:"stable", income_stability:"stable", spending_style:"balanced", savings_habit:"moderate", attitude_to_wealth:"practical", financial_anxiety:0.3, behavior_note:"" });
+    // Session 150 — monthly_income_sek is stripped on load. Session 103 ruled
+    // the amount is WORLD data, set at world-deploy, and excised it from this
+    // wizard's prompt and form — but not from drafts already saved. The key
+    // kept riding along inside st.economy: restored wholesale here, autosaved
+    // back into draft_state, and POSTed to /api/actors on every save, which
+    // wrote it straight to actor_economic. Nothing in this wizard renders it,
+    // so it was invisible at the only screen that persisted it while showing
+    // as a confident figure on the actor pages that read it. Lindsey carried
+    // 85000 this way from 8 Aug — the "85,000 SEK incident" in the SAD —
+    // because no UI path existed to clear it. Dropping it here breaks the
+    // loop: the POST handler writes NULL when the key is absent, so existing
+    // rows clean themselves on the next save.
+    // Session 150 — strips BOTH spellings. Draft blobs written before the
+    // column was renamed still carry `monthly_income_sek` (Lindsey's 85000
+    // is one of them), so dropping only the new name would quietly reopen
+    // the loop this closes: restored from draft, autosaved back, POSTed on
+    // every save.
+    const { monthly_income_sek: _legacy, monthly_income: _worldOwnsTheAmount, ...savedEconomy } = st.economy || {};
+    setEconomy(st.economy
+      ? savedEconomy
+      : { financial_situation:"stable", income_stability:"stable", spending_style:"balanced", savings_habit:"moderate", attitude_to_wealth:"practical", financial_anxiety:0.3, behavior_note:"" });
     setHomeTemplate(st.homeTemplate || null);
     setAssessmentResults(st.assessmentResults || {});
     setAssessments(st.assessments || { iwm:"", attachment:"", intimacy:"", cogstyle:"" });

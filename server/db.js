@@ -207,7 +207,7 @@ db.exec(`
     savings_habit           TEXT,
     spending_style          TEXT,
     behavior_note           TEXT,
-    monthly_income_sek      INTEGER,
+    monthly_income          INTEGER,
     financial_runway_months REAL,
     inserted_at             TEXT NOT NULL,
     updated_at              TEXT NOT NULL

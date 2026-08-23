@@ -13,8 +13,6 @@ import CharacterWizard from "./pages/CharacterWizard.jsx";
 import ActorsEditorPage from "./pages/ActorsEditorPage.jsx";
 import DeployWizardPage from "./pages/DeployWizardPage.jsx";
 import WorldsPage from "./pages/WorldsPage.jsx";
-import WorldEditorPage from "./pages/WorldEditorPage.jsx";
-import WorldActorPage  from "./pages/WorldActorPage.jsx";
 import KnockEncounterPage from "./pages/KnockEncounterPage.jsx";
 import VenueEncounterPage from "./pages/VenueEncounterPage.jsx";
 
@@ -306,8 +304,6 @@ export default function App() {
       <Routes>
         <Route path="/home"         element={<HomePage />} />
         <Route path="/my-worlds"    element={<WorldsPage />} />
-        <Route path="/my-worlds/:worldId"                   element={<WorldEditorPage />} />
-        <Route path="/my-worlds/:worldId/actors/:actorId"   element={<WorldActorPage />} />
         <Route path="/developer"    element={<DeveloperPage />} />
         <Route path="/messages"     element={<MessagesPage />} />
         <Route path="/calendar"     element={<CalendarPage />} />
