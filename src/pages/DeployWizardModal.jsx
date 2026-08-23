@@ -1,4 +1,7 @@
 import { useState, useEffect, useRef } from "react";
+import { useNavigate } from "react-router-dom";
+import { fmtAmount, fmtSigned, fmtMoney } from "../lib/money.js";
+import AmountInput from "../lib/AmountInput.jsx";
 
 const S = {
   overlay: { position:"fixed",inset:0,zIndex:1000,background:"rgba(238,236,234,0.72)",backdropFilter:"blur(12px)",WebkitBackdropFilter:"blur(12px)",display:"flex",alignItems:"center",justifyContent:"center",padding:"1.5rem" },
@@ -51,9 +54,61 @@ function StepWorld({ actor, state, setState }) {
   const markerRef   = useRef(null);
   const [mapReady,  setMapReady]  = useState(false);
 
+  const [worldsError, setWorldsError] = useState("");
+  const [startingWorld, setStartingWorld] = useState(false);
+
+  // Session 150 — worlds she is already deployed to cannot be chosen again.
+  // The server refuses the duplicate with a 409 regardless, but discovering that
+  // at step 6 after filling in a CV and generating a schedule is a poor way to
+  // learn it.
+  const [alreadyIn, setAlreadyIn] = useState({});   // world_id -> world_name
   useEffect(() => {
-    fetch("/api/worlds", { credentials: "include" }).then(r=>r.ok?r.json():[]).then(setWorlds).catch(()=>{});
-  }, []);
+    if (!actor?.id) return;
+    fetch(`/api/actors/deployments`, { credentials: "include" })
+      .then(r => r.ok ? r.json() : [])
+      .then(ds => {
+        const map = Object.fromEntries(
+          ds.filter(d => d.platform_actor_id === actor.id).map(d => [d.world_id, d.world_name]));
+        setAlreadyIn(map);
+        // A restored draft can hold a world she has been deployed to since the
+        // draft was saved. Clear it, so step 1's gate fails honestly on "no world
+        // chosen" rather than waving through a selection the server will refuse.
+        setState(p => p.world && map[p.world.id] ? { ...p, world: null } : p);
+      })
+      .catch(() => {});
+  }, [actor?.id]);
+
+  function loadWorlds() {
+    return fetch("/api/worlds", { credentials: "include" })
+      .then(async r => {
+        if (!r.ok) throw new Error(r.status === 502 ? "The simulator isn't reachable." : `HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(ws => {
+        setWorlds(ws);
+        setWorldsError(ws.length ? "" : "You don't have any worlds yet — create one before deploying.");
+        // Keep the selected world's status fresh. It is stored in wizard state
+        // and would otherwise stay whatever it was when the wizard opened, which
+        // is exactly how a stopped world reads as running.
+        setState(p => p.world ? { ...p, world: ws.find(w => w.id === p.world.id) || p.world } : p);
+        return ws;
+      })
+      .catch(e => { setWorldsError(e.message); return []; });
+  }
+
+  useEffect(() => { loadWorlds(); }, []);
+
+  // Session 150 — a world has to be running to deploy into, so offer to start it
+  // here rather than sending someone to /my-worlds and back.
+  async function startWorld(w) {
+    setStartingWorld(true);
+    try {
+      await fetch(`/api/worlds/${w.id}/start`, { method:"POST", credentials:"include" });
+      await new Promise(r => setTimeout(r, 1200));
+      await loadWorlds();
+    } catch {}
+    setStartingWorld(false);
+  }
 
   // Load Google Maps
   useEffect(() => {
@@ -183,20 +238,68 @@ function StepWorld({ actor, state, setState }) {
     <div>
       {/* World selector */}
       <div style={{ ...S.label, marginBottom:8 }}>World</div>
-      {worlds.length === 0 && <p style={{ ...S.sans, fontSize:13, color:"#a8a5a0" }}>Loading…</p>}
+      {worlds.length === 0 && (
+        <p style={{ ...S.sans, fontSize:13, color: worldsError ? "#993c1d" : "#a8a5a0" }}>
+          {worldsError || "Loading…"}
+        </p>
+      )}
       {worlds.map(w => {
         const running = w.status === "running";
+        const taken   = !!alreadyIn[w.id];
         return (
-          <div key={w.id} onClick={() => setState(p => ({...p, world:w}))}
-            style={{ padding:"10px 14px", borderRadius:12, border:`1.5px solid ${state.world?.id===w.id?"#1a1814":"rgba(0,0,0,.08)"}`, background:state.world?.id===w.id?"rgba(26,24,20,.04)":"rgba(255,255,255,.5)", cursor:"pointer", marginBottom:8, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-            <div>
+          <div key={w.id} onClick={() => { if (!taken) setState(p => ({...p, world:w})); }}
+            title={taken ? `${actor?.first_name || "She"} is already deployed to ${w.name}` : undefined}
+            style={{ padding:"10px 14px", borderRadius:12,
+              border:`1.5px solid ${state.world?.id===w.id?"#1a1814":"rgba(0,0,0,.08)"}`,
+              background: taken ? "rgba(0,0,0,.025)" : state.world?.id===w.id?"rgba(26,24,20,.04)":"rgba(255,255,255,.5)",
+              cursor: taken ? "default" : "pointer", opacity: taken ? .6 : 1,
+              marginBottom:8, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+            <div style={{ minWidth:0 }}>
               <div style={{ ...S.sans, fontSize:13, fontWeight:500, color:"#1a1814" }}>{w.name}</div>
-              <div style={{ ...S.sans, fontSize:11, color:running?"#5CA87A":"#c0392b", marginTop:1 }}>{running ? "● running" : "● stopped"}</div>
+              <div style={{ ...S.sans, fontSize:11, color: taken ? "#a8a5a0" : running?"#5CA87A":"#c0392b", marginTop:1 }}>
+                {taken ? "already deployed here" : running ? "● running" : "● stopped"}
+              </div>
             </div>
-            {state.world?.id===w.id && <span style={{ color:"#1a1814" }}>✓</span>}
+            {taken
+              ? <span style={{ ...S.sans, fontSize:9, letterSpacing:".08em", textTransform:"uppercase",
+                  padding:"3px 8px", borderRadius:5, background:"rgba(29,158,117,.1)", color:"#0F6E56",
+                  border:"1px solid rgba(29,158,117,.22)", flexShrink:0 }}>in play</span>
+              : state.world?.id===w.id && <span style={{ color:"#1a1814" }}>✓</span>}
           </div>
         );
       })}
+
+      {worlds.length > 0 && worlds.every(w => alreadyIn[w.id]) && (
+        <div style={{ ...S.sans, fontSize:12, color:"#6b6760", padding:"10px 12px", marginTop:2,
+          background:"rgba(0,0,0,.02)", border:"1px solid rgba(0,0,0,.07)", borderRadius:10 }}>
+          {actor?.first_name || "She"} is already in every world you have. To change how she works in one,
+          edit her there instead of deploying again.
+        </div>
+      )}
+
+      {/* Session 150 — a stopped world cannot receive a deploy, so say so at the
+          point of choice and offer the fix inline. The wizard's Next is gated on
+          the same condition, but a disabled button with no explanation is how
+          people end up staring at a screen. */}
+      {state.world && state.world.status !== "running" && (
+        <div style={{ display:"flex", alignItems:"center", gap:11, padding:"11px 13px", marginTop:2, marginBottom:4,
+          background:"rgba(192,57,43,.05)", border:"1px solid rgba(192,57,43,.18)", borderRadius:10 }}>
+          <div style={{ flex:1, minWidth:0 }}>
+            <div style={{ ...S.sans, fontSize:12.5, color:"#993c1d", fontWeight:500 }}>
+              {state.world.name} is stopped
+            </div>
+            <div style={{ ...S.sans, fontSize:11.5, color:"#6b6760", marginTop:1, lineHeight:1.5 }}>
+              She can't be deployed into a world that isn't running.
+            </div>
+          </div>
+          <button onClick={() => startWorld(state.world)} disabled={startingWorld}
+            style={{ ...S.sans, fontSize:11, letterSpacing:".05em", textTransform:"uppercase", padding:"6px 13px",
+              borderRadius:7, border:"none", background:"#1a1814", color:"#faf8f4",
+              cursor: startingWorld ? "default" : "pointer", flexShrink:0, opacity: startingWorld ? .55 : 1 }}>
+            {startingWorld ? "Starting…" : "Start world"}
+          </button>
+        </div>
+      )}
 
       {/* Home section */}
       {state.world && (
@@ -341,6 +444,23 @@ const normName = s => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()
 // monthly), contract pays for a JOB (one sum, once, on completion), and
 // independent is the MARKET paying for OUTPUT (monthly, moving with demand).
 // Mirrors default_basis/1 in ScheduledPaymentProcess on the simulator.
+// Session 150 — the effective pay day, resolved in ONE place.
+//
+// The fallback used to be written out at every use site: the input rendered
+// `src.pay_day ?? 25`, the review line printed `s.pay_day ?? 25`, and the deploy
+// sent `s.pay_day ?? 25` — but the step-3 gate tested the raw `s.pay_day`. So a
+// source that had never had the field touched showed 25 on screen, would have
+// deployed as 25, and still blocked Next with "Set a pay day", because only the
+// gate saw the undefined the other three were papering over.
+//
+// per_contract has no pay day at all: it is paid on completion, so there is no
+// day of the month for it to land on.
+function srcPayDay(src) {
+  if (srcBasis(src) === "per_contract") return null;
+  const n = Number(src?.pay_day);
+  return Number.isFinite(n) && n >= 1 && n <= 28 ? n : 25;
+}
+
 function srcBasis(src) {
   if (src.amount_basis) return src.amount_basis;
   if (src.source_type === "contract")    return "per_contract";
@@ -350,6 +470,27 @@ function srcBasis(src) {
 function incomeLabel(src) {
   const b = srcBasis(src);
   return b === "per_contract" ? "Contract fee" : b === "variable" ? "Expected income" : "Salary";
+}
+
+// Session 150 — the only cadences payment_due_today? recognises. Anything else
+// lands in its `_ -> false` branch: the row would sit in the table looking
+// configured and never once be charged.
+const EXPENSE_CADENCES = ["monthly", "quarterly", "annual"];
+const EXPENSE_CATEGORIES = ["rent", "utilities", "transit", "food", "phone", "insurance", "subscription", "leisure", "childcare", "debt", "other"];
+
+// A starting point scaled to what she earns, not a fixed price list — 12,000 rent
+// is ordinary for an 80k lawyer and impossible for a 20k barista. Applied only
+// when the button is pressed, and every line stays editable afterwards.
+function suggestExpenses(monthlyIncome) {
+  const r = (frac, min) => Math.max(min, Math.round((monthlyIncome * frac) / 100) * 100);
+  return [
+    { name: "Rent",      category: "rent",         amount: r(0.30, 4000), cadence: "monthly", debit_day: 1  },
+    { name: "Utilities", category: "utilities",    amount: r(0.02, 400),  cadence: "monthly", debit_day: 5  },
+    { name: "Transit",   category: "transit",      amount: r(0.01, 300),  cadence: "monthly", debit_day: 1  },
+    { name: "Groceries", category: "food",         amount: r(0.08, 2000), cadence: "monthly", debit_day: 3  },
+    { name: "Phone",     category: "phone",        amount: r(0.005, 200), cadence: "monthly", debit_day: 20 },
+    { name: "Leisure",   category: "leisure",      amount: r(0.05, 500),  cadence: "monthly", debit_day: 10 },
+  ];
 }
 
 const CAREER_LEVELS = ["junior","established","senior","independent"];
@@ -420,6 +561,40 @@ function StepEmployment({ actor, state, setState }) {
   const monthlyTotal = sources
     .filter(x => srcBasis(x) !== "per_contract")
     .reduce((sum, x) => sum + (Number(x.monthly_amount) || 0), 0);
+
+  // Session 150 — salaries here are GROSS, and payday deducts tax from them.
+  //
+  // Asked of the server rather than computed here on purpose. The bands are
+  // approximations that get corrected as they are found wrong, and a second copy
+  // in JavaScript would drift from DeliverWorlds.Tax silently — the wizard would
+  // keep quoting a rate the simulator had stopped using.
+  //
+  // Employment only, matching what payday actually taxes: freelance and business
+  // income take other code paths and are assessed differently everywhere.
+  const grossEmployment = sources
+    .filter(x => x.source_type === "employment" && srcBasis(x) !== "per_contract")
+    .reduce((sum, x) => sum + (Number(x.monthly_amount) || 0), 0);
+
+  const [tax, setTax] = useState(null);
+  const taxTimer = useRef(null);
+
+  useEffect(() => {
+    const country = state.world?.country;
+    if (!country || !(grossEmployment > 0)) { setTax(null); return; }
+    clearTimeout(taxTimer.current);
+    taxTimer.current = setTimeout(() => {
+      fetch(`/api/tax/estimate?country=${encodeURIComponent(country)}&gross=${grossEmployment}`,
+            { credentials: "include" })
+        .then(r => r.ok ? r.json() : null)
+        .then(setTax)
+        .catch(() => setTax(null));
+    }, 400);
+    return () => clearTimeout(taxTimer.current);
+  }, [state.world?.country, grossEmployment]);
+
+  // What she actually lives on: take-home plus any non-employment income, which
+  // this model does not tax.
+  const netTotal = tax ? (monthlyTotal - grossEmployment) + tax.net_monthly : monthlyTotal;
 
   function addSource() {
     const id = `rs-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
@@ -757,15 +932,17 @@ function StepEmployment({ actor, state, setState }) {
                   <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
                     <div>
                       <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-                        <input type="number" min={0} step={1000}
+                        <AmountInput
                           value={src.monthly_amount ?? ""}
-                          onChange={e => updateSource(src.id, { monthly_amount: e.target.value === "" ? null : parseInt(e.target.value, 10) })}
+                          onCommit={v => updateSource(src.id, { monthly_amount: v })}
                           placeholder={srcBasis(src) === "variable" ? "Typical month" : "Per month"}
                           style={{ flex:1, minWidth:0, fontSize:13, padding:"7px 10px", borderRadius:8, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", boxSizing:"border-box" }} />
                         <span style={{ ...S.mono, fontSize:12, color:"#6b6760", flexShrink:0 }}>{worldCurrency}</span>
                       </div>
                       <div style={{ ...S.sans, fontSize:10, color:"#a8a5a0", marginTop:2 }}>
-                        {srcBasis(src) === "variable" ? "What a normal month brings in" : "Same figure every month"}
+                        {src.source_type === "employment"
+                          ? (srcBasis(src) === "variable" ? "Before tax — what a normal month brings in" : "Before tax — same figure every month")
+                          : (srcBasis(src) === "variable" ? "What a normal month brings in" : "Same figure every month")}
                       </div>
                     </div>
                     {srcBasis(src) === "variable" ? (
@@ -789,7 +966,7 @@ function StepEmployment({ actor, state, setState }) {
                     ) : (
                       <div>
                         <input type="number" min={1} max={28}
-                          value={src.pay_day ?? 25}
+                          value={srcPayDay(src) ?? ""}
                           onChange={e => updateSource(src.id, { pay_day: Math.max(1, Math.min(28, parseInt(e.target.value, 10) || 25)) })}
                           style={{ width:"100%", fontSize:13, padding:"7px 10px", borderRadius:8, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", boxSizing:"border-box" }} />
                         <div style={{ ...S.sans, fontSize:10, color:"#a8a5a0", marginTop:2 }}>Pay day — capped at 28 so it lands every month</div>
@@ -867,6 +1044,98 @@ function StepEmployment({ actor, state, setState }) {
         </button>
       </div>
 
+      {/* ── Fixed expenses ────────────────────────────────────────────────────
+          Session 150 — what leaves her account each month.
+
+          ScheduledPaymentProcess has debited these on their debit_day since it
+          was written, and FinancialEngine divides balance by their monthly total
+          to get financial_runway_months. Nothing had ever created a row, so
+          every character deployed until now had income and no outgoings: a
+          balance that only grew, and a runway that fell through to its
+          "else 99.0" branch because the sum was always zero.
+
+          The starter set below is a suggestion, not a default — it is only
+          applied when you press it, and every line is editable or removable.
+          Rent is scaled off her income rather than fixed, since a number that is
+          right for an 80k lawyer is absurd for a 20k barista. */}
+      <div style={{ marginTop:20 }}>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:6 }}>
+          <div style={{ ...S.label }}>Fixed expenses</div>
+          <div style={{ display:"flex", gap:6 }}>
+            {(state.career?.fixed_expenses || []).length === 0 && monthlyTotal > 0 && (
+              <span onClick={() => setState(p => ({...p, career: {...(p.career||{}), fixed_expenses: suggestExpenses(monthlyTotal)}}))}
+                style={{ ...S.sans, fontSize:11, padding:"4px 10px", borderRadius:20, cursor:"pointer",
+                  border:"1px solid rgba(0,0,0,.12)", background:"rgba(255,255,255,.6)", color:"#6b6760" }}>
+                ✨ Suggest
+              </span>
+            )}
+            <span onClick={() => setState(p => ({...p, career: {...(p.career||{}),
+                fixed_expenses: [...(p.career?.fixed_expenses || []), { name:"", category:"other", amount:0, cadence:"monthly", debit_day:1 }]}}))}
+              style={{ ...S.sans, fontSize:11, padding:"4px 10px", borderRadius:20, cursor:"pointer",
+                border:"1px solid rgba(0,0,0,.12)", background:"rgba(255,255,255,.6)", color:"#6b6760" }}>
+              + Add
+            </span>
+          </div>
+        </div>
+
+        {(state.career?.fixed_expenses || []).length === 0 && (
+          <div style={{ ...S.sans, fontSize:11, color:"#a8a5a0" }}>
+            Nothing leaves her account. Her balance will only ever grow, and financial runway can't be computed.
+          </div>
+        )}
+
+        {(state.career?.fixed_expenses || []).map((exp, i) => {
+          const upd = patch => setState(p => ({...p, career: {...(p.career||{}),
+            fixed_expenses: (p.career?.fixed_expenses || []).map((x, j) => j === i ? { ...x, ...patch } : x)}}));
+          const drop = () => setState(p => ({...p, career: {...(p.career||{}),
+            fixed_expenses: (p.career?.fixed_expenses || []).filter((_, j) => j !== i)}}));
+          return (
+            <div key={i} style={{ display:"grid", gridTemplateColumns:"1.5fr 1fr 1fr .9fr .8fr auto", gap:6, alignItems:"center", marginBottom:6 }}>
+              <input value={exp.name || ""} onChange={e => upd({ name: e.target.value })} placeholder="Rent"
+                style={{ ...S.sans, fontSize:12, padding:"6px 9px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", minWidth:0 }} />
+              <select value={exp.category || "other"} onChange={e => upd({ category: e.target.value })}
+                style={{ ...S.sans, fontSize:12, padding:"6px 9px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", minWidth:0 }}>
+                {EXPENSE_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+              <AmountInput value={exp.amount ?? 0} onCommit={v => upd({ amount: Math.max(0, v || 0) })}
+                style={{ ...S.mono, fontSize:12, padding:"6px 9px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", minWidth:0 }} />
+              <select value={exp.cadence || "monthly"} onChange={e => upd({ cadence: e.target.value })}
+                style={{ ...S.sans, fontSize:12, padding:"6px 9px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", minWidth:0 }}>
+                {EXPENSE_CADENCES.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+              <input type="number" min={1} max={28} value={exp.debit_day ?? 1} onChange={e => upd({ debit_day: Math.min(28, Math.max(1, parseInt(e.target.value, 10) || 1)) })}
+                title="Day of the month it is charged"
+                style={{ ...S.mono, fontSize:12, padding:"6px 9px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)", minWidth:0 }} />
+              <span onClick={drop} title="Remove" style={{ ...S.sans, fontSize:13, color:"#c0392b", cursor:"pointer", padding:"0 4px" }}>✕</span>
+            </div>
+          );
+        })}
+
+        {(state.career?.fixed_expenses || []).length > 0 && (
+          <div style={{ ...S.sans, fontSize:10, color:"#a8a5a0", marginTop:4 }}>
+            {(() => {
+              const per = { monthly: 1, quarterly: 1/3, annual: 1/12 };
+              const m = (state.career?.fixed_expenses || [])
+                .reduce((t, e) => t + (Number(e.amount) || 0) * (per[e.cadence || "monthly"] || 1), 0);
+              // Session 150 — subtract from TAKE-HOME, not gross.
+              //
+              // This line used to read `monthlyTotal - m`, which measured her
+              // expenses against money she never receives. With 80.000 gross,
+              // 37.200 of costs and 39,2% Swedish tax it reported +42.800 when
+              // the real figure is +11.450 — overstating her monthly margin
+              // almost fourfold, on the exact number someone would use to judge
+              // whether the rent is plausible.
+              const spendable = netTotal;
+              const net = spendable - m;
+              return `${fmtAmount(m)} ${worldCurrency}/month out` +
+                (spendable > 0
+                  ? ` · ${fmtSigned(net)} ${worldCurrency} left${net < 0 ? " — she loses money every month" : ""}`
+                  : "");
+            })()}
+          </div>
+        )}
+      </div>
+
       {/* Opening balance — per ACTOR, not per source, so it sits outside the
           sources list. Session 150: deploy now creates a bank_accounts row, and
           it opened at zero. That is not neutral — rent debits on the 1st while
@@ -875,20 +1144,38 @@ function StepEmployment({ actor, state, setState }) {
           from live balance, which makes it real stress rather than a rounding
           detail. What she has in the bank on day one is a fact about the
           character, so it is set here rather than guessed at. */}
+      {/* Session 150 — take-home, stated plainly. Every judgement made further
+          down this step — whether the rent is plausible, whether the opening
+          balance covers a month — is a judgement against this number, not
+          against the gross figure above. */}
+      {tax && tax.monthly_tax > 0 && (
+        <div style={{ marginTop:14, padding:"10px 12px", background:"rgba(0,0,0,.025)",
+          border:"1px solid rgba(0,0,0,.06)", borderRadius:10, display:"flex",
+          alignItems:"baseline", gap:10, flexWrap:"wrap" }}>
+          <span style={{ ...S.mono, fontSize:14, color:"#1a1814" }}>
+            {fmtAmount(tax.net_monthly)} {worldCurrency}
+          </span>
+          <span style={{ ...S.sans, fontSize:11.5, color:"#6b6760" }}>
+            take-home, after {(tax.effective_rate * 100).toFixed(1).replace(".", ",")}% tax
+            {tax.country ? ` in ${tax.country}` : ""}
+            {tax.known === false ? " (estimated — no rates on file for this country)" : ""}
+          </span>
+        </div>
+      )}
+
       <div style={{ marginTop:20 }}>
         <div style={{ ...S.label, marginBottom:6 }}>Opening balance</div>
         <div style={{ display:"flex", alignItems:"center", gap:8 }}>
-          <input type="number" min={0} step={1000}
+          <AmountInput
             value={state.career?.opening_balance ?? ""}
-            onChange={e => setState(p => ({...p, career: {...(p.career||{}),
-              opening_balance: e.target.value === "" ? null : Math.max(0, parseInt(e.target.value, 10) || 0)}}))}
+            onCommit={v => setState(p => ({...p, career: {...(p.career||{}), opening_balance: v == null ? null : Math.max(0, v)}}))}
             placeholder="0"
             style={{ width:160, fontSize:13, padding:"7px 10px", borderRadius:8, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)" }} />
           <span style={{ ...S.mono, fontSize:12, color:"#6b6760" }}>{worldCurrency}</span>
           {monthlyTotal > 0 && (
             <div style={{ display:"flex", gap:5 }}>
               {[1, 3, 6].map(m => (
-                <span key={m} onClick={() => setState(p => ({...p, career: {...(p.career||{}), opening_balance: monthlyTotal * m}}))}
+                <span key={m} onClick={() => setState(p => ({...p, career: {...(p.career||{}), opening_balance: Math.round(netTotal * m)}}))}
                   style={{ ...S.sans, fontSize:11, padding:"4px 9px", borderRadius:20, cursor:"pointer",
                     border:"1px solid rgba(0,0,0,.12)", background:"rgba(255,255,255,.6)", color:"#6b6760" }}>
                   {m} mo
@@ -899,7 +1186,7 @@ function StepEmployment({ actor, state, setState }) {
         </div>
         <div style={{ ...S.sans, fontSize:10, color:"#a8a5a0", marginTop:3 }}>
           {monthlyTotal > 0
-            ? `What she has in the bank on day one. ${monthlyTotal.toLocaleString()} ${worldCurrency}/month across her sources — the shortcuts set that many months of runway.`
+            ? `What she has in the bank on day one. ${fmtAmount(netTotal)} ${worldCurrency}/month take-home — the shortcuts set that many months of runway.`
             : "What she has in the bank on day one. Rent is debited before the first salary lands, so zero means starting overdrawn."}
         </div>
       </div>
@@ -1901,7 +2188,7 @@ function StepDeploy({ actor, state }) {
         b === "per_contract"
           ? (s.gross_amount ? `${s.gross_amount} ${cur} on ${s.ends_on || "completion (no date set)"}` : "no fee set")
           : (s.monthly_amount
-              ? `${s.monthly_amount} ${cur}/mo${b === "variable" ? ` ±${Math.round((s.variability ?? 0.25)*100)}%` : ` on the ${s.pay_day ?? 25}th`}`
+              ? `${s.monthly_amount} ${cur}/mo${b === "variable" ? ` ±${Math.round((s.variability ?? 0.25)*100)}%` : ` on the ${srcPayDay(s)}th`}`
               : "no income set");
       return `${s.name || "(unnamed)"} — ${s.source_type}, ${Math.round((s.reputation_score ?? 0.5)*100)}% (${levelFromReputation(s.reputation_score)}), ${money}`;
     }).join(" · ");
@@ -1921,10 +2208,19 @@ function StepDeploy({ actor, state }) {
   }
   const rows = [
     ["Character",    actor?.name],
-    ["World",        state.world?.name],
+    // Say plainly whether the world is up. The Deploy button re-checks this and
+    // refuses if it isn't, so the review should not read as though it will work.
+    ["World",        state.world ? `${state.world.name}${state.world.status === "running" ? "" : "  ·  STOPPED"}` : null],
     ["Relationships",(state.relationships||[]).map(r=>`${r.character.first_name||r.character.name} — ${relLabel(r)}`).join(", ")||"None seeded"],
     ["Revenue sources", sourcesLabel(state)],
-    ["Opening balance", `${(Number(state.career?.opening_balance) || 0).toLocaleString()} ${state.world?.currency || ""}`.trim()],
+    ["Opening balance", fmtMoney(state.career?.opening_balance || 0, state.world?.currency)],
+    ["Fixed expenses", (() => {
+      const per = { monthly: 1, quarterly: 1/3, annual: 1/12 };
+      const list = (state.career?.fixed_expenses || []).filter(e => (e.name||"").trim() && Number(e.amount) > 0);
+      if (!list.length) return "None — nothing leaves her account";
+      const m = list.reduce((t, e) => t + (Number(e.amount)||0) * (per[e.cadence||"monthly"]||1), 0);
+      return `${list.length} · ${fmtMoney(m, state.world?.currency)}/month`.trim();
+    })()],
     ["Work hours",   state.schedule ? workHoursLabel(state) : "Not set"],
     ["Work week",    workWeekLabel(state)],
     ["Deploy starts", `Week ${state.fromWeek}`],
@@ -2016,6 +2312,7 @@ function savedAgo(ts) {
 
 // ── Main modal ────────────────────────────────────────────────────────────────
 export default function DeployWizardModal({ actor, onClose, onDeployed }) {
+  const navigate = useNavigate();
   // Session 150 — restored draft, read once on mount. `stateImages` was
   // dropped from the initial shape: it was declared here and never read
   // or written anywhere in the file.
@@ -2025,6 +2322,37 @@ export default function DeployWizardModal({ actor, onClose, onDeployed }) {
   const [deploying, setDeploying] = useState(false);
   const [error, setError] = useState("");
   const [draftNotice, setDraftNotice] = useState(!!draft);
+
+  // Session 150 — a deploy cannot land while the simulator is down, so the
+  // wizard should say so instead of letting someone build six steps of work
+  // that fails at the last button.
+  //
+  // Starts optimistic (reachable: true) on purpose: the first check has not
+  // returned yet, and flashing a scary banner for 13ms on every open is worse
+  // than the rare case of showing the controls a moment before disabling them.
+  // Re-checked on an interval because the simulator can die mid-wizard — the
+  // steps take minutes and involve LLM calls.
+  const [sim, setSim] = useState({ reachable: true, checking: true });
+
+  async function checkSim() {
+    try {
+      const r = await fetch("/api/simulator/health", { credentials: "include" });
+      const d = await r.json();
+      setSim({ ...d, checking: false });
+      return d.reachable;
+    } catch (e) {
+      setSim({ reachable: false, checking: false, reason: "Couldn't reach the platform API." });
+      return false;
+    }
+  }
+
+  useEffect(() => {
+    let alive = true;
+    const run = () => { if (alive) checkSim(); };
+    run();
+    const t = setInterval(run, 20000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
 
   useEffect(() => {
     const prev = document.body.style.overflow;
@@ -2057,33 +2385,121 @@ export default function DeployWizardModal({ actor, onClose, onDeployed }) {
     return all.filter(p => !covered.has(p.id));
   }
 
-  function canNext() {
-    if (step===1) return !!state.world && !!state.home?.place_id && !!state.home?.home_type;
-    // Session 150 — added the worldRosterLoaded requirement. Without it a
-    // failed roster fetch produced an empty missing-list and waved the
-    // step through; see the Promise.all in StepRelationships.
-    if (step===2) return !!state.worldRosterLoaded && missingRelationships().length === 0;
-    // Session 150 — step 3 (CV & Employment) had no gate at all, even
-    // though the step itself prints "No revenue sources yet — add at
-    // least one". Deploying with none reaches the simulator and inserts
-    // zero actor_revenue_sources rows, leaving the actor with no income
-    // and nothing for the schedule generator to anchor work against. A
-    // source with a blank name is equally useless downstream — it's
-    // written straight into actor_revenue_sources.name.
-    if (step===3) {
-      const sources = state.career?.revenue_sources || [];
-      return sources.length > 0 && sources.every(s => (s.name || "").trim());
+  // Session 150 — one function that decides whether the step is finished AND
+  // says why it isn't.
+  //
+  // This was a bare boolean, so an incomplete step produced a greyed-out Next
+  // and no explanation. Every reason below was already a rule; none of them were
+  // visible. Returning the reason instead of `false` costs nothing and is the
+  // difference between a blocked user and an informed one.
+  function nextIssue() {
+    if (!sim.reachable) return "The simulator is offline";
+
+    if (step === 1) {
+      if (!state.world) return "Choose a world";
+      // A deploy into a stopped world writes every row and then cannot boot her:
+      // the actor's process tree is started by the world's supervisor, which
+      // isn't running.
+      if (state.world.status !== "running") return `${state.world.name} is stopped — start it to continue`;
+      if (!state.home?.place_id)  return "Set her home address";
+      if (!state.home?.home_type) return "Choose apartment or house";
+      return null;
     }
-    // Session 150 — was `!!state.schedule`, and [] is truthy. A
-    // generation that came back empty walked all the way to Deploy and
-    // failed there against the server's own `!schedule?.length` check
-    // with the generic "missing required deploy fields". Gate on content.
-    if (step===4) return Array.isArray(state.schedule) && state.schedule.length > 0;
-    return true;
+
+    if (step === 2) {
+      // Without the roster check a failed fetch produced an empty missing-list
+      // and waved the step through.
+      if (!state.worldRosterLoaded) return "Loading the world's cast…";
+      const missing = missingRelationships();
+      if (missing.length) {
+        const names = missing.map(m => m.first_name || m.name).filter(Boolean);
+        return `Set a relationship for ${names.slice(0, 3).join(", ")}${names.length > 3 ? ` and ${names.length - 3} more` : ""}`;
+      }
+      return null;
+    }
+
+    if (step === 3) {
+      const sources = state.career?.revenue_sources || [];
+      if (!sources.length) return "Add at least one revenue source";
+
+      const unnamed = sources.find(s => !(s.name || "").trim());
+      if (unnamed) return "Every revenue source needs a name";
+
+      // Written straight into actor_revenue_sources.monthly_amount and read by
+      // ScheduledPaymentProcess — a source paying zero is not income.
+      const unpaid = sources.find(s => !(Number(s.monthly_amount) > 0));
+      if (unpaid) return `How much does ${unpaid.name.trim()} pay?`;
+
+      // per_contract has no pay day by design; everything else needs one or the
+      // payment process has no day to fire on.
+      // srcPayDay always resolves to a usable day for anything that is paid on
+      // one, so this can only fire on a source whose basis has no pay day —
+      // which is per_contract, already excluded. Kept as a guard rather than
+      // removed: it is the check that would catch a future basis that needs a
+      // day and does not get one.
+      const undated = sources.find(s => srcBasis(s) !== "per_contract" && srcPayDay(s) == null);
+      if (undated) return `Set a pay day for ${undated.name.trim()}`;
+
+      const expenses = state.career?.fixed_expenses || [];
+      const badExp = expenses.find(e => !(e.name || "").trim() || !(Number(e.amount) > 0));
+      if (badExp) return "Every expense needs a name and an amount — or remove the row";
+
+      // 0 is a real answer here (she starts broke); blank is not an answer.
+      if (state.career?.opening_balance === null || state.career?.opening_balance === undefined
+          || state.career?.opening_balance === "") return "Set an opening balance — 0 is fine";
+
+      return null;
+    }
+
+    // [] is truthy, so the old `!!state.schedule` let an empty generation walk
+    // to Deploy and fail there against the server's own length check.
+    if (step === 4) {
+      if (!Array.isArray(state.schedule) || !state.schedule.length) return "Generate a schedule";
+      return null;
+    }
+
+    // Step 5 (Media) is deliberately ungated. The voice reference and portraits
+    // are genuinely optional — the XTTS server is frequently unreachable and the
+    // upload is fire-and-forget — so requiring them would block deploys for an
+    // outage that has nothing to do with the character.
+    return null;
   }
 
+  function canNext() { return !nextIssue(); }
+
   async function handleDeploy() {
+    // The interval check can be up to 20s stale, and this is the one call that
+    // must not be made hopefully. Confirm the simulator is there right now.
     setDeploying(true);
+    if (!(await checkSim())) {
+      setError("The simulator isn't reachable — nothing was deployed. It'll re-check automatically.");
+      setDeploying(false);
+      return;
+    }
+
+    // Session 150 — re-confirm the world is still running. Step 1 gates on this,
+    // but the steps in between take minutes (CV parsing, schedule generation),
+    // and the world can be stopped from /my-worlds in another tab meanwhile. The
+    // status held in wizard state is only as fresh as when step 1 was passed.
+    try {
+      const ws = await fetch("/api/worlds", { credentials:"include" }).then(r => r.ok ? r.json() : []);
+      const live = ws.find(w => w.id === state.world?.id);
+      if (!live) {
+        setError(`${state.world?.name || "That world"} no longer exists — nothing was deployed.`);
+        setDeploying(false);
+        return;
+      }
+      if (live.status !== "running") {
+        setState(p => ({ ...p, world: live }));
+        setError(`${live.name} was stopped — nothing was deployed. Start it on step 1, then deploy.`);
+        setDeploying(false);
+        return;
+      }
+    } catch (e) {
+      setError("Couldn't confirm the world is running — nothing was deployed.");
+      setDeploying(false);
+      return;
+    }
     setError("");
     try {
       // Session 150 — career level and reputation are per revenue source
@@ -2113,7 +2529,7 @@ export default function DeployWizardModal({ actor, onClose, onDeployed }) {
         // deploy landed with no pay day and no work days despite the wizard
         // showing 25 and Mon-Fri.
         leave_days_per_year: leaveDaysOf(s),
-        pay_day:   srcBasis(s) === "per_contract" ? null : (s.pay_day ?? 25),
+        pay_day:   srcPayDay(s),
         work_days: daysOf(s),
         work_blocks: blocksOfSource(s),
       }));
@@ -2127,6 +2543,15 @@ export default function DeployWizardModal({ actor, onClose, onDeployed }) {
           // account at whatever arrives, and "not stated" and "nothing" are the
           // same thing for a starting balance.
           opening_balance:  Math.max(0, Number(state.career?.opening_balance) || 0),
+          // Blank rows are dropped here rather than on the server: an expense
+          // with no name or no amount is a half-filled row the user abandoned,
+          // not an instruction to charge her nothing every month.
+          fixed_expenses:   (state.career?.fixed_expenses || [])
+            .filter(e => (e.name || "").trim() && Number(e.amount) > 0)
+            .map(e => ({ name: (e.name || "").trim(), category: e.category || "other",
+                         amount: Number(e.amount) || 0,
+                         cadence: EXPENSE_CADENCES.includes(e.cadence) ? e.cadence : "monthly",
+                         debit_day: Math.min(28, Math.max(1, Number(e.debit_day) || 1)) })),
           career_level:     rollupCareerLevel(sourcesForDeploy),
           reputation_score: rollupReputation(sourcesForDeploy),
         },
@@ -2150,6 +2575,30 @@ export default function DeployWizardModal({ actor, onClose, onDeployed }) {
         // be restored the next time this actor's wizard is opened.
         clearDraft(actor?.id);
         onDeployed({ platform_actor_id: actor.id, world_id: state.world.id, world_name: state.world.name, simulator_actor_id: data.simulator_actor_id });
+
+        // Session 150 — land on her, in the world she just entered.
+        //
+        // The wizard used to close and drop you back wherever you started, with
+        // no confirmation of any kind. Six steps of work ended in a modal
+        // vanishing, and the only way to find out whether it had worked was to
+        // go looking for her. Now it goes where the answer is: her world-scoped
+        // page, which shows the income, expenses, schedule and psychology that
+        // were just written.
+        //
+        // The banner is passed through router state rather than a query param so
+        // it survives exactly one navigation and leaves no ?deployed=1 to be
+        // re-shared, bookmarked, or shown again on reload.
+        navigate(`/my-worlds/${state.world.id}/actors/${actor.id}`, {
+          state: {
+            justDeployed: {
+              name: actor.first_name || actor.name,
+              world: state.world.name,
+              sources: (state.career?.revenue_sources || []).length,
+              expenses: (state.career?.fixed_expenses || []).filter(e => (e.name||"").trim() && Number(e.amount) > 0).length,
+              weeks: Array.isArray(state.schedule) ? 53 - (state.fromWeek || 1) : 0,
+            },
+          },
+        });
       } else {
         setError(data.error || "Deploy failed.");
         setDeploying(false);
@@ -2213,6 +2662,27 @@ export default function DeployWizardModal({ actor, onClose, onDeployed }) {
 
         {/* Body */}
         <div style={{ flex:1, overflowY:"auto", padding:"1.25rem 1.5rem" }}>
+          {!sim.reachable && (
+            <div style={{ display:"flex", alignItems:"flex-start", gap:11, padding:"12px 14px", marginBottom:16,
+              background:"rgba(192,57,43,.05)", border:"1px solid rgba(192,57,43,.18)", borderRadius:10 }}>
+              <div style={{ width:8, height:8, borderRadius:"50%", background:"#c0392b", flexShrink:0, marginTop:5 }} />
+              <div style={{ flex:1, minWidth:0 }}>
+                <div style={{ ...S.sans, fontSize:13, color:"#993c1d", fontWeight:500, marginBottom:2 }}>
+                  The simulator is offline — deploying is disabled
+                </div>
+                <div style={{ ...S.sans, fontSize:12, color:"#6b6760", lineHeight:1.6 }}>
+                  {sim.reason || "The simulator isn't answering."}{" "}
+                  Nothing you've filled in is lost — it's saved as a draft. Re-checking every 20 seconds.
+                </div>
+              </div>
+              <button onClick={checkSim} disabled={sim.checking}
+                style={{ ...S.sans, fontSize:11, letterSpacing:".05em", textTransform:"uppercase", padding:"6px 12px",
+                  borderRadius:7, border:"1px solid rgba(192,57,43,.25)", background:"transparent",
+                  color:"#993c1d", cursor: sim.checking ? "default" : "pointer", flexShrink:0, opacity: sim.checking ? .5 : 1 }}>
+                {sim.checking ? "Checking…" : "Retry"}
+              </button>
+            </div>
+          )}
           {step===1 && <StepWorld      actor={actor} state={state} setState={setState} />}
           {step===2 && <StepRelationships actor={actor} state={state} setState={setState} />}
           {step===3 && (
@@ -2229,8 +2699,19 @@ export default function DeployWizardModal({ actor, onClose, onDeployed }) {
         </div>
 
         {/* Footer */}
-        <div style={{ display:"flex", justifyContent:"space-between", padding:"1rem 1.5rem", borderTop:"1px solid rgba(0,0,0,.06)", flexShrink:0 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:14, justifyContent:"space-between", padding:"1rem 1.5rem", borderTop:"1px solid rgba(0,0,0,.06)", flexShrink:0 }}>
           <button onClick={()=>setStep(p=>Math.max(1,p-1))} disabled={step===1} style={{ ...S.sans, fontSize:13, padding:"8px 18px", borderRadius:9, border:"1px solid rgba(0,0,0,.1)", background:"none", color:"#6b6760", cursor:"pointer", opacity:step===1?.4:1 }}>← Back</button>
+          {/* Session 150 — say what is missing. A disabled Next with no reason
+              makes the user hunt the form for whichever field it means. */}
+          {(() => {
+            const issue = nextIssue();
+            return issue && !deploying ? (
+              <span style={{ ...S.sans, fontSize:12, color:"#a8a5a0", marginLeft:"auto", marginRight:4,
+                textAlign:"right", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                {issue}
+              </span>
+            ) : null;
+          })()}
           <button onClick={()=>{ if(!canNext()) return; if(step===6) handleDeploy(); else setStep(p=>p+1); }} disabled={deploying||!canNext()} style={{ ...S.sans, fontSize:13, padding:"8px 24px", borderRadius:9, border:"none", background:"#1a1814", color:"#faf8f4", cursor:"pointer", opacity:(!canNext()||deploying)?.5:1 }}>
             {deploying?"Deploying…":nextLabels[step]}
           </button>

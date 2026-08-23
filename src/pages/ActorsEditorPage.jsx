@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
 import DeployWizardModal from "./DeployWizardModal.jsx";
 import ActorModelPanel from "./ActorModelPanel.jsx";
 import { NATIONALITIES, flagEmoji } from "./nationalities.js";
+import { fmtAmount } from "../lib/money.js";
 
 const STYLE_COLOR = {
   fearful_avoidant:  { bg: "rgba(55,138,221,.10)",  border: "rgba(55,138,221,.2)",  text: "#185fa5", init: "rgba(55,138,221,.15)" },
@@ -417,7 +418,7 @@ function EconomicPanel({ d, editing, setEditData }) {
           {/* Session 150 — read-only. The amount is world data, set at
               world-deploy from the actor's revenue sources; editing it here
               contradicted that and was one of three writers to one column. */}
-          <Field label="Monthly income"      value={e.monthly_income ? Number(e.monthly_income).toLocaleString() : "Set at deployment"} />
+          <Field label="Monthly income"      value={e.monthly_income ? fmtAmount(e.monthly_income) : "Set at deployment"} />
           <Field label="Behavior note"       value={e.behavior_note} full tall />
         </div>
       )}
@@ -428,7 +429,7 @@ function EconomicPanel({ d, editing, setEditData }) {
             <div key={i} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0", borderBottom:"1px solid rgba(0,0,0,.06)" }}>
               <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, color:"#1a1814" }}>{exp.name}</span>
               <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#a8a5a0" }}>
-                {exp.category} · {exp.monthly_budget_ore ? `${Math.round(exp.monthly_budget_ore/100).toLocaleString()} SEK/mo` : "—"}
+                {exp.category} · {exp.monthly_budget_ore ? `${fmtAmount(exp.monthly_budget_ore/100)} SEK/mo` : "—"}
               </span>
             </div>
           ))}
@@ -671,14 +672,61 @@ const NAV = [
   { id: "expenses",    label: "Expenses",              doneKey: d => d?.expenses?.length > 0 },
 ];
 
+
+// Session 150 — the only signal that an edit reached the server, now that there
+// is no Save button to press and watch. Silence on failure is the risk this
+// pattern carries, so failure is the case it renders most loudly.
+function SaveStatus({ status, error, onRetry }) {
+  if (status === "idle") return null;
+  const map = {
+    saving: ["#a8a5a0", "Saving…"],
+    saved:  ["#1D9E75", "Saved"],
+    error:  ["#993c1d", error || "Couldn't save"],
+  };
+  const [color, label] = map[status] || map.saving;
+  return (
+    <div style={{ display:"flex", alignItems:"center", gap:9, fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11.5, color }}>
+      <span style={{ width:6, height:6, borderRadius:"50%", background:color,
+        opacity: status === "saving" ? .5 : 1, flexShrink:0 }} />
+      {label}
+      {status === "error" && onRetry && (
+        <button onClick={onRetry} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10.5,
+          letterSpacing:".05em", textTransform:"uppercase", padding:"3px 9px", borderRadius:6,
+          border:"1px solid rgba(192,57,43,.25)", background:"transparent", color:"#993c1d", cursor:"pointer" }}>Retry</button>
+      )}
+    </div>
+  );
+}
+
 // ── Main editor page ──────────────────────────────────────────────────────────
 export default function ActorsEditorPage() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
+
+  // Where the back link goes. Defaults to the gallery, but a caller that knows
+  // better — the world editor, which sends you here from a specific world — can
+  // name its own return path so you land back where you were rather than in a
+  // list you did not come from.
+  const backTo = location.state?.from || { label: "Characters", path: "/actors" };
   const [data, setData]         = useState(null);
   const [tab, setTab]           = useState("identity");
-  const [editing, setEditing]   = useState(false);
-  const [saving, setSaving]     = useState(false);
+  // Session 150 — no Edit/Save step: the panels are always live and every change
+  // writes on its own. `editing` doubles as "may this person write", which is
+  // exactly what the panels need to decide between an input and static text.
+  //
+  // Editing the TEMPLATE belongs to its owner alone. A shared character can be
+  // deployed ("use") or forked ("copy"), but never edited in place — otherwise
+  // there is no answer to how much editing makes it yours, which is the
+  // ambiguity the permission ladder exists to remove.
+  //
+  // Until now this was hardcoded true, so a shared character rendered fully
+  // editable and failed on save with a bare 404 from the server's ownership
+  // check. The refusal was correct; arriving after the typing was not.
+  const isOwner = data?.actor?.is_owner !== false;
+  const editing = isOwner;
+  const [status, setStatus]         = useState("idle");   // idle | saving | saved | error
+  const [saveError, setSaveError]   = useState(null);
   const [editData, setEditData] = useState(null);
   const [showDeploy, setShowDeploy] = useState(false);
 
@@ -693,6 +741,99 @@ export default function ActorsEditorPage() {
       .catch(() => {});
   }, [id]);
 
+  // Session 150 — debounced autosave, replacing Edit / Cancel / Save.
+  //
+  // Debounced because the alternative is a PUT per keystroke: typing a backstory
+  // would fire a request per character. 700ms after typing stops reads as
+  // instant and is one write.
+  //
+  // Only CHANGED sections are sent. The old Save looped over all seven
+  // regardless, so editing a name rewrote psychology, lifestyle and economics
+  // too — harmless while it was one deliberate press, wasteful several times a
+  // sentence.
+  const pending  = useRef({});
+  const timer    = useRef(null);
+  const live     = useRef(true);
+  const lastSent = useRef(null);
+
+  useEffect(() => () => {
+    live.current = false;
+    if (timer.current) { clearTimeout(timer.current); flushEdits(); }
+  }, []);
+
+  // Baseline for change detection: whatever the server last confirmed.
+  useEffect(() => { if (data && !lastSent.current) lastSent.current = JSON.parse(JSON.stringify(data)); }, [data]);
+
+  const SECTIONS = ["actor", "psychology", "big5", "disc", "hds", "lifestyle", "economic"];
+
+  // Commit whatever is queued and move the change-detection baseline forward.
+  async function commitNow(snapshotSource) {
+    const snapshot = JSON.parse(JSON.stringify(snapshotSource || editDataRef.current || data));
+    clearTimeout(timer.current);
+    await flushEdits();
+    lastSent.current = snapshot;
+  }
+
+  // editData is read inside blur handlers that close over an older render, so
+  // the latest value is mirrored into a ref.
+  const editDataRef = useRef(null);
+
+  async function flushEdits() {
+    const next = pending.current;
+    pending.current = {};
+    const dirty = Object.keys(next);
+    if (!dirty.length) return;
+
+    setStatus("saving"); setSaveError(null);
+    try {
+      for (const section of dirty) {
+        const r = await fetch(`/api/actors/${id}`, {
+          method: "PUT", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ section, data: next[section] }), keepalive: true,
+        });
+        if (!r.ok) {
+          if (live.current) { setSaveError(`Couldn't save ${section} — HTTP ${r.status}`); setStatus("error"); }
+          return;
+        }
+      }
+      if (live.current) { setStatus("saved"); }
+    } catch (e) {
+      if (live.current) { setSaveError(`Couldn't save — ${e.message}`); setStatus("error"); }
+    }
+  }
+
+  // Panels call setEditData; this wraps it so every mutation also queues a write.
+  function updateEditData(updater) {
+    if (!isOwner) return;   // read-only: nothing to stage, nothing to send
+    setEditData(prev => {
+      const base = prev || JSON.parse(JSON.stringify(data));
+      const next = typeof updater === "function" ? updater(base) : updater;
+
+      for (const section of SECTIONS) {
+        const val  = section === "actor" ? next.actor : next[section];
+        const prevVal = section === "actor" ? lastSent.current?.actor : lastSent.current?.[section];
+        if (val && JSON.stringify(val) !== JSON.stringify(prevVal)) pending.current[section] = val;
+      }
+
+      if (Object.keys(pending.current).length) {
+        setStatus("saving");
+        clearTimeout(timer.current);
+        // Session 150 — the real commit point is blur (see the panel body's
+        // onBlur below), not this timer.
+        //
+        // A 700ms debounce was the first attempt and it is wrong for typing done
+        // at a human pace: "300000" entered with ordinary pauses saved 30, then
+        // 300, then 300000 — three writes, two of them values the character
+        // never had. The fallback is kept and lengthened only so a control that
+        // never blurs (a select the user leaves focused, then navigates away
+        // from) still lands.
+        timer.current = setTimeout(() => commitNow(next), 2500);
+      }
+      editDataRef.current = next;
+      return next;
+    });
+  }
+
   if (!data) return (
     <div style={{ background:"#eeecea", minHeight:"100vh", display:"flex", alignItems:"center", justifyContent:"center" }}>
       <p style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, color:"#a8a5a0" }}>Loading...</p>
@@ -702,44 +843,19 @@ export default function ActorsEditorPage() {
   const { actor: a } = data;
   const c = sc(a?.attachment_style);
 
-  function startEdit() {
-    setEditData(JSON.parse(JSON.stringify(data)));
-    setEditing(true);
-  }
-  function cancelEdit() { setEditing(false); setEditData(null); }
-
-  async function saveEdit() {
-    if (!editData) return;
-    setSaving(true);
-    try {
-      const sections = ["actor","psychology","big5","disc","hds","lifestyle","economic"];
-      for (const section of sections) {
-        const sdata = section === "actor" ? editData.actor : editData[section];
-        if (!sdata) continue;
-        await fetch(`/api/actors/${id}`, {
-          method:"PUT", headers:{"Content-Type":"application/json"},
-          body: JSON.stringify({ section, data: sdata }),
-        });
-      }
-      setData(editData);
-      setEditing(false); setEditData(null);
-    } catch(e) { alert("Save failed: "+e.message); }
-    setSaving(false);
-  }
-
-  const viewData = editing ? editData : data;
+  const viewData = editData || data;
 
   const panels = {
-    identity:    <IdentityPanel    d={viewData} editing={editing} setEditData={setEditData} />,
-    psych:       <PsychPanel       d={viewData} editing={editing} setEditData={setEditData} />,
-    assessments: <AssessmentsPanel d={viewData} editing={editing} setEditData={setEditData} actorId={id} />,
-    mental:      <MentalPanel      d={viewData} editing={editing} setEditData={setEditData} />,
-    lifestyle:   <LifestylePanel   d={viewData} editing={editing} setEditData={setEditData} />,
-    economic:    <EconomicPanel    d={viewData} editing={editing} setEditData={setEditData} />,
+    identity:    <IdentityPanel    d={viewData} editing={editing} setEditData={updateEditData} />,
+    psych:       <PsychPanel       d={viewData} editing={editing} setEditData={updateEditData} />,
+    assessments: <AssessmentsPanel d={viewData} editing={editing} setEditData={updateEditData} actorId={id} />,
+    mental:      <MentalPanel      d={viewData} editing={editing} setEditData={updateEditData} />,
+    lifestyle:   <LifestylePanel   d={viewData} editing={editing} setEditData={updateEditData} />,
+    economic:    <EconomicPanel    d={viewData} editing={editing} setEditData={updateEditData} />,
     inplay:      <InPlayPanel      actorId={id} />,
     model3d:     <ActorModelPanel  actorId={id} />,
-    diagnoses:   <MentalPanel      d={viewData} editing={editing} setEditData={setEditData} />,
-    expenses:    <EconomicPanel    d={viewData} editing={editing} setEditData={setEditData} />,
+    diagnoses:   <MentalPanel      d={viewData} editing={editing} setEditData={updateEditData} />,
+    expenses:    <EconomicPanel    d={viewData} editing={editing} setEditData={updateEditData} />,
   };
 
   const activeNav = NAV.find(n => n.id === tab);
@@ -754,7 +870,7 @@ export default function ActorsEditorPage() {
 
           {/* Actor header */}
           <div style={{ padding:"20px 20px 16px", borderBottom:"1px solid rgba(0,0,0,.06)" }}>
-            <a onClick={() => navigate("/actors")} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, letterSpacing:".08em", textTransform:"uppercase", color:"#a8a5a0", cursor:"pointer", textDecoration:"none", display:"block", marginBottom:16 }}>← Characters</a>
+            <a onClick={() => navigate(backTo.path)} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, letterSpacing:".08em", textTransform:"uppercase", color:"#a8a5a0", cursor:"pointer", textDecoration:"none", display:"block", marginBottom:16 }}>← {backTo.label}</a>
             {a?.photo_url
               ? <img src={a.photo_url} alt={a.name} style={{ width:52, height:52, borderRadius:"50%", objectFit:"cover", marginBottom:12, border:`1px solid ${c.border}` }} />
               : <div style={{ width:52, height:52, borderRadius:"50%", background:c.init, display:"flex", alignItems:"center", justifyContent:"center", fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:17, fontWeight:500, color:c.text, marginBottom:12 }}>{ini(a?.name)}</div>
@@ -803,18 +919,21 @@ export default function ActorsEditorPage() {
             <div style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", fontSize:26, fontWeight:400, color:"#1a1814" }}>
               {activeNav?.label}
             </div>
-            {editing ? (
-              <div style={{ display:"flex", gap:8 }}>
-                <button onClick={cancelEdit} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, letterSpacing:".08em", textTransform:"uppercase", padding:"7px 16px", borderRadius:8, background:"none", border:"1px solid rgba(0,0,0,.1)", color:"#6b6760", cursor:"pointer" }}>Cancel</button>
-                <button onClick={saveEdit} disabled={saving} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, letterSpacing:".08em", textTransform:"uppercase", padding:"7px 16px", borderRadius:8, background:"#1a1814", color:"#faf8f4", border:"none", cursor:"pointer", opacity:saving?.6:1 }}>{saving?"Saving…":"Save"}</button>
-              </div>
-            ) : (
-              <button onClick={startEdit} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, letterSpacing:".08em", textTransform:"uppercase", padding:"7px 16px", borderRadius:8, background:"none", border:"1px solid rgba(0,0,0,.1)", color:"#6b6760", cursor:"pointer" }}>Edit</button>
-            )}
+            {isOwner
+              ? <SaveStatus status={status} error={saveError} onRetry={flushEdits} />
+              : (
+                <div style={{ display:"flex", alignItems:"center", gap:9, fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11.5, color:"#6b6760" }}>
+                  <span style={{ fontSize:12 }}>🔒</span>
+                  Shared with you{data?.actor?.permission ? ` — you have “${data.actor.permission}”` : ""}. Only the owner can edit this profile.
+                </div>
+              )}
           </div>
 
-          {/* Panel body */}
-          <div style={{ flex:1, overflowY:"auto", padding:"24px 28px" }}>
+          {/* Panel body — onBlur bubbles in React, so leaving any field in any
+              panel commits it. This is the commit point; the timer above is only
+              a fallback for controls that never blur. */}
+          <div style={{ flex:1, overflowY:"auto", padding:"24px 28px" }}
+            onBlur={() => { if (Object.keys(pending.current).length) commitNow(); }}>
             {panels[tab] || null}
           </div>
         </div>

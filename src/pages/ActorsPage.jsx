@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { fmtAmount } from "../lib/money.js";
 
 // ── Colour palette per attachment style ────────────────────────────────────
 const STYLE_COLOR = {
@@ -259,7 +260,7 @@ function EconomicPanel({ data }) {
         <Field label="Attitude to wealth"  value={economic.attitude_to_wealth} />
         <Field label="Savings habit"       value={economic.savings_habit} />
         <Field label="Financial anxiety"   value={economic.financial_anxiety != null ? Number(economic.financial_anxiety).toFixed(2) : null} />
-        <Field label="Monthly income"      value={economic.monthly_income ? economic.monthly_income.toLocaleString() : "Set at deployment"} />
+        <Field label="Monthly income"      value={economic.monthly_income ? fmtAmount(economic.monthly_income) : "Set at deployment"} />
         <Field label="Behavior note"       value={economic.behavior_note} full tall />
       </>}
       {expenses?.length > 0 && (
@@ -268,7 +269,7 @@ function EconomicPanel({ data }) {
           {expenses.map((e, i) => (
             <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12 }}>
               <span style={{ color: "var(--color-text-primary)" }}>{e.name}</span>
-              <span style={{ color: "var(--color-text-secondary)" }}>{e.category} · {e.monthly_budget_ore ? `${Math.round(e.monthly_budget_ore/100).toLocaleString()} SEK/mo` : "—"}</span>
+              <span style={{ color: "var(--color-text-secondary)" }}>{e.category} · {e.monthly_budget_ore ? `${fmtAmount(e.monthly_budget_ore/100)} SEK/mo` : "—"}</span>
             </div>
           ))}
         </div>

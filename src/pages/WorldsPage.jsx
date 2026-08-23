@@ -92,6 +92,7 @@ function WorldCard({ world, onOpen, onToggleRun, busy }) {
           <span style={{ ...F, fontSize:12, color:"#a8a5a0" }}>
             {cast.length > 0 ? `${cast.length} in play` : "nobody deployed"}
             {` · ${world.member_count ?? 0} member${(world.member_count ?? 0) === 1 ? "" : "s"}`}
+            {world.role === "owner" ? "" : ` · you're a ${world.role || "viewer"}`}
           </span>
         </div>
       </div>
@@ -103,6 +104,16 @@ function WorldCard({ world, onOpen, onToggleRun, busy }) {
             padding:"6px 14px", borderRadius:6, border:"1px solid rgba(0,0,0,0.1)",
             background:"transparent", color:"#6b6760", cursor: busy ? "default" : "pointer", opacity: busy ? .5 : 1 }}>
           {busy ? "…" : running ? "Stop" : "Start"}
+        </button>
+        {/* Session 150 — members were only settable when the world was created,
+            so there was nowhere to add an owner or invite anyone afterwards.
+            This goes straight to the world editor's Members panel. */}
+        <button onClick={e => { e.stopPropagation(); onOpen(world, "members"); }}
+          title="Members and owners"
+          style={{ ...F, fontSize:10, letterSpacing:".06em", textTransform:"uppercase",
+            padding:"6px 14px", borderRadius:6, border:"1px solid rgba(0,0,0,0.1)",
+            background:"transparent", color:"#6b6760", cursor:"pointer" }}>
+          Members
         </button>
         <button onClick={e => { e.stopPropagation(); onOpen(world); }}
           style={{ ...F, fontSize:10, letterSpacing:".06em", textTransform:"uppercase",
@@ -187,7 +198,7 @@ export default function WorldsPage() {
         <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))", gap:16 }}>
           {worlds.map(w => (
             <WorldCard key={w.id} world={w}
-              onOpen={world => navigate(`/my-worlds/${world.id}`)}
+              onOpen={(world, tab) => navigate(`/my-worlds/${world.id}${tab ? `?tab=${tab}` : ""}`)}
               onToggleRun={toggleRun}
               busy={busyId === w.id}
             />

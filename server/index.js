@@ -233,14 +233,132 @@ app.get("/api/orgs/:org/members", (req, res) => {
 app.get("/api/users", (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
-  const users = db.prepare(`SELECT id, name, email, photo_url FROM users WHERE status = 'active' ORDER BY name`).all();
+  // Session 150 — never list the caller.
+  //
+  // Both callers of this endpoint are "pick someone else": share targets in the
+  // character dialog, and invitees in the world wizard. You cannot share a
+  // character with yourself — the share endpoint rejects it with 400 — and you
+  // are already the creator of a world you are making, so offering your own name
+  // in either list is an invitation to an error.
+  const users = db.prepare(
+    `SELECT id, name, email, photo_url FROM users WHERE status = 'active' AND id != ? ORDER BY name`
+  ).all(user.id);
   res.json(users);
+});
+
+// ── Managing world members ───────────────────────────────────────────────────
+//
+// Session 150 — members could only be set when a world was created. There was
+// no way to add anyone afterwards, promote a member to owner, or remove one, so
+// a world's people were fixed at birth. That is a strange limit for a system
+// whose whole premise is worlds you share.
+//
+// All three are owner-only. A world may have SEVERAL owners: the check is
+// whether the caller holds the owner role, never whether they created it.
+
+app.post("/api/worlds/:id/members", async (req, res) => {
+  const ok = requireWorld(req, res, req.params.id, "owner");
+  if (!ok) return;
+
+  const { email, role = "viewer" } = req.body || {};
+  if (!["owner", "viewer"].includes(role)) {
+    return res.status(400).json({ error: "role must be owner or viewer" });
+  }
+  const target = db.prepare(`SELECT id, name FROM users WHERE email = ? AND status = 'active'`).get(email);
+  if (!target) return res.status(404).json({ error: "user not found" });
+
+  const already = db.prepare(
+    `SELECT role FROM world_memberships WHERE user_id = ? AND world_id = ?`
+  ).get(target.id, req.params.id);
+  if (already) return res.status(409).json({ error: `${target.name} is already a ${already.role} of this world.` });
+
+  // The simulator mints the player actor, using the same id convention as world
+  // creation, so a member added now is indistinguishable from an original one.
+  let actorId = `${target.id}-${req.params.id.slice(0, 8)}`;
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.id}/members`, {
+      method: "POST",
+      headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: target.id, name: target.name }),
+    });
+    if (!r.ok) return res.status(502).json({ error: `Simulator refused: HTTP ${r.status}` });
+    const body = await r.json();
+    if (body.actor_id) actorId = body.actor_id;
+  } catch (e) {
+    return res.status(502).json({ error: `Couldn't reach the simulator (${e.message}). Nobody was added.` });
+  }
+
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO world_memberships (id, user_id, world_id, actor_id, role, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?)`
+  ).run(randomUUID(), target.id, req.params.id, actorId, role, now, now);
+
+  res.json({ ok: true, user_id: target.id, name: target.name, role, actor_id: actorId });
+});
+
+app.patch("/api/worlds/:id/members/:user_id", (req, res) => {
+  const ok = requireWorld(req, res, req.params.id, "owner");
+  if (!ok) return;
+
+  const { role } = req.body || {};
+  if (!["owner", "viewer"].includes(role)) {
+    return res.status(400).json({ error: "role must be owner or viewer" });
+  }
+
+  // A world must keep at least one owner, or it becomes unmanageable by anyone.
+  if (role === "viewer") {
+    const owners = db.prepare(
+      `SELECT COUNT(*) AS n FROM world_memberships WHERE world_id = ? AND role = 'owner'`
+    ).get(req.params.id).n;
+    const targetIsOwner = db.prepare(
+      `SELECT role FROM world_memberships WHERE world_id = ? AND user_id = ?`
+    ).get(req.params.id, req.params.user_id)?.role === "owner";
+    if (targetIsOwner && owners <= 1) {
+      return res.status(409).json({ error: "This is the world's only owner. Make someone else an owner first." });
+    }
+  }
+
+  const info = db.prepare(
+    `UPDATE world_memberships SET role = ?, updated_at = ? WHERE world_id = ? AND user_id = ?`
+  ).run(role, new Date().toISOString(), req.params.id, req.params.user_id);
+  if (!info.changes) return res.status(404).json({ error: "not a member of this world" });
+  res.json({ ok: true, user_id: req.params.user_id, role });
+});
+
+app.delete("/api/worlds/:id/members/:user_id", async (req, res) => {
+  const ok = requireWorld(req, res, req.params.id, "owner");
+  if (!ok) return;
+
+  const m = db.prepare(
+    `SELECT role FROM world_memberships WHERE world_id = ? AND user_id = ?`
+  ).get(req.params.id, req.params.user_id);
+  if (!m) return res.status(404).json({ error: "not a member of this world" });
+
+  if (m.role === "owner") {
+    const owners = db.prepare(
+      `SELECT COUNT(*) AS n FROM world_memberships WHERE world_id = ? AND role = 'owner'`
+    ).get(req.params.id).n;
+    if (owners <= 1) return res.status(409).json({ error: "This is the world's only owner. Make someone else an owner first." });
+  }
+
+  // Removing a person erases their player actor, not the characters they
+  // deployed — those belong to whoever owns them and stay where they are.
+  try {
+    await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.id}/members/${req.params.user_id}`, {
+      method: "DELETE", headers: { "X-Service-Token": SERVICE_TOKEN },
+    });
+  } catch { /* the membership row is the authority; a stale sim actor is harmless */ }
+
+  db.prepare(`DELETE FROM world_memberships WHERE world_id = ? AND user_id = ?`)
+    .run(req.params.id, req.params.user_id);
+  res.json({ ok: true });
 });
 
 // ── GET /api/worlds/:id/members — users who are members of this world ─────────
 app.get("/api/worlds/:id/members", (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const members = db.prepare(`
     SELECT u.id, u.name, u.email, u.photo_url, m.actor_id, m.role
     FROM world_memberships m
@@ -293,6 +411,45 @@ app.get("/api/me", async (req, res) => {
 });
 
 // ── GET /api/worlds ───────────────────────────────────────────────────────────
+// ── GET /api/simulator/health — is the simulator actually there? ─────────────
+//
+// Session 150 — the deploy wizard needs to know this BEFORE it lets someone
+// spend six steps building a deployment that cannot land. Every other route
+// discovers the simulator is down only at the moment it needs it, and the
+// wizard's world list turned a 502 into an empty array, so a downed simulator
+// looked identical to "you have no worlds".
+//
+// This pings /internal/worlds rather than the bare root on purpose: it proves
+// the service token is accepted and the router is up, not merely that something
+// is listening on the port. Short timeout — this gates a UI control, so a slow
+// answer is as bad as no answer.
+app.get("/api/simulator/health", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+
+  const started = Date.now();
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 4000);
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds?ids=`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN },
+      signal: ctl.signal,
+    });
+    clearTimeout(timer);
+    const latency_ms = Date.now() - started;
+    if (!r.ok) {
+      return res.json({ reachable: false, status: r.status, latency_ms,
+        reason: `The simulator answered HTTP ${r.status}.` });
+    }
+    return res.json({ reachable: true, status: r.status, latency_ms });
+  } catch (e) {
+    return res.json({ reachable: false, status: null, latency_ms: Date.now() - started,
+      reason: e.name === "AbortError"
+        ? "The simulator didn't answer within 4 seconds."
+        : `Couldn't reach the simulator (${e.message}).` });
+  }
+});
+
 app.get("/api/worlds", async (req, res) => {
   const cookieHeader = req.headers["cookie"] || "";
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
@@ -334,8 +491,9 @@ app.get("/api/worlds", async (req, res) => {
 
 // ── POST /api/worlds/:world_id/actors/:actor_id/portrait ─────────────────────
 app.post("/api/worlds/:world_id/actors/:actor_id/portrait", upload.single("photo"), async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
+  const user = ok.user;
   const { world_id, actor_id } = req.params;
   const { user_id, use_default } = req.body;
 
@@ -398,8 +556,9 @@ app.get("/api/ambient-actors/:actor_id/portrait-status", async (req, res) => {
 
 // ── POST /api/worlds/:world_id/ambient-encounter/start ───────────────────────
 app.post("/api/worlds/:world_id/ambient-encounter/start", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const { world_id } = req.params;
   try {
     const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/ambient-encounter/start`, {
@@ -415,8 +574,9 @@ app.post("/api/worlds/:world_id/ambient-encounter/start", async (req, res) => {
 
 // ── GET /api/worlds/:world_id/ambient-encounter/:id/opening ─────────────────
 app.get("/api/worlds/:world_id/ambient-encounter/:encounter_id/opening", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const { world_id, encounter_id } = req.params;
   try {
     const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/ambient-encounter/${encounter_id}/opening`, {
@@ -428,8 +588,9 @@ app.get("/api/worlds/:world_id/ambient-encounter/:encounter_id/opening", async (
 
 // ── POST /api/worlds/:world_id/ambient-encounter/:id/message ─────────────────
 app.post("/api/worlds/:world_id/ambient-encounter/:encounter_id/message", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const { world_id, encounter_id } = req.params;
   try {
     const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/ambient-encounter/${encounter_id}/message`, {
@@ -445,8 +606,9 @@ app.post("/api/worlds/:world_id/ambient-encounter/:encounter_id/message", async 
 
 // ── POST /api/worlds/:world_id/ambient-encounter/:id/end ─────────────────────
 app.post("/api/worlds/:world_id/ambient-encounter/:encounter_id/end", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const { world_id, encounter_id } = req.params;
   try {
     await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/ambient-encounter/${encounter_id}/end`, {
@@ -479,8 +641,9 @@ app.post("/api/ambient-actors/:actor_id/generate-portrait", async (req, res) => 
 
 // ── DELETE /api/worlds/:id ────────────────────────────────────────────────────
 app.delete("/api/worlds/:id", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
+  const user = ok.user;
   const { id } = req.params;
   const membership = db.prepare(`SELECT role FROM world_memberships WHERE user_id = ? AND world_id = ?`).get(user.id, id);
   if (!membership || membership.role !== "owner") return res.status(403).json({ error: "forbidden" });
@@ -554,7 +717,7 @@ app.post("/api/worlds", async (req, res) => {
       body: JSON.stringify({
         id: world_id, name, city, lat, lng, timezone,
         news_feed_url, modules, scenario_seed,
-        members: members.map((m, i) => ({ ...m, role: i === 0 ? "owner" : "member" })),
+        members: members.map((m, i) => ({ ...m, role: i === 0 ? "owner" : "viewer" })),
         home_address: home_address || undefined,
         llm_capabilities,
         // Session 150 — per-world XTTS endpoint. The voice server runs on a GPU
@@ -580,7 +743,10 @@ app.post("/api/worlds", async (req, res) => {
     `);
     insertMembership.run(randomUUID(), user.id, world_id, actorMap[user.id] || `${user.id}-actor`, "owner", now, now);
     for (const invitee of inviteeUsers) {
-      insertMembership.run(randomUUID(), invitee.id, world_id, actorMap[invitee.id] || `${invitee.id}-actor`, "member", now, now);
+      // Session 150 — "viewer", not "member". Invitees were recorded as "member",
+      // a third role string that no code has ever read, alongside the "viewer"
+      // rows the existing worlds carry. Two names for the same nothing.
+      insertMembership.run(randomUUID(), invitee.id, world_id, actorMap[invitee.id] || `${invitee.id}-actor`, "viewer", now, now);
     }
 
     res.json({ world_id, name, status: "running", ...simWorld });
@@ -617,28 +783,256 @@ app.post("/api/auth/signout", (req, res) => {
 const SIMULATOR_URL = "http://192.168.1.58:4000";
 const SERVICE_TOKEN = process.env.PLATFORM_SERVICE_TOKEN || "";
 
+// ── World authorisation ───────────────────────────────────────────────────────
+//
+// Session 150 — until now, 38 of the 52 world-scoped routes checked only that
+// the caller was logged in and then trusted the world_id in the URL.
+// world_memberships was written at world creation and never read again, so any
+// authenticated user could list any world's cast, read and edit a character's
+// psychology and salary, or stop the world outright, purely by knowing its id.
+//
+// Roles are `owner` and `viewer`, and a world may have SEVERAL owners — the
+// check is set membership, not "is this the creator".
+//
+//   viewer — read the world and interact with it
+//   owner  — everything a viewer can do, plus start/stop, configure, deploy,
+//            delete, and manage who else belongs
+//
+// A third string, "member", was written for invitees at world creation and read
+// by nothing. It is collapsed into "viewer" rather than defined, because a role
+// no code consults cannot be said to mean anything.
+//
+// Returns the membership row on success. On failure it has ALREADY answered —
+// callers must `return` immediately, hence the `if (!ok) return;` shape.
+function requireWorld(req, res, worldId, minRole = "viewer") {
+  const user = authUser(req);
+  if (!user) { res.status(401).json({ error: "unauthorized" }); return null; }
+
+  if (!worldId) { res.status(400).json({ error: "world id missing" }); return null; }
+
+  const m = db.prepare(
+    `SELECT role FROM world_memberships WHERE user_id = ? AND world_id = ? LIMIT 1`
+  ).get(user.id, worldId);
+
+  if (!m) {
+    // Deliberately 404, not 403: telling a stranger "forbidden" confirms the
+    // world exists. A non-member has no business learning that either way.
+    res.status(404).json({ error: "world not found" });
+    return null;
+  }
+
+  if (minRole === "owner" && m.role !== "owner") {
+    res.status(403).json({ error: "Only an owner of this world can do that." });
+    return null;
+  }
+
+  return { ...m, user };
+}
+
+// ── Character access ──────────────────────────────────────────────────────────
+//
+// Session 150 — three rungs, each a different verb, plus an orthogonal
+// re-share flag.
+//
+//   read  — view the profile. Cannot deploy, cannot edit.
+//   use   — deploy the owner's character into a world YOU own. Their template is
+//           never touched; the world instance you get is yours to edit, which is
+//           exactly the split the world editor already enforces.
+//   copy  — fork it into a new character you own outright.
+//   owner — created it.
+//
+// The ladder deliberately does not include "edit the original". That was the
+// ambiguity worth removing: if editing someone else's character gradually made
+// it yours, there would be no answer to how much editing is enough. Ownership
+// changes by one explicit act — taking a copy — and never by degrees.
+//
+// The old vocabulary was read/clone, where "clone" granted a capability that had
+// no implementation anywhere.
+const ACCESS_RANK = { read: 1, use: 2, copy: 3, owner: 4 };
+
+function actorAccess(actorId, user) {
+  if (!user) return null;
+  const a = db.prepare(`SELECT owner_id FROM actors WHERE id = ?`).get(actorId);
+  if (!a) return null;
+  if (a.owner_id === user.id) return { level: "owner", can_reshare: 1, owner_id: a.owner_id };
+
+  const sh = db.prepare(
+    `SELECT permission, can_reshare FROM actor_shares WHERE actor_id = ? AND shared_with_id = ?`
+  ).get(actorId, user.id);
+  if (!sh) return null;
+  return { level: sh.permission || "read", can_reshare: sh.can_reshare ? 1 : 0, owner_id: a.owner_id };
+}
+
+function hasAccess(actorId, user, min) {
+  const acc = actorAccess(actorId, user);
+  if (!acc) return null;
+  return (ACCESS_RANK[acc.level] || 0) >= (ACCESS_RANK[min] || 0) ? acc : null;
+}
+
+// The world id sits under different param names across the routes.
+function worldIdOf(req) { return req.params.world_id || req.params.id || null; }
+
 async function simFetch(path, method = "GET") {
   const res = await fetch(`${SIMULATOR_URL}${path}`, { method, headers: { "X-Service-Token": SERVICE_TOKEN } });
   return res.json();
 }
 
 app.get("/api/worlds/:id/status", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
   try { res.json(await simFetch(`/internal/worlds/${req.params.id}/status`)); }
   catch { res.status(502).json({ error: "simulator unreachable" }); }
 });
 
 app.post("/api/worlds/:id/start", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
   try { res.json(await simFetch(`/internal/worlds/${req.params.id}/start`, "POST")); }
   catch { res.status(502).json({ error: "simulator unreachable" }); }
 });
 
 app.post("/api/worlds/:id/stop", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
   try { res.json(await simFetch(`/internal/worlds/${req.params.id}/stop`, "POST")); }
   catch { res.status(502).json({ error: "simulator unreachable" }); }
 });
 
 // ── GET /api/worlds/:world_id/actors/:actor_id/videos ────────────────────────
+// ── GET /api/tax/estimate?country=&gross= ────────────────────────────────────
+//
+// Session 150 — take-home pay while a salary is being typed in the deploy
+// wizard, before there is an actor to attach it to. Proxies straight to the
+// simulator so DeliverWorlds.Tax stays the only place the bands exist.
+app.get("/api/tax/estimate", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const { country = "", gross = "0" } = req.query;
+  try {
+    const r = await fetch(
+      `${SIMULATOR_URL}/internal/tax/estimate?country=${encodeURIComponent(country)}&gross=${encodeURIComponent(gross)}`,
+      { headers: { "X-Service-Token": SERVICE_TOKEN } });
+    if (!r.ok) return res.status(r.status).json({ error: `simulator returned ${r.status}` });
+    res.json(await r.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── /api/worlds/:world_id/actors/:actor_id/economy ───────────────────────────
+//
+// Session 150 — read and edit a deployed character's money in one world.
+//
+// The platform's actor id is not the simulator's: a deploy mints a new actor on
+// the simulator each time, and actor_deployments is the only mapping between
+// them. Same lookup as the other world+actor proxies. It falls back to the id as
+// given so a caller who already holds a simulator id still works.
+function resolveSimActor(world_id, actor_id) {
+  const dep = db.prepare(
+    "SELECT simulator_actor_id FROM actor_deployments WHERE world_id = ? AND platform_actor_id = ? AND undeployed_at IS NULL"
+  ).get(world_id, actor_id);
+  return dep?.simulator_actor_id || actor_id;
+}
+
+// ── /api/worlds/:world_id/actors/:actor_id/profile ───────────────────────────
+// Identity and psychology of the deployed instance — the copies the simulator
+// reads, as opposed to the template at /actors/:id that a deploy ships from.
+app.get("/api/worlds/:world_id/actors/:actor_id/profile", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
+  const { world_id, actor_id } = req.params;
+  try {
+    const sim = resolveSimActor(world_id, actor_id);
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/actors/${sim}/profile`,
+      { headers: { "X-Service-Token": SERVICE_TOKEN } });
+    if (!r.ok) return res.status(r.status).json({ error: `simulator returned ${r.status}` });
+    res.json(await r.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+app.patch("/api/worlds/:world_id/actors/:actor_id/profile", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
+  const user = ok.user;
+  const { world_id, actor_id } = req.params;
+  try {
+    const sim = resolveSimActor(world_id, actor_id);
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/actors/${sim}/profile`, {
+      method: "PATCH",
+      headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify(req.body || {}),
+    });
+    if (!r.ok) return res.status(r.status).json({ error: `simulator returned ${r.status}` });
+    res.json(await r.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/worlds/:world_id/actors/:actor_id/schedule ──────────────────────
+app.get("/api/worlds/:world_id/actors/:actor_id/schedule", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
+  const { world_id, actor_id } = req.params;
+  try {
+    const sim = resolveSimActor(world_id, actor_id);
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/actors/${sim}/schedule`,
+      { headers: { "X-Service-Token": SERVICE_TOKEN } });
+    if (!r.ok) return res.status(r.status).json({ error: `simulator returned ${r.status}` });
+    res.json(await r.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/worlds/:world_id/actors/:actor_id/media ─────────────────────────
+// Media captured in this world. The simulator indexes it per actor; the actor
+// id is already world-specific, so no extra scoping is needed.
+app.get("/api/worlds/:world_id/actors/:actor_id/media", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
+  const { world_id, actor_id } = req.params;
+  try {
+    const sim = resolveSimActor(world_id, actor_id);
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/actors/${sim}/media`,
+      { headers: { "X-Service-Token": SERVICE_TOKEN } });
+    if (!r.ok) return res.status(r.status).json({ error: `simulator returned ${r.status}` });
+    res.json(await r.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+app.get("/api/worlds/:world_id/actors/:actor_id/economy", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
+  const { world_id, actor_id } = req.params;
+  try {
+    const sim = resolveSimActor(world_id, actor_id);
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/actors/${sim}/economy`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN },
+    });
+    if (!r.ok) return res.status(r.status).json({ error: `simulator returned ${r.status}` });
+    res.json(await r.json());
+  } catch (e) { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+app.patch("/api/worlds/:world_id/actors/:actor_id/economy", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
+  const user = ok.user;
+  const { world_id, actor_id } = req.params;
+  try {
+    const sim = resolveSimActor(world_id, actor_id);
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/actors/${sim}/economy`, {
+      method: "PATCH",
+      headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify(req.body || {}),
+    });
+    if (!r.ok) return res.status(r.status).json({ error: `simulator returned ${r.status}` });
+    res.json(await r.json());
+  } catch (e) { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
 app.get("/api/worlds/:world_id/actors/:actor_id/videos", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
   try {
     const { world_id, actor_id } = req.params;
     const deployment = db.prepare("SELECT simulator_actor_id FROM actor_deployments WHERE world_id = ? AND platform_actor_id = ?").get(world_id, actor_id);
@@ -658,6 +1052,8 @@ app.get("/api/worlds/:world_id/actors/:actor_id/videos", async (req, res) => {
 
 // ── GET /api/worlds/:id/modules ─────────────────────────────────────────────
 app.get("/api/worlds/:id/modules", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
   try {
     const simRes = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.id}/modules`, {
       headers: { "X-Service-Token": SERVICE_TOKEN },
@@ -668,6 +1064,8 @@ app.get("/api/worlds/:id/modules", async (req, res) => {
 
 // ── PATCH /api/worlds/:id/modules ────────────────────────────────────────────
 app.patch("/api/worlds/:id/modules", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
   try {
     const simRes = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.id}/modules`, {
       method: "PATCH",
@@ -696,6 +1094,8 @@ app.get("/api/llm-config/available", async (req, res) => {
 
 // ── GET /api/worlds/:id/llm-config ───────────────────────────────────────────
 app.get("/api/worlds/:id/llm-config", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
   try {
     const simRes = await fetch(`${SIMULATOR_URL}/internal/config/llm?world_id=${req.params.id}`, {
       headers: { "X-Service-Token": SERVICE_TOKEN },
@@ -706,6 +1106,8 @@ app.get("/api/worlds/:id/llm-config", async (req, res) => {
 
 // ── POST /api/worlds/:id/llm-config ──────────────────────────────────────────
 app.post("/api/worlds/:id/llm-config", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
   try {
     const simRes = await fetch(`${SIMULATOR_URL}/internal/config/llm`, {
       method: "POST",
@@ -718,6 +1120,8 @@ app.post("/api/worlds/:id/llm-config", async (req, res) => {
 
 // ── DELETE /api/worlds/:id/llm-config ─────────────────────────────────────────
 app.delete("/api/worlds/:id/llm-config", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
   try {
     const simRes = await fetch(`${SIMULATOR_URL}/internal/config/llm`, {
       method: "DELETE",
@@ -730,6 +1134,8 @@ app.delete("/api/worlds/:id/llm-config", async (req, res) => {
 
 // ── POST /api/worlds/:id/llm-config/providers ─────────────────────────────────
 app.post("/api/worlds/:id/llm-config/providers", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
   // Session 150 — this used to return {ok:true} and store NOTHING, while the
   // panel reported "Provider URLs saved". xtts_url is now genuinely persisted,
   // to worlds.xtts_url on the simulator.
@@ -760,6 +1166,8 @@ app.post("/api/worlds/:id/llm-config/providers", async (req, res) => {
 
 // ── GET /api/worlds/:id/xtts ─────────────────────────────────────────────────
 app.get("/api/worlds/:id/xtts", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
   try {
     const simRes = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.id}/xtts`, {
       headers: { "X-Service-Token": SERVICE_TOKEN },
@@ -884,8 +1292,9 @@ app.delete("/api/apps/:id", (req, res) => {
 // generates one fresh key, updates ALL registered_tools for this world to use it.
 // Returns { key: raw } — client stores in localStorage as anima_world_key_${worldId}.
 app.post("/api/worlds/:world_id/issue-key", (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
+  const user = ok.user;
 
   const worldId = req.params.world_id;
 
@@ -917,6 +1326,8 @@ app.post("/api/worlds/:world_id/issue-key", (req, res) => {
 
 // ── GET /api/worlds/:world_id/actors/:actor_id/contacts ───────────────────────
 app.get("/api/worlds/:world_id/actors/:actor_id/contacts", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
   try {
     const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/contacts`);
     res.json(data);
@@ -925,8 +1336,9 @@ app.get("/api/worlds/:world_id/actors/:actor_id/contacts", async (req, res) => {
 
 // ── GET /api/worlds/:world_id/actors/:actor_id/messages/:contact_id ───────────
 app.get("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   // Verify user is a member of this world with the claimed actor_id
   const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`).get(user.id, req.params.world_id);
   if (!membership) return res.status(403).json({ error: "not a member of this world" });
@@ -939,6 +1351,8 @@ app.get("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id", async (re
 
 // ── GET /api/worlds/:world_id/actors/:actor_id/context/:contact_id ────────────
 app.get("/api/worlds/:world_id/actors/:actor_id/context/:contact_id", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
   const cookieHeader = req.headers["cookie"] || "";
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (!match) return res.status(401).json({ error: "unauthorized" });
@@ -953,8 +1367,9 @@ app.get("/api/worlds/:world_id/actors/:actor_id/context/:contact_id", async (req
 
 // ── POST /api/worlds/:world_id/actors/:actor_id/messages/:contact_id ──────────
 app.post("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`).get(user.id, req.params.world_id);
   if (!membership) return res.status(403).json({ error: "not a member of this world" });
   if (membership.actor_id !== req.params.actor_id) return res.status(403).json({ error: "actor mismatch" });
@@ -1216,21 +1631,120 @@ app.get("/api/actors/:id/shares", (req, res) => {
 });
 
 // ── POST /api/actors/:id/shares ───────────────────────────────────────────────
+// ── POST /api/actors/:id/fork — take a copy that is yours ────────────────────
+//
+// Session 150 — the act that transfers ownership, and the only one.
+//
+// "Can clone" has been offered in the share dialog since the feature existed and
+// never had an implementation behind it: granting it changed a badge and nothing
+// more. This is that endpoint.
+//
+// The copy is complete and independent — psychology, assessments, lifestyle,
+// economics, education, media rows — owned by whoever forked it, editable
+// without limit, and never synced back. What it is NOT is a share: the original
+// keeps its own shares, and the fork starts with none.
+//
+// forked_from is provenance only. It carries no behaviour except the clash check
+// at deploy, and answers "where did this character come from" months later, when
+// nobody remembers.
+const FORK_TABLES = [
+  "actor_psychology", "actor_big5", "actor_disc", "actor_hds",
+  "actor_lifestyle", "actor_economic", "actor_mental_health",
+  "actor_upbringing", "actor_education", "actor_diagnoses",
+  "actor_expense_defaults", "actor_assessment_results",
+];
+
+app.post("/api/actors/:id/fork", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+
+  const acc = hasAccess(req.params.id, user, "copy");
+  if (!acc) {
+    const any = actorAccess(req.params.id, user);
+    if (!any) return res.status(404).json({ error: "not found" });
+    return res.status(403).json({ error: `You have "${any.level}" on this character. Forking needs "copy".` });
+  }
+
+  const src = db.prepare(`SELECT * FROM actors WHERE id = ?`).get(req.params.id);
+  if (!src) return res.status(404).json({ error: "not found" });
+
+  const newId = randomUUID();
+  const now = new Date().toISOString();
+  const suffix = (req.body?.name_suffix ?? " (copy)");
+
+  const tx = db.transaction(() => {
+    // Columns are read from the source row rather than listed, so a migration
+    // that adds a column does not silently stop being copied.
+    const cols = Object.keys(src).filter(c => ![
+      "id", "owner_id", "inserted_at", "updated_at", "forked_from",
+      "media_folder", "status",
+    ].includes(c));
+
+    db.prepare(
+      `INSERT INTO actors (id, owner_id, forked_from, status, media_folder, inserted_at, updated_at, ${cols.join(", ")})
+       VALUES (?,?,?,?,?,?,?,${cols.map(() => "?").join(",")})`
+    ).run(newId, user.id, src.id, "ready_to_deploy", `fork-${newId.slice(0, 8)}`, now, now,
+          ...cols.map(c => src[c]));
+
+    // The fork gets its own name so two identical entries never sit side by side
+    // in a gallery with no way to tell them apart.
+    if (suffix) {
+      db.prepare(`UPDATE actors SET name = ?, updated_at = ? WHERE id = ?`)
+        .run(`${src.name}${suffix}`, now, newId);
+    }
+
+    for (const t of FORK_TABLES) {
+      let rows = [];
+      try { rows = db.prepare(`SELECT * FROM ${t} WHERE actor_id = ?`).all(req.params.id); }
+      catch { continue; }                       // table absent in this schema
+      for (const row of rows) {
+        const keys = Object.keys(row).filter(k => k !== "actor_id");
+        const vals = keys.map(k => (k === "id" ? randomUUID() : row[k]));
+        try {
+          db.prepare(`INSERT INTO ${t} (actor_id, ${keys.join(", ")}) VALUES (?, ${keys.map(() => "?").join(",")})`)
+            .run(newId, ...vals);
+        } catch { /* a row that will not copy is not worth failing the fork over */ }
+      }
+    }
+  });
+
+  try { tx(); }
+  catch (e) { return res.status(500).json({ error: `Fork failed: ${e.message}` }); }
+
+  const made = db.prepare(`SELECT id, name, status, forked_from FROM actors WHERE id = ?`).get(newId);
+  res.json({ ok: true, ...made });
+});
+
 app.post("/api/actors/:id/shares", (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
-  const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
-  if (!actor) return res.status(404).json({ error: "not found" });
-  const { email, permission = "read" } = req.body;
+  // Session 150 — the creator can always share. Anyone else needs the re-share
+  // flag on their own share, and can never grant more than they hold: a `use`
+  // holder passing the character on cannot hand out `copy`.
+  const mine = actorAccess(req.params.id, user);
+  if (!mine) return res.status(404).json({ error: "not found" });
+  if (mine.level !== "owner" && !mine.can_reshare) {
+    return res.status(403).json({ error: "You don't have permission to share this character on." });
+  }
+
+  const { email, permission = "read", can_reshare = false } = req.body;
+  if (!["read", "use", "copy"].includes(permission)) {
+    return res.status(400).json({ error: `permission must be read, use or copy` });
+  }
+  if (mine.level !== "owner" && ACCESS_RANK[permission] > ACCESS_RANK[mine.level]) {
+    return res.status(403).json({ error: `You only have "${mine.level}" on this character, so you cannot grant "${permission}".` });
+  }
   if (!email) return res.status(400).json({ error: "email required" });
   const target = db.prepare(`SELECT id, name FROM users WHERE email = ?`).get(email);
   if (!target) return res.status(404).json({ error: "user not found" });
   if (target.id === user.id) return res.status(400).json({ error: "cannot share with yourself" });
   const now = new Date().toISOString();
   try {
-    db.prepare(`INSERT INTO actor_shares (id, actor_id, owner_id, shared_with_id, shared_with_type, permission, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?)`)
-      .run(randomUUID(), req.params.id, user.id, target.id, "user", permission, now, now);
-    res.json({ ok: true, name: target.name, shared_with_id: target.id, permission });
+    // owner_id records the CREATOR, not whoever performed the share — otherwise a
+    // re-share would quietly reassign the character's origin.
+    db.prepare(`INSERT INTO actor_shares (id, actor_id, owner_id, shared_with_id, shared_with_type, permission, can_reshare, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)`)
+      .run(randomUUID(), req.params.id, mine.owner_id, target.id, "user", permission, can_reshare ? 1 : 0, now, now);
+    res.json({ ok: true, name: target.name, shared_with_id: target.id, permission, can_reshare: !!can_reshare });
   } catch (e) {
     if (e.message?.includes("UNIQUE")) return res.status(409).json({ error: "already shared" });
     throw e;
@@ -1252,7 +1766,7 @@ app.get("/api/actors/shared", (req, res) => {
   if (!user) return res.status(401).json({ error: "unauthorized" });
   const actors = db.prepare(`
     SELECT a.id, a.name, a.age, a.gender, a.occupation, a.status,
-           p.attachment_style, b.openness, b.neuroticism, s.permission,
+           p.attachment_style, b.openness, b.neuroticism, s.permission, s.can_reshare, a.forked_from,
            (SELECT url FROM actor_media WHERE actor_id = a.id AND media_type = 'photo' AND state_slug IN ('photo_close','profile') LIMIT 1) as photo_url
     FROM actor_shares s
     JOIN actors a ON a.id = s.actor_id
@@ -1379,8 +1893,9 @@ app.get("/api/actors/:id/media", (req, res) => {
 // ── GET /api/worlds — worlds available to deploy into ────────────────────────
 // ── GET /api/worlds/:id/actors — characters deployed in a world ───────────────
 app.get("/api/worlds/:id/actors", (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const actors = db.prepare(`
     SELECT a.id, a.name, a.first_name, a.last_name, a.occupation, a.gender,
            COALESCE(
@@ -1585,7 +2100,35 @@ app.post("/api/actors/:id/undeploy", async (req, res) => {
   const actor = db.prepare(`SELECT * FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
   if (!actor) return res.status(404).json({ error: "not found" });
 
-  const deployment = db.prepare(`SELECT * FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL ORDER BY deployed_at DESC LIMIT 1`).get(req.params.id);
+  // Session 150 — undeploy has to name a world.
+  //
+  // This used to take the most recent live deployment and say nothing about it.
+  // For a character deployed to one world that is right by accident; for a
+  // character in several it silently erased her from whichever she happened to
+  // join last, which is not a choice anyone made. The caller now passes
+  // world_id, and if it is ambiguous we refuse and hand back the options rather
+  // than guessing.
+  const liveDeployments = db.prepare(
+    `SELECT * FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL ORDER BY deployed_at DESC`
+  ).all(req.params.id);
+
+  if (liveDeployments.length === 0) return res.status(404).json({ error: "no deployment found" });
+
+  const wantWorld = req.body?.world_id;
+  let deployment;
+  if (wantWorld) {
+    deployment = liveDeployments.find(d => d.world_id === wantWorld);
+    if (!deployment) {
+      return res.status(404).json({ error: "She isn't deployed to that world." });
+    }
+  } else if (liveDeployments.length > 1) {
+    return res.status(400).json({
+      error: "She's deployed to more than one world — say which.",
+      worlds: liveDeployments.map(d => ({ world_id: d.world_id, world_name: d.world_name })),
+    });
+  } else {
+    deployment = liveDeployments[0];
+  }
   if (!deployment) return res.status(400).json({ error: "not deployed" });
 
   // Stamped on the archive rows, the deployment row and the status change
@@ -1612,11 +2155,48 @@ app.post("/api/actors/:id/undeploy", async (req, res) => {
     console.warn("[undeploy] archive marking failed:", e.message);
   }
 
+  // Session 150 — the platform must not record her as undeployed unless the
+  // simulator actually confirmed it erased her.
+  //
+  // This used to swallow the result entirely. Two ways that went wrong, and the
+  // second one is not hypothetical: fetch only throws on a transport failure, so
+  // a 500 from the simulator is not an exception — it sets res.ok = false and
+  // nothing else. Every undeploy between Sessions 79 and 150 returned 500
+  // (`unknown registry: DeliverWorlds.ActorRegistry`), and this code cleared
+  // undeployed_at, reset status to 'ready_to_deploy' and answered {ok:true}
+  // regardless. The platform said she was gone; the simulator still had her
+  // process running and all her rows. Redeploying from that state would have
+  // produced a second live instance of the same character.
+  //
+  // So: check the status AND the body, and on anything other than a confirmed
+  // erase, leave the deployment row and her status untouched and report the
+  // failure. An undeploy that cannot reach the simulator has not happened, and
+  // saying otherwise is worse than failing — the user can retry once it is up.
+  //
+  // Media archiving above deliberately stays outside this gate. It is
+  // idempotent, it only touches platform rows, and running it on a failed
+  // attempt costs nothing that a later successful attempt will not redo.
+  let simBody = null;
   try {
-    await fetch(`${SIMULATOR_URL}/internal/actors/${deployment.simulator_actor_id}/undeploy`, { method:"POST", headers:{"X-Service-Token": SERVICE_TOKEN} });
+    const simRes = await fetch(`${SIMULATOR_URL}/internal/actors/${deployment.simulator_actor_id}/undeploy`,
+      { method:"POST", headers:{"X-Service-Token": SERVICE_TOKEN} });
+    simBody = await simRes.json().catch(() => null);
+    if (!simRes.ok || simBody?.ok === false) {
+      console.warn(`[undeploy] simulator refused for ${deployment.simulator_actor_id}: HTTP ${simRes.status}`, simBody);
+      return res.status(502).json({
+        error: `The simulator did not erase her — HTTP ${simRes.status}. She is still deployed; nothing was changed. Try again once the simulator is healthy.`,
+        simulator_status: simRes.status,
+        simulator_body: simBody,
+      });
+    }
   } catch (e) {
-    console.warn("[undeploy] simulator call failed:", e.message);
+    console.warn("[undeploy] simulator unreachable:", e.message);
+    return res.status(502).json({
+      error: `Couldn't reach the simulator (${e.message}). She is still deployed; nothing was changed.`,
+    });
   }
+
+  console.log(`[undeploy] simulator erased ${deployment.simulator_actor_id} — ${simBody?.rows_deleted ?? "?"} row(s)`);
 
   db.prepare(`UPDATE actor_deployments SET undeployed_at = ? WHERE id = ?`).run(now, deployment.id);
 
@@ -1625,17 +2205,19 @@ app.post("/api/actors/:id/undeploy", async (req, res) => {
   // elsewhere stays 'active' — only drop to 'ready_to_deploy' once no
   // active deployment remains anywhere.
   const stillDeployed = db.prepare(`SELECT 1 FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL LIMIT 1`).get(req.params.id);
+  const status = stillDeployed ? "active" : "ready_to_deploy";
   if (!stillDeployed) {
     db.prepare(`UPDATE actors SET status = 'ready_to_deploy', updated_at = ? WHERE id = ?`).run(now, req.params.id);
   }
 
-  res.json({ ok: true });
+  res.json({ ok: true, status, rows_deleted: simBody?.rows_deleted ?? null, still_deployed_elsewhere: !!stillDeployed });
 });
 
 // ── POST /api/worlds/:world_id/actors/:actor_id/archive-media — manual backup ─
 app.post("/api/worlds/:world_id/actors/:actor_id/archive-media", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
+  const user = ok.user;
 
   const { world_id, actor_id } = req.params;
   const actor = db.prepare(`SELECT * FROM actors WHERE id = ?`).get(actor_id);
@@ -1672,6 +2254,121 @@ app.post("/api/actors/:id/deploy", async (req, res) => {
 
   if (!world?.id || !home?.place_id || !schedule?.length) {
     return res.status(400).json({ error: "missing required deploy fields" });
+  }
+
+  // ── Session 150 — who may deploy whom, where ───────────────────────────────
+  //
+  // Two independent questions, both previously unasked: this route checked only
+  // that the caller was logged in, so any user could deploy any character into
+  // any world.
+  //
+  // 1. The character. "use" is the rung that permits deploying someone else's
+  //    character; their template is never modified, only the world instance the
+  //    deploy creates, which belongs to the deployer's world.
+  const acc = hasAccess(actorId, user, "use");
+  if (!acc) {
+    const any = actorAccess(actorId, user);
+    if (!any) return res.status(404).json({ error: "not found" });
+    return res.status(403).json({ error: `You have "${any.level}" on this character. Deploying needs "use".` });
+  }
+
+  // 2. The world. Deploying adds a permanent inhabitant, so it is a world-level
+  //    act reserved to owners — of which a world may have several.
+  const wm = db.prepare(
+    `SELECT role FROM world_memberships WHERE user_id = ? AND world_id = ? LIMIT 1`
+  ).get(user.id, world.id);
+  if (!wm) return res.status(404).json({ error: "world not found" });
+  if (wm.role !== "owner") {
+    return res.status(403).json({ error: "Only an owner of this world can deploy a character into it." });
+  }
+
+  // Session 150 — refuse a second deploy into a world she is already in.
+  //
+  // actor_deployments is UNIQUE(platform_actor_id, world_id) and the insert
+  // below is INSERT OR REPLACE, so a repeat deploy quietly overwrote the row —
+  // and with it the only record of the previous simulator_actor_id. The old
+  // simulator actor was never told to stop. It stayed online, kept its rows,
+  // kept ticking, and became unreachable from the platform: a ghost of the same
+  // character living in the same world, discoverable only by reading the
+  // simulator's tables directly. One was found this session holding 29 rows.
+  //
+  // Deploying twice is not a meaningful operation anyway. To change how she is
+  // set up, edit her in the world editor; to start her over, undeploy first —
+  // which erases the old instance properly rather than abandoning it.
+  const existing = db.prepare(
+    `SELECT world_name FROM actor_deployments
+     WHERE platform_actor_id = ? AND world_id = ? AND undeployed_at IS NULL`
+  ).get(actorId, world.id);
+
+  if (existing) {
+    return res.status(409).json({
+      error: `She's already deployed to ${existing.world_name || "that world"}. Undeploy her from it first, or edit her there instead.`,
+      already_deployed: true,
+      world_id: world.id,
+    });
+  }
+
+  // Session 150 — a fork is a different character id, so the duplicate check
+  // above cannot see it. Without this, forking a character and deploying the
+  // copy puts two near-identical people in one world, which reads as a bug to
+  // anyone looking at the cast.
+  //
+  // Blocked for anyone who is not an owner of the target world. An owner may do
+  // it knowingly — it is their world, and twins or an alternate version are a
+  // legitimate thing to want. Deploy already requires ownership, so today this
+  // never fires; it is kept because it stays correct if deploy rights are ever
+  // widened beyond owners, which is exactly when it would start mattering.
+  if (wm.role !== "owner") {
+    const lineage = db.prepare(
+      `SELECT id FROM actors WHERE id = ? OR forked_from = ? OR id = (SELECT forked_from FROM actors WHERE id = ?)`
+    ).all(actorId, actorId, actorId).map(r => r.id).filter(Boolean);
+
+    if (lineage.length) {
+      const clash = db.prepare(
+        `SELECT d.world_name, a.name FROM actor_deployments d JOIN actors a ON a.id = d.platform_actor_id
+         WHERE d.world_id = ? AND d.undeployed_at IS NULL AND d.platform_actor_id IN (${lineage.map(() => "?").join(",")})`
+      ).get(world.id, ...lineage);
+
+      if (clash) {
+        return res.status(409).json({
+          error: `${clash.name} is already in ${clash.world_name} and this character is a copy of her. Only a world owner can place both.`,
+          fork_clash: true,
+        });
+      }
+    }
+  }
+
+  // Session 150 — the world has to be running, checked here and not only in the
+  // wizard.
+  //
+  // A deploy into a stopped world succeeds at every step and then cannot boot
+  // her: the actor's process tree is started by the world's supervisor, which
+  // isn't there. The result is a character who exists in full across twenty-odd
+  // tables and is alive in none of them, with nothing anywhere saying why.
+  //
+  // The wizard already refuses this, but the wizard is not the only caller — the
+  // orphaned instance found earlier tonight came from a direct API call that
+  // bypassed it entirely. Status lives on the simulator (WorldSupervisor knows
+  // which worlds are up; the worlds table does not), so it has to be asked.
+  try {
+    const wr = await fetch(`${SIMULATOR_URL}/internal/worlds?ids=${encodeURIComponent(world.id)}`,
+      { headers: { "X-Service-Token": SERVICE_TOKEN } });
+    if (!wr.ok) {
+      return res.status(502).json({ error: `Couldn't check whether the world is running — simulator returned ${wr.status}. Nothing was deployed.` });
+    }
+    const [live] = await wr.json();
+    if (!live) {
+      return res.status(404).json({ error: "That world no longer exists. Nothing was deployed." });
+    }
+    if (live.status !== "running") {
+      return res.status(409).json({
+        error: `${live.name || "That world"} is stopped. Start it first — a character deployed into a stopped world is written to the database but never boots.`,
+        world_stopped: true,
+        world_id: world.id,
+      });
+    }
+  } catch (e) {
+    return res.status(502).json({ error: `Couldn't reach the simulator (${e.message}). Nothing was deployed.` });
   }
 
   const actor = db.prepare(`SELECT * FROM actors WHERE id = ? AND owner_id = ?`).get(actorId, user.id);
@@ -1904,10 +2601,28 @@ Respond with JSON only — no preamble:
   }
 });
 
+// ── GET /api/worlds/:world_id/actors/:actor_id/home ──────────────────────────
+// Where she lives and works in this world. Only the POST existed, so the world
+// editor's Home and work panel was calling a route that was never there.
+app.get("/api/worlds/:world_id/actors/:actor_id/home", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
+  const { world_id, actor_id } = req.params;
+  try {
+    const sim = resolveSimActor(world_id, actor_id);
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/actors/${sim}/home`,
+      { headers: { "X-Service-Token": SERVICE_TOKEN } });
+    if (!r.ok) return res.status(r.status).json({ error: `simulator returned ${r.status}` });
+    res.json(await r.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
 // ── POST /api/worlds/:world_id/actors/:actor_id/home — set player home ─────────
 app.post("/api/worlds/:world_id/actors/:actor_id/home", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
+  const user = ok.user;
   const { home_place_id } = req.body;
   if (!home_place_id) return res.status(400).json({ error: "home_place_id required" });
   try {
@@ -1969,8 +2684,9 @@ app.get("/api/states/home-activities", async (req, res) => {
 
 // ── GET /api/worlds/:world_id/player/state ────────────────────────────────────
 app.get("/api/worlds/:world_id/player/state", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const m = db.prepare("SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?").get(user.id, req.params.world_id);
   if (!m) return res.json({});
   try {
@@ -1984,8 +2700,9 @@ app.get("/api/worlds/:world_id/player/state", async (req, res) => {
 
 // ── POST /api/worlds/:world_id/player/state ───────────────────────────────────
 app.post("/api/worlds/:world_id/player/state", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const m = db.prepare("SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?").get(user.id, req.params.world_id);
   if (!m) return res.json({});
   try {
@@ -2001,8 +2718,9 @@ app.post("/api/worlds/:world_id/player/state", async (req, res) => {
 
 // ── GET /api/worlds/:world_id/player/home ─────────────────────────────────────
 app.get("/api/worlds/:world_id/player/home", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   try {
     const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/actors/${user.id}/home`, {
       headers: { "X-Service-Token": SERVICE_TOKEN }
@@ -2016,8 +2734,9 @@ app.get("/api/worlds/:world_id/player/home", async (req, res) => {
 
 // ── POST /api/worlds/:world_id/home-knock/decline ────────────────────────────
 app.post("/api/worlds/:world_id/home-knock/decline", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const { actor_id } = req.body;
   if (!actor_id) return res.status(400).json({ error: "actor_id required" });
   try {
@@ -2034,8 +2753,9 @@ app.post("/api/worlds/:world_id/home-knock/decline", async (req, res) => {
 
 // ── GET /api/worlds/:id/actors/residences — actors with home data ─────────────
 app.get("/api/worlds/:id/actors/residences", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const world_id = req.params.id;
   try {
     const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/actors/residences`, {
@@ -2073,8 +2793,9 @@ app.get("/api/worlds/:id/actors/residences", async (req, res) => {
 
 // ── GET /api/worlds/:id/places — list places for a world ────────────────────────
 app.get("/api/worlds/:id/places", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const { category } = req.query;
   const qs = category ? `?category=${encodeURIComponent(category)}` : "";
   try {
@@ -3021,12 +3742,12 @@ app.get("/api/actors/deployments", (req, res) => {
     SELECT d.platform_actor_id, d.world_id, d.world_name, d.deployed_at
     FROM actor_deployments d
     JOIN actors a ON a.id = d.platform_actor_id
-    WHERE a.owner_id = ?
+    WHERE a.owner_id = ? AND d.undeployed_at IS NULL
     UNION
     SELECT d.platform_actor_id, d.world_id, d.world_name, d.deployed_at
     FROM actor_deployments d
     JOIN actor_shares s ON s.actor_id = d.platform_actor_id
-    WHERE s.shared_with_id = ?
+    WHERE s.shared_with_id = ? AND d.undeployed_at IS NULL
   `).all(user.id, user.id);
 
   // Enrich each deployment with the world-specific profile photo
@@ -3056,7 +3777,7 @@ app.get("/api/actors/:id/in-play", async (req, res) => {
   const viewerActorId = isOwner ? null : (share.viewer_actor_id || null);
 
   // Get deployments from platform DB
-  const deployments = db.prepare(`SELECT * FROM actor_deployments WHERE platform_actor_id = ?`).all(req.params.id);
+  const deployments = db.prepare(`SELECT * FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL`).all(req.params.id);
   if (!deployments.length) return res.json({ data: [], is_owner: isOwner, viewer_actor_id: null });
 
   // Look up the viewing user's player actor in each world
@@ -3681,6 +4402,19 @@ app.get("/api/actors/:id", (req, res) => {
   // instead of guessing file conventions (the pipeline's pulled
   // copies live elsewhere and may predate the pull fix).
   const mediaPhotos = db.prepare(`SELECT state_slug, url FROM actor_media WHERE actor_id = ? AND media_type = 'photo' AND world_id IS NULL`).all(req.params.id);
+  // Session 150 — say plainly whether this caller owns the character.
+  //
+  // owner_id and permission were both already in the payload and the profile
+  // editor used neither: it rendered every field as editable for a shared
+  // character, then failed the save with a bare 404 from the PUT's
+  // `WHERE owner_id = ?`. Renaming somebody else's character appeared to work
+  // right up until it didn't.
+  //
+  // Editing the TEMPLATE is the owner's alone at every rung. "use" buys
+  // deploying it; "copy" buys forking it. Neither buys editing the original —
+  // that is the ambiguity the ladder exists to remove.
+  actor.is_owner = actor.owner_id === user.id;
+
   res.json({ actor, psychology, big5, disc, hds, lifestyle, economic, mental, upbringing, education, diagnoses, expenses, mediaPhotos, measurements });
 });
 
@@ -3691,7 +4425,23 @@ app.put("/api/actors/:id", (req, res) => {
   const { id } = req.params;
   const { section, data } = req.body;
 
-  const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(id, user.id);
+  // A 404 here is misleading when the character plainly exists and is visible on
+  // screen — it reads as "gone", not as "not yours". Distinguish the two.
+  const owned = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(id, user.id);
+  if (!owned) {
+    const shared = db.prepare(
+      `SELECT s.permission, u.name AS owner_name FROM actor_shares s
+       JOIN actors a ON a.id = s.actor_id JOIN users u ON u.id = a.owner_id
+       WHERE s.actor_id = ? AND s.shared_with_id = ?`
+    ).get(id, user.id);
+    if (shared) {
+      return res.status(403).json({
+        error: `${shared.owner_name} owns this character — you have "${shared.permission}". Only the owner can edit the profile. Fork it if you want your own version.`,
+        owner_name: shared.owner_name, permission: shared.permission,
+      });
+    }
+  }
+  const actor = owned;
   if (!actor) return res.status(404).json({ error: "not found" });
 
   const now = new Date().toISOString();
@@ -3764,8 +4514,9 @@ function authUser(req) {
 // Player accepts a meetup proposal — writes PlannedMeeting on simulator,
 // Amber's engine fires the meeting when scheduled_at is reached.
 app.post("/api/worlds/:world_id/meetings/confirm", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   try {
     const resp = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/meetings/confirm`, {
       method: "POST",
@@ -3779,8 +4530,9 @@ app.post("/api/worlds/:world_id/meetings/confirm", async (req, res) => {
 // ── POST /api/worlds/:world_id/actors/:actor_id/messages/:contact_id/respond/:msg_id
 // Marks a proposal message as responded on the simulator.
 app.post("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id/respond/:msg_id", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`).get(user.id, req.params.world_id);
   if (!membership) return res.status(403).json({ error: "not a member of this world" });
   if (membership.actor_id !== req.params.actor_id) return res.status(403).json({ error: "actor mismatch" });
@@ -3796,8 +4548,9 @@ app.post("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id/respond/:m
 // ── GET /api/worlds/:world_id/actors/:actor_id/calendar ──────────────────────
 // Returns today's schedule slots + upcoming confirmed planned meetings.
 app.get("/api/worlds/:world_id/actors/:actor_id/calendar", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`).get(user.id, req.params.world_id);
   if (!membership) return res.status(403).json({ error: "not a member of this world" });
   if (membership.actor_id !== req.params.actor_id) return res.status(403).json({ error: "actor mismatch" });
@@ -3810,8 +4563,9 @@ app.get("/api/worlds/:world_id/actors/:actor_id/calendar", async (req, res) => {
 // ── GET /api/worlds/:world_id/actors/:actor_id/voicemail ─────────────────────
 // Returns voice messages received by actor, marks as read.
 app.get("/api/worlds/:world_id/actors/:actor_id/voicemail", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   try {
     const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/voicemail`);
     res.json(data);
@@ -3845,8 +4599,9 @@ app.post("/api/tts", async (req, res) => {
 
 // ── GET /api/worlds/:world_id/presence ───────────────────────────────────────
 app.get("/api/worlds/:world_id/presence", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   try {
     const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ? LIMIT 1`).get(user.id, req.params.world_id);
     const playerActorId = membership?.actor_id || "";
@@ -3856,8 +4611,9 @@ app.get("/api/worlds/:world_id/presence", async (req, res) => {
 
 // ── POST /api/worlds/:world_id/spawn ─────────────────────────────────────────
 app.post("/api/worlds/:world_id/spawn", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const { world_id } = req.params;
   const { location_id } = req.body;
   if (!location_id) return res.status(400).json({ error: "location_id required" });
@@ -3950,8 +4706,9 @@ app.get("/api/meeting/:session_id/stream", async (req, res) => {
 
 // ── POST /api/worlds/:world_id/encounter/start ───────────────────────────────
 app.post("/api/worlds/:world_id/encounter/start", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const { world_id } = req.params;
   const membership = db.prepare(
     `SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`
@@ -3975,8 +4732,9 @@ app.post("/api/worlds/:world_id/encounter/start", async (req, res) => {
 
 // ── POST /api/worlds/:world_id/encounter/:encounter_id/end ────────────────────
 app.post("/api/worlds/:world_id/encounter/:encounter_id/end", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   try {
     const resp = await fetch(
       `${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/encounter/${req.params.encounter_id}/end`,
@@ -3988,8 +4746,9 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/end", async (req, res) =
 
 // ── GET /api/worlds/:world_id/encounter/:encounter_id ─────────────────────────
 app.get("/api/worlds/:world_id/encounter/:encounter_id", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   try {
     res.json(await simFetch(
       `/internal/worlds/${req.params.world_id}/encounter/${req.params.encounter_id}`
@@ -3999,8 +4758,9 @@ app.get("/api/worlds/:world_id/encounter/:encounter_id", async (req, res) => {
 
 // ── POST /api/worlds/:world_id/encounter/:encounter_id/enter ─────────────────
 app.post("/api/worlds/:world_id/encounter/:encounter_id/enter", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   try {
     const resp = await fetch(
       `${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/encounter/${req.params.encounter_id}/enter`,
@@ -4012,8 +4772,9 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/enter", async (req, res)
 
 // ── POST /api/worlds/:world_id/encounter/:encounter_id/message ────────────────
 app.post("/api/worlds/:world_id/encounter/:encounter_id/message", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const { content } = req.body;
   if (!content) return res.status(400).json({ error: "content required" });
   try {
@@ -4031,8 +4792,9 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/message", async (req, re
 
 // ── POST /api/worlds/:world_id/encounter/:encounter_id/typing ─────────────────
 app.post("/api/worlds/:world_id/encounter/:encounter_id/typing", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   try {
     fetch(
       `${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/encounter/${req.params.encounter_id}/typing`,
@@ -4044,8 +4806,9 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/typing", async (req, res
 
 // ── POST /api/worlds/:world_id/leave — clear player location ─────────────────
 app.post("/api/worlds/:world_id/leave", async (req, res) => {
-  const user = authUser(req);
-  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  if (!ok) return;
+  const user = ok.user;
   const { world_id } = req.params;
   const membership = db.prepare(
     `SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`
@@ -4220,8 +4983,18 @@ app.post("/api/actors", (req, res) => {
       // must never offer half-built drafts for deployment, and active
       // must mean deployed.
       const p = psychology||{};
-      db.prepare(`UPDATE actor_psychology SET attachment_style=?, wound=?, what_they_want=?, blindspot=?, defenses=?, contradiction=?, backstory=?, orientation=?, view_on_sex=?, marital_status=?, coping_mechanisms=?, updated_at=? WHERE actor_id=?`)
-        .run(personality?.attachment_style||p.attachment_style||"secure", p.wound||null, p.what_they_want||null, p.blindspot||null, p.defenses||null, p.contradiction||null, p.backstory||null, identity.orientation||"straight", p.view_on_sex||null, p.marital_status||"single", p.coping_mechanisms||null, now, id);
+      // Session 150 — self_view, others_view, family_model,
+      // relationship_read_pattern and identity_certainty added.
+      //
+      // The character wizard has collected all five for a long time: they are in
+      // its psychology state, rendered as fields on the Psychology step, and
+      // named in the prompt that asks the model to write them. They were simply
+      // absent from this statement and the INSERT below, so everything typed or
+      // generated into them was posted to the server and dropped on the floor.
+      // Every character therefore had four permanently blank psychology fields
+      // and nothing anywhere said why.
+      db.prepare(`UPDATE actor_psychology SET attachment_style=?, wound=?, what_they_want=?, blindspot=?, defenses=?, contradiction=?, backstory=?, orientation=?, view_on_sex=?, marital_status=?, coping_mechanisms=?, self_view=?, others_view=?, family_model=?, relationship_read_pattern=?, identity_certainty=?, updated_at=? WHERE actor_id=?`)
+        .run(personality?.attachment_style||p.attachment_style||"secure", p.wound||null, p.what_they_want||null, p.blindspot||null, p.defenses||null, p.contradiction||null, p.backstory||null, identity.orientation||"straight", p.view_on_sex||null, p.marital_status||"single", p.coping_mechanisms||null, p.self_view||null, p.others_view||null, p.family_model||null, p.relationship_read_pattern||null, p.identity_certainty ?? null, now, id);
       const b = personality?.big5||{};
       db.prepare(`UPDATE actor_big5 SET openness=?, conscientiousness=?, extraversion=?, agreeableness=?, neuroticism=?, updated_at=? WHERE actor_id=?`)
         .run(b.openness||50, b.conscientiousness||50, b.extraversion||50, b.agreeableness||50, b.neuroticism||50, now, id);
@@ -4260,8 +5033,9 @@ app.post("/api/actors", (req, res) => {
     db.prepare(`INSERT INTO actors (id, owner_id, name, first_name, last_name, age, gender, nationality, occupation, appearance, default_home_template_url, media_folder, status, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(id, user.id, name, identity.first_name?.trim(), identity.last_name?.trim()||null, identity.age||null, identity.gender||"female", identity.nationality||null, identity.occupation||null, identity.appearance||null, default_home_template_url||null, mediaFolder, draft ? "draft" : "ready_to_deploy", now, now);
     const p = psychology||{};
-    db.prepare(`INSERT INTO actor_psychology (actor_id, attachment_style, wound, what_they_want, blindspot, defenses, contradiction, backstory, orientation, view_on_sex, marital_status, coping_mechanisms, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(id, personality?.attachment_style||p.attachment_style||"secure", p.wound||null, p.what_they_want||null, p.blindspot||null, p.defenses||null, p.contradiction||null, p.backstory||null, identity.orientation||"straight", p.view_on_sex||null, p.marital_status||"single", p.coping_mechanisms||null, now, now);
+    // Same five columns as the UPDATE above — see the note there.
+    db.prepare(`INSERT INTO actor_psychology (actor_id, attachment_style, wound, what_they_want, blindspot, defenses, contradiction, backstory, orientation, view_on_sex, marital_status, coping_mechanisms, self_view, others_view, family_model, relationship_read_pattern, identity_certainty, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, personality?.attachment_style||p.attachment_style||"secure", p.wound||null, p.what_they_want||null, p.blindspot||null, p.defenses||null, p.contradiction||null, p.backstory||null, identity.orientation||"straight", p.view_on_sex||null, p.marital_status||"single", p.coping_mechanisms||null, p.self_view||null, p.others_view||null, p.family_model||null, p.relationship_read_pattern||null, p.identity_certainty ?? null, now, now);
     const b = personality?.big5||{};
     db.prepare(`INSERT INTO actor_big5 (actor_id, openness, conscientiousness, extraversion, agreeableness, neuroticism, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?)`)
       .run(id, b.openness||50, b.conscientiousness||50, b.extraversion||50, b.agreeableness||50, b.neuroticism||50, now, now);
@@ -4356,9 +5130,16 @@ if (fs.existsSync(distPath)) {
   app.use(express.static(distPath));
   app.get("*", (req, res) => {
     if (req.path.startsWith("/assets/")) { return res.status(404).end(); }
-    if (!req.path.startsWith("/api") && !req.path.startsWith("/media")) {
-      res.sendFile(path.join(distPath, "index.html"));
+    // Session 150 — an unmatched /api or /media GET used to fall through this
+    // branch WITHOUT responding, so the request never completed: the browser sat
+    // on an open connection until it timed out, and any fetch() awaiting it
+    // never settled. A panel calling an endpoint that did not exist showed
+    // "Loading…" forever rather than an error — which is exactly how the missing
+    // GET .../home presented.
+    if (req.path.startsWith("/api") || req.path.startsWith("/media")) {
+      return res.status(404).json({ error: `No such endpoint: ${req.method} ${req.path}` });
     }
+    res.sendFile(path.join(distPath, "index.html"));
   });
 }
 

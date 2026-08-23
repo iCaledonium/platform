@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import LlmConfigPanel from "./LlmConfigPanel.jsx";
 
 // ── WorldEditorPage ───────────────────────────────────────────────────────────
@@ -308,6 +308,156 @@ function ResidencesTab({ world }) {
     </div>
   );
 }
+
+// ── MembersPanel ──────────────────────────────────────────────────────────────
+//
+// Session 150 — who belongs to this world, and what they may do.
+//
+// Members could only ever be set when a world was created: there was no way to
+// add anyone afterwards, promote a member, or remove one. A world's people were
+// fixed at birth, which is a strange limit for a system whose premise is worlds
+// you share.
+//
+// A world may have SEVERAL owners. The last one cannot be demoted or removed —
+// the server refuses — because a world with no owner is a world nobody can
+// configure, start, or delete.
+const ROLE_HELP = {
+  owner:  "Full control — start and stop, configure, deploy characters, manage members, delete the world.",
+  viewer: "Can see the world and interact with it. Cannot change it or deploy anyone into it.",
+};
+
+function MembersPanel({ worldId, isOwner }) {
+  const [members, setMembers] = useState(undefined);
+  const [users, setUsers]     = useState([]);
+  const [pick, setPick]       = useState("");
+  const [role, setRole]       = useState("viewer");
+  const [busy, setBusy]       = useState(false);
+  const [error, setError]     = useState(null);
+
+  function load() {
+    fetch(`/api/worlds/${worldId}/members`)
+      .then(r => r.ok ? r.json() : []).then(setMembers).catch(() => setMembers([]));
+  }
+  useEffect(() => {
+    load();
+    fetch("/api/users").then(r => r.ok ? r.json() : []).then(setUsers).catch(() => {});
+  }, [worldId]);
+
+  if (members === undefined) return <p style={{ ...F, fontSize:13, color:"#a8a5a0" }}>Loading…</p>;
+
+  const memberIds = new Set(members.map(m => m.id));
+  const available = users.filter(u => !memberIds.has(u.id));
+  const ownerCount = members.filter(m => m.role === "owner").length;
+
+  async function call(method, path, body) {
+    setBusy(true); setError(null);
+    try {
+      const r = await fetch(path, body
+        ? { method, headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) }
+        : { method });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { setError(d.error || `Failed — HTTP ${r.status}`); setBusy(false); return false; }
+      load();
+    } catch (e) { setError(e.message); }
+    setBusy(false);
+    return true;
+  }
+
+  const add     = () => { const u = users.find(x => x.id === pick); if (u) call("POST", `/api/worlds/${worldId}/members`, { email: u.email, role }).then(ok => ok && setPick("")); };
+  const setRoleOf = (id, r) => call("PATCH", `/api/worlds/${worldId}/members/${id}`, { role: r });
+  const remove  = (id)      => call("DELETE", `/api/worlds/${worldId}/members/${id}`);
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:18, maxWidth:600 }}>
+      {isOwner && (
+        <div>
+          <div style={{ ...F, fontSize:10, letterSpacing:".16em", textTransform:"uppercase", color:"#a8a5a0", marginBottom:8 }}>Add someone</div>
+          {available.length === 0 ? (
+            <p style={{ ...F, fontSize:13, color:"#a8a5a0", margin:0 }}>Everyone already belongs to this world.</p>
+          ) : (
+            <>
+              <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
+                <select value={pick} onChange={e => setPick(e.target.value)}
+                  style={{ ...F, flex:1, minWidth:170, fontSize:13, padding:"8px 11px", borderRadius:9,
+                    border:"1px solid rgba(0,0,0,.12)", background:"rgba(255,255,255,.8)", color: pick ? "#1a1814" : "#a8a5a0" }}>
+                  <option value="">Select person…</option>
+                  {available.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
+                </select>
+                <select value={role} onChange={e => setRole(e.target.value)}
+                  style={{ ...F, fontSize:13, padding:"8px 11px", borderRadius:9, border:"1px solid rgba(0,0,0,.12)", background:"rgba(255,255,255,.8)" }}>
+                  <option value="viewer">Viewer</option>
+                  <option value="owner">Owner</option>
+                </select>
+                <button onClick={add} disabled={busy || !pick}
+                  style={{ ...F, fontSize:11, letterSpacing:".06em", textTransform:"uppercase", padding:"9px 18px",
+                    borderRadius:9, border:"none", background:"#1a1814", color:"#faf8f4",
+                    cursor: (busy||!pick) ? "default" : "pointer", opacity: (busy||!pick) ? .4 : 1 }}>
+                  {busy ? "…" : "Add"}
+                </button>
+              </div>
+              <div style={{ ...F, fontSize:11, color:"#a8a5a0", marginTop:7, lineHeight:1.55 }}>
+                <b style={{ fontWeight:500, color: role === "owner" ? "#0F6E56" : "#6b6760" }}>{role}</b> — {ROLE_HELP[role]}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {error && <div style={{ ...F, fontSize:12, color:"#993c1d" }}>{error}</div>}
+
+      <div>
+        <div style={{ ...F, fontSize:10, letterSpacing:".16em", textTransform:"uppercase", color:"#a8a5a0", marginBottom:8 }}>
+          Members — {members.length}
+        </div>
+        {members.map(m => {
+          const owner = m.role === "owner";
+          const lastOwner = owner && ownerCount <= 1;
+          return (
+            <div key={m.id} style={{ display:"flex", alignItems:"center", gap:11, padding:"9px 0", borderBottom:"1px solid rgba(0,0,0,.05)" }}>
+              {m.photo_url
+                ? <img src={m.photo_url} alt="" style={{ width:30, height:30, borderRadius:"50%", objectFit:"cover", flexShrink:0 }} />
+                : <div style={{ width:30, height:30, borderRadius:"50%", background:"rgba(0,0,0,.06)", display:"flex", alignItems:"center", justifyContent:"center", ...F, fontSize:11, color:"#6b6760", flexShrink:0 }}>{ini(m.name)}</div>}
+              <div style={{ flex:1, minWidth:0 }}>
+                <div style={{ ...F, fontSize:13, color:"#1a1814" }}>{m.name}</div>
+                <div style={{ ...F, fontSize:11, color:"#a8a5a0", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{m.email}</div>
+              </div>
+
+              {isOwner ? (
+                <select value={m.role || "viewer"} onChange={e => setRoleOf(m.id, e.target.value)}
+                  disabled={busy || lastOwner}
+                  title={lastOwner ? "The world's only owner — make someone else an owner first" : undefined}
+                  style={{ ...F, fontSize:11.5, padding:"5px 9px", borderRadius:7, border:"1px solid rgba(0,0,0,.12)",
+                    background: owner ? "rgba(29,158,117,.08)" : "rgba(255,255,255,.75)",
+                    color: owner ? "#0F6E56" : "#6b6760", cursor: lastOwner ? "default" : "pointer", opacity: lastOwner ? .6 : 1 }}>
+                  <option value="viewer">viewer</option>
+                  <option value="owner">owner</option>
+                </select>
+              ) : (
+                <span style={{ ...F, fontSize:9, letterSpacing:".08em", textTransform:"uppercase", padding:"3px 8px",
+                  borderRadius:5, background: owner ? "rgba(29,158,117,.1)" : "rgba(0,0,0,.04)",
+                  color: owner ? "#0F6E56" : "#6b6760" }}>{m.role || "viewer"}</span>
+              )}
+
+              {isOwner && (
+                <span onClick={() => !lastOwner && !busy && remove(m.id)}
+                  title={lastOwner ? "The world's only owner cannot be removed" : `Remove ${m.name}`}
+                  style={{ ...F, fontSize:13, color: lastOwner ? "rgba(0,0,0,.15)" : "#c0392b",
+                    cursor: lastOwner ? "default" : "pointer", padding:"0 3px", flexShrink:0 }}>✕</span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {!isOwner && (
+        <p style={{ ...F, fontSize:11.5, color:"#a8a5a0", margin:0, lineHeight:1.6 }}>
+          Only an owner of this world can add, promote or remove members.
+        </p>
+      )}
+    </div>
+  );
+}
+
 // ── Panels ────────────────────────────────────────────────────────────────────
 function OverviewPanel({ world, cast, onToggleRun, busy }) {
   const running = world.status === "running" || world.status === "active";
@@ -465,7 +615,13 @@ export default function WorldEditorPage() {
   const navigate    = useNavigate();
   const [world, setWorld] = useState(null);
   const [cast,  setCast]  = useState([]);
-  const [tab,   setTab]   = useState("overview");
+  // ?tab= lets a caller deep-link a panel — the world card's Members button
+  // goes straight there rather than dropping you on Overview to hunt for it.
+  const [params] = useSearchParams();
+  const [tab, setTab] = useState(() => {
+    const t = params.get("tab");
+    return ["overview","modules","residences","llm","members","danger"].includes(t) ? t : "overview";
+  });
   const [busy,  setBusy]  = useState(false);
   const [missing, setMissing] = useState(false);
 
@@ -521,10 +677,11 @@ export default function WorldEditorPage() {
     modules:    <ModulesPanel worldId={worldId} />,
     residences: <div style={{ height:560, margin:"-24px -28px" }}><ResidencesTab world={world} /></div>,
     llm:        <LlmConfigPanel world={world} />,
+    members:    <MembersPanel worldId={worldId} isOwner={world.role === "owner"} />,
     danger:     <DangerPanel world={world} onDeleted={() => navigate("/my-worlds")} />,
   };
 
-  const LABELS = { overview:"Overview", modules:"Modules", residences:"Residences", llm:"LLM and voice", danger:"Delete world" };
+  const LABELS = { overview:"Overview", modules:"Modules", residences:"Residences", llm:"LLM and voice", members:"Members", danger:"Delete world" };
 
   return (
     <div style={{ background:"#eeecea", minHeight:"100vh", position:"relative" }}>
@@ -550,7 +707,7 @@ export default function WorldEditorPage() {
 
           <div style={{ flex:1, overflowY:"auto", paddingBottom:8 }}>
             <NavSection label="World" />
-            {["overview","modules","residences","llm"].map(k => (
+            {["overview","modules","residences","llm","members"].map(k => (
               <NavItem key={k} label={LABELS[k]} active={tab===k} done onClick={() => setTab(k)} />
             ))}
 
