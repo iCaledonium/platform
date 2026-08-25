@@ -74,6 +74,12 @@ function getActorPosition(actor, placesCoords) {
 }
 const MAPS_KEY = "AIzaSyDy45Dov_WkN9FcxdVNYQEx23PjexI-Fxc";
 
+// The map opens at 13 — the whole city, which is the right first question.
+// Picking a specific person or venue out of a panel is a different question,
+// so that goes to 16: the block they are on, with enough streets around it to
+// place them. Anything closer stops being a map and starts being a rooftop.
+const FOCUS_ZOOM = 16;
+
 const PIN_STYLES = `
   .anima-pin { display:flex; flex-direction:column; align-items:center; cursor:pointer; }
   .anima-pin-bubble {
@@ -691,8 +697,38 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
   // path a click on its pin takes — select the pin, pan to it, open its card —
   // so the two ways of finding a place end in exactly the same state.
   useEffect(() => {
-    window.__animaSelectLocation = (loc) => selectLocation(loc);
-    return () => { delete window.__animaSelectLocation; };
+    window.__animaSelectLocation = (loc, opts) => selectLocation(loc, opts);
+
+    // Session 153 — and the same bridge for People.
+    //
+    // Places could already say "go here"; People had no way to say "go to
+    // them", so picking a name lit up the panels and left the map where it
+    // was. Where someone is depends on whether they are moving: a walker is a
+    // live point on a polyline and has no pin of their own, so the map goes to
+    // the interpolated position and their transit card opens. Anyone else is
+    // wherever they are standing, which is a place — so that resolves to the
+    // ordinary place selection and ends in the same state as clicking its pin,
+    // card and all.
+    window.__animaFocusActor = (actorId) => {
+      if (!actorId) return false;
+      for (const l of (locationsRef.current || [])) {
+        for (const a of (l.actors || [])) {
+          if ((a.actor_id || a.id) !== actorId) continue;
+          if (a.in_transit) {
+            const pos = getActorPosition(a);
+            if (pos) { setSelectedActor(a); focusMap(pos); return true; }
+          }
+          selectLocation(l, { focus: true });
+          return true;
+        }
+      }
+      return false;   // not somewhere the viewer can see — leave the map alone
+    };
+
+    return () => {
+      delete window.__animaSelectLocation;
+      delete window.__animaFocusActor;
+    };
   }, []);
 
   // Session 151 — closing the card is three things, not one: drop the React
@@ -707,14 +743,50 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
     setSelectedActor(null);
   }
 
-  function selectLocation(loc) {
+  // Session 153 — centring, and going in close.
+  //
+  // Panning alone answers "which direction" and not "where": at the city zoom
+  // the map opens on, a pin arriving in the middle of the frame is still one
+  // dot among eighty-five. Picking a name out of a list is a request to look at
+  // something, so the map goes to street level with it.
+  //
+  // Only ever zooms IN. Someone who has already pushed past this level was
+  // reading detail we should not throw away, and a click that yanked them back
+  // out would be the map arguing with them.
+  function focusMap(pos, zoom = FOCUS_ZOOM) {
+    const map = mapInstance.current;
+    if (!map || !pos || pos.lat == null || pos.lng == null) return;
+    const p = { lat: Number(pos.lat), lng: Number(pos.lng) };
+    if (Number.isNaN(p.lat) || Number.isNaN(p.lng)) return;
+
+    const now = map.getZoom() ?? 0;
+    const target = Math.max(now, zoom);
+    if (target !== now) {
+      // Centre and zoom in one move. Done as panTo-then-setZoom they are two
+      // animations racing each other across the city: the glide is still in
+      // flight when the zoom re-anchors it, and the map crawls to its final
+      // position over about five seconds, showing intermediate frames that
+      // look like it landed in the wrong place. setOptions applies both at
+      // once, so the answer to "where are they" arrives immediately.
+      map.setOptions({ center: p, zoom: target });
+    } else {
+      // Already this close or closer — nothing to zoom, so keep the glide.
+      map.panTo(p);
+    }
+  }
+
+  function selectLocation(loc, opts) {
     if (selectedRef.current) {
       markers.current.find(m => m._locId === selectedRef.current.id)?.setSelected(false);
     }
     markers.current.find(m => m._locId === loc.id)?.setSelected(true);
     selectedRef.current = loc;
     setSelected(loc);
-    mapInstance.current?.panTo({ lat: Number(loc.lat), lng: Number(loc.lng) });
+    // A pin click keeps the zoom it had — you are already looking where you
+    // clicked. A name picked out of an instrument panel is the case that needs
+    // taking there.
+    if (opts?.focus) focusMap({ lat: loc.lat, lng: loc.lng });
+    else mapInstance.current?.panTo({ lat: Number(loc.lat), lng: Number(loc.lng) });
   }
 
   async function handleSpawn() {

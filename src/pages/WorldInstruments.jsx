@@ -374,8 +374,22 @@ export default function WorldInstruments({ world, playerActorId }) {
       (b.cast - a.cast) || (b.total - a.total) || a.name.localeCompare(b.name, "sv"));
   })();
 
+  // Session 153 — a click in a panel takes the map there.
+  //
+  // Both of these were selection-only: Places panned without going in close,
+  // People did not move the map at all. Picking a name out of a list is an
+  // ask to be shown where they are, so both now centre and zoom to street
+  // level. The overlay owns the map and decides how far in — see FOCUS_ZOOM.
   const goToPlace = p => {
-    if (window.__animaSelectLocation) window.__animaSelectLocation(p.loc);
+    if (window.__animaSelectLocation) window.__animaSelectLocation(p.loc, { focus: true });
+  };
+
+  // Selection still stands on its own: Vitals and Comms follow `sel` whether or
+  // not the map could place them, so the focus is an addition to that click and
+  // never a precondition for it.
+  const goToPerson = p => {
+    setSel(p.id);
+    window.__animaFocusActor?.(p.id);
   };
 
   const forceTick = async () => {
@@ -417,7 +431,7 @@ export default function WorldInstruments({ world, playerActorId }) {
             {people.map(p => (
               <div key={p.id}
                 className={`${styles.row} ${sel === p.id ? styles.rowOn : ""}`}
-                onClick={() => setSel(p.id)}>
+                onClick={() => goToPerson(p)}>
                 <div className={styles.face}>
                   {initials(p.name)}
                   {p.portrait && <img className={styles.facePhoto} src={p.portrait} alt=""
