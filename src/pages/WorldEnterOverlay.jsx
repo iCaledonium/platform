@@ -172,6 +172,13 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
   const spawnLock = useRef(false);
 
   const [locations, setLocations] = useState([]);
+  // Session 153 — who you are already in an encounter with.
+  //
+  // Rejoining a live encounter is not allowed, so offering a knock the server
+  // would only turn away is worse than not offering it. Two sources, and both
+  // are needed: presence answers on first load (open the map mid-conversation
+  // and no event has fired), the SSE stream answers every change after that.
+  const [engaged, setEngaged] = useState(() => new Set());
   const locationsRef   = useRef([]);
   const [weather,   setWeather]   = useState(null);
   const [worldTime, setWorldTime] = useState(null);
@@ -224,6 +231,12 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
           if (data.weather) setWeather(data.weather);
           if (data.world_time) setWorldTime(data.world_time);
           setLocations(locs);
+          // The server read its own live registry to answer this, so it wins
+          // over anything the stream told us earlier.
+          setEngaged(new Set(
+            locs.flatMap(l => l.actors || [])
+                .filter(a => a.in_encounter_with_you)
+                .map(a => a.actor_id)));
           setLoading(false);
           // Keep selected panel in sync
           setSelected(prev => {
@@ -271,6 +284,27 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
         if (payload.type === "transit_arrived") {
           // Force immediate presence reload to snap marker
           if (loadPresenceRef.current) loadPresenceRef.current();
+        }
+        // Session 153 — the encounter you are in, starting and ending.
+        //
+        // The payload is nested under `data` by the SSE bridge, and carries
+        // target_actor_id so the map knows WHO — pairing start to end by
+        // encounter_id alone is no use here, because this component remounts
+        // between knocking and coming back to the map.
+        if (payload.type === "encounter_event" && payload.data) {
+          const { type, target_actor_id } = payload.data;
+          if (target_actor_id) {
+            if (type === "encounter_started") {
+              setEngaged(prev => new Set(prev).add(target_actor_id));
+            } else if (type === "encounter_ended" || type === "encounter_rejected") {
+              setEngaged(prev => {
+                if (!prev.has(target_actor_id)) return prev;
+                const next = new Set(prev);
+                next.delete(target_actor_id);
+                return next;
+              });
+            }
+          }
         }
       } catch {}
     };
@@ -890,6 +924,22 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
   }
 
   // If scene is active render it instead of map (player_home only)
+  // Session 153 — whose door this is, by the same rule handleSpawn knocks on:
+  // the person who LIVES here, wherever they happen to be, else whoever is
+  // standing here who is not you.
+  function knockTargetFor(loc) {
+    if (!loc) return null;
+    const me = user?.worlds?.find(w => w.world_id === world.id)?.actor_id;
+    const locationId = loc.place_id || loc.id;
+    const everyone = locations.flatMap(l => l.actors || []);
+    return everyone.find(a => a.actor_id !== me && a.home_place_id === locationId)
+        || (loc.actors || []).find(a => a.actor_id !== me)
+        || null;
+  }
+  const knockTarget  = selected && selected.category === "residential"
+    ? knockTargetFor(selected) : null;
+  const knockBlocked = !!(knockTarget && engaged.has(knockTarget.actor_id));
+
   // knock and venue scenes now have their own routes → /encounter/knock/:id and /encounter/venue/:wid/:lid
   if (sceneData && sceneData.mode === "player_home") {
     const onLeave = () => {
@@ -1248,9 +1298,11 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
                   <button
                     className={styles.spawnBtn}
                     onClick={handleSpawn}
-                    disabled={spawning}
+                    disabled={spawning || knockBlocked}
                   >
-                    {spawning
+                    {knockBlocked
+                      ? "You are already with them"
+                      : spawning
                       ? (selected.category === "residential_home" ? "Entering…" : selected.category === "residential" ? "Knocking…" : "Entering…")
                       : (selected.category === "residential_home" ? "Enter your home →" : selected.category === "residential" ? "Knock on door →" : "Enter this location →")}
                   </button>
