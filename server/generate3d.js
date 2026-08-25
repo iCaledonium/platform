@@ -42,6 +42,7 @@ import path from "path";
 import os from "os";
 import zlib from "zlib";
 import fs from "fs";
+import crypto from "crypto";
 import sharp from "sharp";
 import express from "express";
 const execAsync = promisify(exec);
@@ -2041,7 +2042,130 @@ export async function deleteActorTmpFolder(actorId) {
   }
 }
 
+// Session 152 — what she looks like, as one short string.
+//
+// Everything that changes her published appearance and nothing that does not:
+// the body file she was built from, the garments and their per-item transforms,
+// and the morph values. Renaming her, or editing her psychology, must not
+// trigger a 13MB rebuild — which is exactly why actors.updated_at is the wrong
+// thing to compare.
+export function appearanceHash({ glbUrl, glbMtimeMs, draft }) {
+  const d = draft || {};
+  const material = {
+    // Session 152 — the bake pipeline's own version is an appearance input.
+    // The hash otherwise only sees her data, so a change to HOW the runtime
+    // file is built (skin-layer culling, rebind fixes) left every existing
+    // build reading "fresh" while being built by superseded logic. Bumping
+    // this flips every actor to stale and surfaces the Rebuild button.
+    bake: "v8-weakmap-layer-state",
+    glbUrl: glbUrl || null,
+    glbMtimeMs: glbMtimeMs || 0,
+    wardrobe: d.selectedAccessoryGlbUrls || {},
+    scales: d.accessoryScales || {},
+    offsets: d.accessoryOffsets || {},
+    rotations: d.accessoryRotations || {},
+    parts: d.accessoryParts || {},
+    tints: d.accessoryTints || {},
+    height: d.bodyHeightCm ?? d.bodyHeight ?? null,
+    torso: d.bodyTorsoLength ?? null,
+    arms: d.bodyArmsLength ?? null,
+    legs: d.bodyLegsLength ?? null,
+    morphs: d.extraMorphValues || {},
+  };
+  // Key order is not guaranteed across writers, so sort before hashing or the
+  // same character fingerprints differently depending on who saved her last.
+  const stable = JSON.stringify(material, Object.keys(material).sort());
+  return crypto.createHash("sha1").update(stable).digest("hex").slice(0, 12);
+}
+
+function currentAppearance(db, __dirname, actorId) {
+  const row = db.prepare(
+    `SELECT id, media_folder, glb_url, draft_state, runtime_glb_url, runtime_glb_hash
+       FROM actors WHERE id = ?`).get(actorId);
+  if (!row) return null;
+
+  let mtime = 0;
+  if (row.glb_url) {
+    try {
+      mtime = fs.statSync(path.join(__dirname, "../public", row.glb_url)).mtimeMs;
+    } catch { /* never exported yet — 0 is a fine component of the fingerprint */ }
+  }
+  let draft = {};
+  try { draft = JSON.parse(row.draft_state || "{}"); } catch { /* unparseable draft is an empty one */ }
+
+  return { row, hash: appearanceHash({ glbUrl: row.glb_url, glbMtimeMs: mtime, draft }) };
+}
+
 export function registerGenerate3DRoutes(app, { db, __dirname, authUser }) {
+  // What the worlds should be loading, and whether it is still true.
+  //
+  // `fresh` is the whole point of the naming scheme: the published file carries
+  // the fingerprint it was built from, so "is this current?" is a string
+  // comparison against her rows rather than a flag somebody has to set.
+  app.get("/api/actors/:id/runtime", (req, res) => {
+    const user = authUser(req);
+    if (!user) return res.status(401).json({ error: "unauthorized" });
+
+    const cur = currentAppearance(db, __dirname, req.params.id);
+    if (!cur) return res.status(404).json({ error: "not found" });
+
+    const built = cur.row.runtime_glb_url;
+    // The stored URL carries ?v=, which is not part of the path on disk.
+    const onDisk = built && fs.existsSync(
+      path.join(__dirname, "../public", built.split("?")[0]));
+
+    res.json({
+      url: onDisk ? built : null,
+      hash: cur.hash,
+      builtHash: cur.row.runtime_glb_hash || null,
+      fresh: !!onDisk && cur.row.runtime_glb_hash === cur.hash,
+    });
+  });
+
+  // The wizard finishing her. The file is named for its fingerprint, so a
+  // rebuild of an unchanged character writes the same name and a changed one
+  // writes a new file that nothing was holding a stale reference to.
+  app.post("/api/actors/:id/runtime-glb",
+    express.raw({ type: "model/gltf-binary", limit: "500mb" }),
+    async (req, res) => {
+      const user = authUser(req);
+      if (!user) return res.status(401).json({ error: "unauthorized" });
+      const actorId = req.params.id;
+
+      const owned = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(actorId, user.id);
+      if (!owned) return res.status(404).json({ error: "not found" });
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        return res.status(400).json({ error: "empty or missing glb body — ensure Content-Type: model/gltf-binary" });
+      }
+
+      const cur = currentAppearance(db, __dirname, actorId);
+      const hash = cur.hash;
+
+      try {
+        const dir = path.join(__dirname, "../public/media/actors", cur.row.media_folder, "3d");
+        await fs.promises.mkdir(dir, { recursive: true });
+        // One stable path, overwritten in place — nothing accumulates and every
+        // reference to her runtime model keeps working across rebuilds.
+        const name = `runtime_${actorId}.glb`;
+        await fs.promises.writeFile(path.join(dir, name), req.body);
+
+        // The fingerprint rides on the URL rather than in the filename. A stable
+        // name is what makes the path predictable; it is also what lets a
+        // browser or a CDN serve yesterday's body forever, and that failure
+        // looks like a character who did not change her top rather than like a
+        // cache. ?v= costs nothing and makes every rebuild a different URL.
+        const url = `/media/actors/${cur.row.media_folder}/3d/${name}?v=${hash}`;
+        db.prepare(`UPDATE actors SET runtime_glb_url = ?, runtime_glb_hash = ?, updated_at = ? WHERE id = ?`)
+          .run(url, hash, new Date().toISOString(), actorId);
+
+        console.log(`[runtime-glb] ${actorId}: built ${(req.body.length / 1e6).toFixed(1)}MB as ${name}`);
+        res.json({ saved: true, url, hash });
+      } catch (err) {
+        console.error(`[runtime-glb] ${actorId}: failed:`, err);
+        res.status(500).json({ error: "failed to save runtime glb" });
+      }
+    });
+
   app.post("/api/actors/:id/generate-3d", (req, res) => {
     const user = authUser(req);
     if (!user) return res.status(401).json({ error: "unauthorized" });

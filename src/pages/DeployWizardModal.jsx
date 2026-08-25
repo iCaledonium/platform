@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { fmtAmount, fmtSigned, fmtMoney } from "../lib/money.js";
 import AmountInput from "../lib/AmountInput.jsx";
+import { isPreciseHome, IMPRECISE_HOME_HINT } from "../lib/placePrecision.js";
 
 const S = {
   overlay: { position:"fixed",inset:0,zIndex:1000,background:"rgba(238,236,234,0.72)",backdropFilter:"blur(12px)",WebkitBackdropFilter:"blur(12px)",display:"flex",alignItems:"center",justifyContent:"center",padding:"1.5rem" },
@@ -221,7 +222,7 @@ function StepWorld({ actor, state, setState }) {
   async function pickPlace(p) {
     setSearchResults([]);
     setSearchQuery(p.description);
-    setState(prev => ({...prev, home: { place_id: p.place_id, address: p.description, name: p.description, home_type: prev.home?.home_type }}));
+    setState(prev => ({...prev, home: { place_id: p.place_id, address: p.description, name: p.description, types: p.types, home_type: prev.home?.home_type }}));
     try {
       const controller = new AbortController();
       setTimeout(() => controller.abort(), 5000);
@@ -332,22 +333,38 @@ function StepWorld({ actor, state, setState }) {
                 {searching && <span style={{ ...S.sans, position:"absolute", right:8, top:9, fontSize:11, color:"#a8a5a0" }}>…</span>}
                 {searchResults.length > 0 && (
                   <div style={{ position:"absolute", top:"calc(100% + 4px)", left:0, right:0, background:"#fff", border:"1px solid rgba(0,0,0,.1)", borderRadius:9, zIndex:20, overflow:"hidden", boxShadow:"0 4px 20px rgba(0,0,0,.1)" }}>
-                    {searchResults.map(p => (
+                    {searchResults.map(p => {
+                      const precise = isPreciseHome(p.types);
+                      return (
                       <div key={p.place_id} onClick={() => pickPlace(p)} style={{ padding:"8px 10px", cursor:"pointer", fontSize:12 }}
                         onMouseEnter={e=>e.currentTarget.style.background="#f5f2ef"}
                         onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-                        <div style={{ ...S.sans, color:"#1a1814" }}>{p.description}</div>
+                        <div style={{ ...S.sans, color: precise ? "#1a1814" : "#a8a5a0" }}>{p.description}</div>
+                        {!precise && (
+                          <div style={{ ...S.sans, fontSize:10, color:"#b8763a", marginTop:2 }}>
+                            {IMPRECISE_HOME_HINT}
+                          </div>
+                        )}
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
 
               {state.home?.place_id && (
                 <>
-                  <div style={{ padding:"8px 10px", borderRadius:9, border:"1.5px solid #1a1814", background:"rgba(26,24,20,.03)" }}>
+                  <div style={{ padding:"8px 10px", borderRadius:9,
+                    border:`1.5px solid ${isPreciseHome(state.home.types) ? "#1a1814" : "#b8763a"}`,
+                    background: isPreciseHome(state.home.types) ? "rgba(26,24,20,.03)" : "rgba(184,118,58,.06)" }}>
                     <div style={{ ...S.sans, fontSize:12, fontWeight:500, color:"#1a1814" }}>{state.home.address}</div>
                     {state.home.lat && <div style={{ ...S.sans, fontSize:10, color:"#a8a5a0", marginTop:2 }}>{state.home.lat?.toFixed(5)}, {state.home.lng?.toFixed(5)}</div>}
+                    {!isPreciseHome(state.home.types) && (
+                      <div style={{ ...S.sans, fontSize:11, color:"#8a5624", marginTop:5, lineHeight:1.45 }}>
+                        That is the whole street. Search again with a house number — she needs a
+                        building to live in, not a road.
+                      </div>
+                    )}
                   </div>
                   <div style={{ display:"flex", gap:6 }}>
                     {["apartment","house"].map(t => (
@@ -2402,6 +2419,7 @@ export default function DeployWizardModal({ actor, onClose, onDeployed }) {
       // isn't running.
       if (state.world.status !== "running") return `${state.world.name} is stopped — start it to continue`;
       if (!state.home?.place_id)  return "Set her home address";
+      if (!isPreciseHome(state.home.types)) return "Add a house number — a street isn't an address";
       if (!state.home?.home_type) return "Choose apartment or house";
       return null;
     }

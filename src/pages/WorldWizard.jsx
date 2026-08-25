@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { CAPABILITIES, LlmCapabilityGrid } from "./LlmConfigPanel.jsx";
+import { isPreciseHome, IMPRECISE_HOME_HINT } from "../lib/placePrecision.js";
 
 const CITIES = [
   {n:"Stockholm",    lat:59.33, lng:18.07,  tz:"Europe/Stockholm",               x:528,y:85},
@@ -211,7 +212,10 @@ export default function WorldWizard({ onClose, onCreated }) {
           news_feed_url: FEED_MAP[city.n] || DEFAULT_FEED,
           modules: enabledModules,
           invitees: invitees.map(u => u.id),
-          home_address: homeAddress || undefined,
+          // Session 150 — a route-level pick is dropped rather than sent. See
+          // lib/placePrecision.js; the UI already refuses to confirm one, this
+          // is the belt to that braces.
+          home_address: (homeAddress && isPreciseHome(homeAddress.types)) ? homeAddress : undefined,
           llm_capabilities: llmCapabilities,
           xtts_url: xttsUrl.trim() || undefined,
         }),
@@ -412,21 +416,37 @@ export default function WorldWizard({ onClose, onCreated }) {
                             setHomeQuery(s.description);
                             setHomeSuggestions([]);
                             const det = await fetch(`/api/places/details?place_id=${s.place_id}`).then(r=>r.ok?r.json():null);
-                            const loc = det?.result?.geometry?.location;
-                            setHomeAddress({ description: s.description, place_id: s.place_id, lat: loc?.lat, lng: loc?.lng });
-                          }} style={{padding:"10px 14px",fontSize:13,fontFamily:"'DM Sans',system-ui,sans-serif",cursor:"pointer",borderBottom:"1px solid rgba(0,0,0,.05)",color:"#1a1814"}}
+                            // Session 150 — this read det.result.geometry.location,
+                            // which is Google's raw shape. /api/places/details
+                            // returns a flattened {place_id,name,address,lat,lng},
+                            // so lat/lng were always undefined and the world
+                            // creator's own home has never been saved with
+                            // coordinates.
+                            setHomeAddress({ description: s.description, place_id: s.place_id, lat: det?.lat, lng: det?.lng, types: det?.types ?? s.types });
+                          }} style={{padding:"10px 14px",fontSize:13,fontFamily:"'DM Sans',system-ui,sans-serif",cursor:"pointer",borderBottom:"1px solid rgba(0,0,0,.05)",
+                            color: isPreciseHome(s.types) ? "#1a1814" : "#a8a5a0"}}
                             onMouseEnter={e=>e.currentTarget.style.background="rgba(0,0,0,.03)"}
                             onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
                             {s.description}
+                            {!isPreciseHome(s.types) && (
+                              <div style={{fontSize:10,color:"#b8763a",marginTop:2}}>{IMPRECISE_HOME_HINT}</div>
+                            )}
                           </div>
                         ))}
                       </div>
                     )}
                   </div>
                   {homeAddress && (
-                    <div style={{marginTop:8,padding:"8px 12px",background:"rgba(29,158,117,.06)",border:"1px solid rgba(29,158,117,.3)",borderRadius:8,fontSize:12,color:"#1D9E75",fontFamily:"'DM Sans',system-ui,sans-serif"}}>
-                      ✓ {homeAddress.description}
-                    </div>
+                    isPreciseHome(homeAddress.types) ? (
+                      <div style={{marginTop:8,padding:"8px 12px",background:"rgba(29,158,117,.06)",border:"1px solid rgba(29,158,117,.3)",borderRadius:8,fontSize:12,color:"#1D9E75",fontFamily:"'DM Sans',system-ui,sans-serif"}}>
+                        ✓ {homeAddress.description}
+                      </div>
+                    ) : (
+                      <div style={{marginTop:8,padding:"8px 12px",background:"rgba(184,118,58,.07)",border:"1px solid rgba(184,118,58,.35)",borderRadius:8,fontSize:12,color:"#8a5624",fontFamily:"'DM Sans',system-ui,sans-serif",lineHeight:1.45}}>
+                        That is the whole street. Search again with a house number — a home
+                        needs a building, not a road. See lib/placePrecision.js.
+                      </div>
+                    )
                   )}
                 </div>
               )}

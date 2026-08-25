@@ -1,5 +1,4 @@
 import Database from "better-sqlite3";
-import { randomUUID } from "crypto";
 import path from "path";
 import os from "os";
 
@@ -325,25 +324,21 @@ for (const e of employees) {
   insert.run(e.id, e.name, e.email);
 }
 
-// ── Seed world memberships ───────────────────────────────────────────────────
-// Magnus is owner/player. Tommy, Johan, David are viewers.
-
-const STOCKHOLM_ID = "e7368020-fc19-4914-95ac-2f7c5508a13c";
-
-const memberships = [
-  { user_id: "mk", world_id: STOCKHOLM_ID, actor_id: "magnus-klack-actor",   role: "owner" },
-  { user_id: "tn", world_id: STOCKHOLM_ID, actor_id: "tommy-norberg-actor",  role: "viewer" },
-  { user_id: "jm", world_id: STOCKHOLM_ID, actor_id: "johan-molin-actor",    role: "viewer" },
-  { user_id: "dn", world_id: STOCKHOLM_ID, actor_id: "david-norberg-actor",  role: "viewer" },
-];
-
-const insertMembership = db.prepare(`
-  INSERT OR IGNORE INTO world_memberships (id, user_id, world_id, actor_id, role, inserted_at, updated_at)
-  VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-`);
-
-for (const m of memberships) {
-  insertMembership.run(randomUUID(), m.user_id, m.world_id, m.actor_id, m.role);
-}
+// Session 150 — this used to unconditionally seed 4 world_memberships for
+// world e7368020 on every single server start: it ran on every boot, not
+// once, relying on the table's UNIQUE(user_id, world_id, actor_id) to make
+// repeat runs a no-op. That world was deliberately deleted at some point
+// after this was written. The seed did not know that and kept winning: the
+// membership rows this same session's owner/player rename and delete_world
+// leak fix both had to clean up came back within one restart, because
+// nothing here ever stopped recreating them — with the pre-rename "viewer"
+// role baked into the array, on top of it. Found live: deleted the 4 rows
+// by hand, restarted the service to test an unrelated fix, and they were
+// back with fresh ids and the old role name inside of two seconds.
+//
+// This was one-time bootstrap convenience for a fresh empty database, not
+// something meant to run forever against a real one. Removed rather than
+// updated to say "player" — reseeding a deleted world's membership is wrong
+// regardless of which word it uses for the role.
 
 export default db;

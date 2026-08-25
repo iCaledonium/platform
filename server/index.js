@@ -10,7 +10,7 @@ import zlib from "zlib";
 import { fileURLToPath } from "url";
 import multer from "multer";
 import db from "./db.js";
-import { registerGenerate3DRoutes, deleteActorTmpFolder } from "./generate3d.js";
+import { registerGenerate3DRoutes, deleteActorTmpFolder, appearanceHash } from "./generate3d.js";
 import { mergeAnimationIntoActorGlb, removeAnimationFromActorGlb, parseDufFrames } from "./animations.js";
 import { educationFromCv } from "./cv_edu.mjs";
 
@@ -26,6 +26,28 @@ try { db.prepare(`ALTER TABLE actors ADD COLUMN draft_state TEXT`).run(); } catc
 // interior_templates); world/place binding stays with the deploy wizard.
 // Same idempotent-at-boot pattern as draft_state above.
 try { db.prepare(`ALTER TABLE actors ADD COLUMN default_home_template_url TEXT`).run(); } catch {}
+// Session 152 — the runtime character.
+//
+// glb_url is a working file: morph targets intact so every slider stays live,
+// garments at identity so the editor can re-apply its own transforms, each
+// garment keeping its own skeleton. All three are right for a model that has to
+// round-trip through ActorModelPanel, and all three are wrong for one that gets
+// fetched by a world and never edited again — 74.6MB of sculpting nobody reads,
+// clothes that need the consumer to know how to dress her, and a `walk` clip
+// that moves the body while the jeans stand still.
+//
+// So the wizard publishes a second file and this records it. The two never
+// fight: editing writes glb_url, finishing writes this.
+//
+// Named for what it is used for, not for what happened to be wrong when it was
+// written. "dressed" described the first symptom anyone noticed — an undressed
+// figure in a doorway — but the clothes are one of three differences, and the
+// file's job is to be the one a running world loads.
+try { db.prepare(`ALTER TABLE actors ADD COLUMN runtime_glb_url TEXT`).run(); } catch {}
+// The fingerprint the published file was built from — body, wardrobe, morph
+// values. Staleness is then a comparison rather than a signal somebody has to
+// remember to send: no cache to invalidate, and no hook to add to MiniGlbViewer.
+try { db.prepare(`ALTER TABLE actors ADD COLUMN runtime_glb_hash TEXT`).run(); } catch {}
 // Session 107 — the actors-table rebuild (Session ~105 schema recovery)
 // came back WITHOUT the appearance column while the save handlers still
 // referenced it; every draft finalize 500'd from that day until the
@@ -260,11 +282,11 @@ app.post("/api/worlds/:id/members", async (req, res) => {
   const ok = requireWorld(req, res, req.params.id, "owner");
   if (!ok) return;
 
-  const { email, role = "viewer" } = req.body || {};
-  if (!["owner", "viewer"].includes(role)) {
-    return res.status(400).json({ error: "role must be owner or viewer" });
+  const { email, role = "player" } = req.body || {};
+  if (!["owner", "player"].includes(role)) {
+    return res.status(400).json({ error: "role must be owner or player" });
   }
-  const target = db.prepare(`SELECT id, name FROM users WHERE email = ? AND status = 'active'`).get(email);
+  const target = db.prepare(`SELECT id, name, gender FROM users WHERE email = ? AND status = 'active'`).get(email);
   if (!target) return res.status(404).json({ error: "user not found" });
 
   const already = db.prepare(
@@ -279,7 +301,7 @@ app.post("/api/worlds/:id/members", async (req, res) => {
     const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.id}/members`, {
       method: "POST",
       headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: target.id, name: target.name }),
+      body: JSON.stringify({ user_id: target.id, name: target.name, gender: target.gender ?? null }),
     });
     if (!r.ok) return res.status(502).json({ error: `Simulator refused: HTTP ${r.status}` });
     const body = await r.json();
@@ -301,12 +323,12 @@ app.patch("/api/worlds/:id/members/:user_id", (req, res) => {
   if (!ok) return;
 
   const { role } = req.body || {};
-  if (!["owner", "viewer"].includes(role)) {
-    return res.status(400).json({ error: "role must be owner or viewer" });
+  if (!["owner", "player"].includes(role)) {
+    return res.status(400).json({ error: "role must be owner or player" });
   }
 
   // A world must keep at least one owner, or it becomes unmanageable by anyone.
-  if (role === "viewer") {
+  if (role === "player") {
     const owners = db.prepare(
       `SELECT COUNT(*) AS n FROM world_memberships WHERE world_id = ? AND role = 'owner'`
     ).get(req.params.id).n;
@@ -343,20 +365,39 @@ app.delete("/api/worlds/:id/members/:user_id", async (req, res) => {
 
   // Removing a person erases their player actor, not the characters they
   // deployed — those belong to whoever owns them and stay where they are.
+  // Session 150 — do not swallow this.
+  //
+  // The original comment here read "the membership row is the authority; a stale
+  // sim actor is harmless". Both halves were wrong. The simulator was returning
+  // 500 (a module-attribute ordering bug on its side), fetch does not throw on
+  // 500 so the catch never even fired, and the removed members' player actors
+  // stayed in the world — found only by reading the actor table by hand.
+  //
+  // The membership row is still removed either way: a person who has lost access
+  // should lose it even if the simulator is unreachable. But the failure is now
+  // reported rather than assumed away.
+  let simWarning = null;
   try {
-    await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.id}/members/${req.params.user_id}`, {
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.id}/members/${req.params.user_id}`, {
       method: "DELETE", headers: { "X-Service-Token": SERVICE_TOKEN },
     });
-  } catch { /* the membership row is the authority; a stale sim actor is harmless */ }
+    if (!r.ok) {
+      simWarning = `Membership removed, but the simulator could not erase their player actor (HTTP ${r.status}).`;
+      console.warn(`[members] simulator refused DELETE for ${req.params.user_id}: HTTP ${r.status}`);
+    }
+  } catch (e) {
+    simWarning = `Membership removed, but the simulator was unreachable (${e.message}) — their player actor may remain.`;
+    console.warn(`[members] simulator unreachable on DELETE:`, e.message);
+  }
 
   db.prepare(`DELETE FROM world_memberships WHERE world_id = ? AND user_id = ?`)
     .run(req.params.id, req.params.user_id);
-  res.json({ ok: true });
+  res.json({ ok: true, ...(simWarning ? { warning: simWarning } : {}) });
 });
 
 // ── GET /api/worlds/:id/members — users who are members of this world ─────────
 app.get("/api/worlds/:id/members", (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const members = db.prepare(`
@@ -554,9 +595,95 @@ app.get("/api/ambient-actors/:actor_id/portrait-status", async (req, res) => {
   }
 });
 
+// ── PUT /api/users/:user_id/gender ───────────────────────────────────────────
+//
+// There is no registration yet, so this is how a user's gender gets recorded at
+// all. It writes the platform's copy and then pushes it to every world the user
+// has a player actor in, because the simulator holds its own and the two drift
+// silently otherwise.
+//
+// The response reports each world separately: a partial success has to be
+// visible, or the platform would claim a sync it did not achieve.
+app.put("/api/users/:user_id/gender", async (req, res) => {
+  const auth = authUser(req);
+  if (!auth) return res.status(401).json({ error: "unauthorized" });
+
+  // authUser returns only {id, name} — user_type is not on it, so checking
+  // auth.user_type directly would have been undefined and refused everyone.
+  const caller = db.prepare(`SELECT user_type FROM users WHERE id = ?`).get(auth.id);
+  if (caller?.user_type !== "staff") return res.status(403).json({ error: "staff only" });
+
+  const { user_id } = req.params;
+  const raw = req.body?.gender;
+  const allowed = ["male", "female", "non-binary", null];
+  const gender = raw === undefined || raw === "" ? null : raw;
+
+  if (!allowed.includes(gender)) {
+    return res.status(422).json({ error: "gender must be male, female, non-binary, or null" });
+  }
+
+  const target = db.prepare(`SELECT id, name FROM users WHERE id = ?`).get(user_id);
+  if (!target) return res.status(404).json({ error: "user not found" });
+
+  db.prepare(`UPDATE users SET gender = ?, updated_at = ? WHERE id = ?`)
+    .run(gender, new Date().toISOString(), user_id);
+
+  const memberships = db.prepare(
+    `SELECT world_id, actor_id FROM world_memberships WHERE user_id = ?`
+  ).all(user_id);
+
+  const synced = [];
+  for (const m of memberships) {
+    try {
+      const r = await fetch(
+        `${SIMULATOR_URL}/internal/worlds/${m.world_id}/members/${user_id}`,
+        {
+          method: "PATCH",
+          headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+          body: JSON.stringify({ actor_id: m.actor_id, gender }),
+        }
+      );
+      synced.push({ world_id: m.world_id, actor_id: m.actor_id, ok: r.ok, status: r.status });
+    } catch (e) {
+      synced.push({ world_id: m.world_id, actor_id: m.actor_id, ok: false, error: e.message });
+    }
+  }
+
+  const failed = synced.filter(s => !s.ok);
+  res.status(failed.length ? 502 : 200).json({
+    ok: failed.length === 0,
+    user_id,
+    name: target.name,
+    gender,
+    worlds: synced,
+  });
+});
+
+// ── POST /api/worlds/:world_id/crowd/approach ────────────────────────────────
+//
+// Walks up to somebody in a venue's background crowd. They have no record
+// until this call; the simulator recomputes the room, checks they are still
+// standing in it, and writes them one. Only the ref is forwarded — the
+// simulator supplies the person, so a client cannot invent a guest.
+app.post("/api/worlds/:world_id/crowd/approach", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
+  if (!ok) return;
+  const { world_id } = req.params;
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/crowd/approach`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Service-Token": SERVICE_TOKEN },
+      body: JSON.stringify({ place_id: req.body?.place_id, ref: req.body?.ref })
+    });
+    res.status(r.status).json(await r.json());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── POST /api/worlds/:world_id/ambient-encounter/start ───────────────────────
 app.post("/api/worlds/:world_id/ambient-encounter/start", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const { world_id } = req.params;
@@ -574,7 +701,7 @@ app.post("/api/worlds/:world_id/ambient-encounter/start", async (req, res) => {
 
 // ── GET /api/worlds/:world_id/ambient-encounter/:id/opening ─────────────────
 app.get("/api/worlds/:world_id/ambient-encounter/:encounter_id/opening", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const { world_id, encounter_id } = req.params;
@@ -588,7 +715,7 @@ app.get("/api/worlds/:world_id/ambient-encounter/:encounter_id/opening", async (
 
 // ── POST /api/worlds/:world_id/ambient-encounter/:id/message ─────────────────
 app.post("/api/worlds/:world_id/ambient-encounter/:encounter_id/message", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const { world_id, encounter_id } = req.params;
@@ -598,7 +725,14 @@ app.post("/api/worlds/:world_id/ambient-encounter/:encounter_id/message", async 
       headers: { "Content-Type": "application/json", "X-Service-Token": SERVICE_TOKEN },
       body: JSON.stringify(req.body)
     });
-    res.json(await r.json());
+    // Session 151 — forward the simulator's status.
+    //
+    // This answered 200 whatever came back, so a 404 "encounter not found"
+    // arrived at the browser looking like a successful reply with no words in
+    // it, and the chat drew an empty bubble. A failure that renders as silence
+    // is worse than a failure that says so: the room looked like it had nothing
+    // to say to you.
+    res.status(r.status).json(await r.json());
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -606,7 +740,7 @@ app.post("/api/worlds/:world_id/ambient-encounter/:encounter_id/message", async 
 
 // ── POST /api/worlds/:world_id/ambient-encounter/:id/end ─────────────────────
 app.post("/api/worlds/:world_id/ambient-encounter/:encounter_id/end", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const { world_id, encounter_id } = req.params;
@@ -678,6 +812,27 @@ app.delete("/api/worlds/:id", async (req, res) => {
   // time this throws. fs.promises.rm is the actual Promise-returning API.
   const worldMediaDir = path.join(__dirname, "../public/media/worlds", id);
   fs.promises.rm(worldMediaDir, { recursive: true, force: true }).catch(() => {});
+
+  // This is the OTHER place a world's media lives, and this cleanup never
+  // reached it. POST /api/actors/:id/media stores photos/audio for a
+  // world-specific character at public/media/actors/{slug}/worlds/{world_id}/
+  // — a path nested under the ACTOR, not the world — specifically to dodge
+  // the nginx rule that sends /media/worlds/* to the simulator (see that
+  // handler's own comment). Deleting worldMediaDir above never touches this.
+  // Confirmed live: an old world's actor photo was still HTTP 200 here after
+  // the world itself, and its /media/worlds/ tree, were both long gone.
+  // There's no per-world index of which actor slugs have content, so this
+  // scans every actor folder for a worlds/{id} subdirectory and removes it —
+  // cheap; actor counts here are small, and this runs once per world delete.
+  fs.promises.readdir(path.join(__dirname, "../public/media/actors"), { withFileTypes: true })
+    .then(entries => Promise.all(
+      entries.filter(e => e.isDirectory()).map(e => {
+        const worldSubdir = path.join(__dirname, "../public/media/actors", e.name, "worlds", id);
+        return fs.promises.rm(worldSubdir, { recursive: true, force: true }).catch(() => {});
+      })
+    ))
+    .catch(() => {});
+
   res.json({ ok: true });
 });
 
@@ -700,13 +855,16 @@ app.post("/api/worlds", async (req, res) => {
 
   // Resolve invitee names from users table
   const inviteeUsers = invitees.map(id => {
-    const u = db.prepare(`SELECT id, name FROM users WHERE id = ?`).get(id);
+    const u = db.prepare(`SELECT id, name, gender FROM users WHERE id = ?`).get(id);
     return u || null;
   }).filter(Boolean);
 
-  // Full members list: creator + invitees
+  // Full members list: creator + invitees. `gender` rides along so the player
+  // actor is minted with one — every generated actor had a gender and no human
+  // did, purely because this payload never carried the field.
+  const creator = db.prepare(`SELECT id, name, gender FROM users WHERE id = ?`).get(user.id);
   const members = [
-    { id: user.id, name: user.name },
+    { id: user.id, name: user.name, gender: creator?.gender ?? null },
     ...inviteeUsers
   ];
 
@@ -717,7 +875,7 @@ app.post("/api/worlds", async (req, res) => {
       body: JSON.stringify({
         id: world_id, name, city, lat, lng, timezone,
         news_feed_url, modules, scenario_seed,
-        members: members.map((m, i) => ({ ...m, role: i === 0 ? "owner" : "viewer" })),
+        members: members.map((m, i) => ({ ...m, role: i === 0 ? "owner" : "player" })),
         home_address: home_address || undefined,
         llm_capabilities,
         // Session 150 — per-world XTTS endpoint. The voice server runs on a GPU
@@ -743,10 +901,11 @@ app.post("/api/worlds", async (req, res) => {
     `);
     insertMembership.run(randomUUID(), user.id, world_id, actorMap[user.id] || `${user.id}-actor`, "owner", now, now);
     for (const invitee of inviteeUsers) {
-      // Session 150 — "viewer", not "member". Invitees were recorded as "member",
-      // a third role string that no code has ever read, alongside the "viewer"
-      // rows the existing worlds carry. Two names for the same nothing.
-      insertMembership.run(randomUUID(), invitee.id, world_id, actorMap[invitee.id] || `${invitee.id}-actor`, "viewer", now, now);
+      // Session 150 — "player". Invitees were originally recorded as "member", a
+      // third role string no code ever read, alongside the "viewer" rows the
+      // existing worlds carried — two names for the same nothing. Both are now
+      // "player", which is what the rung actually is.
+      insertMembership.run(randomUUID(), invitee.id, world_id, actorMap[invitee.id] || `${invitee.id}-actor`, "player", now, now);
     }
 
     res.json({ world_id, name, status: "running", ...simWorld });
@@ -791,20 +950,28 @@ const SERVICE_TOKEN = process.env.PLATFORM_SERVICE_TOKEN || "";
 // authenticated user could list any world's cast, read and edit a character's
 // psychology and salary, or stop the world outright, purely by knowing its id.
 //
-// Roles are `owner` and `viewer`, and a world may have SEVERAL owners — the
+// Roles are `owner` and `player`, and a world may have SEVERAL owners — the
 // check is set membership, not "is this the creator".
 //
-//   viewer — read the world and interact with it
-//   owner  — everything a viewer can do, plus start/stop, configure, deploy,
+//   player — lives in the world: enters it, has a player actor of their own,
+//            talks to the characters, and is subject to what the world does.
+//            Cannot change how the world is built.
+//   owner  — everything a player can do, plus start/stop, configure, deploy,
 //            delete, and manage who else belongs
 //
+// Session 150 — this rung was called "viewer" for most of the session, which
+// misdescribed it: a non-owner member has a player actor minted for them at
+// join time and enters the world through /world/:worldId. They are playing, not
+// watching. The word was doing real harm in the UI, where it told someone their
+// own character's world was something they merely observed.
+//
 // A third string, "member", was written for invitees at world creation and read
-// by nothing. It is collapsed into "viewer" rather than defined, because a role
+// by nothing. It is collapsed into "player" rather than defined, because a role
 // no code consults cannot be said to mean anything.
 //
 // Returns the membership row on success. On failure it has ALREADY answered —
 // callers must `return` immediately, hence the `if (!ok) return;` shape.
-function requireWorld(req, res, worldId, minRole = "viewer") {
+function requireWorld(req, res, worldId, minRole = "player") {
   const user = authUser(req);
   if (!user) { res.status(401).json({ error: "unauthorized" }); return null; }
 
@@ -878,7 +1045,7 @@ async function simFetch(path, method = "GET") {
 }
 
 app.get("/api/worlds/:id/status", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   try { res.json(await simFetch(`/internal/worlds/${req.params.id}/status`)); }
   catch { res.status(502).json({ error: "simulator unreachable" }); }
@@ -936,7 +1103,7 @@ function resolveSimActor(world_id, actor_id) {
 // Identity and psychology of the deployed instance — the copies the simulator
 // reads, as opposed to the template at /actors/:id that a deploy ships from.
 app.get("/api/worlds/:world_id/actors/:actor_id/profile", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const { world_id, actor_id } = req.params;
@@ -968,7 +1135,7 @@ app.patch("/api/worlds/:world_id/actors/:actor_id/profile", async (req, res) => 
 
 // ── GET /api/worlds/:world_id/actors/:actor_id/schedule ──────────────────────
 app.get("/api/worlds/:world_id/actors/:actor_id/schedule", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const { world_id, actor_id } = req.params;
@@ -985,7 +1152,7 @@ app.get("/api/worlds/:world_id/actors/:actor_id/schedule", async (req, res) => {
 // Media captured in this world. The simulator indexes it per actor; the actor
 // id is already world-specific, so no extra scoping is needed.
 app.get("/api/worlds/:world_id/actors/:actor_id/media", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const { world_id, actor_id } = req.params;
@@ -999,7 +1166,7 @@ app.get("/api/worlds/:world_id/actors/:actor_id/media", async (req, res) => {
 });
 
 app.get("/api/worlds/:world_id/actors/:actor_id/economy", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const { world_id, actor_id } = req.params;
@@ -1031,7 +1198,7 @@ app.patch("/api/worlds/:world_id/actors/:actor_id/economy", async (req, res) => 
 });
 
 app.get("/api/worlds/:world_id/actors/:actor_id/videos", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   try {
     const { world_id, actor_id } = req.params;
@@ -1052,7 +1219,7 @@ app.get("/api/worlds/:world_id/actors/:actor_id/videos", async (req, res) => {
 
 // ── GET /api/worlds/:id/modules ─────────────────────────────────────────────
 app.get("/api/worlds/:id/modules", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   try {
     const simRes = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.id}/modules`, {
@@ -1094,7 +1261,7 @@ app.get("/api/llm-config/available", async (req, res) => {
 
 // ── GET /api/worlds/:id/llm-config ───────────────────────────────────────────
 app.get("/api/worlds/:id/llm-config", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   try {
     const simRes = await fetch(`${SIMULATOR_URL}/internal/config/llm?world_id=${req.params.id}`, {
@@ -1166,7 +1333,7 @@ app.post("/api/worlds/:id/llm-config/providers", async (req, res) => {
 
 // ── GET /api/worlds/:id/xtts ─────────────────────────────────────────────────
 app.get("/api/worlds/:id/xtts", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   try {
     const simRes = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.id}/xtts`, {
@@ -1326,7 +1493,7 @@ app.post("/api/worlds/:world_id/issue-key", (req, res) => {
 
 // ── GET /api/worlds/:world_id/actors/:actor_id/contacts ───────────────────────
 app.get("/api/worlds/:world_id/actors/:actor_id/contacts", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   try {
     const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/contacts`);
@@ -1336,7 +1503,7 @@ app.get("/api/worlds/:world_id/actors/:actor_id/contacts", async (req, res) => {
 
 // ── GET /api/worlds/:world_id/actors/:actor_id/messages/:contact_id ───────────
 app.get("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   // Verify user is a member of this world with the claimed actor_id
@@ -1344,14 +1511,18 @@ app.get("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id", async (re
   if (!membership) return res.status(403).json({ error: "not a member of this world" });
   if (membership.actor_id !== req.params.actor_id) return res.status(403).json({ error: "actor mismatch" });
   try {
-    const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/messages/${req.params.contact_id}`);
+    // Session 151 — reader_actor_id is what permits the simulator to mark the
+    // thread read. The guard above has already established that this caller IS
+    // the inbox, so marking is correct here and nowhere else; a request without
+    // it reads without writing.
+    const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/messages/${req.params.contact_id}?reader_actor_id=${encodeURIComponent(req.params.actor_id)}`);
     res.json(data);
   } catch { res.status(502).json({ error: "simulator unreachable" }); }
 });
 
 // ── GET /api/worlds/:world_id/actors/:actor_id/context/:contact_id ────────────
 app.get("/api/worlds/:world_id/actors/:actor_id/context/:contact_id", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const cookieHeader = req.headers["cookie"] || "";
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
@@ -1367,7 +1538,7 @@ app.get("/api/worlds/:world_id/actors/:actor_id/context/:contact_id", async (req
 
 // ── POST /api/worlds/:world_id/actors/:actor_id/messages/:contact_id ──────────
 app.post("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`).get(user.id, req.params.world_id);
@@ -1893,7 +2064,7 @@ app.get("/api/actors/:id/media", (req, res) => {
 // ── GET /api/worlds — worlds available to deploy into ────────────────────────
 // ── GET /api/worlds/:id/actors — characters deployed in a world ───────────────
 app.get("/api/worlds/:id/actors", (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const actors = db.prepare(`
@@ -2244,6 +2415,41 @@ app.get("/api/actors/:id/archived-media", (req, res) => {
   res.json(rows);
 });
 
+// ── Session 150 — is this place_id somewhere a person can actually live? ─────
+//
+// Google's `route` type covers a whole street; `street_address`, `premise` and
+// `subpremise` cover a building, a named building and a flat within one. Only
+// the last three are addresses in the sense a home needs. The wizard filters on
+// this too, but the check has to exist here as well: a place_id is just a
+// string in a JSON body, and a stale draft or a direct POST would otherwise
+// still register a road as a residence. Returns { ok, types, address } — and on
+// any failure to reach Google, { ok: true, unverified: true }, because a deploy
+// should not be blocked by an outage on a check this narrow.
+const HOME_PRECISE_TYPES = ["street_address", "premise", "subpremise"];
+
+async function verifyHomePrecision(place_id) {
+  const MAPS_KEY = "AIzaSyDy45Dov_WkN9FcxdVNYQEx23PjexI-Fxc";
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const r = await fetch(
+      `https://maps.googleapis.com/maps/api/place/details/json?place_id=${encodeURIComponent(place_id)}&fields=place_id,formatted_address,type&language=en&key=${MAPS_KEY}`,
+      { signal: controller.signal }
+    );
+    clearTimeout(timeout);
+    const data = await r.json();
+    const types = data.result?.types || [];
+    if (!data.result) return { ok: true, unverified: true, types: [] };
+    return {
+      ok: types.some(t => HOME_PRECISE_TYPES.includes(t)),
+      types,
+      address: data.result.formatted_address,
+    };
+  } catch {
+    return { ok: true, unverified: true, types: [] };
+  }
+}
+
 // ── POST /api/actors/:id/deploy ───────────────────────────────────────────────
 app.post("/api/actors/:id/deploy", async (req, res) => {
   const user = authUser(req);
@@ -2254,6 +2460,18 @@ app.post("/api/actors/:id/deploy", async (req, res) => {
 
   if (!world?.id || !home?.place_id || !schedule?.length) {
     return res.status(400).json({ error: "missing required deploy fields" });
+  }
+
+  // A street is not an address. See verifyHomePrecision above for why this
+  // matters: accepting a route-level place_id is what put two apartments in
+  // TEST WORLD with only one tenant between them.
+  const homePrecision = await verifyHomePrecision(home.place_id);
+  if (!homePrecision.ok) {
+    return res.status(400).json({
+      error: `"${homePrecision.address || home.address || "That place"}" is a street, not an address. Add a house number — a character needs a building to live in, and deploying a whole road creates a residence nobody can occupy.`,
+      home_imprecise: true,
+      types: homePrecision.types,
+    });
   }
 
   // ── Session 150 — who may deploy whom, where ───────────────────────────────
@@ -2374,6 +2592,42 @@ app.post("/api/actors/:id/deploy", async (req, res) => {
   const actor = db.prepare(`SELECT * FROM actors WHERE id = ? AND owner_id = ?`).get(actorId, user.id);
   if (!actor) return res.status(403).json({ error: "forbidden" });
 
+  // Session 152 — refuse rather than ship the wrong body.
+  //
+  // Deploy copies the runtime model into the world; it cannot build one. The
+  // bake runs GLTFExporter against a model loaded in a browser, and this is a
+  // server handling a POST from a gallery card. So the only honest options when
+  // it is missing or stale are to stop, or to deploy a character a world cannot
+  // render — or, worse, one wearing last week's clothes, which nobody would
+  // notice until they saw her.
+  //
+  // Staleness is derived, not signalled: hash the body file, the wardrobe and
+  // the morph values, and compare with the hash the built file was made from.
+  {
+    const fsm = await import("fs");
+    let mtime = 0;
+    if (actor.glb_url) {
+      try { mtime = fsm.statSync(path.join(__dirname, "../public", actor.glb_url)).mtimeMs; } catch {}
+    }
+    let draft = {};
+    try { draft = JSON.parse(actor.draft_state || "{}"); } catch {}
+    const want = appearanceHash({ glbUrl: actor.glb_url, glbMtimeMs: mtime, draft });
+
+    if (!actor.runtime_glb_url) {
+      return res.status(409).json({
+        error: `${actor.name} has no runtime model yet. Open her 3D character tab and build one — a world has nothing to load without it.`,
+        reason: "runtime_missing",
+      });
+    }
+    if (actor.runtime_glb_hash !== want) {
+      return res.status(409).json({
+        error: `${actor.name}'s runtime model is out of date — she has been edited since it was built. Open her 3D character tab and rebuild it, or the world gets the older her.`,
+        reason: "runtime_stale",
+        built: actor.runtime_glb_hash, current: want,
+      });
+    }
+  }
+
   function getPsychTable(table, id) {
     try { return db.prepare(`SELECT * FROM ${table} WHERE actor_id = ?`).get(id) || null; } catch { return null; }
   }
@@ -2439,10 +2693,29 @@ app.post("/api/actors/:id/deploy", async (req, res) => {
   // Send media as URLs — simulator fetches them if needed. No base64 embedding.
   let mediaRows = db.prepare(`SELECT media_type, filename, url, state_slug FROM actor_media WHERE actor_id = ? AND media_type != 'animation'`).all(actorId);
   const platformBase = process.env.PLATFORM_PUBLIC_URL || "";
+  // Session 153 — these URLs are consumed only by the simulator's server-side
+  // Req.get; nginx has returned 401 for /media/* on the public domain since
+  // Aug 24, so every download in a deploy silently became a 188-byte 401 page.
+  // Server-to-server transfers go over the LAN. The browser-facing paths the
+  // simulator stores are built on its side from PLATFORM_PUBLIC_URL and are
+  // unaffected.
+  //
+  // ANIMA-INVARIANT (owner policy, Magnus 2026-08-25): personal media —
+  // reference photos, models, voice — must never transit the public ngrok
+  // tunnel. toInternal() and the LAN base below are that policy, not an
+  // optimization. Do not revert these URLs to PLATFORM_PUBLIC_URL, and do not
+  // "fix" a deploy 401 by loosening nginx — fix the caller's fetch path.
+  // Routines: flag, never edit. See ~/anima-conduct.log 2026-08-24T17:50Z.
+  const internalBase = process.env.PLATFORM_INTERNAL_URL || "http://192.168.1.59:4002";
+  const toInternal = (u) => {
+    if (!u) return u;
+    if (platformBase && u.startsWith(platformBase)) return `${internalBase}${u.slice(platformBase.length)}`;
+    return u.startsWith("http") ? u : `${internalBase}${u}`;
+  };
   const mediaWithData = mediaRows.map(m => {
     const ext  = path.extname(m.filename || "").toLowerCase();
     const mime = ext === ".mp3" ? "audio/mpeg" : ext === ".mp4" ? "video/mp4" : ext === ".png" ? "image/png" : "image/jpeg";
-    const url  = m.url.startsWith("http") ? m.url : `${platformBase}${m.url}`;
+    const url  = toInternal(m.url);
     return { media_type: m.media_type, filename: m.filename, state_slug: m.state_slug, mime, url };
   });
 
@@ -2455,13 +2728,36 @@ app.post("/api/actors/:id/deploy", async (req, res) => {
   // through the identical transfer mechanism as everything else rather
   // than being a special case.
   if (actor.glb_url) {
-    const glbAbsUrl = actor.glb_url.startsWith("http") ? actor.glb_url : `${platformBase}${actor.glb_url}`;
+    const glbAbsUrl = toInternal(actor.glb_url);
     mediaWithData.push({
       media_type: "model",
       filename: path.basename(actor.glb_url),
       state_slug: "body",
       mime: "model/gltf-binary",
       url: glbAbsUrl,
+    });
+  }
+
+  // Session 152 — and the model the world will actually load.
+  //
+  // The body above is the editable one: 113 morph targets, garments carrying
+  // their own skeletons, 92MB. A world needs the built version — sculpt folded
+  // into the vertices, wardrobe baked in, every garment rebound onto the body's
+  // skeleton so `walk` moves her clothes with her.
+  //
+  // Deploy copies rather than builds, and has no choice about it: the bake runs
+  // GLTFExporter against a loaded model, and this request has no browser and no
+  // model. That is why the build lives in the editor and why the check below
+  // refuses rather than repairing.
+  if (actor.runtime_glb_url) {
+    const runtimePath = actor.runtime_glb_url.split("?")[0];
+    const runtimeAbs = toInternal(runtimePath);
+    mediaWithData.push({
+      media_type: "model",
+      filename: path.basename(runtimePath),
+      state_slug: "runtime",
+      mime: "model/gltf-binary",
+      url: runtimeAbs,
     });
   }
 
@@ -2605,7 +2901,7 @@ Respond with JSON only — no preamble:
 // Where she lives and works in this world. Only the POST existed, so the world
 // editor's Home and work panel was calling a route that was never there.
 app.get("/api/worlds/:world_id/actors/:actor_id/home", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const { world_id, actor_id } = req.params;
@@ -2684,7 +2980,7 @@ app.get("/api/states/home-activities", async (req, res) => {
 
 // ── GET /api/worlds/:world_id/player/state ────────────────────────────────────
 app.get("/api/worlds/:world_id/player/state", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const m = db.prepare("SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?").get(user.id, req.params.world_id);
@@ -2700,7 +2996,7 @@ app.get("/api/worlds/:world_id/player/state", async (req, res) => {
 
 // ── POST /api/worlds/:world_id/player/state ───────────────────────────────────
 app.post("/api/worlds/:world_id/player/state", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const m = db.prepare("SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?").get(user.id, req.params.world_id);
@@ -2718,7 +3014,7 @@ app.post("/api/worlds/:world_id/player/state", async (req, res) => {
 
 // ── GET /api/worlds/:world_id/player/home ─────────────────────────────────────
 app.get("/api/worlds/:world_id/player/home", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   try {
@@ -2734,7 +3030,7 @@ app.get("/api/worlds/:world_id/player/home", async (req, res) => {
 
 // ── POST /api/worlds/:world_id/home-knock/decline ────────────────────────────
 app.post("/api/worlds/:world_id/home-knock/decline", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const { actor_id } = req.body;
@@ -2753,7 +3049,7 @@ app.post("/api/worlds/:world_id/home-knock/decline", async (req, res) => {
 
 // ── GET /api/worlds/:id/actors/residences — actors with home data ─────────────
 app.get("/api/worlds/:id/actors/residences", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const world_id = req.params.id;
@@ -2793,7 +3089,7 @@ app.get("/api/worlds/:id/actors/residences", async (req, res) => {
 
 // ── GET /api/worlds/:id/places — list places for a world ────────────────────────
 app.get("/api/worlds/:id/places", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const { category } = req.query;
@@ -2835,9 +3131,20 @@ app.get("/api/places/autocomplete", async (req, res) => {
     const r = await fetch(`https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(q)}&types=${encodeURIComponent(types)}${components}&language=en&key=${MAPS_KEY}`, { signal: controller.signal });
     clearTimeout(timeout);
     const data = await r.json();
+    // Session 150 — `types` is carried through, and this is the fix for the
+    // duplicate-apartment bug. Google marks "Narvavagen, Stockholm" as
+    // ["route","geocode"] and "Narvavagen 34B" as ["street_address","geocode"],
+    // but this mapper threw both away, so the two arrived at the wizard as
+    // indistinguishable strings. A route has a place_id, so every downstream
+    // check passed, and picking the bare street gave a character a whole road
+    // as her home. Re-pick with the house number later and Google returns a
+    // DIFFERENT place_id for the same flat — upsert_place correctly inserts
+    // rather than reuses, and the world ends up with two apartments, one of
+    // which nobody lives in. Confirmed against the live API for both strings.
     const results = (data.predictions || []).slice(0, 5).map(p => ({
       place_id:    p.place_id,
       description: p.description,
+      types:       p.types || [],
     }));
     res.json(results);
   } catch (e) {
@@ -2859,12 +3166,21 @@ app.get("/api/places/reverse", async (req, res) => {
     setTimeout(() => controller.abort(), 5000);
     const r = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lng}&key=${MAPS_KEY}&language=en`, { signal: controller.signal });
     const data = await r.json();
-    const result = data.results?.[0];
+    // Session 150 — the same precision problem reaches here by a different
+    // door. Clicking the map reverse-geocodes the pin, and results[0] is
+    // whatever Google considers closest, which next to a long street with no
+    // numbered building is the route itself. Prefer the first result that
+    // names an actual dwelling; fall back to results[0] only when there is
+    // none, and say so in `types` so the caller can refuse it.
+    const PRECISE = ["subpremise", "premise", "street_address"];
+    const results = data.results || [];
+    const result = results.find(r => (r.types || []).some(t => PRECISE.includes(t))) || results[0];
     if (!result) return res.status(404).json({ error: "no result" });
     res.json({
       place_id: result.place_id,
       address:  result.formatted_address,
       name:     result.formatted_address,
+      types:    result.types || [],
       lat:      parseFloat(lat),
       lng:      parseFloat(lng),
     });
@@ -2883,14 +3199,20 @@ app.get("/api/places/details", async (req, res) => {
 
   const MAPS_KEY = "AIzaSyDy45Dov_WkN9FcxdVNYQEx23PjexI-Fxc";
   try {
-    const r = await fetch(`https://maps.googleapis.com/maps/api/place/details/json?place_id=${place_id}&fields=place_id,name,formatted_address,geometry&language=en&key=${MAPS_KEY}`);
+    const r = await fetch(`https://maps.googleapis.com/maps/api/place/details/json?place_id=${place_id}&fields=place_id,name,formatted_address,geometry,type&language=en&key=${MAPS_KEY}`);
     const data = await r.json();
     const p = data.result;
     if (!p) return res.status(404).json({ error: "not found" });
+    // Session 150 — `types` comes back too. pickPlace() merges this response
+    // over the prediction it started from, so without it the precision signal
+    // added to autocomplete was silently erased one line later. The Places
+    // Details field mask spells the field `type`, singular; the response still
+    // calls it `types`.
     res.json({
       place_id: p.place_id,
       name:     p.name,
       address:  p.formatted_address,
+      types:    p.types || [],
       lat:      p.geometry?.location?.lat,
       lng:      p.geometry?.location?.lng,
     });
@@ -3771,10 +4093,12 @@ app.get("/api/actors/:id/in-play", async (req, res) => {
   if (!actor) return res.status(404).json({ error: "not found" });
 
   const isOwner = actor.owner_id === user.id;
-  const share   = !isOwner && db.prepare(`SELECT permission, viewer_actor_id FROM actor_shares WHERE actor_id = ? AND shared_with_id = ?`).get(req.params.id, user.id);
+  const share   = !isOwner && db.prepare(`SELECT permission FROM actor_shares WHERE actor_id = ? AND shared_with_id = ?`).get(req.params.id, user.id);
   if (!isOwner && !share) return res.status(403).json({ error: "forbidden" });
 
-  const viewerActorId = isOwner ? null : (share.viewer_actor_id || null);
+  // actor_shares has never had a viewer_actor_id column - nothing creates it and
+  // nothing writes it. The viewer's player actor comes from world_memberships below.
+  const viewerActorId = null;
 
   // Get deployments from platform DB
   const deployments = db.prepare(`SELECT * FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL`).all(req.params.id);
@@ -4050,6 +4374,59 @@ function broadcastToUser(userId, event) {
   }
 }
 
+// A world can be deleted two ways: through this platform's own
+// DELETE /api/worlds/:id (which already cleans world_memberships and
+// actor_deployments inline, right there), or directly on the simulator —
+// which is how most of this session's own testing worked, and almost
+// certainly how world e7368020 went: gone from the simulator, but its 4
+// memberships (mk owner, tn/jm/dn player) sat on this side forever, because
+// nothing here was watching for a deletion it did not initiate.
+//
+// The simulator broadcasts {type: "world_deleted", world_id} over SSE
+// unconditionally, from inside delete_world itself, regardless of which
+// endpoint triggered it — so this is the one place a cleanup can catch
+// every deletion, not just the ones this platform happened to originate.
+// Idempotent by construction: DELETEs and directory removals against rows
+// or paths that are already gone are silent no-ops, so running this
+// alongside the existing inline cleanup in the DELETE route (for a
+// platform-initiated delete) does no harm — it just confirms what already
+// happened.
+function reconcileWorldDeleted(worldId) {
+  try {
+    const affectedActorIds = db.prepare(
+      `SELECT DISTINCT platform_actor_id FROM actor_deployments WHERE world_id = ? AND undeployed_at IS NULL`
+    ).all(worldId).map(r => r.platform_actor_id);
+
+    db.prepare(`DELETE FROM world_memberships WHERE world_id = ?`).run(worldId);
+    db.prepare(`DELETE FROM actor_deployments WHERE world_id = ?`).run(worldId);
+
+    const now = new Date().toISOString();
+    for (const actorId of affectedActorIds) {
+      const stillDeployed = db.prepare(
+        `SELECT 1 FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL LIMIT 1`
+      ).get(actorId);
+      if (!stillDeployed) {
+        db.prepare(`UPDATE actors SET status = 'ready_to_deploy', updated_at = ? WHERE id = ?`).run(now, actorId);
+      }
+    }
+
+    const worldMediaDir = path.join(__dirname, "../public/media/worlds", worldId);
+    fs.promises.rm(worldMediaDir, { recursive: true, force: true }).catch(() => {});
+    fs.promises.readdir(path.join(__dirname, "../public/media/actors"), { withFileTypes: true })
+      .then(entries => Promise.all(
+        entries.filter(e => e.isDirectory()).map(e => {
+          const worldSubdir = path.join(__dirname, "../public/media/actors", e.name, "worlds", worldId);
+          return fs.promises.rm(worldSubdir, { recursive: true, force: true }).catch(() => {});
+        })
+      ))
+      .catch(() => {});
+
+    console.log(`[Events] reconciled world_deleted for ${worldId} — ${affectedActorIds.length} actor(s) touched`);
+  } catch (e) {
+    console.warn(`[Events] reconcileWorldDeleted(${worldId}) failed:`, e.message);
+  }
+}
+
 function broadcastWorldEvent(event) {
   // world_created/deleted fires before membership is written — broadcast to all
   if (event.type === "world_created" || event.type === "world_deleted") {
@@ -4136,6 +4513,7 @@ async function connectSimulatorEvents() {
           if (line.startsWith("data: ")) {
             try {
               const event = JSON.parse(line.slice(6));
+              if (event.type === "world_deleted" && event.world_id) reconcileWorldDeleted(event.world_id);
               if (event.type !== "connected") broadcastWorldEvent(event);
             } catch {}
           }
@@ -4313,7 +4691,19 @@ app.post("/api/actors/:id/abandon-draft", (req, res) => {
   }
   const tables = ["actor_psychology","actor_big5","actor_disc","actor_hds","actor_economic",
     "actor_lifestyle","actor_mental_health","actor_education","actor_upbringing",
-    "actor_diagnoses","actor_media","actor_shares","actor_assessment_results","actor_deployments"];
+    "actor_diagnoses","actor_media","actor_shares","actor_assessment_results",
+    // Session 150 — actor_expense_defaults was missing from BOTH delete paths
+    // (draft discard and full delete), so 80 rows of per-character spending
+    // budgets outlived the characters they belonged to.
+    //
+    // Deliberately still hand-listed rather than schema-driven, unlike
+    // delete_world's sweep. There, a world_id column unambiguously means
+    // "belongs to that world". Here it does not: world_memberships.actor_id and
+    // registered_tools.actor_id hold PLAYER actor ids ("mk-87c91ce8",
+    // "magnus-klack-actor"), not characters — a blanket sweep by actor_id would
+    // reach into a different kind of thing that merely shares a column name.
+    // Hand-listed, but now checked against the schema rather than assumed.
+    "actor_expense_defaults","actor_deployments"];
   db.transaction(() => {
     for (const t of tables) { try { db.prepare(`DELETE FROM ${t} WHERE actor_id = ?`).run(req.params.id); } catch {} }
     db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
@@ -4341,7 +4731,19 @@ app.delete("/api/actors/:id", (req, res) => {
 
   const tables = ["actor_psychology","actor_big5","actor_disc","actor_hds","actor_economic",
     "actor_lifestyle","actor_mental_health","actor_education","actor_upbringing",
-    "actor_diagnoses","actor_media","actor_shares","actor_assessment_results","actor_deployments"];
+    "actor_diagnoses","actor_media","actor_shares","actor_assessment_results",
+    // Session 150 — actor_expense_defaults was missing from BOTH delete paths
+    // (draft discard and full delete), so 80 rows of per-character spending
+    // budgets outlived the characters they belonged to.
+    //
+    // Deliberately still hand-listed rather than schema-driven, unlike
+    // delete_world's sweep. There, a world_id column unambiguously means
+    // "belongs to that world". Here it does not: world_memberships.actor_id and
+    // registered_tools.actor_id hold PLAYER actor ids ("mk-87c91ce8",
+    // "magnus-klack-actor"), not characters — a blanket sweep by actor_id would
+    // reach into a different kind of thing that merely shares a column name.
+    // Hand-listed, but now checked against the schema rather than assumed.
+    "actor_expense_defaults","actor_deployments"];
 
   db.transaction(() => {
     for (const t of tables) {
@@ -4514,7 +4916,7 @@ function authUser(req) {
 // Player accepts a meetup proposal — writes PlannedMeeting on simulator,
 // Amber's engine fires the meeting when scheduled_at is reached.
 app.post("/api/worlds/:world_id/meetings/confirm", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   try {
@@ -4530,7 +4932,7 @@ app.post("/api/worlds/:world_id/meetings/confirm", async (req, res) => {
 // ── POST /api/worlds/:world_id/actors/:actor_id/messages/:contact_id/respond/:msg_id
 // Marks a proposal message as responded on the simulator.
 app.post("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id/respond/:msg_id", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`).get(user.id, req.params.world_id);
@@ -4548,7 +4950,7 @@ app.post("/api/worlds/:world_id/actors/:actor_id/messages/:contact_id/respond/:m
 // ── GET /api/worlds/:world_id/actors/:actor_id/calendar ──────────────────────
 // Returns today's schedule slots + upcoming confirmed planned meetings.
 app.get("/api/worlds/:world_id/actors/:actor_id/calendar", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`).get(user.id, req.params.world_id);
@@ -4563,12 +4965,105 @@ app.get("/api/worlds/:world_id/actors/:actor_id/calendar", async (req, res) => {
 // ── GET /api/worlds/:world_id/actors/:actor_id/voicemail ─────────────────────
 // Returns voice messages received by actor, marks as read.
 app.get("/api/worlds/:world_id/actors/:actor_id/voicemail", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
+  // Session 151 — this route trusted its own :actor_id, so any member of the
+  // world could read any actor's voicemail by asking for it. The messages route
+  // beside it has always checked; this one never did. Same check, same words.
+  const membership = db.prepare(
+    `SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`
+  ).get(user.id, req.params.world_id);
+  if (!membership) return res.status(403).json({ error: "not a member of this world" });
+  if (membership.actor_id !== req.params.actor_id) return res.status(403).json({ error: "actor mismatch" });
   try {
-    const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/voicemail`);
+    const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/voicemail?reader_actor_id=${encodeURIComponent(req.params.actor_id)}`);
     res.json(data);
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── POST /api/worlds/:world_id/actors/:actor_id/introduce ────────────────────
+//
+// Session 151 — record that this player now knows who an ambient person is.
+// Gating Approach on it is the point: you cannot walk up to a stranger and open
+// a private conversation with someone whose name nobody has told you.
+//
+// player_actor_id comes from the membership, never from the body — the caller
+// does not get to say who they are.
+app.post("/api/worlds/:world_id/actors/:actor_id/introduce", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
+  if (!ok) return;
+  const membership = db.prepare(
+    `SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ? LIMIT 1`
+  ).get(ok.user.id, req.params.world_id);
+  if (!membership?.actor_id) return res.status(403).json({ error: "no character in this world" });
+  try {
+    const r = await fetch(
+      `${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/introduce`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Service-Token": SERVICE_TOKEN },
+        body: JSON.stringify({ player_actor_id: membership.actor_id }),
+      }
+    );
+    res.status(r.status).json(await r.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/worlds/:world_id/relations ──────────────────────────────────────
+//
+// Session 151 — who knows whom. Every member may ask; the answer depends on who
+// is asking, and the scope is decided here because roles live here.
+//
+//   owner  -> scope=cast. The whole cast graph with its numbers. Ties to a user
+//             are counted and withheld, because how far a character has come to
+//             trust a player is a summary of sealed conversations.
+//   player -> scope=self. Only ties that touch them, and no numbers: that she is
+//             drawn to you is yours, what her trust reads is hers.
+app.get("/api/worlds/:world_id/relations", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
+  if (!ok) return;
+  const membership = db.prepare(
+    `SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ? LIMIT 1`
+  ).get(ok.user.id, req.params.world_id);
+  const viewer = membership?.actor_id || "";
+  const scope  = ok.role === "owner" ? "cast" : "self";
+  try {
+    res.json(await simFetch(
+      `/internal/worlds/${req.params.world_id}/relations?scope=${scope}&viewer_actor_id=${encodeURIComponent(viewer)}`
+    ));
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/worlds/:world_id/cast/:actor_id/comms ───────────────────────────
+//
+// Session 151 — a character's correspondence, for the owner of the world she
+// lives in. Owner only, and the simulator seals it a second time: threads,
+// voicemail and appointments whose other party is a user are counted, never
+// sent. Nothing on this path writes, so looking at her phone does not mark it
+// read, and she is not told she was read.
+app.get("/api/worlds/:world_id/cast/:actor_id/comms", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
+  try {
+    const r = await fetch(
+      `${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/cast/${req.params.actor_id}/comms`,
+      { headers: { "X-Service-Token": SERVICE_TOKEN } }
+    );
+    res.status(r.status).json(await r.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/worlds/:world_id/cast/:actor_id/thread/:contact_id ──────────────
+app.get("/api/worlds/:world_id/cast/:actor_id/thread/:contact_id", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
+  try {
+    const r = await fetch(
+      `${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/cast/${req.params.actor_id}/thread/${req.params.contact_id}`,
+      { headers: { "X-Service-Token": SERVICE_TOKEN } }
+    );
+    res.status(r.status).json(await r.json());
   } catch { res.status(502).json({ error: "simulator unreachable" }); }
 });
 
@@ -4597,9 +5092,66 @@ app.post("/api/tts", async (req, res) => {
 });
 
 
+// ── GET /api/worlds/:world_id/runtime ────────────────────────────────────────
+//
+// Session 151 — vitals, active need, and what the engine last picked, for every
+// actor in the world. The data the MONITOR button existed to show.
+//
+// Owner only, and that is the whole point rather than a precaution: a player
+// lives in the world, so they get the map, the people and their own phone. Its
+// interior — stress, balances, the reasoning behind a choice — belongs to
+// whoever built it. requireWorld answers 404 to a stranger and 403 to a player.
+app.get("/api/worlds/:world_id/runtime", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
+  try { res.json(await simFetch(`/internal/worlds/${req.params.world_id}/runtime`)); }
+  catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/worlds/:world_id/feed ───────────────────────────────────────────
+//
+// Session 151 — the world's event log. Every member, player and owner alike.
+//
+// The seal travels with the request rather than being applied to the response:
+// the caller's OWN actor id is what goes to the simulator, so a private entry
+// comes back only to someone party to it. An owner is not a party to a
+// conversation between a character and a player, and does not become one by
+// owning the world — they get the same feed anyone else would, filtered by who
+// they are in it. Nothing is dropped on this side, because nothing that should
+// not be read ever arrives.
+app.get("/api/worlds/:world_id/feed", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
+  if (!ok) return;
+  const membership = db.prepare(
+    `SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ? LIMIT 1`
+  ).get(ok.user.id, req.params.world_id);
+  const viewer = membership?.actor_id || "";
+  const limit  = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 60));
+  try {
+    res.json(await simFetch(
+      `/internal/worlds/${req.params.world_id}/feed?viewer_actor_id=${encodeURIComponent(viewer)}&limit=${limit}`
+    ));
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── POST /api/worlds/:world_id/tick ──────────────────────────────────────────
+//
+// Session 151 — force every actor to re-evaluate now. Owner only: it moves the
+// world for everyone in it, which is a thing you do to a world you own.
+app.post("/api/worlds/:world_id/tick", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/tick`, {
+      method: "POST", headers: { "X-Service-Token": SERVICE_TOKEN },
+    });
+    res.status(r.status).json(await r.json());
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
 // ── GET /api/worlds/:world_id/presence ───────────────────────────────────────
 app.get("/api/worlds/:world_id/presence", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   try {
@@ -4611,7 +5163,7 @@ app.get("/api/worlds/:world_id/presence", async (req, res) => {
 
 // ── POST /api/worlds/:world_id/spawn ─────────────────────────────────────────
 app.post("/api/worlds/:world_id/spawn", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const { world_id } = req.params;
@@ -4706,7 +5258,7 @@ app.get("/api/meeting/:session_id/stream", async (req, res) => {
 
 // ── POST /api/worlds/:world_id/encounter/start ───────────────────────────────
 app.post("/api/worlds/:world_id/encounter/start", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const { world_id } = req.params;
@@ -4732,7 +5284,7 @@ app.post("/api/worlds/:world_id/encounter/start", async (req, res) => {
 
 // ── POST /api/worlds/:world_id/encounter/:encounter_id/end ────────────────────
 app.post("/api/worlds/:world_id/encounter/:encounter_id/end", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   try {
@@ -4746,7 +5298,7 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/end", async (req, res) =
 
 // ── GET /api/worlds/:world_id/encounter/:encounter_id ─────────────────────────
 app.get("/api/worlds/:world_id/encounter/:encounter_id", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   try {
@@ -4758,7 +5310,7 @@ app.get("/api/worlds/:world_id/encounter/:encounter_id", async (req, res) => {
 
 // ── POST /api/worlds/:world_id/encounter/:encounter_id/enter ─────────────────
 app.post("/api/worlds/:world_id/encounter/:encounter_id/enter", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   try {
@@ -4772,7 +5324,7 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/enter", async (req, res)
 
 // ── POST /api/worlds/:world_id/encounter/:encounter_id/message ────────────────
 app.post("/api/worlds/:world_id/encounter/:encounter_id/message", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const { content } = req.body;
@@ -4792,7 +5344,7 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/message", async (req, re
 
 // ── POST /api/worlds/:world_id/encounter/:encounter_id/typing ─────────────────
 app.post("/api/worlds/:world_id/encounter/:encounter_id/typing", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   try {
@@ -4806,7 +5358,7 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/typing", async (req, res
 
 // ── POST /api/worlds/:world_id/leave — clear player location ─────────────────
 app.post("/api/worlds/:world_id/leave", async (req, res) => {
-  const ok = requireWorld(req, res, worldIdOf(req), "viewer");
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
   const { world_id } = req.params;
@@ -5127,7 +5679,23 @@ app.use("/media", (req, res) => {
 
 const distPath = path.join(__dirname, "../dist");
 if (fs.existsSync(distPath)) {
-  app.use(express.static(distPath));
+  // Session 152 — index.html must never be cached; hashed assets may be
+  // cached forever. Without explicit headers, express.static serves
+  // index.html with an ETag and no Cache-Control, and somewhere between the
+  // browser's heuristic cache and the ngrok edge, stale copies survived even
+  // hard reloads: twice in one evening a freshly built fix was judged "still
+  // broken" while the page was quietly running the previous bundle. The
+  // filename hash makes assets self-invalidating; the entry document is the
+  // one file whose freshness actually matters.
+  app.use(express.static(distPath, {
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith("index.html")) {
+        res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+      } else if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+        res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      }
+    },
+  }));
   app.get("*", (req, res) => {
     if (req.path.startsWith("/assets/")) { return res.status(404).end(); }
     // Session 150 — an unmatched /api or /media GET used to fall through this
@@ -5139,6 +5707,7 @@ if (fs.existsSync(distPath)) {
     if (req.path.startsWith("/api") || req.path.startsWith("/media")) {
       return res.status(404).json({ error: `No such endpoint: ${req.method} ${req.path}` });
     }
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.sendFile(path.join(distPath, "index.html"));
   });
 }

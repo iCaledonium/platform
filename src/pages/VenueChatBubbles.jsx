@@ -1,19 +1,53 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useLayoutEffect } from "react";
 
 const font = "'DM Sans', system-ui, sans-serif";
 
+// ── Session 151 — stage directions ───────────────────────────────────────────
+//
+// Everything a character DOES rather than says comes back wrapped in asterisks
+// now (the simulator prompts for it and normalises the variants). Printing the
+// asterisks would just be punctuation in the reader's face; splitting on them
+// lets the action read as an action — dimmer, italic, clearly not speech.
+//
+// The split keeps the delimiters so the odd stray asterisk in ordinary text
+// survives as ordinary text rather than swallowing the rest of the line.
+function withActions(text) {
+  if (typeof text !== "string" || !text.includes("*")) return text;
+  return text.split(/(\*[^*\n]+\*)/g).map((part, i) =>
+    /^\*[^*\n]+\*$/.test(part)
+      ? <em key={i} style={{ opacity: .62, fontStyle: "italic" }}>{part.slice(1, -1)}</em>
+      : part
+  );
+}
+
 // ── Venue feed bubble (bottom right, always present) ─────────────────────────
 
-function VenueFeedBubble({ chat, onSend, onToggle }) {
+function VenueFeedBubble({ chat, onSend, onToggle, onDrag }) {
   const [input, setInput] = useState("");
-  const bottomRef = useRef(null);
+  const listRef = useRef(null);
 
-  useEffect(() => {
-    if (chat.open) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [chat.messages, chat.open]);
+  // Session 152 — the newest line is always the one you can see.
+  //
+  // scrollIntoView on a zero-height sentinel scrolls the nearest scrollable
+  // ancestor, and for a window that now floats over the map that is not
+  // reliably the message list. Worse, its smooth animation is cancelled by the
+  // next render, so when the room answers with three lines at once the last of
+  // them settled half below the fold and stayed there. Setting scrollTop on the
+  // list itself has neither problem, and useLayoutEffect runs before paint so
+  // the jump is never seen.
+  //
+  // The second pass on the next frame is for height that arrives late: a
+  // portrait loading, or a long line rewrapping after the effect has run.
+  useLayoutEffect(() => {
+    const el = listRef.current;
+    if (!el || !chat.open) return;
+    el.scrollTop = el.scrollHeight;
+    const id = requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
+    return () => cancelAnimationFrame(id);
+  }, [chat.messages, chat.loading, chat.open]);
 
   return (
-    <div style={{
+    <div onMouseDown={onDrag} style={{
       width: 260, background: "rgba(18,16,14,.96)",
       border: "1px solid rgba(255,255,255,.1)",
       borderRadius: chat.open ? "12px 12px 0 0" : 12,
@@ -33,7 +67,7 @@ function VenueFeedBubble({ chat, onSend, onToggle }) {
 
       {chat.open && (
         <>
-          <div style={{ overflowY:"auto", padding:"10px 12px", display:"flex", flexDirection:"column", gap:6, maxHeight:260, minHeight:120 }}>
+          <div ref={listRef} style={{ overflowY:"auto", padding:"10px 12px", display:"flex", flexDirection:"column", gap:6, maxHeight:260, minHeight:120, scrollBehavior:"smooth" }}>
             {chat.loading && chat.messages.length === 0 && (
               <div style={{ display:"flex", gap:4, padding:"4px 2px" }}>
                 {[0,.15,.3].map((d,i) => <div key={i} style={{ width:5, height:5, borderRadius:"50%", background:"rgba(181,148,90,.6)", animation:`pulse .9s ${d}s infinite` }} />)}
@@ -45,7 +79,7 @@ function VenueFeedBubble({ chat, onSend, onToggle }) {
                   <div style={{ fontFamily:font, fontSize:9, color:"rgba(181,148,90,.7)", marginBottom:2, paddingLeft:2 }}>{m.speaker}</div>
                 )}
                 <div style={{ display:"flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start" }}>
-                  <div style={{ maxWidth:"85%", padding:"6px 10px", borderRadius: m.role==="user" ? "12px 12px 3px 12px" : "12px 12px 12px 3px", background: m.role==="user" ? "rgba(181,148,90,.25)" : "rgba(255,255,255,.08)", color: m.role==="user" ? "rgba(255,255,255,.9)" : "rgba(255,255,255,.75)", fontSize:12, fontFamily:font, lineHeight:1.45 }}>{m.content}</div>
+                  <div style={{ maxWidth:"85%", padding:"6px 10px", borderRadius: m.role==="user" ? "12px 12px 3px 12px" : "12px 12px 12px 3px", background: m.role==="user" ? "rgba(181,148,90,.25)" : "rgba(255,255,255,.08)", color: m.role==="user" ? "rgba(255,255,255,.9)" : "rgba(255,255,255,.75)", fontSize:12, fontFamily:font, lineHeight:1.45 }}>{withActions(m.content)}</div>
                 </div>
               </div>
             ))}
@@ -54,7 +88,12 @@ function VenueFeedBubble({ chat, onSend, onToggle }) {
                 {[0,.15,.3].map((d,i) => <div key={i} style={{ width:5, height:5, borderRadius:"50%", background:"rgba(181,148,90,.6)", animation:`pulse .9s ${d}s infinite` }} />)}
               </div>
             )}
-            <div ref={bottomRef} />
+            {chat.note && !chat.loading && (
+              <div style={{ fontFamily:font, fontSize:11, fontStyle:"italic",
+                color:"rgba(255,255,255,.35)", padding:"2px 2px 0", alignSelf:"flex-start" }}>
+                {chat.note}
+              </div>
+            )}
           </div>
           {!chat.ended && (
             <div style={{ padding:"8px 10px", borderTop:"1px solid rgba(255,255,255,.06)", display:"flex", gap:6 }}>
@@ -79,10 +118,26 @@ function PrivateChatWindow({ chat, onSend, onClose, initialX, initialY }) {
   const [input, setInput]         = useState("");
   const [pos, setPos]             = useState({ x: initialX, y: initialY });
   const [minimized, setMinimized] = useState(false);
-  const bottomRef                 = useRef(null);
+  const listRef                   = useRef(null);
 
-  useEffect(() => {
-    if (!minimized) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  // Session 152 — the newest line is always the one you can see.
+  //
+  // scrollIntoView on a zero-height sentinel scrolls the nearest scrollable
+  // ancestor, and for a window that now floats over the map that is not
+  // reliably the message list. Worse, its smooth animation is cancelled by the
+  // next render, so when the room answers with three lines at once the last of
+  // them settled half below the fold and stayed there. Setting scrollTop on the
+  // list itself has neither problem, and useLayoutEffect runs before paint so
+  // the jump is never seen.
+  //
+  // The second pass on the next frame is for height that arrives late: a
+  // portrait loading, or a long line rewrapping after the effect has run.
+  useLayoutEffect(() => {
+    const el = listRef.current;
+    if (!el || minimized) return;
+    el.scrollTop = el.scrollHeight;
+    const id = requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
+    return () => cancelAnimationFrame(id);
   }, [chat.messages, minimized]);
 
   function startDrag(e) {
@@ -139,7 +194,7 @@ function PrivateChatWindow({ chat, onSend, onClose, initialX, initialY }) {
             </div>
 
             {/* Messages */}
-            <div style={{ flex:1, overflowY:"auto", padding:"10px", display:"flex", flexDirection:"column", gap:6, borderLeft:"1px solid rgba(255,255,255,.06)" }}>
+            <div ref={listRef} style={{ flex:1, overflowY:"auto", padding:"10px", display:"flex", flexDirection:"column", gap:6, borderLeft:"1px solid rgba(255,255,255,.06)", scrollBehavior:"smooth" }}>
               {chat.loading && chat.messages.length === 0 && (
                 <div style={{ display:"flex", gap:4, padding:"4px 2px" }}>
                   {[0,.15,.3].map((d,i) => <div key={i} style={{ width:5, height:5, borderRadius:"50%", background:"rgba(181,148,90,.6)", animation:`pulse .9s ${d}s infinite` }} />)}
@@ -147,7 +202,7 @@ function PrivateChatWindow({ chat, onSend, onClose, initialX, initialY }) {
               )}
               {chat.messages.map((m, i) => (
                 <div key={i} style={{ display:"flex", justifyContent: m.role==="user" ? "flex-end" : "flex-start" }}>
-                  <div style={{ maxWidth:"88%", padding:"5px 9px", borderRadius: m.role==="user" ? "10px 10px 2px 10px" : "10px 10px 10px 2px", background: m.role==="user" ? "rgba(181,148,90,.25)" : "rgba(255,255,255,.08)", color: m.role==="user" ? "rgba(255,255,255,.9)" : "rgba(255,255,255,.75)", fontSize:11, fontFamily:font, lineHeight:1.4 }}>{m.content}</div>
+                  <div style={{ maxWidth:"88%", padding:"5px 9px", borderRadius: m.role==="user" ? "10px 10px 2px 10px" : "10px 10px 10px 2px", background: m.role==="user" ? "rgba(181,148,90,.25)" : "rgba(255,255,255,.08)", color: m.role==="user" ? "rgba(255,255,255,.9)" : "rgba(255,255,255,.75)", fontSize:11, fontFamily:font, lineHeight:1.4 }}>{withActions(m.content)}</div>
                 </div>
               ))}
               {chat.loading && chat.messages.length > 0 && (
@@ -155,7 +210,12 @@ function PrivateChatWindow({ chat, onSend, onClose, initialX, initialY }) {
                   {[0,.15,.3].map((d,i) => <div key={i} style={{ width:5, height:5, borderRadius:"50%", background:"rgba(181,148,90,.6)", animation:`pulse .9s ${d}s infinite` }} />)}
                 </div>
               )}
-              <div ref={bottomRef} />
+              {chat.note && !chat.loading && (
+              <div style={{ fontFamily:font, fontSize:11, fontStyle:"italic",
+                color:"rgba(255,255,255,.35)", padding:"2px 2px 0", alignSelf:"flex-start" }}>
+                {chat.note}
+              </div>
+            )}
             </div>
           </div>
 
@@ -203,6 +263,29 @@ export default function VenueChatBubbles({ chats, deltas, onSend, onClose, onTog
   const venueChat    = chats.find(c => c.is_venue);
   const privateChats = chats.filter(c => !c.is_venue);
 
+  // Where the room chat sits. Opens to the left of the HERE NOW column rather
+  // than underneath it, and remembers wherever you drag it for the session.
+  const FEED_W = 260;
+  const [feedPos, setFeedPos] = useState(() => ({
+    x: Math.max(16, (typeof window !== "undefined" ? window.innerWidth : 1200) - 200 - FEED_W - 40),
+    y: Math.max(80, (typeof window !== "undefined" ? window.innerHeight : 800) - 300),
+  }));
+
+  function startFeedDrag(e) {
+    // Only the chrome drags — not the text field, the send button or the
+    // minimise control, or you cannot type without moving the window.
+    if (e.target.closest("input, button, textarea")) return;
+    const startX = e.clientX - feedPos.x;
+    const startY = e.clientY - feedPos.y;
+    const onMove = ev => setFeedPos({ x: ev.clientX - startX, y: ev.clientY - startY });
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
   return (
     <>
       <style>{`
@@ -227,13 +310,18 @@ export default function VenueChatBubbles({ chats, deltas, onSend, onClose, onTog
         />
       ))}
 
-      {/* Venue feed — bottom right, always */}
+      {/* Session 151 — the room chat floats.
+          It was pinned bottom-right at right:16, which is exactly where the
+          HERE NOW panel lives (right:16, width 200), so the conversation sat on
+          top of the people having it. It now opens clear of that column and can
+          be dragged anywhere, the same as the private chat windows beside it. */}
       {venueChat && (
-        <div style={{ position:"fixed", bottom:0, right:16, zIndex:1200 }}>
+        <div style={{ position:"fixed", left:feedPos.x, top:feedPos.y, zIndex:1200 }}>
           <VenueFeedBubble
             chat={venueChat}
             onSend={msg => onSend(venueChat.id, msg)}
             onToggle={() => onToggle(venueChat.id)}
+            onDrag={startFeedDrag}
           />
         </div>
       )}

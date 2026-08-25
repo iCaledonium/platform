@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate, useLocation } from "react-router-dom";
 import { fmtAmount, fmtSigned } from "../lib/money.js";
 import AmountInput from "../lib/AmountInput.jsx";
+import UndeployButton from "./UndeployButton.jsx";
 
 // ── WorldActorPage ────────────────────────────────────────────────────────────
 //
@@ -138,7 +139,7 @@ function Field({ label, children }) {
 // Session 150 — a control you may not use should look like one.
 //
 // The world editor rendered every field as editable regardless of role, so a
-// viewer could type into a salary, tab away, and only then be told 403 by the
+// player could type into a salary, tab away, and only then be told 403 by the
 // server. The permission was enforced and invisible, which is the worst of both:
 // the work is lost and the reason arrives too late to be useful.
 const roStyle = ro => ro ? { background:"rgba(0,0,0,.025)", color:"#6b6760", cursor:"default" } : null;
@@ -149,7 +150,7 @@ function ReadOnlyNotice({ what = "this character" }) {
       background:"rgba(0,0,0,.025)", border:"1px solid rgba(0,0,0,.07)", borderRadius:10 }}>
       <span style={{ color:"#a8a5a0", fontSize:13, lineHeight:1.3, flexShrink:0 }}>🔒</span>
       <div style={{ ...F, fontSize:12, color:"#6b6760", lineHeight:1.6 }}>
-        You're a viewer of this world, so {what} is read-only here. Only an owner can change it.
+        You're a player in this world, not an owner, so {what} is read-only here.
       </div>
     </div>
   );
@@ -998,7 +999,7 @@ export default function WorldActorPage() {
     identity:"Identity", psych:"Psychology", media:"Media", runtime:"Runtime",
   };
 
-  // A viewer of the world may look but not touch. The server enforces this on
+  // A player may look but not build. The server enforces this on
   // every PATCH; this makes the answer visible before anything is typed.
   const canEdit = world?.role === "owner";
 
@@ -1038,6 +1039,19 @@ export default function WorldActorPage() {
               style={{ ...F, fontSize:11, color:"#b05c08", cursor:"pointer", display:"block", marginTop:10 }}>
               View basic profile →
             </a>
+
+            {/* Session 152 — the same control as the character page and the
+                gallery. This page is where you watch a deployment; it should be
+                somewhere you can end one. */}
+            <div style={{ marginTop: 12 }}>
+              <UndeployButton
+                actorId={actorId}
+                worldId={worldId}
+                worldName={world?.name}
+                name={actor?.name}
+                onDone={() => navigate(`/my-worlds/${worldId}`)}
+              />
+            </div>
           </div>
 
           <div style={{ flex:1, overflowY:"auto", paddingBottom:8 }}>

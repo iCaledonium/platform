@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import styles from "./WorldEnterOverlay.module.css";
 import PlayerHomeScene from "./PlayerHomeScene.jsx";
@@ -11,30 +11,6 @@ function resizedPhoto(photoSrc, size = 64) {
   const photoPath = photoSrc.startsWith(SIMULATOR_URL) ? photoSrc.replace(SIMULATOR_URL, "") : (photoSrc.startsWith("http") ? null : photoSrc);
   if (!photoPath) return photoSrc;
   return `/api/media/resize?url=${encodeURIComponent(photoPath)}&w=${size}&h=${size}`;
-}
-
-function parseHours(operating_hours) {
-  // operating_hours format: "09:00-17:00" or null
-  if (!operating_hours) return null;
-  const parts = operating_hours.split("-");
-  if (parts.length !== 2) return null;
-  const toMins = t => { const [h,m] = t.split(":").map(Number); return h*60+(m||0); };
-  return { open: toMins(parts[0]), close: toMins(parts[1]) };
-}
-
-function isVenueOpen(operating_hours) {
-  const h = parseHours(operating_hours);
-  if (!h) return null; // unknown
-  const now = new Date();
-  const mins = now.getHours()*60 + now.getMinutes();
-  // Handle overnight (e.g. 22:00-04:00)
-  if (h.close < h.open) return mins >= h.open || mins < h.close;
-  return mins >= h.open && mins < h.close;
-}
-
-function formatHours(operating_hours) {
-  if (!operating_hours) return null;
-  return operating_hours;
 }
 
 function decodePolyline(encoded) {
@@ -138,6 +114,36 @@ const PIN_STYLES = `
     border:1.5px solid #fff; transition:transform 0.15s;
   }
   .anima-pin-dot-base:hover { transform:scale(1.3); }
+
+  /* Session 151 — the quiet tier.
+     The city used to hold four places, so every one of them could afford a
+     black label. Seeded properly it holds eighty-six, and eighty-six labels
+     is not a map — it is a wall of names with a street plan somewhere behind
+     it. A place with nobody in it is a dot; it says its name when you point
+     at it. What has people in it keeps the label, which means the labels on
+     screen are exactly the places worth looking at. */
+  .anima-pin-quiet { position:relative; }
+  /* Empty room: hollow. Somebody in it, ambient or not: filled. */
+  .anima-pin-quiet .anima-pin-dot-base {
+    width:9px; height:9px; background:rgba(255,255,255,.92);
+    border:1.5px solid #9c948a;
+    box-shadow:0 1px 3px rgba(0,0,0,.18);
+  }
+  .anima-pin-quiet.lively .anima-pin-dot-base {
+    background:#6f665c; border-color:rgba(255,255,255,.92);
+    box-shadow:0 1px 3px rgba(0,0,0,.28);
+  }
+  .anima-pin-quiet:hover .anima-pin-dot-base { transform:scale(1.35); background:#c9973a; }
+  .anima-pin-name {
+    position:absolute; bottom:15px; left:50%; transform:translateX(-50%);
+    background:#1a1a1a; color:#fff; font-family:'DM Sans',sans-serif;
+    font-size:10px; letter-spacing:.02em; padding:3px 8px; border-radius:12px;
+    white-space:nowrap; opacity:0; pointer-events:none; transition:opacity .12s;
+    border:1.5px solid rgba(255,255,255,0.12);
+  }
+  .anima-pin-quiet:hover .anima-pin-name { opacity:1; }
+  .anima-pin.sel .anima-pin-dot-base { background:#c9973a; transform:scale(1.35); }
+  .anima-pin.sel .anima-pin-name { opacity:1; background:#c9973a; }
 `;
 
 function injectPinStyles() {
@@ -162,6 +168,7 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
   const [locations, setLocations] = useState([]);
   const locationsRef   = useRef([]);
   const [weather,   setWeather]   = useState(null);
+  const [worldTime, setWorldTime] = useState(null);
   const [selected,  setSelected]  = useState(null);
   const [mapReady,  setMapReady]  = useState(false);
   const [spawning,  setSpawning]  = useState(false);
@@ -171,6 +178,16 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
   const [selectedActor, setSelectedActor] = useState(null); // for transit panel
   const [selectedAmbient, setSelectedAmbient] = useState(null); // ambient NPC bubble
   const [mapKey,    setMapKey]    = useState(0);
+
+  // ── Session 151 — anchoring the place card to its pin ──────────────────────
+  // A bare OverlayView exists purely to borrow the map's projection; it draws
+  // nothing. fromLatLngToContainerPixel is the only honest way to turn a
+  // lat/lng into a screen position — deriving it from bounds is linear in
+  // latitude and Mercator is not, so the card would drift off the pin.
+  const projRef  = useRef(null);
+  const panelRef = useRef(null);
+  const [anchor, setAnchor] = useState(null);
+  const [panelH, setPanelH] = useState(320);
 
   // ── Auto-enter player home — set by VisitorPresenceView on exit, since
   // for knock_user_door the player never actually left home to begin with.
@@ -199,6 +216,7 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
           const locs = data.locations || data;
           if (!Array.isArray(locs)) return; // guard against unexpected response shape
           if (data.weather) setWeather(data.weather);
+          if (data.world_time) setWorldTime(data.world_time);
           setLocations(locs);
           setLoading(false);
           // Keep selected panel in sync
@@ -298,6 +316,24 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
     });
   }, [mapReady, mapKey]);
 
+  // Session 151 — what the pins actually draw, as a string.
+  //
+  // Presence polls every 30s and hands back a fresh array every time, so the
+  // markers effect below re-ran on identity rather than on change: it tore down
+  // every pin and built new ones. OverlayView.setMap() does not run onAdd
+  // immediately — it waits for the map's next redraw — so on an idle map every
+  // label on the map blinked out for several seconds, twice a minute, and the
+  // selected pin lost its highlight while its card stayed open.
+  //
+  // Compare what is drawn instead of what was allocated. Identical poll, no
+  // work at all.
+  const locSig = useMemo(() => JSON.stringify(
+    locations.map(l => [
+      l.id, l.name, l.lat, l.lng, l.category, l.meeting_session_id,
+      (l.actors || []).map(a => `${a.actor_id}${a.in_transit ? "t" : ""}`).join(","),
+    ])
+  ), [locations]);
+
   // Place markers
   useEffect(() => {
     if (!mapReady || !mapInstance.current || locations.length === 0) return;
@@ -315,29 +351,50 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
       }
       onAdd() {
         const loc = this.loc;
-        const hasActors = loc.actors && loc.actors.length > 0;
+        // Session 151 — a label is for people you would cross the city to see.
+        //
+        // hasActors counted everyone in the room, and once the world had run for
+        // a few hours the ambient cast had filled sixty-one of eighty-six venues
+        // with staff and regulars — so every venue earned a label again and the
+        // map went back to being a wall of names. Ambient people are what makes
+        // a room feel inhabited; they are not news. Cast and players are.
+        const cast = (loc.actors || []).filter(a => !a.is_ambient && !a.in_transit);
+        const hasActors = cast.length > 0;
+        // Somebody is in there, even if it is only the barista: a filled dot
+        // rather than a hollow one. Open rooms and empty ones stop looking alike
+        // without either of them shouting.
+        const lively = (loc.actors || []).length > 0 || (loc.crowd_size || 0) > 0;
         const div = document.createElement("div");
         div.style.cssText = "position:absolute;cursor:pointer;";
         const label = loc.name.length > 18 ? loc.name.slice(0, 17) + "…" : loc.name;
-        const actors = (loc.actors || []).filter(a => !a.in_transit);
-        const shown = actors.slice(0, 3);
+        const shown = cast.slice(0, 3);
         const stackedPhotos = shown.map((a, i) => {
           const pinPhoto = a.generated_portrait_url || (a.photo_url ? resizedPhoto(a.photo_url, 48) : null);
           return pinPhoto
             ? `<img src="${pinPhoto}" style="width:22px;height:22px;border-radius:50%;object-fit:cover;border:1.5px solid rgba(255,255,255,.8);margin-left:${i===0?0:-8}px;z-index:${shown.length-i};position:relative;" onerror="this.style.display='none'" />`
             : `<div style="width:22px;height:22px;border-radius:50%;background:rgba(181,148,90,.3);border:1.5px solid rgba(255,255,255,.8);display:inline-flex;align-items:center;justify-content:center;font-size:9px;color:#1a1814;margin-left:${i===0?0:-8}px;z-index:${shown.length-i};position:relative;">${a.name[0]}</div>`;
         }).join("");
-        div.innerHTML = `
+        // Your own front door stays labelled whether or not anyone is home —
+        // it is the one address on the map you navigate by.
+        const isHome = loc.category === "residential_home";
+        div.innerHTML = hasActors || isHome
+          ? `
           <div class="anima-pin" style="transform:translate(-50%,-100%);display:flex;flex-direction:column;align-items:center;">
             <div class="anima-pin-bubble" style="display:flex;flex-direction:row;align-items:center;gap:5px;">
               ${hasActors ? `<div style="display:flex;align-items:center;">${stackedPhotos}</div>` : ""}
               <span class="anima-pin-label">${label}</span>
             </div>
             <div class="anima-pin-stem"></div>
+          </div>`
+          : `
+          <div class="anima-pin anima-pin-quiet${lively ? " lively" : ""}" style="transform:translate(-50%,-50%);display:flex;align-items:center;justify-content:center;">
+            <div class="anima-pin-dot-base"></div>
+            <div class="anima-pin-name">${label}</div>
           </div>`;
         div.addEventListener("click", () => this.onSelect(this.loc));
         this.div = div;
         this.getPanes().overlayMouseTarget.appendChild(div);
+        if (this._selected) this.setSelected(true);
       }
       draw() {
         const proj = this.getProjection();
@@ -352,7 +409,15 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
         this.div = null;
       }
       setSelected(sel) {
+        // Session 151 — the flag lives on the instance, not only on the DOM.
+        // setMap() schedules onAdd for the map's next redraw rather than running
+        // it now, so a pin rebuilt by a presence refresh has no div yet when the
+        // selection is re-applied; onAdd picks the flag up instead.
+        this._selected = sel;
         if (!this.div) return;
+        // A quiet pin has no bubble to turn gold, so the root carries the state
+        // and the dot and its name respond to that instead.
+        this.div.querySelector(".anima-pin")?.classList.toggle("sel", sel);
         this.div.querySelector(".anima-pin-bubble")?.classList.toggle("selected", sel);
         this.div.querySelector(".anima-pin-stem")?.classList.toggle("selected", sel);
       }
@@ -361,11 +426,22 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
     locations.forEach(loc => {
       if (!loc.lat || !loc.lng) return;
       const pin = new AnimaPin(loc, selectLocation);
-      pin.setMap(mapInstance.current);
       pin._locId = loc.id;
+      // Presence refreshes every 30s, `locations` gets a new identity, and this
+      // effect rebuilds every pin from scratch. The gold highlight lived on the
+      // old DOM node, so the selected pin quietly went grey while its card
+      // stayed open — and once the card is anchored to a pin, losing which pin
+      // is worse than it used to be.
+      if (selectedRef.current && selectedRef.current.id === loc.id) pin._selected = true;
+      pin.setMap(mapInstance.current);
       markers.current.push(pin);
     });
-  }, [mapReady, locations, mapKey]);
+  // locSig, not locations: rebuild when the pins would look different, not
+  // every time the poll returns a new array. `locations` is still read inside —
+  // when the signature is unchanged the closure's copy is equivalent by
+  // definition.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mapReady, locSig, mapKey]);
 
   // Keep locationsRef current so transit effect can read latest without re-running
   locationsRef.current = locations;
@@ -546,11 +622,90 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
     });
   }, [thoughtBubbles]);
 
+  // A projection-only overlay. onAdd/draw are required to exist and are
+  // deliberately empty — adding it to the map is what makes getProjection()
+  // return something.
+  useEffect(() => {
+    if (!mapReady || !mapInstance.current || !window.google) return;
+    const ov = new window.google.maps.OverlayView();
+    ov.onAdd = function () {};
+    ov.draw = function () {};
+    ov.onRemove = function () {};
+    ov.setMap(mapInstance.current);
+    projRef.current = ov;
+    return () => { try { ov.setMap(null); } catch {} projRef.current = null; };
+  }, [mapReady, mapKey]);
+
+  // Recompute the anchor whenever the map moves or the selection changes. A
+  // transit actor is anchored to their interpolated position, so the card
+  // follows someone walking across town rather than sitting still while they
+  // leave it behind.
+  useEffect(() => {
+    const map = mapInstance.current;
+    if (!mapReady || !map || !window.google) return;
+
+    const update = () => {
+      const target = selected
+        ? { lat: Number(selected.lat), lng: Number(selected.lng) }
+        : selectedActor ? getActorPosition(selectedActor) : null;
+      const proj = projRef.current?.getProjection();
+      if (!target || !proj || !mapRef.current || target.lat == null) { setAnchor(null); return; }
+      const pt = proj.fromLatLngToContainerPixel(
+        new window.google.maps.LatLng(Number(target.lat), Number(target.lng))
+      );
+      if (!pt) { setAnchor(null); return; }
+      const r = mapRef.current.getBoundingClientRect();
+      setAnchor({ x: r.left + pt.x, y: r.top + pt.y });
+    };
+
+    update();
+    const evs = ["bounds_changed", "center_changed", "zoom_changed", "idle", "drag"];
+    const ls = evs.map(e => map.addListener(e, update));
+    window.addEventListener("resize", update);
+    // Someone in transit keeps moving between map events.
+    const t = selectedActor ? setInterval(update, 1000) : null;
+    return () => {
+      ls.forEach(l => { try { window.google.maps.event.removeListener(l); } catch {} });
+      window.removeEventListener("resize", update);
+      if (t) clearInterval(t);
+    };
+  }, [selected, selectedActor, mapReady, mapKey]);
+
+  // Measured, not guessed: the card centres on the pin, and where it cannot
+  // (near the top or bottom of the window) the arrow slides to keep pointing.
+  useEffect(() => {
+    if (panelRef.current) setPanelH(panelRef.current.offsetHeight || 320);
+  }, [selected, selectedActor, anchor]);
+
   // Wire transit actor click to React state
   useEffect(() => {
     window.__selectTransitActor = (actor) => setSelectedActor(actor);
     return () => { delete window.__selectTransitActor; };
   }, []);
+
+  // Session 151 — the same bridge, for the Places instrument.
+  //
+  // The instrument layer is a sibling of this component, not a child, so it
+  // cannot reach selectLocation directly. A window handle is how the transit
+  // dots already talk to React here; searching for a venue lands on the same
+  // path a click on its pin takes — select the pin, pan to it, open its card —
+  // so the two ways of finding a place end in exactly the same state.
+  useEffect(() => {
+    window.__animaSelectLocation = (loc) => selectLocation(loc);
+    return () => { delete window.__animaSelectLocation; };
+  }, []);
+
+  // Session 151 — closing the card is three things, not one: drop the React
+  // state, drop the ref the map effects read, and release the pin. Leaving the
+  // pin gold with no card attached to it was the failure mode to avoid.
+  function closePlace() {
+    if (selectedRef.current) {
+      markers.current.find(m => m._locId === selectedRef.current.id)?.setSelected(false);
+      selectedRef.current = null;
+    }
+    setSelected(null);
+    setSelectedActor(null);
+  }
 
   function selectLocation(loc) {
     if (selectedRef.current) {
@@ -589,45 +744,51 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
 
       if (selected.category === "residential") {
         await new Promise(r => setTimeout(r, 1200));
-        let encounter_id = null;
 
-        // Find the target actor — never the player themselves
+        // Session 152 — find whose door this is, not who happens to be behind it.
+        //
+        // This asked `a.home_location === locationId` against presence, which
+        // has never sent a home_location, so the test could not match and it
+        // always fell through to "anyone standing here who isn't me". Fine
+        // while Lindsey is home; wrong when a guest is in her flat, and no help
+        // at all when she is out — you could not knock on an empty flat because
+        // the owner was not standing in it to be found.
+        //
+        // presence now carries home_place_id, so the search is over everyone in
+        // the world rather than everyone in the room, and an empty flat still
+        // has an owner. Knocking when she is out is a real thing to do; nobody
+        // answering is the answer.
         const locationId = selected.place_id || selected.id;
-        const targetActor = selected.actors && (
-          selected.actors.find(a => a.actor_id !== playerActorId && a.home_location === locationId) ||
-          selected.actors.find(a => a.actor_id !== playerActorId)
-        );
+        const everyone = locations.flatMap(l => l.actors || []);
 
-        if (targetActor) {
-          const encResp = await fetch(`/api/worlds/${world.id}/encounter/start`, {
-            method:  "POST",
-            headers: { "Content-Type": "application/json" },
-            body:    JSON.stringify({
-              target_actor_id: targetActor.actor_id,
-              player_actor_id: playerActorId,
-              location_id:     selected.place_id || selected.id,
-              trigger:         "knock"
-            })
-          });
-          const encData = await encResp.json();
-          encounter_id = encData.encounter_id;
+        const targetActor =
+          everyone.find(a => a.actor_id !== playerActorId && a.home_place_id === locationId) ||
+          (selected.actors || []).find(a => a.actor_id !== playerActorId);
+
+        if (!targetActor) {
+          console.warn("[knock] nobody lives at", locationId);
+          return;
         }
-        // Store everything in sessionStorage — no API needed in encounter page
-        sessionStorage.setItem("encounterContext", JSON.stringify({
-          world:      world,
-          user:       user,
-          sceneData:  { location: selected, encounter_id, trigger: "knock", mode: "scene" }
-        }));
-        navigate(`/encounter/knock/${encounter_id || "pending"}`);
-        onClose();
+        // Session 151 — no onClose() after a navigate.
+        //
+        // Session 150 redefined onClose from "unmount me" to "go back to home",
+        // which is right for the ✕ in the header and wrong here: these two lines
+        // ran back to back, so knocking navigated to the encounter and was
+        // immediately redirected to /home by the next statement. Both doors in
+        // this world have been shut since. Navigating away already leaves the
+        // map; there is nothing left to close.
+        // The page starts the encounter itself, keyed on whose door it is, so
+        // the address survives a reload instead of pointing at an encounter id
+        // that expired — or, when the start call failed, at the string
+        // "pending".
+        navigate(`/world/${world.id}/knock/${targetActor.actor_id}/door`);
       } else {
         sessionStorage.setItem("venueContext", JSON.stringify({
           world:    world,
           user:     user,
           location: selected
         }));
-        navigate(`/encounter/venue/${world.id}/${selected.place_id || selected.id}`);
-        onClose();
+        navigate(`/world/${world.id}/venue/${selected.place_id || selected.id}`);
       }
     } catch (e) {
       console.error("Spawn failed", e);
@@ -675,9 +836,29 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
     );
   }
 
-  const worldTime = new Date().toLocaleTimeString("sv-SE", {
-    hour: "2-digit", minute: "2-digit", timeZone: world?.timezone || "Europe/Stockholm",
-  });
+  // Right of the pin by default; left of it when the window edge is closer than
+  // the card is wide. With no anchor yet — map still loading — it parks where
+  // the column used to be, so nothing jumps on first paint.
+  const place = (() => {
+    const W = 300, GAP = 22, EDGE = 16, TOP_SAFE = 74;
+    if (!anchor || typeof window === "undefined") {
+      return { style: { right: EDGE, top: 96 }, flip: true, arrowTop: 40 };
+    }
+    let left = anchor.x + GAP;
+    let flip = false;
+    if (left + W > window.innerWidth - EDGE) { left = anchor.x - GAP - W; flip = true; }
+    if (left < EDGE) { left = EDGE; }
+
+    const h = Math.min(panelH, window.innerHeight - 140);
+    let top = anchor.y - h / 2;
+    top = Math.max(TOP_SAFE, Math.min(top, window.innerHeight - h - EDGE));
+
+    return {
+      style: { left, top },
+      flip,
+      arrowTop: Math.max(24, Math.min(anchor.y - top, h - 24)),
+    };
+  })();
 
   return (
     <>
@@ -731,10 +912,22 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
           )}
         </div>
 
-        <div className={`${styles.panel} ${selected || selectedActor ? styles.panelVisible : ""}`}>
+        <div
+          ref={panelRef}
+          className={`${styles.panel} ${selected || selectedActor ? styles.panelVisible : ""}`}
+          style={place.style}
+        >
+          {anchor && (selected || selectedActor) && (
+            <span
+              className={`${styles.panelArrow} ${place.flip ? styles.panelArrowRight : styles.panelArrowLeft}`}
+              style={{ top: place.arrowTop }}
+            />
+          )}
+          {(selected || selectedActor) && (
+            <button className={styles.panelClose} onClick={closePlace} aria-label="Close">✕</button>
+          )}
           {selectedActor && (
             <div className={styles.panelInner}>
-              <button className={styles.panelClose} onClick={() => setSelectedActor(null)}>✕</button>
               <div className={styles.panelMeta}>
                 <span className={styles.panelType}>In transit</span>
               </div>
@@ -771,26 +964,26 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
                 </div>
                 <h2 className={styles.panelName}>{selected.name}</h2>
 
-                {/* Open/closed + hours — server-filtered ambient staff = open */}
-                {!["residential","residential_home"].includes(selected.category) && (() => {
-                  const hasStaff = selected.actors.some(a => a.is_ambient && a.is_staff); // staff specifically
-                  const venueOpen = selected.actors.some(a => a.is_ambient) || !selected.operating_hours;
-                  const hours = formatHours(selected.operating_hours);
-                  const showBadge = selected.operating_hours != null;
-                  return (
-                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
-                      {showBadge && (
-                        <span style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,fontWeight:500,
-                          color: venueOpen ? "#4caf87" : "#e07070",
-                          background: venueOpen ? "rgba(76,175,135,.12)" : "rgba(224,112,112,.12)",
-                          padding:"2px 8px",borderRadius:20}}>
-                          {venueOpen ? "Open" : "Closed"}
-                        </span>
-                      )}
-                      {hours && <span style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"rgba(255,255,255,.35)"}}>{hours}</span>}
-                    </div>
-                  );
-                })()}
+                {/* Open/closed. `is_open` is decided by the simulator against
+                    the city's clock; null means the venue records no usable
+                    hours, and an absent badge is the honest answer there. */}
+                {!["residential","residential_home"].includes(selected.category)
+                  && selected.is_open != null && (
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6,flexWrap:"wrap"}}>
+                    <span style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,fontWeight:500,
+                      color: selected.is_open ? "#4caf87" : "#e07070",
+                      background: selected.is_open ? "rgba(76,175,135,.12)" : "rgba(224,112,112,.12)",
+                      padding:"2px 8px",borderRadius:20}}>
+                      {selected.is_open ? "Open" : "Closed"}
+                    </span>
+                    {selected.hours_today && (
+                      <span className={styles.venueHours}>{selected.hours_today}</span>
+                    )}
+                    {selected.hours_note && (
+                      <span className={styles.venueNote}>{selected.hours_note}</span>
+                    )}
+                  </div>
+                )}
 
                 {selected.formatted_address && (
                   <p className={styles.panelAddress}>{selected.formatted_address}</p>
@@ -800,7 +993,7 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
 
                 {/* Staff section — ambient actors at this venue */}
                 {(() => {
-                  const venueOpen2 = selected.actors.some(a => a.is_ambient) || !selected.operating_hours;
+                  const venueOpen2 = selected.is_open !== false;
                   const staff = selected.actors.filter(a => a.is_ambient && a.is_staff);
                   // Only show ambient visitors when open — real actors always shown
                   const visitors = selected.actors.filter(a => {
@@ -837,14 +1030,42 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
                       </>
                     )}
 
-                    <p className={styles.sectionLabel}>Here now</p>
+                    {/* Session 151 — order follows the population model: staff hold
+                        the room, then the people you can actually walk up to, then
+                        the computed crowd. The crowd used to sit above the named
+                        visitors, so the one person in the room with a face and a
+                        name was listed below five who have neither.
+
+                        The named ambient layer is labelled "Regulars" rather than
+                        "Here now", because that is what they are — someone whose
+                        being here is a standing arrangement. Once you have actually
+                        met one, the label becomes "Acquaintance": the word is
+                        earned by the relationship rather than asserted by the UI. */}
                     {visitors.length === 0 ? (
+                      <>
+                      <p className={styles.sectionLabel}>Here now</p>
                       <p className={styles.emptyState}>
-                        {!venueOpen2 && selected.operating_hours ? "Closed right now" : "Nobody here right now"}
+                        {selected.is_open === false
+                          ? "Closed right now"
+                          : selected.crowd_size > 0
+                            ? "Nobody you can approach"
+                            : "Nobody here right now"}
                       </p>
-                    ) : (
+                      </>
+                    ) : ([
+                      { key: "cast",     people: visitors.filter(a => !a.is_ambient) },
+                      { key: "regulars", people: visitors.filter(a =>  a.is_ambient) },
+                    ]).filter(g => g.people.length > 0).map(g => (
+                      <div key={g.key}>
+                        <p className={styles.sectionLabel}>
+                          {g.key === "cast"
+                            ? "Here now"
+                            : g.people.every(a => a.knows_player)
+                              ? (g.people.length === 1 ? "Acquaintance" : "Acquaintances")
+                              : "Regulars"}
+                        </p>
                       <div className={styles.actorList}>
-                        {visitors.map(a => (
+                        {g.people.map(a => (
                           <div key={a.actor_id} className={styles.actorRow}
                             onClick={() => a.is_ambient ? setSelectedAmbient(a) : null}
                             style={a.is_ambient ? {cursor:"pointer"} : {}}>
@@ -864,6 +1085,7 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
                               <p className={styles.actorName}>{a.actor_id === user?.worlds?.find(w => w.world_id === world.id)?.actor_id ? "You" : a.name}</p>
                               <p className={styles.actorStatus}>
                                 {a.in_transit ? "In transit" : a.activity_slug ? a.activity_slug.replace(/_/g, " ") : a.occupation || "—"}
+                                {a.knows_player && a.is_ambient ? " · you've met" : ""}
                               </p>
                             </div>
                             {a.is_ambient && (
@@ -872,7 +1094,53 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
                           </div>
                         ))}
                       </div>
+                      </div>
+                    ))}
+                    {/* The rule belongs to the crowd block, not to the space
+                        above it: a restaurant between lunch and dinner has no
+                        crowd at all, and the divider was still drawing — a line
+                        under the last person with nothing beneath it. */}
+                    {selected.crowd && selected.crowd.length > 0 && (
+                      <div className={styles.divider} />
                     )}
+                    {selected.crowd && selected.crowd.length > 0 && (() => {
+                      const parties = selected.crowd.reduce((groups, person) => {
+                        groups[person.party] = groups[person.party] || [];
+                        groups[person.party].push(person);
+                        return groups;
+                      }, {});
+
+                      // Gröna Lund holds ninety-odd people on a Monday
+                      // afternoon, which is right for the place and useless as
+                      // a list. Show a few groups and count the rest.
+                      const keys = Object.keys(parties);
+                      const shown = keys.slice(0, 6);
+                      const restCount = keys
+                        .slice(6)
+                        .reduce((n, key) => n + parties[key].length, 0);
+
+                      return (
+                        <>
+                          <p className={styles.sectionLabel}>
+                            Also here · {selected.crowd_size} {selected.crowd_size === 1 ? "person" : "people"}
+                          </p>
+                          <div className={styles.crowdList}>
+                            {shown.map(key => (
+                              <p key={key} className={styles.crowdParty}>
+                                {parties[key].map(p => `${p.name} (${p.age})`).join(", ")}
+                              </p>
+                            ))}
+                            {restCount > 0 && (
+                              <p className={styles.crowdParty} style={{ opacity: .7 }}>
+                                and {restCount} more
+                              </p>
+                            )}
+                          </div>
+                          <div className={styles.divider} />
+                        </>
+                      );
+                    })()}
+
                   </>);
                 })()}
               </div>

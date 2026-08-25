@@ -21,9 +21,28 @@ export default function VenueScene({ world, user, location, onLeave }) {
   const [encounterStatus,  setEncounterStatus]  = useState("Connecting…");
   const [selectedAmbient, setSelectedAmbient] = useState(null);
   const [ambientGenerating, setAmbientGenerating] = useState(false);
+  const [crowd, setCrowd] = useState([]);
+  // Not to be confused with `approaching` above, which is somebody walking up
+  // to the player. This is the player walking over to someone.
+  const [walkingOver, setWalkingOver] = useState(null);
   const [chats, setChats]     = useState([]); // [{id, is_venue, name, portrait_url, messages, open, loading, ended, encounter_id}]
   const [deltas, setDeltas]   = useState([]);
   const [weather, setWeather] = useState(null);
+
+  // Session 151 — asking who somebody is, is a thing that happens in the world.
+  //
+  // It used to only open a card over data the client already held. Now it is
+  // written down: the person is someone this player has been introduced to, and
+  // Approach unlocks because of it. Optimistic locally so the button appears at
+  // once rather than on the next presence poll.
+  async function introduce(actor) {
+    if (!actor?.actor_id || actor.knows_player) return;
+    setActors(prev => prev.map(a => a.actor_id === actor.actor_id ? { ...a, knows_player: true } : a));
+    setSelectedAmbient(prev => prev?.actor_id === actor.actor_id ? { ...prev, knows_player: true } : prev);
+    try {
+      await fetch(`/api/worlds/${world.id}/actors/${actor.actor_id}/introduce`, { method: "POST" });
+    } catch { /* the next presence poll carries the truth either way */ }
+  }
 
   function handleAmbientPortraitReady(actorId, url) {
     setActors(prev => prev.map(a => a.actor_id === actorId ? {...a, generated_portrait_url: url} : a));
@@ -86,6 +105,45 @@ export default function VenueScene({ world, user, location, onLeave }) {
     return () => clearInterval(timer);
   }, []);
 
+  // Someone in the background crowd exists only as arithmetic until now. The
+  // simulator re-checks they are still in the room and writes them a record;
+  // after that they are an ordinary ambient and the normal card opens on them.
+  const approachCrowd = async (person) => {
+    if (walkingOver) return;
+    setWalkingOver(person.ref);
+    try {
+      const r = await fetch(`/api/worlds/${world.id}/crowd/approach`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ place_id: location.place_id || location.id, ref: person.ref }),
+      });
+      const d = await r.json().catch(() => null);
+
+      if (!r.ok || !d?.actor_id) {
+        // 410 means they finished up and left while the panel still showed them.
+        setCrowd(prev => prev.filter(p => p.ref !== person.ref));
+        return;
+      }
+
+      const pres = await fetch(`/api/worlds/${world.id}/presence`).then(x => (x.ok ? x.json() : null));
+      const loc = (pres?.locations || []).find(l => l.id === location.id || l.place_id === location.place_id);
+      if (loc) {
+        setActors(loc.actors || []);
+        setCrowd(loc.crowd || []);
+      }
+
+      const actor = (loc?.actors || []).find(a => a.actor_id === d.actor_id);
+      if (actor) {
+        setSelectedAmbient(actor);
+        setAmbientGenerating(!actor.generated_portrait_url);
+      }
+    } catch {
+      /* leave the crowd as it was; the next poll will correct it */
+    } finally {
+      setWalkingOver(null);
+    }
+  };
+
   // Presence poll — first fetch sets baseline, subsequent diffs detect arrivals
   const knownActorIdsRef = useRef(null); // null = not yet initialised
 
@@ -121,6 +179,7 @@ export default function VenueScene({ world, user, location, onLeave }) {
             knownActorIdsRef.current = currentIds;
           }
           setActors(current);
+          setCrowd(loc.crowd || []);
         })
         .catch(() => {});
     };
@@ -315,18 +374,34 @@ export default function VenueScene({ world, user, location, onLeave }) {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content, venue: chat.is_venue })
       });
-      const data = await resp.json();
-      if (data.ended) {
+      const data = await resp.json().catch(() => null);
+
+      if (data?.ended) {
         setChats(prev => prev.map(c => c.id === chatId ? { ...c, loading: false, ended: true } : c));
-      } else {
-        const newMsgs = data.lines
-          ? data.lines.map(([speaker, text]) => ({ role: "assistant", content: text, speaker }))
-          : [{ role: "assistant", content: data.reply || "", speaker: data.speaker }];
-        setChats(prev => prev.map(c => c.id === chatId
-          ? { ...c, loading: false, messages: [...c.messages, ...newMsgs] }
-          : c));
+        return;
       }
-    } catch { setChats(prev => prev.map(c => c.id === chatId ? { ...c, loading: false } : c)); }
+
+      // Session 151 — `data.reply || ""` used to append a message no matter
+      // what, so a failed request drew a bubble with nothing in it. Build only
+      // from lines that actually carry words; anything else is a failure and
+      // gets said out loud rather than mimed.
+      const newMsgs = (
+        Array.isArray(data?.lines)
+          ? data.lines.map(([speaker, text]) => ({ role: "assistant", content: text, speaker }))
+          : [{ role: "assistant", content: data?.reply, speaker: data?.speaker }]
+      ).filter(m => typeof m.content === "string" && m.content.trim() !== "");
+
+      setChats(prev => prev.map(c => c.id === chatId
+        ? { ...c, loading: false,
+            messages: [...c.messages, ...newMsgs],
+            note: (resp.ok && newMsgs.length) ? null
+                : !resp.ok ? "Nobody could answer just now."
+                : "Nobody answers." }
+        : c));
+    } catch {
+      setChats(prev => prev.map(c => c.id === chatId
+        ? { ...c, loading: false, note: "Nobody could answer just now." } : c));
+    }
   }
 
   function handleChatClose(chatId) {
@@ -471,10 +546,28 @@ export default function VenueScene({ world, user, location, onLeave }) {
           <span style={{ fontSize: 9, fontWeight: 600, letterSpacing: ".1em", color: "#a8a5a0", textTransform: "uppercase" }}>Here now</span>
         </div>
         <div style={{ flex: 1, overflowY: "auto" }}>
-          {actors.length === 0
+          {actors.length === 0 && crowd.length === 0
             ? <p style={{ fontSize: 11, color: "#a8a5a0", padding: "16px 14px", margin: 0 }}>Nobody here right now</p>
-            : actors.map(a => <ActorRow key={a.actor_id} actor={a} playerActorId={user?.worlds?.find(w => w.world_id === world.id)?.actor_id} onReachOut={handleReachOut} onAmbientClick={(a) => { setSelectedAmbient(a); setAmbientGenerating(!a.generated_portrait_url); }} />)
+            : actors.map(a => <ActorRow key={a.actor_id} actor={a} playerActorId={user?.worlds?.find(w => w.world_id === world.id)?.actor_id} onReachOut={handleReachOut} onAmbientClick={(a) => { introduce(a); setSelectedAmbient(a); setAmbientGenerating(!a.generated_portrait_url); }} />)
           }
+
+          {crowd.length > 0 && (
+            <>
+              <div style={{ padding: "10px 14px 4px", marginTop: 4, borderTop: "1px solid rgba(0,0,0,0.07)" }}>
+                <span style={{ fontSize: 9, fontWeight: 600, letterSpacing: ".1em", color: "#a8a5a0", textTransform: "uppercase" }}>
+                  Also here
+                </span>
+              </div>
+              {crowd.slice(0, 12).map(p => (
+                <CrowdRow key={p.ref} person={p} busy={walkingOver === p.ref} disabled={!!walkingOver} onApproach={approachCrowd} />
+              ))}
+              {crowd.length > 12 && (
+                <p style={{ fontSize: 10, color: "#c2bfba", padding: "4px 14px 10px", margin: 0 }}>
+                  and {crowd.length - 12} more
+                </p>
+              )}
+            </>
+          )}
         </div>
         {photos.length > 1 && (
           <div style={{ padding: "8px 14px", borderTop: "1px solid rgba(0,0,0,0.07)", display: "flex", gap: 4 }}>
@@ -668,8 +761,13 @@ function ActorRow({ actor, onReachOut, onAmbientClick, playerActorId }) {
             ? <div style={{display:"flex", gap:5, marginTop:3}}>
                 <button onClick={() => { if(onAmbientClick) { onAmbientClick(actor); } }}
                   style={{background:"#1a1814", border:"none", borderRadius:8, padding:"3px 8px", fontSize:10, fontWeight:500, color:"#fff", cursor:"pointer", fontFamily:"inherit"}}>ℹ Who?</button>
-                <button onClick={() => onReachOut && onReachOut(actor)}
-                  style={{background:"#1a1814", border:"none", borderRadius:8, padding:"3px 8px", fontSize:10, fontWeight:500, color:"#fff", cursor:"pointer", fontFamily:"inherit"}}>Approach</button>
+                {/* Approach only once you have been introduced — either you
+                    asked who they were, or they answered you in the room and
+                    said their name. knows_player is that fact. */}
+                {actor.knows_player && (
+                  <button onClick={() => onReachOut && onReachOut(actor)}
+                    style={{background:"#1a1814", border:"none", borderRadius:8, padding:"3px 8px", fontSize:10, fontWeight:500, color:"#fff", cursor:"pointer", fontFamily:"inherit"}}>Approach</button>
+                )}
               </div>
             : <div style={{marginTop:3}}>
                 <button onClick={() => onReachOut && onReachOut(actor)}
@@ -679,6 +777,47 @@ function ActorRow({ actor, onReachOut, onAmbientClick, playerActorId }) {
               {actor.in_transit ? "in transit" : actor.activity_slug?.replace(/_/g, " ") || actor.occupation || "—"}
             </p>
         }
+      </div>
+    </div>
+  );
+}
+
+// A face in the crowd. Same shape as ActorRow but with no portrait to show and
+// a single action, because until they are approached there is no record of them
+// to open.
+function CrowdRow({ person, busy, disabled, onApproach }) {
+  const [hover, setHover] = useState(false);
+
+  return (
+    <div
+      className="venue-actor-row"
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{ display: "flex", alignItems: "center", gap: 9, padding: "8px 14px", transition: "background .12s", opacity: busy ? .55 : 1 }}
+    >
+      <div style={{ flexShrink: 0, width: 32, height: 32, borderRadius: "50%", overflow: "hidden", border: "1.5px dashed rgba(0,0,0,0.14)", background: "rgba(0,0,0,0.04)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <span style={{ fontSize: 11, fontWeight: 500, color: "#a8a5a0" }}>{person.name?.[0] || "?"}</span>
+      </div>
+      <div style={{ minWidth: 0, flex: 1, overflow: "hidden" }}>
+        <p style={{ fontSize: 12, fontWeight: 500, color: "#6b6760", lineHeight: 1.3, margin: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+          {person.name}
+        </p>
+        {hover && !disabled && !person.minor ? (
+          <div style={{ marginTop: 3 }}>
+            <button onClick={() => onApproach && onApproach(person)}
+              style={{ background: "#1a1814", border: "none", borderRadius: 8, padding: "3px 8px", fontSize: 10, fontWeight: 500, color: "#fff", cursor: "pointer", fontFamily: "inherit" }}>
+              ℹ Who?
+            </button>
+          </div>
+        ) : (
+          <p style={{ fontSize: 10, color: "#c2bfba", margin: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {busy
+              ? "walking over…"
+              : person.minor
+                ? `${person.age} · with family`
+                : `${person.age} · ${person.gender === "male" ? "man" : "woman"}`}
+          </p>
+        )}
       </div>
     </div>
   );

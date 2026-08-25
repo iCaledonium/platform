@@ -92,7 +92,7 @@ function WorldCard({ world, onOpen, onToggleRun, busy }) {
           <span style={{ ...F, fontSize:12, color:"#a8a5a0" }}>
             {cast.length > 0 ? `${cast.length} in play` : "nobody deployed"}
             {` · ${world.member_count ?? 0} member${(world.member_count ?? 0) === 1 ? "" : "s"}`}
-            {world.role === "owner" ? "" : ` · you're a ${world.role || "viewer"}`}
+            {world.role === "owner" ? "" : ` · you're a ${world.role || "player"}`}
           </span>
         </div>
       </div>

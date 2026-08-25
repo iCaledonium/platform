@@ -1,3 +1,4 @@
+import UndeployButton from "./UndeployButton.jsx";
 import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate, useLocation } from "react-router-dom";
 import DeployWizardModal from "./DeployWizardModal.jsx";
@@ -513,7 +514,7 @@ function MemoryList({ mems, expanded, setExpanded, S }) {
 }
 
 // ── Panel: In Play ────────────────────────────────────────────────────────────
-function InPlayPanel({ actorId }) {
+function InPlayPanel({ actorId, actorName }) {
   const [data, setData]           = useState(null);
   const [loading, setLoading]     = useState(true);
   const [expanded, setExpanded]   = useState({});
@@ -580,6 +581,18 @@ function InPlayPanel({ actorId }) {
                     <span key={w} style={{ ...S.sans, fontSize:10, color: w==="core"?"#c0392b":w==="strong"?"#b05c08":"#a8a5a0" }}>{world.memory_counts[w]} {w}</span>
                   ))}
                 </div>
+              )}
+              {/* Session 152 — remove her from this world, from the page that
+                  shows she is in it. It only ever lived in the gallery list, as
+                  a ✕ inside a chip that nobody could find. */}
+              {isOwner && world.world_id && (
+                <UndeployButton
+                  actorId={actorId}
+                  worldId={world.world_id}
+                  worldName={world.world_name}
+                  name={actorName}
+                  onDone={() => setData(d => ({ ...d, data: d.data.filter(w => w.world_id !== world.world_id) }))}
+                />
               )}
               <span style={{ ...S.sans, fontSize:14, color:"#a8a5a0" }}>{isOpen?"▲":"▼"}</span>
             </div>
@@ -852,7 +865,7 @@ export default function ActorsEditorPage() {
     mental:      <MentalPanel      d={viewData} editing={editing} setEditData={updateEditData} />,
     lifestyle:   <LifestylePanel   d={viewData} editing={editing} setEditData={updateEditData} />,
     economic:    <EconomicPanel    d={viewData} editing={editing} setEditData={updateEditData} />,
-    inplay:      <InPlayPanel      actorId={id} />,
+    inplay:      <InPlayPanel      actorId={id} actorName={viewData?.actor?.name} />,
     model3d:     <ActorModelPanel  actorId={id} />,
     diagnoses:   <MentalPanel      d={viewData} editing={editing} setEditData={updateEditData} />,
     expenses:    <EconomicPanel    d={viewData} editing={editing} setEditData={updateEditData} />,

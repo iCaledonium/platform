@@ -16,7 +16,7 @@
 //
 // Deps: three, @pixiv/three-vrm  (FBXLoader ships inside three)
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import ReactDOM from "react-dom";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
@@ -839,6 +839,19 @@ export default function ActorModelPanel({ actorId }) {
   const [accessories, setAccessories] = useState(() => defaultAccessories());
   const [selectedAccessoryGlbUrls, setSelectedAccessoryGlbUrls] = useState({});
   const [accessoryScales, setAccessoryScales] = useState({});
+  // Session 152 — her saved body proportions, straight from draft_state.
+  //
+  // This panel mounted MiniGlbViewer with NO morph props, and the viewer
+  // force-applies its prop defaults over the file's saved influences on load —
+  // zeroing exactly the proportion morphs that carry her height. The wizard
+  // showed a 178cm Lindsey; this tab measured her at 170.3, silently — and the
+  // runtime bake folds the influences as THIS panel has them, so every world
+  // was getting the shortened her. Pass what the wizard passes, from the same
+  // record, and the two views stop disagreeing about how tall she is.
+  const [bodyMorphs, setBodyMorphs] = useState({
+    bodyHeight: 0, bodyTorsoLength: 0, bodyArmsLength: 0, bodyLegsLength: 0,
+    extraMorphValues: {}, poseValues: {},
+  });
   const [accessoryOffsets, setAccessoryOffsets] = useState({});
   const [accessoryRotations, setAccessoryRotations] = useState({});
   const [accessoryParts, setAccessoryParts] = useState({});
@@ -968,6 +981,60 @@ export default function ActorModelPanel({ actorId }) {
   // switching back to it — the two engines don't share geometry, so a
   // tint change made in Inspect otherwise never reaches Explore's copy.
   const exportGlbRef = useRef(null);
+
+  // Session 152 — the runtime model, and whether it is still her.
+  //
+  // Nothing rebuilds during editing. A slider drag would otherwise mean a
+  // 13-second, 27MB export, and this panel is a continuous-drag interface —
+  // glbSaveInFlightRef exists a few lines up because stacked background exports
+  // have crashed this page before.
+  //
+  // Instead staleness is derived: the server hashes the body file, the wardrobe
+  // and the morph values, and compares that to the hash the built file was made
+  // from. Nothing has to signal a change, so nothing can forget to.
+  const [runtimeState, setRuntimeState] = useState(null);   // {url, hash, builtHash, fresh}
+  const [building, setBuilding] = useState(null);           // null | "working" | error string
+
+  const refreshRuntime = useCallback(async () => {
+    try {
+      const r = await fetch(`/api/actors/${actorId}/runtime`, { credentials: "include" });
+      if (r.ok) setRuntimeState(await r.json());
+    } catch (e) {
+      console.warn("[ActorModelPanel] could not read runtime model state:", e);
+    }
+  }, [actorId]);
+
+  useEffect(() => { refreshRuntime(); }, [refreshRuntime]);
+
+  async function buildRuntimeModel() {
+    if (!exportGlbRef.current) {
+      setBuilding("The viewer has not finished loading her yet.");
+      return;
+    }
+    setBuilding("working");
+    const t0 = performance.now();
+    try {
+      const blob = await exportGlbRef.current({ includeAccessories: true, runtime: true });
+      const r = await fetch(`/api/actors/${actorId}/runtime-glb`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "model/gltf-binary" },
+        body: blob,
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || data.error) {
+        setBuilding(data.error || `Save failed (HTTP ${r.status})`);
+        return;
+      }
+      console.log(`[ActorModelPanel] runtime model built: ${(blob.size / 1e6).toFixed(1)}MB in ` +
+        `${((performance.now() - t0) / 1000).toFixed(1)}s → ${data.url}`);
+      setBuilding(null);
+      await refreshRuntime();
+    } catch (e) {
+      console.error("[ActorModelPanel] runtime build failed:", e);
+      setBuilding(e.message || "Build failed");
+    }
+  }
   const wardrobeDirtyRef = useRef(false);
   // Session 147 — Plan A bridge state: one rebake at a time, and a
   // bounded retry count so a garment that permanently fails to load in
@@ -3282,6 +3349,14 @@ export default function ActorModelPanel({ actorId }) {
           setAccessoryRotations(parsedDraft.accessoryRotations || {});
           setAccessoryParts(parsedDraft.accessoryParts || {});
           setAccessoryTints(parsedDraft.accessoryTints || {});
+          setBodyMorphs({
+            bodyHeight: parsedDraft.bodyHeight ?? 0,
+            bodyTorsoLength: parsedDraft.bodyTorsoLength ?? 0,
+            bodyArmsLength: parsedDraft.bodyArmsLength ?? 0,
+            bodyLegsLength: parsedDraft.bodyLegsLength ?? 0,
+            extraMorphValues: parsedDraft.extraMorphValues || {},
+            poseValues: parsedDraft.poseValues || {},
+          });
           setDraftStateUnparseable(false);
           setWardrobeSaveError(null);
         } catch (we) {
@@ -3360,6 +3435,15 @@ export default function ActorModelPanel({ actorId }) {
           setError(`Character loaded, but her home did not: ${he?.message ?? String(he)}`);
         }
       }
+      // Session 152 — clear the overlay on SUCCESS, unconditionally.
+      //
+      // This function never cleared its own busy state: for every actor WITH a
+      // default home template, the loadRoom call above happened to clear it in
+      // its finally block, which made the bug invisible for as long as every
+      // character had a home. Benny — no home template picked in the wizard —
+      // was the first without one, and his page sat on "Loading character…"
+      // forever while he stood fully loaded and animating behind the overlay.
+      setBusy(null);
     } catch (e) {
       setBusy(null);
       setError(`Could not load actor's 3D model: ${e?.message ?? String(e)}`);
@@ -3652,6 +3736,12 @@ export default function ActorModelPanel({ actorId }) {
               <MiniGlbViewer
                 glbUrl={actorGlbUrl}
                 accessories={previewAccessories}
+                bodyHeight={bodyMorphs.bodyHeight}
+                bodyTorsoLength={bodyMorphs.bodyTorsoLength}
+                bodyArmsLength={bodyMorphs.bodyArmsLength}
+                bodyLegsLength={bodyMorphs.bodyLegsLength}
+                extraMorphValues={bodyMorphs.extraMorphValues}
+                poseValues={bodyMorphs.poseValues}
                 activeAnimation={mode === "explore" ? exploreAnim : inspectActiveAnimation}
                 onSceneReady={(sc) => { miniSceneRef.current = sc; setMiniReady(true); }}
                 onAnimationsLoaded={setEmbeddedAnimations}
@@ -3706,6 +3796,39 @@ export default function ActorModelPanel({ actorId }) {
 
         {mode === "explore" && (
         <div style={{ ...LIGHT.panel, flex: "0 1 300px", minWidth: 240, maxWidth: 320 }}>
+
+          {/* Session 152 — the model a running world loads.
+              Deliberately its own block above Display: Display is how she looks
+              on this screen, this is what leaves it. */}
+          <div style={{ ...LIGHT.sectionLabel, marginBottom: 6 }}>
+            <span>Runtime model</span>
+          </div>
+          <div style={{ fontSize: 11.5, lineHeight: 1.5, color: "#666", marginBottom: 14 }}>
+            {building === "working" ? (
+              <span>Building — folding in her sculpt, baking the wardrobe, rebinding the skeletons…</span>
+            ) : typeof building === "string" ? (
+              <span style={{ color: "#993c1d" }}>{building}</span>
+            ) : !runtimeState ? (
+              <span>Checking…</span>
+            ) : runtimeState.fresh ? (
+              <span style={{ color: "#0F6E56" }}>Up to date — worlds will load this.</span>
+            ) : runtimeState.builtHash ? (
+              <span>
+                Out of date. She has been edited since this was built, so a world
+                would load the older her.
+              </span>
+            ) : (
+              <span>Never built. Deploying her now would give a world nothing to load.</span>
+            )}
+          </div>
+          {building !== "working" && (!runtimeState || !runtimeState.fresh) && (
+            <button
+              style={{ ...LIGHT.btnGhostSmall, width: "100%", marginBottom: 18, padding: "8px 0" }}
+              onClick={buildRuntimeModel}>
+              {runtimeState?.builtHash ? "Rebuild" : "Build"} runtime model
+            </button>
+          )}
+
           <div style={LIGHT.sectionLabel}>
             <span>Display</span>
             <button

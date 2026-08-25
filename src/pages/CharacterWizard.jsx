@@ -1907,7 +1907,16 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
             </div>
           )}
           {step===1&&<div style={{display:"grid",gridTemplateColumns:"400px minmax(0,1fr) 300px",gap:28,alignItems:"start",minHeight:"calc(100vh - 260px)"}}>
-          <div>
+          {/* Session 152 — the LEFT column gets the same viewport cap the right
+              column earned in Session 101, for the same confirmed reason: an
+              uncapped column dictates the whole grid row's height, and the
+              centre viewer matches it via alignSelf:"stretch". The right side
+              was fixed then; the left kept growing (reference photo, body
+              photos, height, voice…) until on a tall monitor the VIEWER was
+              taller than the screen and the whole page scrolled. Both side
+              columns now scroll themselves, the row settles at the viewport
+              calc, and the 3D preview fits the screen with no main scrollbar. */}
+          <div style={{maxHeight:"calc(100vh - 260px)", overflowY:"auto", overflowX:"hidden", paddingRight:4}}>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:18}}>
               <Field label="First Name" required><input style={S.input} value={identity.first_name} onChange={e=>updI("first_name",e.target.value)} placeholder="Emma…" /></Field>
               <Field label="Last Name" required><input style={S.input} value={identity.last_name} onChange={e=>updI("last_name",e.target.value)} placeholder="Lindqvist…" /></Field>

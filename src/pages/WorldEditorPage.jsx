@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import LlmConfigPanel from "./LlmConfigPanel.jsx";
+import { isPreciseHome, IMPRECISE_HOME_HINT } from "../lib/placePrecision.js";
 
 // ── WorldEditorPage ───────────────────────────────────────────────────────────
 //
@@ -256,9 +257,12 @@ function ResidencesTab({ world }) {
             )}
             <div style={{position:"relative",marginBottom:12}}>
               <input value={homeQuery} onChange={async e => {
-                const query = e.target.value; setHomeQuery(q);
-                if (q.length < 3) { setHomeSuggs([]); return; }
-                const resp = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(q)}`).then(r=>r.ok?r.json():[]);
+                // Session 150 — this read `q`, which is declared nowhere in this
+                // file. The handler threw ReferenceError on the first keystroke,
+                // so "Move in / Change home" has never returned a suggestion.
+                const query = e.target.value; setHomeQuery(query);
+                if (query.length < 3) { setHomeSuggs([]); return; }
+                const resp = await fetch(`/api/places/autocomplete?q=${encodeURIComponent(query)}`).then(r=>r.ok?r.json():[]);
                 setHomeSuggs(Array.isArray(resp)?resp:[]);
               }} placeholder={`Search address in ${world.city||"city"}…`}
                 style={{width:"100%",boxSizing:"border-box",padding:"9px 12px",borderRadius:9,border:"1px solid rgba(0,0,0,.12)",fontSize:13,outline:"none"}}
@@ -270,21 +274,34 @@ function ResidencesTab({ world }) {
                       e.stopPropagation();
                       setHomeQuery(s.description); setHomeSuggs([]);
                       const det = await fetch(`/api/places/details?place_id=${s.place_id}`).then(r=>r.ok?r.json():null);
-                      console.log("[place details]", s.place_id, det);
-                      setSelectedHome({ place_id: s.place_id, description: s.description, lat: det?.lat, lng: det?.lng });
-                    }} style={{padding:"10px 14px",fontSize:13,cursor:"pointer",borderBottom:"1px solid rgba(0,0,0,.05)"}}
+                      setSelectedHome({ place_id: s.place_id, description: s.description, lat: det?.lat, lng: det?.lng, types: det?.types ?? s.types });
+                    }} style={{padding:"10px 14px",fontSize:13,cursor:"pointer",borderBottom:"1px solid rgba(0,0,0,.05)",
+                      color: isPreciseHome(s.types) ? "inherit" : "#a8a5a0"}}
                       onMouseEnter={e=>e.currentTarget.style.background="rgba(0,0,0,.03)"}
                       onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
                       {s.description}
+                      {!isPreciseHome(s.types) && (
+                        <div style={{fontSize:10,color:"#b8763a",marginTop:2}}>{IMPRECISE_HOME_HINT}</div>
+                      )}
                     </div>
                   ))}
                 </div>
               )}
             </div>
             {selectedHome && (
-              <div style={{padding:"8px 12px",background:"rgba(29,158,117,.06)",border:"1px solid rgba(29,158,117,.3)",borderRadius:8,fontSize:12,color:"#1D9E75",marginBottom:12}}>
-                ✓ {selectedHome.description}
-              </div>
+              isPreciseHome(selectedHome.types) ? (
+                <div style={{padding:"8px 12px",background:"rgba(29,158,117,.06)",border:"1px solid rgba(29,158,117,.3)",borderRadius:8,fontSize:12,color:"#1D9E75",marginBottom:12}}>
+                  ✓ {selectedHome.description}
+                </div>
+              ) : (
+                // Session 150 — moving someone into a street rather than a
+                // building is what produced the second, tenantless Narvavägen
+                // apartment. See lib/placePrecision.js.
+                <div style={{padding:"8px 12px",background:"rgba(184,118,58,.07)",border:"1px solid rgba(184,118,58,.35)",borderRadius:8,fontSize:12,color:"#8a5624",marginBottom:12,lineHeight:1.45}}>
+                  That is the whole street. Search again with a house number — she needs a
+                  building to live in, not a road.
+                </div>
+              )
             )}
             <div style={{marginBottom:12}}>
               <div style={{fontSize:11,color:"#a8a5a0",marginBottom:4,letterSpacing:".04em"}}>DISPLAY NAME (optional)</div>
@@ -295,12 +312,14 @@ function ResidencesTab({ world }) {
             </div>
             <div style={{display:"flex",justifyContent:"flex-end",gap:8}}>
               <button onClick={() => { setChangeTarget(null); setHomeQuery(""); setHomeSuggs([]); setSelectedHome(null); setHomeName(""); }} style={{fontSize:12,padding:"7px 16px",borderRadius:8,border:"1px solid rgba(0,0,0,.12)",background:"transparent",color:"#6b6760",cursor:"pointer"}}>Cancel</button>
-              <button disabled={!selectedHome||saving} onClick={() => setHome(changeTarget.id, selectedHome.place_id, homeName.trim() || selectedHome.description, selectedHome.lat, selectedHome.lng)}
+              {(() => { const homeOk = !!selectedHome && isPreciseHome(selectedHome.types) && !saving; return (
+              <button disabled={!homeOk} onClick={() => setHome(changeTarget.id, selectedHome.place_id, homeName.trim() || selectedHome.description, selectedHome.lat, selectedHome.lng)}
                 style={{fontSize:12,padding:"7px 16px",borderRadius:8,border:"none",
-                  background:selectedHome&&!saving?"#1a1814":"rgba(0,0,0,.15)",
-                  color:selectedHome&&!saving?"#faf8f4":"#a8a5a0",cursor:selectedHome&&!saving?"pointer":"not-allowed"}}>
+                  background:homeOk?"#1a1814":"rgba(0,0,0,.15)",
+                  color:homeOk?"#faf8f4":"#a8a5a0",cursor:homeOk?"pointer":"not-allowed"}}>
                 {saving ? "Saving…" : changeTarget?.home_lat ? "Change home" : "Move in"}
               </button>
+              ); })()}
             </div>
           </div>
         </div>
@@ -323,14 +342,14 @@ function ResidencesTab({ world }) {
 // configure, start, or delete.
 const ROLE_HELP = {
   owner:  "Full control — start and stop, configure, deploy characters, manage members, delete the world.",
-  viewer: "Can see the world and interact with it. Cannot change it or deploy anyone into it.",
+  player: "Lives in the world — enters it, has their own player character, and talks to the cast. Cannot change how the world is built.",
 };
 
 function MembersPanel({ worldId, isOwner }) {
   const [members, setMembers] = useState(undefined);
   const [users, setUsers]     = useState([]);
   const [pick, setPick]       = useState("");
-  const [role, setRole]       = useState("viewer");
+  const [role, setRole]       = useState("player");
   const [busy, setBusy]       = useState(false);
   const [error, setError]     = useState(null);
 
@@ -385,7 +404,7 @@ function MembersPanel({ worldId, isOwner }) {
                 </select>
                 <select value={role} onChange={e => setRole(e.target.value)}
                   style={{ ...F, fontSize:13, padding:"8px 11px", borderRadius:9, border:"1px solid rgba(0,0,0,.12)", background:"rgba(255,255,255,.8)" }}>
-                  <option value="viewer">Viewer</option>
+                  <option value="player">Player</option>
                   <option value="owner">Owner</option>
                 </select>
                 <button onClick={add} disabled={busy || !pick}
@@ -423,19 +442,19 @@ function MembersPanel({ worldId, isOwner }) {
               </div>
 
               {isOwner ? (
-                <select value={m.role || "viewer"} onChange={e => setRoleOf(m.id, e.target.value)}
+                <select value={m.role || "player"} onChange={e => setRoleOf(m.id, e.target.value)}
                   disabled={busy || lastOwner}
                   title={lastOwner ? "The world's only owner — make someone else an owner first" : undefined}
                   style={{ ...F, fontSize:11.5, padding:"5px 9px", borderRadius:7, border:"1px solid rgba(0,0,0,.12)",
                     background: owner ? "rgba(29,158,117,.08)" : "rgba(255,255,255,.75)",
                     color: owner ? "#0F6E56" : "#6b6760", cursor: lastOwner ? "default" : "pointer", opacity: lastOwner ? .6 : 1 }}>
-                  <option value="viewer">viewer</option>
+                  <option value="player">player</option>
                   <option value="owner">owner</option>
                 </select>
               ) : (
                 <span style={{ ...F, fontSize:9, letterSpacing:".08em", textTransform:"uppercase", padding:"3px 8px",
                   borderRadius:5, background: owner ? "rgba(29,158,117,.1)" : "rgba(0,0,0,.04)",
-                  color: owner ? "#0F6E56" : "#6b6760" }}>{m.role || "viewer"}</span>
+                  color: owner ? "#0F6E56" : "#6b6760" }}>{m.role || "player"}</span>
               )}
 
               {isOwner && (

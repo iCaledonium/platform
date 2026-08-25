@@ -3,6 +3,7 @@ import homeStyles from "./HomePage.module.css";
 import AppWizard from "./AppWizard.jsx";
 import AppConfig from "./AppConfig.jsx";
 import WorldEnterOverlay from "./WorldEnterOverlay.jsx";
+import { useNavigate } from "react-router-dom";
 
 function greeting() {
   const currentHour = new Date().getHours();
@@ -17,6 +18,7 @@ const TOOL_ICON = {
 };
 
 export default function HomePage() {
+  const navigate = useNavigate();
   const [user, setUser]               = useState(null);
   const [worlds, setWorlds]           = useState([]);
   const [togglingId, setTogglingId]   = useState(null);
@@ -228,8 +230,12 @@ export default function HomePage() {
                       .then(d=>window.open(`https://anima.simulator.ngrok.dev/worlds/${w.id}?viewer=${d.token}`,"_blank"))
                       .catch(()=>window.open(`https://anima.simulator.ngrok.dev/worlds/${w.id}`,"_blank"));
                   }}>Monitor →</button>
+                  {/* Session 150 — a real route, not an overlay on /home.
+                      Being inside a world had no address: it could not be
+                      linked, reloaded into, or reached from a notification, and
+                      Back left the world rather than stepping within it. */}
                   <button className={homeStyles.btnEnter} disabled={!isRunning}
-                    onClick={() => { setSelectedWorld(w); setShowEnterOverlay(true); }}>
+                    onClick={() => navigate(`/world/${w.id}`)}>
                     Enter →
                   </button>
                 </div>

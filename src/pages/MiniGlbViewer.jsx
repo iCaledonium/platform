@@ -6,6 +6,7 @@ import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
 import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { MeshBVH } from "three-mesh-bvh";
+import { applySkinLayers, suspendSkinLayers, fitOuterLayers } from "./bodyLayers.js";
 
 // Session 96: the three real, confirmed body-shape morphs (see
 // generate3d.js / favorite_morphs.json). Every GLB this pipeline
@@ -1083,9 +1084,42 @@ const ACCESSORY_SHRINKWRAP = {
   // specific path or build a tightness gate — do not blanket-enable
   // /torso/ again. /head/ (hair) stays excluded per the
   // ACCESSORY_INFLATE note above.
-  pathFragments: ["/underwear/", "/legs/", "/feet/"],
+  // Session 152 — the Angie top's specific path, exactly as the note above
+  // prescribes for a tight top. On a full-sculpt body (BodyMass 1.0) the bust
+  // sits INSIDE this blouse's yoke: skin islands through the fabric below the
+  // collar, at the neckline boundary where the skin-layer mask must keep skin.
+  // Culling cannot fix a garment the body protrudes through at its own edge —
+  // only fitting can. Shrinkwrap moves nothing on the parts of a loose blouse
+  // that are already outside the body, so the drape survives; the bust region
+  // gets pushed out to surface+2.5mm like every other fitted garment.
+  pathFragments: ["/underwear/", "/legs/", "/feet/", "/torso/top/top_long_angie_top"],
   clearanceMeters: 0.0025, // fabric rests ~2.5mm above the skin
   maxSearchMeters: 0.12,   // vertices with no body surface within 12cm are ignored
+  // Session 152, second iteration — direction, not distance, was the disease.
+  //
+  // On a BodyMass-100 male the garments arrive sized for a THIN man: the
+  // landmark registration scales by bone distances, and morphs move vertices,
+  // not bones. His flesh is therefore outside the authored fabric nearly
+  // everywhere, and closest-point resolve hauled cloth THROUGH the belly fold
+  // to whatever daylight was nearest — measured on Benny: all 5280 waistband
+  // vertices, max 17.2cm, a crumpled fan (directions criss-cross inside a
+  // concavity). A plain distance cap was tried first and swallowed the
+  // garments whole — abandoning most of both.
+  //
+  // The cure the codebase already proved for thin bands (the Session 103
+  // wrong-side guard): push RADIALLY OUTWARD from the body's central axis.
+  // Radial directions from one axis never cross, so a ring stays a ring and a
+  // big push is simply the garment inflating around the body it is worn on.
+  // Pushes past radialAboveMeters resolve radially; only past
+  // maxResolveMeters (a genuine teleport) is a vertex left buried.
+  // 3cm caught the SLEEVES too (measured on Benny's shirt: sleeve fabric needs
+  // 3-6cm toward the arm right beside it, and torso-radial hauled the sleeve
+  // backs away from the arms they wrap — spikes and armpit tears). Closest-
+  // point is correct wherever the target surface is near and locally
+  // consistent; only the long cross-fold hauls (belly, crotch: 8-17cm) need
+  // the radial field. The threshold sits between the two measured regimes.
+  radialAboveMeters: 0.07,
+  maxResolveMeters: 0.25,
   // Displacement-field smoothing (v5): without it, only genuinely-inside
   // vertices move while their just-outside neighbors stay frozen, so the
   // fabric creases and lumps exactly along the resolve boundary. Each
@@ -1416,6 +1450,7 @@ function shrinkwrapToBody(accessoryMesh, mainSkinnedMesh, accessoryUrl) {
     disp.fill(0);
     let violations = 0;
     let maxPush = 0;
+    let abandoned = 0;
     for (let i = 0; i < posAttr.count; i++) {
       p.set(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i));
       const inside = isInsideBody(p.x, p.y, p.z);
@@ -1452,10 +1487,32 @@ function shrinkwrapToBody(accessoryMesh, mainSkinnedMesh, accessoryUrl) {
             }
           }
         }
+        let push = target.point.distanceTo(p) + clearance;
+        // Large push: re-aim radially outward (see radialAboveMeters above) —
+        // same probe mechanics as the band guard, applied by push size.
+        if (push > ACCESSORY_SHRINKWRAP.radialAboveMeters) {
+          const rlen = Math.hypot(p.x, p.z);
+          if (rlen > 1e-4) {
+            const probe = p.clone();
+            probe.x += (p.x / rlen) * ACCESSORY_SHRINKWRAP.maxSearchMeters * 0.6;
+            probe.z += (p.z / rlen) * ACCESSORY_SHRINKWRAP.maxSearchMeters * 0.6;
+            const t2 = { point: new THREE.Vector3(), faceIndex: 0 };
+            const hit2 = bvh.closestPointToPoint(probe, t2, 0, ACCESSORY_SHRINKWRAP.maxSearchMeters);
+            if (hit2) {
+              target.point.copy(t2.point);
+              n.set(p.x / rlen, 0, p.z / rlen);
+              push = target.point.distanceTo(p) + clearance;
+            }
+          }
+        }
+        if (push > ACCESSORY_SHRINKWRAP.maxResolveMeters) {
+          violations--;
+          abandoned++;
+          continue;
+        }
         disp[i * 3] = target.point.x + n.x * clearance - p.x;
         disp[i * 3 + 1] = target.point.y + n.y * clearance - p.y;
         disp[i * 3 + 2] = target.point.z + n.z * clearance - p.z;
-        const push = target.point.distanceTo(p) + clearance;
         if (push > maxPush) maxPush = push;
       } else if (ACCESSORY_SHRINKWRAP.nearContactLift && garmentNormals) {
         const signed = toP.subVectors(p, target.point).dot(n);
@@ -1471,7 +1528,7 @@ function shrinkwrapToBody(accessoryMesh, mainSkinnedMesh, accessoryUrl) {
         }
       }
     }
-    return { violations, maxPush };
+    return { violations, maxPush, abandoned };
   };
 
   // Adjacency (once) for the smoothing passes.
@@ -1517,8 +1574,10 @@ function shrinkwrapToBody(accessoryMesh, mainSkinnedMesh, accessoryUrl) {
   let firstViolations = 0;
   let firstMaxPush = 0;
   let residual = 0;
+  let buried = 0;
   while (passes < ACCESSORY_SHRINKWRAP.maxPasses) {
-    const { violations, maxPush } = computeField(disp);
+    const { violations, maxPush, abandoned } = computeField(disp);
+    buried = abandoned;
     if (passes === 0) { firstViolations = violations; firstMaxPush = maxPush; }
     residual = violations;
     if (violations === 0) break;
@@ -1542,7 +1601,8 @@ function shrinkwrapToBody(accessoryMesh, mainSkinnedMesh, accessoryUrl) {
   }
   posAttr.needsUpdate = true;
 
-  const status = residual === 0 ? "ASSERT PASS (converged)" : (enforced > 0 ? `ASSERT ENFORCED (${enforced} vertices hard-snapped after ${passes} smoothed passes)` : "ASSERT PASS");
+  const status = (residual === 0 ? "ASSERT PASS (converged)" : (enforced > 0 ? `ASSERT ENFORCED (${enforced} vertices hard-snapped after ${passes} smoothed passes)` : "ASSERT PASS"))
+    + (buried > 0 ? ` — ${buried} vertex(es) left buried in flesh (push exceeded ${(ACCESSORY_SHRINKWRAP.maxResolveMeters * 100).toFixed(1)}cm cap)` : "");
   console.log(`[MiniGlbViewer] Shrinkwrap v6: "${accessoryMesh.name}" (${accessoryUrl}) — initial violations ${firstViolations}/${posAttr.count} (max push ${(firstMaxPush * 1000).toFixed(1)}mm), ${passes} resolve+smooth pass(es), ${status}, clearance ${(clearance * 1000).toFixed(1)}mm, ${(performance.now() - t0).toFixed(0)}ms.`);
 }
 
@@ -1617,6 +1677,52 @@ export function effectiveTransform(garmentScale, garmentOffset, garmentRotation,
     // shared pivot — for whole-garment tilts keep values small.
     rotation: { x: gr.x + pr.x, y: gr.y + pr.y, z: gr.z + pr.z },
   };
+}
+
+// Session 152 — everything that must be true once the wardrobe settles, in
+// layer order: hair is lifted over the clothing beneath it (fitOuterLayers),
+// its manual-fit baseline recaptured so slider math builds on the layered
+// shape, and only then is the skin mask computed. One function, because three
+// call sites (settled load, finished load, body refit) were each going to
+// repeat the sequence and drift.
+function settleLayers(loadedRoot, store, accessories) {
+  // Hair gets the same four-step discipline the refit effect uses for
+  // shrinkwrapped garments, and for the same reason: anything that bakes into
+  // positions must restore its raw shape first, or repeated passes compound.
+  // The first version recaptured the manual-fit baseline AFTER the manual
+  // transform was applied — settle twice with a manual hair tweak set and the
+  // tweak doubles.
+  const hairEntries = [];
+  for (const [url, entries] of Object.entries(store || {})) {
+    if (!url.includes("/head/hair/")) continue;
+    for (const e of entries) {
+      if (e.mesh && e.prefitPositions) hairEntries.push({ url, e });
+    }
+  }
+
+  // 1. Back to the raw load shape — settles are now idempotent.
+  for (const { e } of hairEntries) {
+    restorePositions(e.mesh.geometry.attributes.position, e.prefitPositions);
+    e.mesh.geometry.attributes.position.needsUpdate = true;
+  }
+
+  // 2. Lift the hair over the clothing exactly as it is currently fitted,
+  //    manual transforms included — a top scaled up by its slider is a bigger
+  //    surface to rest on, which is precisely the case that exposed this.
+  fitOuterLayers(loadedRoot, store);
+
+  // 3. The layered shape becomes the manual-fit baseline, and the manual
+  //    transform re-applies on top — same order as the body refit.
+  for (const { url, e } of hairEntries) {
+    e.originalPositions = capturePositions(e.mesh.geometry.attributes.position);
+    e.mesh.geometry.computeBoundingBox();
+    e.mesh.geometry.boundingBox.getCenter(e.center);
+    const acc = (accessories || []).find((a) => a.url === url);
+    const t = effectiveTransform(acc?.scale, acc?.offset, acc?.rotation, acc?.parts, e.matName);
+    applyAccessoryScale(e.mesh, e.originalPositions, e.center, t.scale, t.offset, t.rotation);
+  }
+
+  applySkinLayers(loadedRoot, store);
 }
 
 function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loadedRoot, dracoLoader, isMounted, manualScale, manualOffset, manualRotation, manualParts, accessoryMeshesStore, statureHeightM = null, manualTint = null) {
@@ -1928,8 +2034,35 @@ function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loade
 
         const boneIndexMap = new Array(accessoryBones.length);
         let unmatchedCount = 0;
+        let suffixMatchedCount = 0;
         accessoryBones.forEach((b, i) => {
-          const mainIndex = mainBoneNameToIndex[b.name];
+          let mainIndex = mainBoneNameToIndex[b.name];
+          // Session 152 — Blender ".00N" duplicates. The Angie jeans carry 16
+          // bones named l_thigh.001, l_thightwist1.002, spine1.001… — exports
+          // where Blender deduplicated names on import. Exact-name matching
+          // sent every one of them to the root fallback below, which pinned
+          // the jeans' thigh and seat weights to a bone that never moves while
+          // the body's thighs animated out from under the denim. That is the
+          // largest single cause of skin rendering through the jeans in
+          // Explore. Strip the suffix and retry — the stripped name then also
+          // benefits from the "(drv)" redirect above, landing on the bone that
+          // is genuinely animated. (The runtime export bake has done exactly
+          // this since it was written; the live path never did.)
+          if (mainIndex === undefined) {
+            // Two spellings of the same duplicate: the file says "l_thigh.001",
+            // but three.js sanitizes node names at load and the live skeleton
+            // says "l_thigh001" — the dot is already gone by the time this map
+            // is built, so matching "\.\d+$" alone found nothing (measured:
+            // 0 of the jeans' 16). Strip a trailing three-digit run, with or
+            // without its dot, and only accept the result if that bone really
+            // exists — "spine1001" becomes "spine1", while a genuine name
+            // ending in digits that resolves to nothing stays unmatched.
+            const stripped = b.name.replace(/\.?\d{3}$/, "");
+            if (stripped !== b.name && mainBoneNameToIndex[stripped] !== undefined) {
+              mainIndex = mainBoneNameToIndex[stripped];
+              suffixMatchedCount++;
+            }
+          }
           if (mainIndex === undefined) {
             unmatchedCount++;
             boneIndexMap[i] = 0; // Falls back to the root bone rather than an invalid index — flagged below if this ever actually happens.
@@ -1937,7 +2070,7 @@ function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loade
             boneIndexMap[i] = mainIndex;
           }
         });
-        console.log(`[MiniGlbViewer] Accessory bone remap (${accessoryUrl}): ${accessoryBones.length} bones checked, ${unmatchedCount} had no matching name in the main skeleton (mapped to root as fallback).`);
+        console.log(`[MiniGlbViewer] Accessory bone remap (${accessoryUrl}): ${accessoryBones.length} bones checked, ${suffixMatchedCount} matched after stripping a Blender .00N suffix, ${unmatchedCount} had no matching name in the main skeleton (mapped to root as fallback).`);
 
         // Everything from here runs PER PRIMITIVE — each SkinnedMesh has
         // its own geometry (own skinIndex/skinWeight attributes) even
@@ -2779,7 +2912,32 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
           mixerRef.current = mixer;
           clockRef.current = new THREE.Timer();
           const byName = {};
-          for (const clip of gltf.animations) byName[clip.name] = clip;
+          // Session 152 — clips do not get to sculpt her.
+          //
+          // idle and walk carry .morphTargetInfluences tracks alongside their
+          // bone tracks — a constant snapshot of whatever the morph state was
+          // when the clip was merged. The mixer's PropertyBinding writes those
+          // tracks onto the body meshes EVERY FRAME, so the moment a clip
+          // played, every slider the user had dragged snapped back to that
+          // stale snapshot: press Walk and the heavy man you just sculpted
+          // deflates to the base body while the sliders still read your
+          // values. (Found live on Benny, step 1.)
+          //
+          // In this editor the sliders own the morphs, full stop. The bone
+          // tracks — the whole of what makes a clip a walk — are untouched.
+          // The runtime export bake has stripped these same tracks since it
+          // was written, for the file-side version of this same reason.
+          for (const clip of gltf.animations) {
+            const bones = clip.tracks.filter((t) => !t.name.endsWith(".morphTargetInfluences"));
+            if (bones.length !== clip.tracks.length) {
+              const trimmed = clip.clone();
+              trimmed.tracks = bones;
+              console.log(`[MiniGlbViewer] clip "${clip.name}": dropped ${clip.tracks.length - bones.length} morph track(s) — sliders own the morphs; ${bones.length} bone track(s) kept.`);
+              byName[clip.name] = trimmed;
+            } else {
+              byName[clip.name] = clip;
+            }
+          }
           animationsRef.current = byName;
           console.log(`[MiniGlbViewer] ${gltf.animations.length} animation(s) found: ${gltf.animations.map(c => c.name).join(", ")}`);
           if (onAnimationsLoaded) onAnimationsLoaded(Object.keys(byName));
@@ -3108,6 +3266,10 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
         }
         delete store[url];
         console.log(`[MiniGlbViewer] Accessory manager: removed ${url} from the live scene`);
+        // Session 152 — a removed garment uncovers skin. Recompute the layer
+        // culling from what is actually left in the store, or she keeps a
+        // hole shaped like the jeans she just took off.
+        settleLayers(loadedRoot, store, accessories);
         {
           let sceneTop = loadedRootRef.current;
           while (sceneTop && sceneTop.parent) sceneTop = sceneTop.parent;
@@ -3128,7 +3290,17 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
       for (const [u, es] of Object.entries(store)) partsMap[u] = es.map(e => e.matName);
       onAccessoryPartsLoaded(partsMap);
     };
-    if (missing.length === 0) { reportParts(); return () => { cancelled = true; }; }
+    if (missing.length === 0) {
+      reportParts();
+      // Session 152 — the settled path needs the mask too. Under StrictMode the
+      // first effect pass often loads every garment and the second finds the
+      // store already full, landing HERE — and the skin mask only ran at the
+      // end of the additions path below. Whether this run loaded anything or
+      // found it all done, the wardrobe is now settled, and settled is exactly
+      // when the mask must be true.
+      settleLayers(loadedRoot, store, accessories);
+      return () => { cancelled = true; };
+    }
     // Session 103 — CANCELLATION MUST CLEAN ITS HALF-WORK: during a
     // draft restore the deps settle in waves (accessory list, then
     // meshesVersion), so a new run can cancel one mid-garment. The
@@ -3170,7 +3342,14 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
         // loader-wide crash rendered her nude with an empty console.
         // Never silent: name the garment, show the real error.
         .catch((e) => { console.error(`[MiniGlbViewer] Accessory manager: FAILED to load ${url} — she will be missing this garment:`, e); throw e; })
-    )).then(reportParts);
+    )).then(() => {
+      reportParts();
+      // Session 152 — the body joins the layer system (see bodyLayers.js).
+      // After every garment in this batch has loaded AND shrunk-wrapped
+      // (shrinkwrap must see the full body surface, so culling comes last),
+      // hide the skin the active wardrobe covers.
+      if (!cancelled) settleLayers(loadedRoot, store, accessories);
+    });
     return () => {
       cancelled = true;
       for (const url of startedUrls) {
@@ -3375,6 +3554,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
   // Registration is skeleton-bind-pose math — morph-independent — so it
   // stays baked in the prefit snapshot and is not recomputed.
   const refitTimerRef = useRef(null);
+  const layerSettleTimerRef = useRef(null);
   useEffect(() => {
     if (refitTimerRef.current) clearTimeout(refitTimerRef.current);
     refitTimerRef.current = setTimeout(() => {
@@ -3411,6 +3591,17 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
         }
       }
       console.log(`[MiniGlbViewer] Body refit: ${refitted} accessory primitive(s) re-shrinkwrapped against the current body shape in ${(performance.now() - t0).toFixed(0)}ms (body morphs changed).`);
+      // Session 152 — the skin mask ages exactly like the garment fit does.
+      //
+      // The mask was computed against the body as it stood when the wardrobe
+      // finished loading. A later morph change moves the skin — and the panel
+      // now passes her saved proportions as props, which land precisely here,
+      // AFTER the wardrobe's first mask. Found on her chest: the sculpt
+      // arrived, the skin moved, and the stale mask left breast skin showing
+      // through the top. Same cure as the fit itself: recompute after every
+      // refit, against the garments as just re-wrapped and the body as it now
+      // is.
+      settleLayers(loadedRootRef.current, store, accessories);
     }, 300);
     return () => { if (refitTimerRef.current) clearTimeout(refitTimerRef.current); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3453,6 +3644,16 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
         }
       }
     }
+    // Session 152 — a manual fit change moves a LAYER, so the layers above
+    // and beneath it are stale the moment the slider settles: scale a top's Z
+    // to 1.15x and the yoke grows out over hair that was fitted against the
+    // smaller top (found live, red ring around her yoke), while the skin mask
+    // keeps culling for the old surface. Debounced like the body refit, so a
+    // drag costs one settle, not sixty.
+    if (layerSettleTimerRef.current) clearTimeout(layerSettleTimerRef.current);
+    layerSettleTimerRef.current = setTimeout(() => {
+      settleLayers(loadedRootRef.current, accessoryMeshesRef.current, accessories);
+    }, 350);
     // Dependency key covers scale, offset, per-part adjustments AND
     // tint — all re-apply live on every drag/pick, with no model reload.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3498,6 +3699,178 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
     }
   }, [activeAnimation]);
 
+// ── Session 152 — baking, for the file a running world loads ────────────────
+//
+// Three things separate the editor's export from the runtime one, and all three
+// are deliberate choices in the editor that are simply wrong once nobody is
+// going to edit the file again.
+
+// 1. THE SCULPT.
+//
+// GLTFExporter keeps all 113 morph targets and writes the current influences as
+// the file's starting weights — the export opens correctly shaped AND stays
+// adjustable. That is the right trade for a working file and it is 81% of a
+// 92MB download for a world that will never move a slider.
+//
+// The targets cannot simply be dropped: her shape is IN those influences.
+// Sixteen are non-zero on the body meshes (BreastsDiameter -0.41, BreastSize
+// 0.11, BodyMuscularVolume -0.1 …) and three on the head (ProportionLarger
+// 0.32, TorsoLength 0.19, NeckLength 0.1). Strip without baking and she reverts
+// to the unsculpted base — a different woman, quietly.
+//
+// So: fold the influences into the vertices, then drop the targets. glTF morphs
+// are relative (GLTFLoader sets morphTargetsRelative), so a weighted sum of the
+// deltas is the whole of it. Reversible — the caller restores afterwards,
+// because this same mesh is still on screen being edited.
+function bakeMorphsForExport(root) {
+  const undo = [];
+  let baked = 0, saved = 0;
+
+  root.traverse((mesh) => {
+    const geo = mesh.geometry;
+    const infl = mesh.morphTargetInfluences;
+    if (!geo?.morphAttributes?.position || !infl?.length) return;
+
+    const relative = geo.morphTargetsRelative !== false;
+    const live = infl
+      .map((v, i) => [i, v])
+      .filter(([, v]) => Math.abs(v) > 1e-6);
+
+    const keptAttrs = geo.morphAttributes;
+    const keptDict  = mesh.morphTargetDictionary;
+    const keptInfl  = infl.slice();
+    const keptPos   = geo.attributes.position.array.slice();
+    const keptNorm  = geo.attributes.normal ? geo.attributes.normal.array.slice() : null;
+
+    for (const which of ["position", "normal"]) {
+      const base = geo.attributes[which];
+      const targets = geo.morphAttributes[which];
+      if (!base || !targets) continue;
+      const arr = base.array;
+      for (const [t, w] of live) {
+        const d = targets[t];
+        if (!d) continue;
+        const da = d.array;
+        // Absolute targets store final positions, so the delta is theirs minus
+        // the base — which for `normal` would be nonsense, hence the guard.
+        if (relative) {
+          for (let k = 0; k < arr.length; k++) arr[k] += w * da[k];
+        } else if (which === "position") {
+          for (let k = 0; k < arr.length; k++) arr[k] += w * (da[k] - keptPos[k]);
+        }
+      }
+      base.needsUpdate = true;
+    }
+    if (geo.attributes.normal) geo.normalizeNormals?.();
+
+    // Count what the file no longer has to carry.
+    for (const which of Object.keys(geo.morphAttributes)) {
+      for (const a of geo.morphAttributes[which]) saved += a.array.byteLength;
+    }
+
+    geo.morphAttributes = {};
+    // Empty, not undefined: three checks truthiness in some paths and .length
+    // in others, and this mesh is still on screen and still being rendered
+    // between here and the restore.
+    mesh.morphTargetInfluences = [];
+    mesh.morphTargetDictionary = {};
+    baked++;
+
+    undo.push(() => {
+      geo.attributes.position.array.set(keptPos);
+      geo.attributes.position.needsUpdate = true;
+      if (keptNorm && geo.attributes.normal) {
+        geo.attributes.normal.array.set(keptNorm);
+        geo.attributes.normal.needsUpdate = true;
+      }
+      geo.morphAttributes = keptAttrs;
+      mesh.morphTargetInfluences = keptInfl;
+      mesh.morphTargetDictionary = keptDict;
+    });
+  });
+
+  console.log(`[MiniGlbViewer] runtime bake: sculpt folded into ${baked} mesh(es), ` +
+              `${(saved / 1e6).toFixed(1)}MB of morph targets dropped.`);
+  return () => { for (const f of undo) f(); };
+}
+
+// 2. THE SKELETONS.
+//
+// Accessories keep their own skeleton on purpose here (see the note at the top
+// of this file) — for an editor that is right, and standing in bind pose it
+// costs nothing because everything is in the same rest pose. It is fatal for a
+// runtime file: the clips animate the BODY's nodes, so `walk` moves her and
+// leaves the jeans standing where they were.
+//
+// Measured against her actual wardrobe: Angie Top is 42 bones and all 42 match
+// the body by name. Angie Jeans is 48 with 16 misses, every one a Blender
+// `.00N` duplicate — zero misses once the suffix is stripped. Charm Hair shares
+// only 2 of 13: it is skinned to a DAZ chain the body does not carry, so it is
+// left alone rather than forced, and it follows the head because its weights
+// are on the head bone either way.
+//
+// A garment is only rebound when EVERY one of its bones resolves. A partial
+// rebind is worse than none — the unresolved bones collapse to the origin and
+// take their vertices with them.
+function rebindGarmentsForExport(root, bodySkinMesh) {
+  const bodySkeleton = bodySkinMesh?.skeleton;
+  if (!bodySkeleton) {
+    console.warn("[MiniGlbViewer] runtime bake: no body skeleton — garments keep their own (they will not animate).");
+    return () => {};
+  }
+
+  const byName = new Map();
+  bodySkeleton.bones.forEach((b, i) => byName.set(b.name, i));
+  const resolve = (name) => {
+    if (byName.has(name)) return byName.get(name);
+    // Both spellings of a Blender duplicate: "l_thigh.001" in the file,
+    // "l_thigh001" after three.js sanitizes node names at load.
+    const stripped = name.replace(/\.?\d{3}$/, "");
+    return byName.has(stripped) ? byName.get(stripped) : -1;
+  };
+
+  const undo = [];
+  root.traverse((mesh) => {
+    if (!mesh.isSkinnedMesh || !mesh.userData?.isAccessoryMesh) return;
+    if (mesh.skeleton === bodySkeleton) return;
+
+    const bones = mesh.skeleton?.bones || [];
+    const map = bones.map((b) => resolve(b.name));
+    const missing = bones.filter((b, i) => map[i] < 0).map((b) => b.name);
+
+    if (!bones.length || missing.length) {
+      console.warn(`[MiniGlbViewer] runtime bake: "${mesh.name}" keeps its own skeleton — ` +
+        `${missing.length}/${bones.length} bone(s) not on the body, e.g. ${missing.slice(0, 3).join(", ")}. ` +
+        `It will not follow the animation.`);
+      return;
+    }
+
+    const joints = mesh.geometry.getAttribute("skinIndex");
+    if (!joints) return;
+    const before = joints.array.slice();
+    const oldSkeleton = mesh.skeleton;
+    const oldBind = mesh.bindMatrix.clone();
+
+    for (let k = 0; k < joints.array.length; k++) {
+      const j = joints.array[k];
+      joints.array[k] = j < map.length && map[j] >= 0 ? map[j] : 0;
+    }
+    joints.needsUpdate = true;
+    mesh.bind(bodySkeleton, mesh.bindMatrix);
+
+    console.log(`[MiniGlbViewer] runtime bake: "${mesh.name}" rebound onto the body skeleton ` +
+                `(${bones.length} bones).`);
+
+    undo.push(() => {
+      joints.array.set(before);
+      joints.needsUpdate = true;
+      mesh.bind(oldSkeleton, oldBind);
+    });
+  });
+
+  return () => { for (const f of undo) f(); };
+}
+
   // Real feature — produces a blob: URL of the currently-loaded
   // character, with its CURRENT morph slider values as the starting
   // weights, as a real .glb binary. Deliberately NOT a "bake" that
@@ -3511,7 +3884,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
   // Promise-based specifically so callers (the download button below,
   // and CharacterWizard's step-navigation handler) can await a single
   // shared implementation rather than duplicating the export logic.
-  function exportMorphedGlbBlob({ includeAccessories = false } = {}) {
+  function exportMorphedGlbBlob({ includeAccessories = false, runtime = false } = {}) {
     return new Promise((resolve, reject) => {
       if (!loadedRootRef.current) {
         reject(new Error("no character currently loaded"));
@@ -3539,8 +3912,65 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
         }
       } catch (e) { /* body not found — nothing cached to strip */ }
 
+      // Session 152 — the SAME law bit again, through the layer system: its
+      // fullIndex / bodyZones caches live on geometry.userData, the wizard's
+      // per-Next export flattened them into Benny's editable GLB (tens of MB
+      // of JSON'd index), and on the next load the flattened fullIndex crashed
+      // .slice() and hung the loader. Lift the caches off for the export and
+      // hand them straight back — the live scene keeps its state, the file
+      // carries none of it.
+      const liftedLayerCaches = [];
+      loadedRootRef.current.traverse((o) => {
+        if (!o.isMesh || !o.geometry?.userData) return;
+        const ud = o.geometry.userData;
+        if ("fullIndex" in ud || "bodyZones" in ud) {
+          liftedLayerCaches.push({ ud, fullIndex: ud.fullIndex, bodyZones: ud.bodyZones });
+          delete ud.fullIndex;
+          delete ud.bodyZones;
+        }
+      });
+      const restoreLayerCaches = () => {
+        for (const { ud, fullIndex, bodyZones } of liftedLayerCaches) {
+          if (fullIndex !== undefined) ud.fullIndex = fullIndex;
+          if (bodyZones !== undefined) ud.bodyZones = bodyZones;
+        }
+      };
+
       const exporter = new GLTFExporter();
-      const animations = Object.values(animationsRef.current || {});
+      // Session 152 — the skin culling is a RENDER state, and this function
+      // serializes live geometry. An editable export (wizard Save GLB, the
+      // dressed editor snapshot) saved with the culled index would permanently
+      // lose every hidden triangle — real data loss, compounding on each save.
+      // Suspend for those; the runtime file KEEPS the culling, deliberately:
+      // a world loads a body that cannot poke through its clothes.
+      const reapplySkinLayers = runtime ? () => {} : suspendSkinLayers(loadedRootRef.current);
+      const allAnimations = Object.values(animationsRef.current || {});
+
+      // Session 152 — a clip cannot animate targets the file no longer has.
+      //
+      // idle and walk carry morph-influence tracks alongside the bone ones.
+      // Bake the sculpt away and GLTFWriter.processAnimation reads .length off
+      // the influences that are no longer there and throws — which is how this
+      // announced itself, as a TypeError from deep inside the exporter with
+      // nothing to say about morphs.
+      //
+      // Dropping those tracks is not a compromise: with the targets folded into
+      // the vertices there is nothing left for them to drive. The bone tracks —
+      // 773 channels on idle, 775 on walk — are untouched, and they are the
+      // whole of what makes her walk.
+      const animations = runtime
+        ? allAnimations
+            .map((clip) => {
+              const bones = clip.tracks.filter((t) => !t.name.endsWith(".morphTargetInfluences"));
+              if (bones.length === clip.tracks.length) return clip;
+              const trimmed = clip.clone();
+              trimmed.tracks = bones;
+              console.log(`[MiniGlbViewer] runtime bake: "${clip.name}" — dropped ` +
+                `${clip.tracks.length - bones.length} morph track(s), kept ${bones.length} bone track(s).`);
+              return trimmed;
+            })
+            .filter((clip) => clip.tracks.length > 0)
+        : allAnimations;
 
       if (!includeAccessories) {
         // Body-only path — exactly the Session 102 behaviour.
@@ -3565,11 +3995,13 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
           loadedRootRef.current,
           (result) => {
             reattach();
+            restoreLayerCaches();
+            reapplySkinLayers();
             const blob = new Blob([result], { type: "model/gltf-binary" });
             console.log(`[MiniGlbViewer] exportMorphedGlbBlob (body only): produced ${blob.size} bytes, ${animations.length} animation(s) included`);
             resolve(blob);
           },
-          (err) => { reattach(); reject(err); },
+          (err) => { reattach(); restoreLayerCaches(); reapplySkinLayers(); reject(err); },
           { binary: true, animations }
         );
         return;
@@ -3619,15 +4051,40 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
         for (const entry of store[url]) {
           if (!entry.mesh?.geometry?.attributes?.position) continue;
           touched.push({ entry, wasVisible: entry.mesh.visible });
-          restorePositions(entry.mesh.geometry.attributes.position, entry.originalPositions);
+          // 3. THE GARMENT TRANSFORMS.
+          //
+          // The editor writes garments at IDENTITY and tags them identityBaked,
+          // because its consumer captures those positions as its own baseline
+          // and re-applies scale/offset/rotation itself — bake them in and every
+          // later edit compounds on the last one.
+          //
+          // A runtime file has no later edit. It keeps the positions exactly as
+          // they sit on screen, so the thing that loads it needs to know nothing
+          // about accessories at all: no wardrobe config, no transforms, no
+          // applyAccessoryScale. Just a model.
+          if (!runtime) {
+            restorePositions(entry.mesh.geometry.attributes.position, entry.originalPositions);
+            entry.mesh.userData.identityBaked = true;
+          }
           entry.mesh.visible = true;
-          entry.mesh.userData.identityBaked = true;
         }
       }
+
+      const unbake = runtime ? bakeMorphsForExport(loadedRootRef.current) : () => {};
+      const unbind = runtime
+        ? rebindGarmentsForExport(loadedRootRef.current, findBodySkinMesh(loadedRootRef.current))
+        : () => {};
       const restoreLive = () => {
+        // Order matters on the way back: rebinding and morphs were applied after
+        // the garment positions were staged, so they come off first.
+        unbind();
+        unbake();
+        restoreLayerCaches();
+        reapplySkinLayers();
         for (const { entry, wasVisible } of touched) {
           delete entry.mesh.userData.identityBaked;
           entry.mesh.visible = wasVisible;
+          if (runtime) continue;   // never moved — nothing to put back
           const cfg = accessories.find((a) => a.url === entry.url);
           const t = effectiveTransform(cfg?.scale, cfg?.offset, cfg?.rotation, cfg?.parts, entry.matName);
           applyAccessoryScale(entry.mesh, entry.originalPositions, entry.center, t.scale, t.offset, t.rotation);
@@ -3638,7 +4095,8 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
         (result) => {
           restoreLive();
           const blob = new Blob([result], { type: "model/gltf-binary" });
-          console.log(`[MiniGlbViewer] exportMorphedGlbBlob (dressed, identity-baked): produced ${blob.size} bytes, ${touched.length} garment primitive(s), ${animations.length} animation(s) included`);
+          console.log(`[MiniGlbViewer] exportMorphedGlbBlob (${runtime ? "RUNTIME: sculpt+transforms baked, morphs dropped" : "dressed, identity-baked"}): ` +
+            `produced ${(blob.size / 1e6).toFixed(1)}MB, ${touched.length} garment primitive(s), ${animations.length} animation(s) included`);
           resolve(blob);
         },
         (err) => { restoreLive(); reject(err); },

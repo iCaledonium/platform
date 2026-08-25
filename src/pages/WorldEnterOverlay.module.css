@@ -1,9 +1,11 @@
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500&family=Cormorant+Garamond:ital,wght@0,400;0,500;1,400&display=swap');
 
+/* Session 150 — this is a page now (/world/:worldId), not an overlay stacked on
+   /home, so it sits in normal flow rather than fixed above everything. Visually
+   identical at full height; the difference is that it can be scrolled to, linked
+   to, and left with Back. */
 .overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 1000;
+  min-height: 100vh;
   background: #eeecea;
   display: flex;
   flex-direction: column;
@@ -116,36 +118,107 @@
   letter-spacing: 0.04em;
 }
 
-/* ── Side panel ── */
+/* ── Place card ──────────────────────────────────────────────────────────────
+   Session 151 — this was a 290px column beside the map: it squeezed the map,
+   it was the only opaque panel left on a surface that had become floating
+   glass, and it sat exactly where the Pulse instrument opens.
+
+   It is now a card anchored to the pin you clicked, tracking it through pan and
+   zoom and flipping to the pin's other side near the edge of the window. The
+   panel is about a place on the map, so it belongs on the map. */
 .panel {
-  width: 0;
-  overflow: hidden;
-  background: #f5f3f0;
-  border-left: 0.5px solid rgba(0,0,0,0.1);
+  position: fixed;
+  z-index: 700;
+  width: 300px;
+  max-height: calc(100vh - 140px);
   display: flex;
   flex-direction: column;
-  transition: width 0.22s ease;
-  flex-shrink: 0;
+  overflow: hidden;
+  background: rgba(255,255,255,.82);
+  backdrop-filter: blur(40px) saturate(200%);
+  -webkit-backdrop-filter: blur(40px) saturate(200%);
+  border: 1px solid rgba(255,255,255,.95);
+  box-shadow: 0 2px 32px rgba(0,0,0,.12), 0 1px 0 rgba(255,255,255,1) inset;
+  border-radius: 20px;
+  opacity: 0;
+  transform: scale(.97);
+  pointer-events: none;
+  transition: opacity .18s ease, transform .18s ease;
 }
 
 .panelVisible {
-  width: 290px;
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
 }
 
+/* The little pointer back to the pin. Solid rather than glass — a 12px square
+   cannot blur anything convincingly, and over a map this reads as the same
+   material. */
+.panelArrow {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  background: rgba(255,255,255,.92);
+  transform: rotate(45deg);
+  margin-top: -6px;
+  pointer-events: none;
+}
+.panelArrowLeft  { left: -5px;  border-left: 1px solid rgba(255,255,255,.95); border-bottom: 1px solid rgba(255,255,255,.95); }
+.panelArrowRight { right: -5px; border-right: 1px solid rgba(255,255,255,.95); border-top: 1px solid rgba(255,255,255,.95); }
+
+/* Session 151 — the card had no way to dismiss it, and the one ✕ that existed
+   (on the transit variant) referenced a class this stylesheet never defined, so
+   it rendered as a bare browser button. One styled close, shared by both. */
+.panelClose {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 2;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 0.5px solid rgba(0,0,0,.1);
+  background: rgba(255,255,255,.7);
+  color: #a8a5a0;
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color .15s, border-color .15s, background .15s;
+}
+
+.panelClose:hover {
+  color: #1a1814;
+  border-color: rgba(0,0,0,.2);
+  background: #fff;
+}
+
+.panelClose:focus-visible {
+  outline: 2px solid #b05c08;
+  outline-offset: 2px;
+}
+
+/* The close sits over the top-right corner, so the first line of content keeps
+   clear of it. */
 .panelInner {
   flex: 1;
-  padding: 22px 20px 16px;
+  padding: 20px 20px 14px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 14px;
-  min-width: 290px;
+  min-width: 0;
 }
 
 .panelMeta {
   display: flex;
   align-items: center;
   gap: 8px;
+  padding-right: 26px;
 }
 
 .panelType {
@@ -174,7 +247,7 @@
   color: #1a1a1a;
   line-height: 1.2;
   margin: 0;
-  min-width: 250px;
+  min-width: 0;
 }
 
 .panelAddress {
@@ -182,7 +255,7 @@
   color: #999;
   margin: 0;
   line-height: 1.4;
-  min-width: 250px;
+  min-width: 0;
 }
 
 .divider {
@@ -202,6 +275,35 @@
   font-size: 12px;
   color: #ccc;
   font-style: italic;
+  margin: 0;
+}
+
+/* Today's window, beside the open/closed pill. Same weight as .panelAddress —
+   it is secondary detail, not a heading. */
+.venueHours {
+  font-size: 11px;
+  color: #999;
+}
+
+/* Prose the hours data carried with it, e.g. "May-September primarily". */
+.venueNote {
+  font-size: 11px;
+  color: #bbb;
+  font-style: italic;
+}
+
+/* The background crowd. Dimmer than the cast and deliberately not clickable —
+   these people are computed per request and have no record to open. */
+.crowdList {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.crowdParty {
+  font-size: 11px;
+  color: #bbb;
+  line-height: 1.45;
   margin: 0;
 }
 
@@ -282,9 +384,9 @@
 
 /* ── Panel footer ── */
 .panelFooter {
-  padding: 16px 20px;
+  padding: 14px 20px 16px;
   border-top: 0.5px solid rgba(0,0,0,0.08);
-  min-width: 290px;
+  min-width: 0;
 }
 
 .spawnBtn {

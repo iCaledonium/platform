@@ -15,8 +15,11 @@ import DeployWizardPage from "./pages/DeployWizardPage.jsx";
 import WorldsPage from "./pages/WorldsPage.jsx";
 import WorldEditorPage from "./pages/WorldEditorPage.jsx";
 import WorldActorPage  from "./pages/WorldActorPage.jsx";
+import WorldPage       from "./pages/WorldPage.jsx";
 import KnockEncounterPage from "./pages/KnockEncounterPage.jsx";
-import VenueEncounterPage from "./pages/VenueEncounterPage.jsx";
+import KnockActorDoor      from "./pages/KnockActorDoor.jsx";
+import VenuePage from "./pages/VenuePage.jsx";
+import "./pages/runtimeCheck.js";   // Session 152 — window.__checkRuntimeWalk
 
 const CONV_TO_TOOL = {
   text_thread:   "messages",
@@ -305,6 +308,7 @@ export default function App() {
     <>
       <Routes>
         <Route path="/home"         element={<HomePage />} />
+        <Route path="/world/:worldId"                       element={<WorldPage />} />
         <Route path="/my-worlds"    element={<WorldsPage />} />
         <Route path="/my-worlds/:worldId"                   element={<WorldEditorPage />} />
         <Route path="/my-worlds/:worldId/actors/:actorId"   element={<WorldActorPage />} />
@@ -316,8 +320,14 @@ export default function App() {
         <Route path="/actors/new"        element={<CharacterWizard />} />
         <Route path="/actors/:id"        element={<ActorsEditorPage />} />
         <Route path="/actors/:id/deploy" element={<DeployWizardPage />} />
+        {/* Session 152 — the player knocking on someone's door.
+            Keyed on whose door it is, so it survives a reload and can be
+            returned to. /encounter/knock/:encounterId stays for the other
+            direction: an actor knocking on YOUR door, which arrives through the
+            overlay below and is your address, not theirs. */}
+        <Route path="/world/:worldId/knock/:actorId/door" element={<KnockActorDoor />} />
         <Route path="/encounter/knock/:encounterId" element={<KnockEncounterPage />} />
-        <Route path="/encounter/venue/:worldId/:locationId" element={<VenueEncounterPage />} />
+        <Route path="/world/:worldId/venue/:venueId"        element={<VenuePage />} />
         <Route path="*"             element={<Navigate to="/login" replace />} />
       </Routes>
 
