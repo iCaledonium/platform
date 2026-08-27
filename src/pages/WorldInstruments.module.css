@@ -37,24 +37,26 @@
   box-shadow: 0 2px 32px rgba(0,0,0,.06), 0 1px 0 rgba(255,255,255,1) inset;
   border-radius: 20px;
 }
+/* Session 153 — every group caption is identical, in colour and in metrics.
+   The first was grey with a bottom rule and the rest amber with a top rule.
+   That made World and Owner differ twice over: different colour, and — because
+   the top rule brought its own padding and margin — different heights. Since
+   the rail wraps at group boundaries, those two are the ones that head their
+   respective columns, so unequal caption boxes put them on visibly different
+   levels. Identical boxes are what makes them line up, whichever column each
+   ends up in, at any viewport. Group separation is carried by the amber and
+   the space around it rather than by a rule, because a rule on one side only
+   is what broke the alignment in the first place. */
 .railcap {
   /* Each column is 44px of button; the caption must not widen it. */
   width: 44px;
   font-size: 9px;
   letter-spacing: .2em;
   text-transform: uppercase;
-  color: var(--text-3);
-  text-align: center;
-  padding: 4px 0 8px;
-  border-bottom: .5px solid var(--border);
-  margin-bottom: 5px;
-}
-.railcapMid {
-  border-bottom: none;
-  border-top: .5px solid var(--border);
-  margin: 6px 0 2px;
-  padding: 9px 0 5px;
   color: var(--amber);
+  text-align: center;
+  padding: 7px 0 8px;
+  margin: 0 0 4px;
 }
 .rbtn {
   width: 44px;

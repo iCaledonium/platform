@@ -479,9 +479,9 @@ export default function WorldInstruments({ world, playerActorId }) {
       <nav ref={railRef} className={styles.rail} aria-label="Instruments">
         {["World", "Comms", "Owner"]
           .filter(g => INSTRUMENTS.some(i => i.group === g))
-          .map((g, gi) => (
+          .map(g => (
             <div key={g}>
-              <div className={`${styles.railcap} ${gi ? styles.railcapMid : ""} ${g === "Owner" ? styles.railcapOwn : ""}`}>{g}</div>
+              <div className={styles.railcap}>{g}</div>
               {INSTRUMENTS.filter(i => i.group === g).map(i => (
                 <RailButton key={i.key} i={i} on={isOpen(i.key)} onClick={() => toggle(i.key)} />
               ))}
