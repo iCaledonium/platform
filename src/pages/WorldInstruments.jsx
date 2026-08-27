@@ -183,8 +183,36 @@ export default function WorldInstruments({ world, playerActorId }) {
   useEffect(() => {
     const el = railRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;
-    const publish = () => document.documentElement.style.setProperty(
-      "--rail-right", `${Math.round(el.getBoundingClientRect().right)}px`);
+    const publish = () => {
+      document.documentElement.style.setProperty(
+        "--rail-right", `${Math.round(el.getBoundingClientRect().right)}px`);
+      // Mark whichever group heads a wrapped column, so a rule can be drawn
+      // between columns. Which group that is depends on where the wrap falls,
+      // and only the layout knows that — at full height nothing wraps and no
+      // rule is drawn, which is correct: there is only one column to divide.
+      const groups = [...el.children];
+      if (!groups.length) return;
+      const firstLeft = groups[0].offsetLeft;
+      const split = groups.find((g, i) => i > 0 && g.offsetLeft > firstLeft);
+      groups.forEach(g => {
+        const startsColumn = g === split;
+        // Written only when it changes: this runs inside a ResizeObserver and
+        // the gutter costs width, so an unconditional write would keep
+        // re-triggering the observer.
+        if (startsColumn && g.dataset.colstart !== "true") g.dataset.colstart = "true";
+        else if (!startsColumn && g.dataset.colstart) delete g.dataset.colstart;
+      });
+      // The rule itself is drawn by the rail, not by the group, so it runs the
+      // full height of the columns instead of stopping after Owner's two
+      // buttons. The group only opens the gutter it sits in.
+      if (split) {
+        el.style.setProperty("--split-x", `${split.offsetLeft}px`);
+        if (el.dataset.split !== "true") el.dataset.split = "true";
+      } else if (el.dataset.split) {
+        delete el.dataset.split;
+        el.style.removeProperty("--split-x");
+      }
+    };
     publish();
     const ro = new ResizeObserver(publish);
     ro.observe(el);

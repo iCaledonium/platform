@@ -58,6 +58,33 @@
   padding: 7px 0 8px;
   margin: 0 0 4px;
 }
+/* Session 153 — an etched rule between the rail's columns.
+   Dark hairline with a highlight beside it, the same engraving as the rail's
+   own inset white edge, so the divider reads as part of the glass rather than
+   a line drawn over it.
+   Drawn by the rail rather than by the group that starts the column: a border
+   on the group would stop after Owner's two buttons, a third of the way down,
+   where what is wanted is a rule the height of the columns it separates. Both
+   the position and whether there is a second column at all come from the
+   observer — at full height nothing wraps, there is one column, and no rule. */
+.rail[data-split="true"]::before {
+  content: "";
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  left: var(--split-x, 50%);
+  width: 1px;
+  background: var(--border);
+  box-shadow: 1px 0 0 rgba(255, 255, 255, .85);
+  pointer-events: none;
+}
+
+/* The group that heads the second column opens the gutter the rule sits in. */
+.rail > div[data-colstart="true"] {
+  margin-left: 9px;
+  padding-left: 9px;
+}
+
 .rbtn {
   width: 44px;
   height: 44px;
