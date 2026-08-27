@@ -1011,7 +1011,14 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
           <div ref={mapRef} className={styles.map} />
           {weather && weather !== "weather disabled" && (
             <div style={{
-              position:"absolute", top:12, left:12, zIndex:10,
+              // Session 153 — clear of the instrument rail's gutter.
+              //
+              // The rail is fixed at left:20 and 64 wide, so it owns x 20-84
+              // whatever the map does. This chip sat at left:12 underneath it,
+              // and the rail's glass hid the weather icon and the first digits
+              // of the temperature — two widgets drawn in the same corner, each
+              // unaware of the other.
+              position:"absolute", top:12, left:104, zIndex:10,
               background:"rgba(255,255,255,0.92)", backdropFilter:"blur(8px)",
               borderRadius:10, padding:"6px 12px",
               fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12,
