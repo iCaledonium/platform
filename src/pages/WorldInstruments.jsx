@@ -80,6 +80,9 @@ function clock(iso) {
 function Panel({ id, title, count, owner, onClose, children, width }) {
   const ref = useRef(null);
   const [pos, setPos] = useState(null);
+  // Session 153 — null until the user resizes; after that the panel is the
+  // size they chose and stops sizing itself to its contents.
+  const [size, setSize] = useState(null);
 
   const onGrab = e => {
     if (e.target.closest("button")) return;
@@ -99,9 +102,40 @@ function Panel({ id, title, count, owner, onClose, children, width }) {
     window.addEventListener("pointerup", up);
   };
 
+  // Session 153 — drag the corner to resize.
+  //
+  // Hand-rolled rather than CSS `resize: both` because the default size has to
+  // stay content-driven: the body carries a 300px cap so a panel opens at the
+  // height of what is in it, and CSS resize cannot lift that cap only once the
+  // user has taken over. Here the cap is dropped by a class the moment a size
+  // exists, so the list grows into the space instead of leaving it blank.
+  const onResize = e => {
+    e.preventDefault();
+    e.stopPropagation();          // never let the header's drag see this
+    const el = ref.current;
+    const r  = el.getBoundingClientRect();
+    // Panels anchored by right/bottom (Pulse, Engine) would otherwise grow
+    // away from the corner being dragged. Pin to left/top first so every
+    // panel grows toward the pointer.
+    if (!pos) setPos({ left: Math.round(r.left), top: Math.round(r.top) });
+    const x0 = e.clientX, y0 = e.clientY;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const move = ev => setSize({
+      w: Math.max(240, Math.min(window.innerWidth  - r.left - 8, r.width  + (ev.clientX - x0))),
+      h: Math.max(140, Math.min(window.innerHeight - r.top  - 8, r.height + (ev.clientY - y0))),
+    });
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
   return (
-    <section ref={ref} className={styles.w}
-      style={{ ...(pos || DEFAULT_POS[id]), ...(width ? { width } : {}) }}>
+    <section ref={ref} className={`${styles.w}${size ? " " + styles.wSized : ""}`}
+      style={{ ...(pos || DEFAULT_POS[id]), ...(width ? { width } : {}),
+               ...(size ? { width: size.w, height: size.h } : {}) }}>
       <header className={styles.whd} onPointerDown={onGrab}>
         <span className={styles.wttl}>{title}</span>
         {count != null && <span className={styles.wcnt}>{count}</span>}
@@ -109,6 +143,7 @@ function Panel({ id, title, count, owner, onClose, children, width }) {
         <button className={styles.wx} onClick={onClose} aria-label={`Close ${title}`}>✕</button>
       </header>
       {children}
+      <div className={styles.wrz} onPointerDown={onResize} aria-hidden="true" />
     </section>
   );
 }

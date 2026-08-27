@@ -137,6 +137,33 @@
 .wx:hover { color: var(--text); }
 .wbd { overflow-y: auto; max-height: 300px; }
 
+/* Session 153 — once resized, the panel owns its height and the body fills it.
+   The 300px cap above is only the default that keeps an unresized panel as
+   tall as its contents; leaving it on after a resize would grow the frame and
+   not the list, giving a panel with empty space under a scrollbar. */
+.wSized .wbd { max-height: none; flex: 1 1 auto; min-height: 0; }
+
+/* The corner grip. Sits above the body so it stays grabbable over a scrolled
+   list, and carries touch-action:none so a drag never scrolls the page. */
+.wrz {
+  position: absolute;
+  right: 0; bottom: 0;
+  width: 18px; height: 18px;
+  cursor: nwse-resize;
+  touch-action: none;
+  z-index: 2;
+}
+.wrz::after {
+  content: "";
+  position: absolute; right: 5px; bottom: 5px;
+  width: 7px; height: 7px;
+  border-right: 1.5px solid var(--text-3);
+  border-bottom: 1.5px solid var(--text-3);
+  border-bottom-right-radius: 3px;
+  opacity: .45;
+}
+.wrz:hover::after { opacity: .9; }
+
 /* ── people ── */
 .row {
   display: flex; align-items: center; gap: 10px;
