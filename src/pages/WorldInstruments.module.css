@@ -22,9 +22,14 @@
      scrolls internally rather than growing past it — every instrument stays
      reachable, and none of them are ever drawn over the header. */
   max-height: calc(100dvh - 128px);
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  scrollbar-width: none;
+  /* When the instruments do not fit the height, they take a second column
+     rather than scrolling. Scrolling hid the entire Owner group below the
+     fold — Vitals and Engine simply were not there, with nothing to say so,
+     which is worse than a wider rail. A column flex container with a bounded
+     height wraps overflow sideways, so the rail grows into the map (which it
+     already floats over) and every instrument stays on screen. */
+  flex-wrap: wrap;
+  align-content: flex-start;
   background: var(--glass);
   backdrop-filter: blur(40px) saturate(200%);
   -webkit-backdrop-filter: blur(40px) saturate(200%);
@@ -32,9 +37,9 @@
   box-shadow: 0 2px 32px rgba(0,0,0,.06), 0 1px 0 rgba(255,255,255,1) inset;
   border-radius: 20px;
 }
-.rail::-webkit-scrollbar { width: 0; height: 0; }
-
 .railcap {
+  /* Each column is 44px of button; the caption must not widen it. */
+  width: 44px;
   font-size: 9px;
   letter-spacing: .2em;
   text-transform: uppercase;

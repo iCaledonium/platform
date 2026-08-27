@@ -35,16 +35,25 @@ const ICONS = {
   places: <><circle cx="10.5" cy="10.5" r="6.4" /><path d="M15.2 15.2 20.5 20.5" /></>,
 };
 
+// Session 153 — the panels that open beside the rail follow its real edge.
+//
+// left:116 was "rail edge 84, plus a 32px gap" written out as a constant, and
+// it stopped being true the moment the rail could wrap to two columns: the
+// panels then opened underneath it. --rail-right is published by the rail
+// itself (see the ResizeObserver below), so these clear whatever it is now.
+// The fallback is the one-column figure, for the first paint.
+const BESIDE_RAIL = "calc(var(--rail-right, 84px) + 32px)";
+
 const DEFAULT_POS = {
-  people: { left: 116, top: 96 },
+  people: { left: BESIDE_RAIL, top: 96 },
   pulse:  { right: 20, top: 96 },
-  vitals: { left: 116, top: 420 },
-  engine: { left: 116, bottom: 24 },
+  vitals: { left: BESIDE_RAIL, top: 420 },
+  engine: { left: BESIDE_RAIL, bottom: 24 },
   messages:  { left: 434, top: 96 },
   calendar:  { left: 758, top: 96 },
   voicemail: { left: 434, bottom: 24 },
   relations: { right: 20, bottom: 24, width: 320 },
-  places:    { left: 116, top: 96, width: 306 },
+  places:    { left: BESIDE_RAIL, top: 96, width: 306 },
 };
 
 const VITAL_COLOURS = {
@@ -161,6 +170,31 @@ export default function WorldInstruments({ world, playerActorId }) {
   const [ticking, setTicking] = useState(false);
 
   const [query, setQuery]         = useState("");
+
+  // Session 153 — publish how far right the rail actually reaches.
+  //
+  // The rail's width is not a constant: it is one column normally and two when
+  // it wraps to keep the Owner group on screen. Anything else drawn in that
+  // corner has to clear whichever it currently is. Hard-coding the offset has
+  // now put the weather chip under the rail twice — once at 64px wide, again
+  // at 111 — so the rail states its own edge and the map reads it, instead of
+  // a third guess that the next layout change invalidates.
+  const railRef = useRef(null);
+  useEffect(() => {
+    const el = railRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const publish = () => document.documentElement.style.setProperty(
+      "--rail-right", `${Math.round(el.getBoundingClientRect().right)}px`);
+    publish();
+    const ro = new ResizeObserver(publish);
+    ro.observe(el);
+    window.addEventListener("resize", publish);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", publish);
+      document.documentElement.style.removeProperty("--rail-right");
+    };
+  }, []);
   const [relations, setRelations] = useState(null);
   const [comms, setComms]         = useState(null);   // whoever is being read
   const [thread, setThread]       = useState(null);  // {id, name}
@@ -442,7 +476,7 @@ export default function WorldInstruments({ world, playerActorId }) {
 
   return (
     <>
-      <nav className={styles.rail} aria-label="Instruments">
+      <nav ref={railRef} className={styles.rail} aria-label="Instruments">
         {["World", "Comms", "Owner"]
           .filter(g => INSTRUMENTS.some(i => i.group === g))
           .map((g, gi) => (

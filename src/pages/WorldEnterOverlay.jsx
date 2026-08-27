@@ -1011,14 +1011,18 @@ export default function WorldEnterOverlay({ world, user, onClose }) {
           <div ref={mapRef} className={styles.map} />
           {weather && weather !== "weather disabled" && (
             <div style={{
-              // Session 153 — clear of the instrument rail's gutter.
+              // Session 153 — clear of the instrument rail, whatever width it is.
               //
-              // The rail is fixed at left:20 and 64 wide, so it owns x 20-84
-              // whatever the map does. This chip sat at left:12 underneath it,
-              // and the rail's glass hid the weather icon and the first digits
-              // of the temperature — two widgets drawn in the same corner, each
-              // unaware of the other.
-              position:"absolute", top:12, left:104, zIndex:10,
+              // This chip sat at left:12, underneath a rail that owns the left
+              // gutter whatever the map does — the rail's glass hid the weather
+              // icon and the leading digits of the temperature. A fixed offset
+              // is not enough either: the rail is one column normally and two
+              // when it wraps to keep the Owner group on screen, so it now
+              // publishes its own right edge as --rail-right and this clears
+              // whatever that currently is. The fallback matches a one-column
+              // rail, for the moment before the observer first fires.
+              position:"absolute", top:12,
+              left:"calc(var(--rail-right, 84px) + 20px)", zIndex:10,
               background:"rgba(255,255,255,0.92)", backdropFilter:"blur(8px)",
               borderRadius:10, padding:"6px 12px",
               fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12,
