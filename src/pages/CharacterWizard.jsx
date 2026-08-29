@@ -213,7 +213,25 @@ function AutoTextarea({ style, value, ...props }) {
   return <textarea ref={ref} style={{ ...style, overflow: "hidden" }} value={value} {...props} />;
 }
 
-export default function CharacterWizard({ user, worlds }) {
+export default function CharacterWizard({ user, worlds, mode = "character" }) {
+  // ── Avatar mode ───────────────────────────────────────────────────────────
+  //
+  // The same wizard, building YOU rather than a character. It shows only the
+  // steps that describe a body — Appearance, Accessories, Review — and skips
+  // Psychology, Personality, Lifestyle and Economy, which author an NPC's inner
+  // life. A player brings their own; the simulator drives those tables for AI
+  // actors and never for the person holding the mouse.
+  //
+  // Deliberately a mode on this component and not a fork of it. The appearance
+  // step is the morph editor, the reference-photo solve, the draft rail and the
+  // GLB export — reimplementing any of that for a second caller would mean two
+  // of them to keep correct.
+  const isAvatar = mode === "avatar";
+  const AVATAR_STEPS = [1, 2, 7];   // Appearance, Accessories, Review
+  // Where every exit lands. You reached avatar mode from /home; sending you
+  // to the character gallery on the way out would strand you somewhere you
+  // never asked to be.
+  const exitTo = isAvatar ? "/home" : "/actors";
   const navigate = useNavigate();
   const [step, setStep]       = useState(1);
   // Session 97: real accessories state — selected value per region/slot,
@@ -742,7 +760,7 @@ export default function CharacterWizard({ user, worlds }) {
       return;
     }
     setClosePrompt(false);
-    navigate("/actors");
+    navigate(exitTo);
   }
   async function discardAndClose() {
     if (autoPersistTimerRef.current) clearTimeout(autoPersistTimerRef.current); // a queued autosave must not outlive the discard
@@ -763,7 +781,7 @@ export default function CharacterWizard({ user, worlds }) {
       }).catch(() => {});
     }
     setClosePrompt(false);
-    navigate("/actors");
+    navigate(exitTo);
   }
 
   // Session 102 — AUTO-PERSIST: every adjustment change writes
@@ -1510,7 +1528,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
     // the character). Now routes to the save/discard/cancel prompt;
     // deletion only happens when Discard is chosen explicitly.
     if (!actorId) {
-      if (window.confirm("Close the wizard? All unsaved work will be lost.")) navigate("/actors");
+      if (window.confirm("Close the wizard? All unsaved work will be lost.")) navigate(exitTo);
       return;
     }
     setClosePrompt(true);
@@ -1572,6 +1590,26 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
             method:"POST", headers:{"Content-Type":"application/json"},
             body:JSON.stringify({ assessment_type:atype, ...result }),
           }).catch(()=>{});
+        }
+      }
+
+      // Adopting it as your body is the last step and it is separate from
+      // saving: POST /api/actors made a character, this is what makes that
+      // character you. If it fails the character still exists and is still
+      // yours — say so rather than implying the whole save was lost.
+      if (isAvatar) {
+        try {
+          const r = await fetch("/api/me/avatar", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ actor_id: savedActorId }),
+          });
+          if (!r.ok) throw new Error((await r.json().catch(()=>({}))).error || "Could not set it as your profile.");
+          navigate("/home");
+          return;
+        } catch (e) {
+          setError(`Saved, but not set as your 3D profile: ${e.message} You can pick it in your character gallery.`);
+          setSaving(false);
+          return;
         }
       }
 
@@ -1791,6 +1829,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
           <div style={{display:"flex",gap:0}}>
             {STEPS.map((label,i)=>{
               const n=i+1,active=n===step;
+              if (isAvatar && !AVATAR_STEPS.includes(n)) return null;
               // Per-step completeness — the exact same signals that
               // already gate Next (step1Complete/step3Complete/
               // step4Complete), reused here rather than a second
@@ -2882,9 +2921,9 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
 
         {/* Footer */}
         <div style={S.foot}>
-          <button style={S.btnSecondary} onClick={()=>{setError(null);setStep(s=>Math.max(s-1,1))}} disabled={step===1}>← Back</button>
-          <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#a8a5a0"}}>Step {step} of 7</div>
-          {step<7&&<button style={{...S.btnPrimary, opacity:((step===1&&!step1Complete)||(step===3&&!step3Complete)||(step===4&&!step4Complete))?0.4:1, cursor:((step===1&&!step1Complete)||(step===3&&!step3Complete)||(step===4&&!step4Complete))?"not-allowed":"pointer"}} onClick={()=>{setError(null);advanceStep(step, () => setStep(s=>s+1))}} disabled={(step===1&&!step1Complete)||(step===3&&!step3Complete)||(step===4&&!step4Complete)}>{step===6?"Review →":"Next →"}</button>}
+          <button style={S.btnSecondary} onClick={()=>{setError(null);if(isAvatar&&step===1){handleCloseWizard();return;}setStep(s=>isAvatar&&s===7?2:Math.max(s-1,1))}} disabled={step===1&&!isAvatar}>← Back</button>
+          <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11,color:"#a8a5a0"}}>Step {isAvatar?AVATAR_STEPS.indexOf(step)+1:step} of {isAvatar?3:7}</div>
+          {step<7&&<button style={{...S.btnPrimary, opacity:((step===1&&!step1Complete)||(step===3&&!step3Complete)||(step===4&&!step4Complete))?0.4:1, cursor:((step===1&&!step1Complete)||(step===3&&!step3Complete)||(step===4&&!step4Complete))?"not-allowed":"pointer"}} onClick={()=>{setError(null);advanceStep(step, () => setStep(s=>isAvatar&&s===2?7:s+1))}} disabled={(step===1&&!step1Complete)||(step===3&&!step3Complete)||(step===4&&!step4Complete)}>{step===6?"Review →":"Next →"}</button>}
           {step===7&&<div />}
         </div>
 

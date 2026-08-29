@@ -373,6 +373,8 @@ export default function App() {
         <Route path="/lab" element={<Navigate to="/lab/home" replace />} />
         <Route path="/actors"            element={<ActorsGalleryPage />} />
         <Route path="/actors/new"        element={<CharacterWizard />} />
+        {/* The same wizard in avatar mode: your own body, three steps. */}
+        <Route path="/me/avatar"         element={<CharacterWizard mode="avatar" />} />
         <Route path="/actors/:id"        element={<ActorsEditorPage />} />
         <Route path="/actors/:id/deploy" element={<DeployWizardPage />} />
         {/* Session 152 — the player knocking on someone's door.

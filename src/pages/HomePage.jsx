@@ -3,6 +3,7 @@ import homeStyles from "./HomePage.module.css";
 import AppWizard from "./AppWizard.jsx";
 import AppConfig from "./AppConfig.jsx";
 import WorldEnterOverlay from "./WorldEnterOverlay.jsx";
+import UserMenu from "../components/UserMenu.jsx";
 import { useNavigate } from "react-router-dom";
 
 function greeting() {
@@ -39,6 +40,21 @@ export default function HomePage() {
       .catch(() => {});
   }
 
+  const avatarReady = user?.avatar?.state === "ready";
+
+  // Named rather than inline in the effect, because the user menu changes the
+  // photo and the gender and the topbar has to show the result without a reload.
+  function loadMe() {
+    fetch("/api/me")
+      .then(r => { if (r.status === 401) { window.location.href = "/login"; return null; } return r.ok ? r.json() : null; })
+      .then(data => {
+        if (!data) return;
+        setUser(data);
+        document.title = `Anima — ${data.name}`;
+      })
+      .catch(() => {});
+  }
+
   useEffect(() => {
     // If VisitorPresenceView/KnockEncounterPage left a pendingHomeScene signal
     // on exit, mount WorldEnterOverlay immediately rather than waiting for the
@@ -56,14 +72,7 @@ export default function HomePage() {
       } catch {}
     }
 
-    fetch("/api/me")
-      .then(r => { if (r.status === 401) { window.location.href = "/login"; return null; } return r.ok ? r.json() : null; })
-      .then(data => {
-        if (!data) return;
-        setUser(data);
-        document.title = `Anima — ${data.name}`;
-      })
-      .catch(() => {});
+    loadMe();
     fetchWorlds();
     loadApps();
     checkPendingMessages();
@@ -220,19 +229,36 @@ export default function HomePage() {
           </div>
           <div style={{display:"flex",alignItems:"center",gap:10}}>
             <div id="topbar-bell" />
-            {user && (
-              <img src={`/media/users/${user.id}/photo.png`}
-                onError={e => e.target.style.display="none"}
-                style={{width:32,height:32,borderRadius:"50%",objectFit:"cover",
-                  objectPosition:"top center",border:"1.5px solid rgba(0,0,0,0.1)",flexShrink:0}}/>
-            )}
             {!isDesktopApp && (
               <button className={homeStyles.signOutBtn} onClick={openInDesktopApp}
                 title="Hand this session to the Anima desktop app">Open in Anima</button>
             )}
-            <button className={homeStyles.signOutBtn} onClick={signOut}>Sign out</button>
+            {/* The avatar was a bare <img> pointed at a guessed
+                /media/users/<id>/photo.png. Only a PNG upload ever resolved, so
+                the .jpg and .jpeg avatars on this system 404'd and hid
+                themselves. UserMenu renders photo_url instead, and falls back to
+                initials rather than to nothing. */}
+            <UserMenu user={user} onSignOut={signOut} onUserChanged={loadMe} />
           </div>
         </div>
+
+        {/* No body yet. A prompt rather than a forced redirect: you can sign in,
+            look around and author characters without one — it is entering a
+            world that needs a 3D profile, and that is where the block lives. */}
+        {user && user.avatar?.state !== "ready" && (
+          <div className={homeStyles.nudgeBanner} data-testid="avatarPrompt"
+               onClick={() => window.location.href = "/me/avatar"}>
+            <span className={homeStyles.nudgeIcon}>{user.avatar?.state === "building" ? "\u{1F6E0}" : "\u{1F9CD}"}</span>
+            <span className={homeStyles.nudgeText}>
+              {user.avatar?.state === "building"
+                ? "Your 3D profile has no model yet \u2014 finish it to enter a world"
+                : "You need a 3D profile before you can enter a world"}
+            </span>
+            <span className={homeStyles.nudgeAction}>
+              {user.avatar?.state === "building" ? "Finish it \u2192" : "Create it \u2192"}
+            </span>
+          </div>
+        )}
 
         {pendingCount > 0 && apps.filter(a => a.tool_type === "messages").length === 0 && (
           <div className={homeStyles.nudgeBanner} onClick={() => setShowWizard(true)}>
@@ -277,8 +303,15 @@ export default function HomePage() {
                       Being inside a world had no address: it could not be
                       linked, reloaded into, or reached from a notification, and
                       Back left the world rather than stepping within it. */}
-                  <button className={homeStyles.btnEnter} disabled={!isRunning}
-                    onClick={() => navigate(`/world/${w.id}`)}>
+                  {/* Two separate reasons Enter can be unavailable, and they
+                      must not be conflated: the world is stopped, or you have
+                      no body to put in it. The title says which. The real
+                      block is server-side on /spawn. */}
+                  <button className={homeStyles.btnEnter} disabled={!isRunning || !avatarReady}
+                    title={!isRunning ? "This world is stopped"
+                          : !avatarReady ? "You need a 3D profile before you can enter a world"
+                          : undefined}
+                    onClick={() => avatarReady && navigate(`/world/${w.id}`)}>
                     Enter →
                   </button>
                 </div>
@@ -410,19 +443,6 @@ export default function HomePage() {
             <p className={homeStyles.toolName}>Test Lab</p>
             <p className={homeStyles.toolDesc}>Author a past, test a scene from any stage.</p>
           </div>
-          {/* Account management belongs to an organization. A private account is
-              an org of one, so there is nobody to invite — the endpoints refuse
-              them anyway; this just stops offering a door that does not open. */}
-          {user?.can_manage_users && (
-          <div className={`${homeStyles.toolCard} ${homeStyles.toolCardLive}`} style={{cursor:"pointer"}} onClick={() => window.location.href="/admin/users"}>
-            <span className={homeStyles.liveBadge}>live</span>
-            <div className={homeStyles.toolIcon} style={{background:"rgba(92,158,190,.07)",border:"1px solid rgba(92,158,190,.13)"}}>
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="6" cy="5" r="2.6" stroke="#5c9ebe" strokeWidth="1.1"/><path d="M1.6 14c0-2.4 2-4 4.4-4s4.4 1.6 4.4 4" stroke="#5c9ebe" strokeWidth="1.1" strokeLinecap="round"/><path d="M12.5 5.5v4M10.5 7.5h4" stroke="#5c9ebe" strokeWidth="1.1" strokeLinecap="round"/></svg>
-            </div>
-            <p className={homeStyles.toolName}>People</p>
-            <p className={homeStyles.toolDesc}>Create an account and issue its invite link.</p>
-          </div>
-          )}
         </div>
 
       </div>

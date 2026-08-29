@@ -373,6 +373,19 @@ if (!db.prepare(`PRAGMA table_info(users)`).all().some(c => c.name === "org_role
 }
 db.prepare(`UPDATE users SET org_role = 'member' WHERE org_role IS NULL`).run();
 
+// ── 3D profile ──────────────────────────────────────────────────────────────
+//
+// A user's own body in-world. It is an `actors` row they own rather than a set
+// of columns here, so the whole existing pipeline applies to it unchanged:
+// the wizard, generate3d's morph/export, the runtime bake, the deploy transfer.
+// Only the pointer lives on the user.
+//
+// Nullable on purpose — it is null for exactly as long as somebody has not
+// built one yet, which is the state the onboarding wizard exists to end.
+if (!db.prepare(`PRAGMA table_info(users)`).all().some(c => c.name === "avatar_actor_id")) {
+  db.prepare(`ALTER TABLE users ADD COLUMN avatar_actor_id TEXT REFERENCES actors(id)`).run();
+}
+
 // ── Seed Anima employees if not present ─────────────────────────────────────
 
 const employees = [

@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import styles from "./AdminUsersPage.module.css";
+import homeStyles from "./HomePage.module.css";   // shared topbar, same as DeveloperPage
 
 const GENDERS = ["", "female", "male", "other"];
 
@@ -139,6 +140,19 @@ export default function AdminUsersPage() {
   return (
     <div className={styles.page}>
       <div className={styles.inner}>
+
+        {/* Same topbar as the Developer page — this was a dead end without it:
+            no nav, and the browser back button is no help to anyone who opened
+            /admin/users directly. */}
+        <div className={homeStyles.topbar}>
+          <div className={homeStyles.topbarLeft}>
+            <span className={homeStyles.logo}>Anima</span>
+            <span className={homeStyles.welcome}>{me?.org?.name || " "}</span>
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className={homeStyles.signOutBtn} onClick={() => window.location.href = "/home"}>← Home</button>
+          </div>
+        </div>
 
         <h1 className={styles.heading}>People</h1>
         <p className={styles.sub}>

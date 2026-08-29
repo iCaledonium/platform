@@ -1003,7 +1003,7 @@ app.get("/api/me", async (req, res) => {
   if (!match) return res.status(401).json({ error: "not authenticated" });
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
   const row = db.prepare(`
-    SELECT u.id, u.name, u.email, u.photo_url, u.user_type, u.org_id, u.org_role,
+    SELECT u.id, u.name, u.email, u.photo_url, u.user_type, u.org_id, u.org_role, u.gender, u.avatar_actor_id,
            o.name AS org_name, o.kind AS org_kind
     FROM auth_tokens t
     JOIN users u ON u.id = t.user_id
@@ -1016,6 +1016,8 @@ app.get("/api/me", async (req, res) => {
     id: row.id, name: row.name, email: row.email, photo_url: row.photo_url, worlds,
     user_type: row.user_type,
     org_role: row.org_role,
+    gender: row.gender,
+    avatar: avatarStateOf(row.avatar_actor_id),
     // The UI hides account management from anyone who cannot use it — a member
     // is not an administrator, and a private user has no colleagues to invite.
     // This is a convenience, not the control: the admin endpoints refuse them
@@ -1024,6 +1026,151 @@ app.get("/api/me", async (req, res) => {
     can_manage_users: row.user_type === "staff" && row.org_kind === "organization"
                       && row.org_role === "admin",
   });
+});
+
+// ── The user's own 3D profile ────────────────────────────────────────────────
+//
+// "Has an avatar" is not the same question as "can appear in a world", and the
+// gap between them is where a half-finished wizard lives. A row can exist with
+// no model on it yet — generation is long-running and can fail — so `ready` is
+// computed from an actual model file, never from the pointer being non-null.
+function avatarStateOf(actorId) {
+  if (!actorId) return { actor_id: null, ready: false, state: "none" };
+  const a = db.prepare(
+    `SELECT id, name, glb_url, runtime_glb_url, status FROM actors WHERE id = ?`
+  ).get(actorId);
+  // The pointer outlived the actor — treat it as absent rather than serving a
+  // dangling id the UI would try to load.
+  if (!a) return { actor_id: null, ready: false, state: "none" };
+  const ready = !!(a.runtime_glb_url || a.glb_url);
+  return {
+    actor_id: a.id,
+    name: a.name,
+    ready,
+    // "building" is the honest middle state: you made one, it has no body yet.
+    state: ready ? "ready" : "building",
+    has_runtime: !!a.runtime_glb_url,
+  };
+}
+
+// Entering a world means being placed in it as a body. Without a model there is
+// nothing to place, so this is a precondition of spawning rather than a policy
+// bolted on top of it — and it is checked on the server because the disabled
+// button on /home is an affordance, not a control.
+//
+// `ready` deliberately means a model file exists, not that a row was created:
+// a half-finished profile must not get you in.
+function requireReadyAvatar(req, res, user) {
+  const row = db.prepare(`SELECT avatar_actor_id FROM users WHERE id = ?`).get(user.id);
+  const avatar = avatarStateOf(row?.avatar_actor_id);
+  if (avatar.ready) return true;
+  res.status(403).json({
+    error: avatar.state === "building"
+      ? "Your 3D profile has no model yet. Finish it before entering a world."
+      : "You need a 3D profile before you can enter a world.",
+    reason: "avatar_required",
+    avatar,
+  });
+  return false;
+}
+
+// Push the user's model onto their player actor in every world they are in.
+//
+// Their player actor already exists — the simulator mints it on join — so this
+// attaches a body to it rather than creating anybody. That is why it calls
+// deploy_player and not deploy_actor: deploy_actor generates a new uuid and
+// inserts actor_type "character", takes the Ollama lock and authors a career, a
+// psychology and a schedule. A person playing brings their own.
+async function deployAvatarToWorlds(user) {
+  const row    = db.prepare(`SELECT avatar_actor_id FROM users WHERE id = ?`).get(user.id);
+  const state  = avatarStateOf(row?.avatar_actor_id);
+  if (!state.ready) return { ok: false, reason: "avatar_not_ready", avatar: state, worlds: [] };
+
+  const actor = db.prepare(
+    `SELECT id, appearance, glb_url, runtime_glb_url FROM actors WHERE id = ?`
+  ).get(state.actor_id);
+
+  // ANIMA-INVARIANT (owner policy, Magnus 2026-08-25): personal media never
+  // transits the public tunnel. This is the LAN base — nginx on :80, reached
+  // through the `allow 192.168.1.58` rule on the media locations. The old
+  // default pointed at the node listener on :4002, which has been bound to
+  // 127.0.0.1 since 2026-08-28 and is therefore unreachable from the simulator:
+  // every download failed silently. Do not "fix" a 401 here by loosening nginx.
+  const lanBase = process.env.PLATFORM_INTERNAL_URL || "http://192.168.1.59";
+  const lan = (u) => u ? (u.startsWith("http") ? u : `${lanBase}${u.split("?")[0]}`) : null;
+
+  const media = [];
+  if (actor.glb_url)         media.push({ media_type: "model", url: lan(actor.glb_url) });
+  if (actor.runtime_glb_url) media.push({ media_type: "model", state_slug: "runtime", url: lan(actor.runtime_glb_url) });
+
+  const memberships = db.prepare(
+    `SELECT world_id, actor_id FROM world_memberships WHERE user_id = ?`
+  ).all(user.id);
+
+  const worlds = [];
+  for (const m of memberships) {
+    try {
+      const r = await fetch(
+        `${SIMULATOR_URL}/internal/worlds/${m.world_id}/player/${m.actor_id}/deploy`,
+        { method: "POST",
+          headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+          body: JSON.stringify({ appearance: actor.appearance || null, media }) }
+      );
+      const body = await r.json().catch(() => ({}));
+      // Reported per world, never collapsed into one boolean: a body that
+      // landed in one world and not another is exactly the state somebody needs
+      // to see rather than a blanket "failed".
+      worlds.push({ world_id: m.world_id, actor_id: m.actor_id, ok: r.ok, status: r.status,
+                    models: body.models || [], error: r.ok ? null : (body.error || `HTTP ${r.status}`) });
+    } catch (e) {
+      worlds.push({ world_id: m.world_id, actor_id: m.actor_id, ok: false, error: e.message });
+    }
+  }
+  return { ok: worlds.every(w => w.ok), avatar: state, worlds };
+}
+
+// ── POST /api/me/avatar/deploy — (re)push your body into your worlds ─────────
+app.post("/api/me/avatar/deploy", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const result = await deployAvatarToWorlds(user);
+  if (result.reason === "avatar_not_ready") {
+    return res.status(409).json({ error: "Your 3D profile has no model yet.", ...result });
+  }
+  res.status(result.ok ? 200 : 502).json(result);
+});
+
+// ── GET /api/me/avatar ───────────────────────────────────────────────────────
+app.get("/api/me/avatar", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const row = db.prepare(`SELECT avatar_actor_id FROM users WHERE id = ?`).get(user.id);
+  res.json(avatarStateOf(row?.avatar_actor_id));
+});
+
+// ── POST /api/me/avatar { actor_id } — adopt one of your characters as you ───
+//
+// Ownership is checked here rather than trusted from the wizard: this endpoint
+// is what makes an actor "you", and pointing it at somebody else's character
+// would put their face on your player.
+app.post("/api/me/avatar", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const actorId = String(req.body?.actor_id || "").trim();
+  if (!actorId) return res.status(400).json({ error: "actor_id required" });
+
+  const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(actorId, user.id);
+  if (!actor) return res.status(404).json({ error: "character not found" });
+
+  db.prepare(`UPDATE users SET avatar_actor_id = ?, updated_at = datetime('now') WHERE id = ?`)
+    .run(actorId, user.id);
+
+  // Adopting it is not finished until it is in the worlds. Doing this here means
+  // "this is me" cannot be true on the platform and false everywhere it counts.
+  // A push failure does not undo the adoption — the profile IS yours either way
+  // — so it is reported alongside rather than thrown.
+  const push = await deployAvatarToWorlds(user);
+  res.json({ ok: true, avatar: avatarStateOf(actorId), deploy: push });
 });
 
 // ── GET /api/worlds ───────────────────────────────────────────────────────────
@@ -5778,6 +5925,9 @@ app.post("/api/worlds/:world_id/spawn", async (req, res) => {
     `SELECT actor_id FROM world_memberships WHERE user_id = ? AND world_id = ?`
   ).get(user.id, world_id);
   if (!membership) return res.status(403).json({ error: "not a member of this world" });
+  // After the membership check on purpose: answering "you need a 3D profile" to
+  // someone who is not a member would confirm the world exists.
+  if (!requireReadyAvatar(req, res, user)) return;
   try {
     const resp = await fetch(
       `${SIMULATOR_URL}/internal/worlds/${world_id}/player/${membership.actor_id}/spawn`,
