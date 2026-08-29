@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 
 // ── Test Lab ─────────────────────────────────────────────────────────────────
@@ -72,6 +72,8 @@ export default function LabPage() {
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [checks, setChecks] = useState(null);
+  const [checksErr, setChecksErr] = useState(null); // null = first fetch in flight, "" = ok, text = last refresh failed
+  const checksReqRef = useRef("");
 
   const scenario = useMemo(
     () => scenarios.find(s => s.id === scenarioId) || null, [scenarios, scenarioId]);
@@ -150,16 +152,25 @@ export default function LabPage() {
   }, [scenarioId, scenarios]);
 
   // Scorecard — assertions against live state, mirroring the transport bench.
-  // A failed refresh keeps the last board up rather than blanking it.
+  // A failed refresh keeps the last board up but says so in the header;
+  // switching world/actor RESETS the board (a stale actor's rows must never
+  // sit under a fresh selection); the request key discards out-of-order
+  // responses when selections change faster than the simulator answers.
   async function refreshChecks() {
     if (!worldId || !actorId) return;
+    const key = worldId + "|" + actorId;
+    checksReqRef.current = key;
     try {
       const r = await fetch(`/api/test/encounter/checks?world_id=${encodeURIComponent(worldId)}&actor_id=${encodeURIComponent(actorId)}`, { credentials: "include" });
       const j = await r.json().catch(() => null);
-      if (j && j.ok) setChecks(j);
-    } catch { /* simulator away; the board simply doesn't render */ }
+      if (checksReqRef.current !== key) return; // a newer selection owns the board now
+      if (j && j.ok) { setChecks(j); setChecksErr(""); }
+      else setChecksErr(j && j.error ? `the simulator said: ${j.error}` : `the simulator answered HTTP ${r.status} without a usable board`);
+    } catch {
+      if (checksReqRef.current === key) setChecksErr("the simulator did not answer");
+    }
   }
-  useEffect(() => { refreshChecks(); /* eslint-disable-next-line */ }, [worldId, actorId]);
+  useEffect(() => { setChecks(null); setChecksErr(null); refreshChecks(); /* eslint-disable-next-line */ }, [worldId, actorId]);
 
   async function refreshSnapshots() {
     try {
@@ -277,7 +288,7 @@ export default function LabPage() {
     </div>
   );
 
-  const failing = (checks?.checks || []).filter(c => c.verdict === "fail").length;
+  const failing = (checks?.checks || []).filter(c => c.verdict !== "pass" && c.verdict !== "skip").length;
 
   return (
     <div style={{ minHeight: "100vh", background: "#0d0c0a", fontFamily: "'DM Sans',system-ui,sans-serif" }}>
@@ -638,7 +649,9 @@ export default function LabPage() {
             <span style={{ fontSize: 10.5, color: "rgba(255,255,255,.35)" }}>
               {!actorId
                 ? "Waiting for an eligible actor — this world has no one to assert about. Pick a world with a cast."
-                : "Checks unavailable — the simulator did not answer."}
+                : checksErr === null
+                  ? "Checking\u2026"
+                  : `Checks unavailable — ${checksErr}.`}
             </span>
           </div>
         )}
@@ -647,6 +660,9 @@ export default function LabPage() {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <span style={label}>Scorecard — assertions against live state</span>
               <span style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                {checksErr ? (
+                  <span style={{ ...label, color: "rgba(226,120,110,.7)" }}>stale — last refresh failed</span>
+                ) : null}
                 <span style={{ ...label, color: failing ? "rgba(226,120,110,.95)" : "rgba(150,210,150,.85)" }}>
                   {failing ? `${failing} failing` : "no failures"}
                 </span>
@@ -659,11 +675,28 @@ export default function LabPage() {
             <div>
               {(checks.checks || []).map((c, i) => (
                 <div key={i} style={{ display: "flex", gap: 10, padding: "7px 0", borderTop: i ? "0.5px solid rgba(255,255,255,.06)" : "none" }}>
-                  <span style={{ ...label, fontSize: 9, minWidth: 34, color: VERDICT_COLOR[c.verdict] }}>{c.verdict}</span>
+                  <span style={{ ...label, fontSize: 9, minWidth: 34, color: VERDICT_COLOR[c.verdict] || "rgba(255,255,255,.6)" }}>{c.verdict}</span>
                   <div style={{ flex: 1 }}>
                     <div style={{ fontSize: 11.5, color: "rgba(255,255,255,.75)" }}>{c.name}</div>
                     <div style={{ fontSize: 10.5, color: "rgba(255,255,255,.4)", lineHeight: 1.6, marginTop: 2 }}>{c.detail}</div>
                   </div>
+                  {c.verdict === "fail" && (
+                    <button
+                      title="Hand this failure to the watcher: diagnose, fix within its charter, re-run the check"
+                      onClick={() => window.dispatchEvent(new CustomEvent("watcher:ask", { detail: { text:
+                        `Developer pressed FIX on the failing scorecard check "${c.name}". Its detail: ${c.detail} — ` +
+                        "Diagnose the root cause and FIX it within your charter: snapshot first if anything state-destroying, " +
+                        "state writes only through the test endpoints, code changes compile-proofed (staged if a restart is " +
+                        "needed — do not restart just for this; say so instead). When done, re-run the check " +
+                        "(GET /internal/test/encounter/checks) and report whether it went green, or exactly why it must stay red." } }))}
+                      style={{ alignSelf: "flex-start", flex: "none", padding: "4px 10px", borderRadius: 5,
+                        cursor: "pointer", background: "rgba(201,151,58,.12)",
+                        border: "0.5px solid rgba(201,151,58,.4)", color: "rgba(201,151,58,.9)",
+                        fontSize: 9.5, letterSpacing: ".1em", textTransform: "uppercase",
+                        fontFamily: "'DM Sans',system-ui,sans-serif" }}>
+                      Fix
+                    </button>
+                  )}
                 </div>
               ))}
             </div>
