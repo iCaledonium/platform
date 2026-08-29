@@ -101,10 +101,25 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // process down mid-generation, unrelated to the generation itself.
 // Registered as early as possible, before any route or background task
 // that could throw.
+// Boot-time errors are the exception: before server.listen's callback has
+// fired, an uncaught error means module evaluation died partway and every
+// route below the throwing line was never registered (found 2026-08-29: a
+// module-scope require() in this ESM file left the service "active" with
+// /api/enroll/start 404ing). Exiting non-zero lets systemd restart us and
+// makes the failure loud instead of a silently half-booted route table.
+let booted = false;
 process.on("uncaughtException", (err) => {
+  if (!booted) {
+    console.error("[uncaughtException] during boot — exiting so the failure is loud:", err);
+    process.exit(1);
+  }
   console.error("[uncaughtException] not crashing the process:", err);
 });
 process.on("unhandledRejection", (reason) => {
+  if (!booted) {
+    console.error("[unhandledRejection] during boot — exiting so the failure is loud:", reason);
+    process.exit(1);
+  }
   console.error("[unhandledRejection] not crashing the process:", reason);
 });
 
@@ -4944,6 +4959,7 @@ server.on("upgrade", (req, socket, head) => {
 // localhost:4002, ngrok tunnels to :80 (nginx), and the simulator fetches
 // platform media over http://192.168.1.59 — port 80, also nginx.
 server.listen(PORT, "127.0.0.1", () => {
+  booted = true;
   console.log(`Platform API running on 127.0.0.1:${PORT}`);
   connectSimulatorEvents();
 });
