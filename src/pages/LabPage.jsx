@@ -175,7 +175,9 @@ export default function LabPage() {
   async function refreshSnapshots() {
     try {
       const d = await fetch("/api/test/snapshots", { credentials: "include" }).then(r => r.json());
-      setSnapshots(d.snapshots || []);
+      // The simulator snapshot dir can carry stray .json (the transport lab
+      // arms itself there) — a row with no id is not a snapshot.
+      setSnapshots((d.snapshots || []).filter(s => s.id));
     } catch { /* the lab still works without a snapshot list */ }
   }
 
