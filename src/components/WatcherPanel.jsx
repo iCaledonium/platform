@@ -1,0 +1,515 @@
+import { useEffect, useRef, useState } from "react";
+
+// ── Watcher panel ────────────────────────────────────────────────────────────
+//
+// Floating chat dock connecting to the anima-watcher-bridge on the DEVELOPER'S
+// OWN machine (ws://127.0.0.1:8787). One open panel = one ephemeral Claude
+// watcher session attached to the run; closing the panel kills it.
+//
+// On any machine without a local bridge the probe fails and this renders
+// nothing, so the public page is unchanged. The bridge itself must never be
+// exposed beyond loopback — the panel reaching it is what marks the developer.
+
+const BRIDGE_URL = "ws://127.0.0.1:8787";
+const TOKEN_KEY = "watcherBridgeToken";
+const GOLD = "rgba(201,151,58,";
+
+// Session 155 — the watcher FOLLOWS the run instead of following the URL.
+//
+// The overlay used to decide visibility from the route alone (/lab, or a
+// ?lab=/?eid= query), which covered the lab and the door scene the lab builds.
+// It did not cover where a run actually goes next: the world enter scene is
+// plain /world/:id with NO query string, so the predicate went false, React
+// unmounted this component, and an attached watcher died mid-run — silently,
+// because a panel that is gone cannot report that it is gone.
+//
+// A route list can never be right here: the run can go to a venue, to messages,
+// anywhere. So the panel states its own claim on the screen. While a session is
+// open (including minimized to the pill) it writes this flag, and the overlay
+// keeps rendering wherever the developer walks. Cleared only by ×, the gesture
+// that already means "kill the watcher".
+//
+// sessionStorage, not localStorage, on purpose: per-tab, and gone when the tab
+// closes, so a crashed panel cannot haunt every future page load.
+export const FOLLOW_KEY = "watcherFollowRun";
+
+export function watcherIsFollowing() {
+  try { return sessionStorage.getItem(FOLLOW_KEY) === "1"; } catch { return false; }
+}
+
+const label = {
+  fontSize: 9.5, letterSpacing: ".18em", textTransform: "uppercase",
+  color: "rgba(255,255,255,.4)",
+};
+
+function readToken() {
+  try { return localStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; }
+}
+
+export default function WatcherPanel({ bound = null }) {
+  const [reachable, setReachable] = useState(false);
+  const [open, setOpen] = useState(false);
+  const [phase, setPhase] = useState("idle"); // idle | token | connecting | pick | live | dead
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [minimized, setMinimized] = useState(false);
+  const [watchers, setWatchers] = useState([]);
+  const [watcherName, setWatcherName] = useState("");
+  const [newName, setNewName] = useState("");
+  // Draggable position. null = the default corner (right/bottom 22). Once
+  // dragged, {x,y} is the panel's top-left, remembered per browser — so the
+  // watcher can always be moved off whatever it happens to cover (it shipped
+  // sitting on top of "Build the run").
+  const POS_KEY = "watcherPanelPos";
+  const [pos, setPos] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(POS_KEY)) || null; } catch { return null; }
+  });
+  const dragRef = useRef(null);
+
+  const dragged = pos
+    ? { left: Math.max(0, Math.min(pos.x, window.innerWidth - 60)),
+        top:  Math.max(0, Math.min(pos.y, window.innerHeight - 40)) }
+    : null;
+  // Pills sit bottom-left; the open panel is a tall left column (the shape
+  // Magnus asked for), unless the user has dragged it somewhere.
+  const posStyle = dragged || { left: 22, bottom: 22 };
+  const panelPosStyle = dragged || { left: 22, top: 90 };
+
+  const startDrag = (e) => {
+    if (e.target.closest("button") && e.currentTarget.tagName !== "BUTTON") return;
+    const el = e.currentTarget.closest("[data-watcher-root]") || e.currentTarget;
+    const r = el.getBoundingClientRect();
+    const d = { dx: e.clientX - r.left, dy: e.clientY - r.top, moved: false };
+    dragRef.current = d;
+    const onMove = (ev) => {
+      if (Math.abs(ev.clientX - (r.left + d.dx)) + Math.abs(ev.clientY - (r.top + d.dy)) > 4) d.moved = true;
+      if (d.moved) setPos({ x: ev.clientX - d.dx, y: ev.clientY - d.dy });
+    };
+    const onUp = (ev) => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      if (d.moved) {
+        const v = { x: ev.clientX - d.dx, y: ev.clientY - d.dy };
+        try { localStorage.setItem(POS_KEY, JSON.stringify(v)); } catch {}
+      }
+      setTimeout(() => { dragRef.current = null; }, 250);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
+  const clickUnlessDragged = (fn) => () => { if (!dragRef.current?.moved) fn(); };
+  const wsRef = useRef(null);
+  const streamRef = useRef("");
+  const scrollRef = useRef(null);
+
+  // Probe once: is a local bridge listening? If not, render nothing at all.
+  const autoAttachName = useRef(null);
+  const autoTried = useRef(false);
+  const boundRef = useRef(bound);
+  boundRef.current = bound;
+
+  // Crossing into a lab surface with a DIFFERENT bound conversation switches
+  // the panel to it: kill this process (the conversation survives), reconnect,
+  // attach the page's own watcher. Strict by Magnus's rule.
+  useEffect(() => {
+    if (!bound || !open) return;
+    if (watcherName && watcherName !== bound) {
+      killSession();
+      const t = readToken();
+      if (t) { autoAttachName.current = bound; startSession(t); }
+    }
+  }, [bound]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    let ws;
+    try { ws = new WebSocket(BRIDGE_URL); } catch { return; }
+    ws.onopen = () => {
+      setReachable(true); ws.close();
+      // Start as an open, attached panel: resume the last watcher without
+      // making the developer click through pill → picker every page load.
+      if (!autoTried.current) {
+        autoTried.current = true;
+        const t = readToken();
+        let last = null; try { last = localStorage.getItem("watcherLastName"); } catch {}
+        // The page's bound conversation wins: the encounter lab must never
+        // host the transport watcher, whatever was used last.
+        const want = boundRef.current || last;
+        if (t && want) { autoAttachName.current = want; setOpen(true); startSession(t); }
+      }
+    };
+    ws.onerror = () => {};
+    return () => { try { ws.close(); } catch {} };
+  }, []);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight);
+  }, [messages]);
+
+  const push = (m) => setMessages((prev) => [...prev, m]);
+
+  const finalizeStream = () => {
+    streamRef.current = "";
+  };
+
+  const appendDelta = (text) => {
+    streamRef.current += text;
+    const buf = streamRef.current;
+    setMessages((prev) => {
+      const last = prev[prev.length - 1];
+      if (last?.kind === "watcher" && last.live) {
+        return [...prev.slice(0, -1), { ...last, text: buf }];
+      }
+      return [...prev, { kind: "watcher", text: buf, live: true }];
+    });
+  };
+
+  const settleBubble = (text) => {
+    setMessages((prev) => {
+      const last = prev[prev.length - 1];
+      if (last?.kind === "watcher" && last.live) {
+        return [...prev.slice(0, -1), { kind: "watcher", text: last.text }];
+      }
+      return text ? [...prev, { kind: "watcher", text }] : prev;
+    });
+    finalizeStream();
+  };
+
+  const killSession = () => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify({ type: "kill" })); } catch {}
+      try { ws.close(); } catch {}
+    }
+    wsRef.current = null;
+  };
+
+  const startSession = (token) => {
+    setMessages([]);
+    setBusy(false);
+    finalizeStream();
+    setPhase("connecting");
+    const ws = new WebSocket(BRIDGE_URL);
+    wsRef.current = ws;
+    ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token }));
+    ws.onmessage = (evt) => {
+      let msg;
+      try { msg = JSON.parse(evt.data); } catch { return; }
+      if (msg.type === "ready") {
+        setWatchers(msg.watchers || []);
+        const auto = autoAttachName.current;
+        autoAttachName.current = null;
+        if (auto && (msg.watchers || []).some(w => w.name === auto)) {
+          setWatcherName(auto); setPhase("connecting");
+          ws.send(JSON.stringify({ type: "attach", name: auto, kickoff: true }));
+        } else setPhase("pick");
+      }
+      else if (msg.type === "init") { setPhase("live"); setBusy(true); if (msg.watcher) setWatcherName(msg.watcher); }
+      else if (msg.type === "text") appendDelta(msg.text);
+      else if (msg.type === "assistant") settleBubble(msg.text);
+      else if (msg.type === "tool") {
+        settleBubble("");
+        push({ kind: "tool", text: `${msg.name} ${msg.input}` });
+      } else if (msg.type === "uploaded") { /* path already travelling to the watcher */ }
+      else if (msg.type === "turn_done") { settleBubble(""); setBusy(false); }
+      else if (msg.type === "error") {
+        if (/already attached elsewhere/.test(msg.message || "")) { setPhase("pick"); setWatcherName(""); }
+        push({ kind: "sys", text: `error: ${msg.message}` });
+      }
+    };
+    ws.onclose = (evt) => {
+      if (wsRef.current !== ws) return;
+      wsRef.current = null;
+      if (evt.code === 4003) {
+        try { localStorage.removeItem(TOKEN_KEY); } catch {}
+        setPhase("token");
+        push({ kind: "sys", text: "bad token — enter it again" });
+      } else {
+        setPhase("dead");
+        setBusy(false);
+      }
+    };
+    ws.onerror = () => {};
+  };
+
+  const attachWatcher = (name) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    setWatcherName(name);
+    setPhase("connecting");
+    try { localStorage.setItem("watcherLastName", name); } catch {}
+    ws.send(JSON.stringify({ type: "attach", name, kickoff: true }));
+  };
+
+  const openPanel = () => {
+    setOpen(true);
+    setMinimized(false);
+    const token = readToken();
+    if (!token) { setPhase("token"); return; }
+    if (boundRef.current) autoAttachName.current = boundRef.current;
+    startSession(token);
+  };
+
+  const closePanel = () => {
+    killSession();
+    setOpen(false);
+    setMinimized(false);
+    setPhase("idle");
+  };
+
+  // Claim the screen for as long as the panel is open, and let go on ×. Written
+  // from an effect rather than inside openPanel/closePanel so that it tracks the
+  // state that actually decides whether a socket exists — including the pill,
+  // which is minimized but very much alive.
+  useEffect(() => {
+    try {
+      if (open) sessionStorage.setItem(FOLLOW_KEY, "1");
+      else sessionStorage.removeItem(FOLLOW_KEY);
+    } catch {}
+  }, [open]);
+
+  const send = () => {
+    const text = input.trim();
+    const ws = wsRef.current;
+    if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+    push({ kind: "me", text });
+    ws.send(JSON.stringify({ type: "user", text }));
+    setBusy(true);
+    setInput("");
+  };
+
+  const fileRef = useRef(null);
+
+  const uploadFiles = (files) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN || phase !== "live") return;
+    for (const f of files) {
+      if (f.size > 25 * 1024 * 1024) { push({ kind: "sys", text: `${f.name}: too large (25MB max)` }); continue; }
+      const reader = new FileReader();
+      reader.onload = () => {
+        const data = String(reader.result).split(",")[1] || "";
+        ws.send(JSON.stringify({ type: "upload", name: f.name, mime: f.type, data,
+          note: input.trim() || undefined }));
+        push({ kind: "me", text: `📎 ${f.name} (${f.size > 1048576 ? (f.size / 1048576).toFixed(1) + " MB" : Math.ceil(f.size / 1024) + " KB"})` });
+        setBusy(true);
+        setInput("");
+      };
+      reader.readAsDataURL(f);
+    }
+  };
+
+  if (!reachable) return null;
+
+  if (!open) {
+    return (
+      <button data-watcher-root onPointerDown={startDrag}
+        onClick={clickUnlessDragged(openPanel)} title="Attach a watcher to this run — drag to move"
+        style={{ position: "fixed", ...posStyle, zIndex: 100000,
+          padding: "11px 18px", borderRadius: 999, cursor: "pointer",
+          background: "#12100d", color: GOLD + ".9)",
+          border: `0.5px solid ${GOLD}.45)`,
+          fontSize: 10.5, letterSpacing: ".16em", textTransform: "uppercase",
+          fontFamily: "'DM Sans',system-ui,sans-serif" }}>
+        ◉ Watcher
+      </button>
+    );
+  }
+
+  const dot = phase === "live" ? (busy ? GOLD + ".95)" : "rgba(120,190,120,.9)")
+    : phase === "dead" ? "rgba(200,90,80,.9)" : "rgba(255,255,255,.35)";
+
+  // Minimized: the panel folds back into the pill, but the session stays
+  // alive — unlike ×, which kills the watcher. The dot keeps reporting.
+  if (minimized) {
+    return (
+      <button data-watcher-root onPointerDown={startDrag}
+        onClick={clickUnlessDragged(() => setMinimized(false))} title="Restore the watcher panel — drag to move"
+        style={{ position: "fixed", ...posStyle, zIndex: 100000,
+          display: "flex", alignItems: "center", gap: 8,
+          padding: "11px 18px", borderRadius: 999, cursor: "pointer",
+          background: "#12100d", color: GOLD + ".9)",
+          border: `0.5px solid ${GOLD}.45)`,
+          fontSize: 10.5, letterSpacing: ".16em", textTransform: "uppercase",
+          fontFamily: "'DM Sans',system-ui,sans-serif" }}>
+        <span style={{ width: 7, height: 7, borderRadius: 99, background: dot }} />
+        Watcher{phase === "live" && busy ? " · working" : ""}
+      </button>
+    );
+  }
+
+  return (
+    <div data-watcher-root
+      onDragOver={(e) => { e.preventDefault(); }}
+      onDrop={(e) => { e.preventDefault(); if (e.dataTransfer?.files?.length) uploadFiles([...e.dataTransfer.files]); }}
+      style={{ position: "fixed", ...panelPosStyle, zIndex: 100000,
+      width: 400, height: "min(880px, calc(100vh - 130px))", overflow: "hidden",
+      display: "flex", flexDirection: "column",
+      background: "#0f0e0b", border: "0.5px solid rgba(255,255,255,.12)",
+      borderRadius: 12, boxShadow: "0 18px 50px rgba(0,0,0,.6)",
+      fontFamily: "'DM Sans',system-ui,sans-serif" }}>
+
+      <div onPointerDown={startDrag} title="Drag to move"
+        style={{ display: "flex", alignItems: "center", gap: 9, cursor: "grab",
+        padding: "11px 14px", borderBottom: "0.5px solid rgba(255,255,255,.08)" }}>
+        <span style={{ width: 7, height: 7, borderRadius: 99, background: dot }} />
+        <span style={{ ...label, color: GOLD + ".8)" }}>{watcherName || "Watcher"}</span>
+        <span style={{ ...label, fontSize: 8.5 }}>
+          {phase === "live" ? (busy ? "working" : "watching")
+            : phase === "connecting" ? "attaching"
+            : phase === "dead" ? "session ended" : ""}
+        </span>
+        <div style={{ flex: 1 }} />
+        {phase === "live" && !busy && (
+          <button title="Restart the whole scenario — the watcher snapshots, rebuilds the fixture from the first stage, and posts the new scene link"
+            onClick={() => {
+              const text = "Restart the WHOLE scenario from the beginning: take a labelled snapshot first, " +
+                "then rebuild the fixture for the current pair at the scenario's first stage with the same " +
+                "configuration, and reply with the new scene path (/world/...) so I can click straight into it.";
+              push({ kind: "me", text: "⟳ restart the scenario" });
+              wsRef.current?.send(JSON.stringify({ type: "user", text }));
+              setBusy(true);
+            }}
+            style={{ background: "none", border: "none", cursor: "pointer",
+              color: GOLD + ".8)", fontSize: 13, lineHeight: 1 }}>
+            ⟳
+          </button>
+        )}
+        {phase === "live" && busy && (
+          <button onClick={() => wsRef.current?.send(JSON.stringify({ type: "interrupt" }))}
+            style={{ background: "none", border: "none", cursor: "pointer",
+              color: "rgba(255,255,255,.45)", fontSize: 10, letterSpacing: ".1em" }}>
+            interrupt
+          </button>
+        )}
+        {phase === "dead" && (
+          <button onClick={() => { const t = readToken(); t ? startSession(t) : setPhase("token"); }}
+            style={{ background: "none", border: "none", cursor: "pointer",
+              color: GOLD + ".8)", fontSize: 10, letterSpacing: ".1em" }}>
+            new watcher
+          </button>
+        )}
+        <button onClick={() => setMinimized(true)} title="Minimize — the watcher keeps running"
+          style={{ background: "none", border: "none", cursor: "pointer",
+            color: "rgba(255,255,255,.5)", fontSize: 14, lineHeight: 1 }}>
+          –
+        </button>
+        <button onClick={closePanel} title="Close panel — the process ends, the conversation is kept"
+          style={{ background: "none", border: "none", cursor: "pointer",
+            color: "rgba(255,255,255,.5)", fontSize: 14, lineHeight: 1 }}>
+          ×
+        </button>
+      </div>
+
+      {phase === "pick" ? (
+        <div style={{ padding: 18, display: "flex", flexDirection: "column", gap: 10, overflowY: "auto" }}>
+          <span style={label}>ongoing watchers — pick a conversation</span>
+          {watchers.map(w => (
+            <button key={w.name} onClick={() => !w.live && attachWatcher(w.name)} disabled={w.live}
+              style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 3,
+                padding: "10px 12px", borderRadius: 7, cursor: w.live ? "default" : "pointer",
+                background: "rgba(255,255,255,.03)", textAlign: "left",
+                border: `0.5px solid ${w.name === (localStorage.getItem("watcherLastName") || "") ? GOLD + ".4)" : "rgba(255,255,255,.1)"}`,
+                color: "rgba(255,255,255,.85)", fontFamily: "'DM Sans',system-ui,sans-serif" }}>
+              <span style={{ fontSize: 12.5, color: w.live ? "rgba(255,255,255,.4)" : GOLD + ".9)" }}>{w.name}</span>
+              <span style={{ fontSize: 9, color: "rgba(255,255,255,.35)" }}>
+                {w.live ? "attached in another window" : w.lastUsed ? "last used " + new Date(w.lastUsed).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "never used"}
+              </span>
+            </button>
+          ))}
+          <input value={newName} onChange={e => setNewName(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter" && newName.trim()) attachWatcher(newName.trim()); }}
+            placeholder={watchers.length ? "new watcher — name it, press Enter" : "e.g. Feature — Actor Encounter, press Enter"}
+            style={{ background: "#080706", border: "0.5px solid rgba(255,255,255,.15)",
+              borderRadius: 7, padding: "9px 11px", color: "rgba(255,255,255,.85)",
+              fontSize: 12, outline: "none" }} />
+        </div>
+      ) : phase === "token" ? (
+        <div style={{ padding: 18, display: "flex", flexDirection: "column", gap: 10 }}>
+          <span style={label}>bridge token</span>
+          <input type="password" autoFocus
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && e.target.value.trim()) {
+                try { localStorage.setItem(TOKEN_KEY, e.target.value.trim()); } catch {}
+                startSession(e.target.value.trim());
+              }
+            }}
+            placeholder="paste ~/anima-watcher-bridge/token, press Enter"
+            style={{ background: "#080706", border: "0.5px solid rgba(255,255,255,.15)",
+              borderRadius: 7, padding: "9px 11px", color: "rgba(255,255,255,.85)",
+              fontSize: 12, outline: "none" }} />
+        </div>
+      ) : (
+        <>
+          <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", overflowX: "hidden",
+            scrollbarWidth: "thin", padding: "12px 14px",
+            display: "flex", flexDirection: "column", gap: 8 }}>
+            {messages.map((m, i) =>
+              m.kind === "tool" ? (
+                <div key={i} style={{ fontSize: 9.5, color: "rgba(255,255,255,.28)",
+                  fontFamily: "ui-monospace,monospace", whiteSpace: "nowrap",
+                  overflow: "hidden", textOverflow: "ellipsis" }}>⚙ {m.text}</div>
+              ) : m.kind === "sys" ? (
+                <div key={i} style={{ fontSize: 10, color: "rgba(200,90,80,.85)" }}>{m.text}</div>
+              ) : (
+                <div key={i} style={{ alignSelf: m.kind === "me" ? "flex-end" : "flex-start",
+                  maxWidth: "88%", padding: "8px 11px", borderRadius: 10,
+                  whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "break-word",
+                  fontSize: 12, lineHeight: 1.55,
+                  background: m.kind === "me" ? GOLD + ".14)" : "rgba(255,255,255,.05)",
+                  border: `0.5px solid ${m.kind === "me" ? GOLD + ".3)" : "rgba(255,255,255,.08)"}`,
+                  color: "rgba(255,255,255,.82)" }}>
+                  {m.text.split(/(\/(?:world|lab)\/[^\s)`"']+)/g).map((part, j) =>
+                    /^\/(?:world|lab)\//.test(part) ? (
+                      <span key={j} onClick={() => { window.location.href = part; }}
+                        style={{ color: GOLD + ".9)", textDecoration: "underline", cursor: "pointer" }}>
+                        {part}
+                      </span>
+                    ) : part)}
+                </div>
+              )
+            )}
+            {(phase === "connecting" ||
+              (phase === "live" && busy && !(messages[messages.length - 1]?.kind === "watcher" && messages[messages.length - 1]?.live))) && (
+              <div style={{ alignSelf: "flex-start", padding: "10px 13px", borderRadius: 10,
+                background: "rgba(255,255,255,.05)", border: "0.5px solid rgba(255,255,255,.08)",
+                display: "flex", gap: 4 }}>
+                {[0, 1, 2].map(k => (
+                  <span key={k} style={{ width: 5, height: 5, borderRadius: 99,
+                    background: "rgba(255,255,255,.55)",
+                    animation: `watcherDot 1.2s ${k * 0.2}s infinite` }} />
+                ))}
+              </div>
+            )}
+            <style>{`@keyframes watcherDot { 0%, 60%, 100% { opacity: .25; } 30% { opacity: 1; } }`}</style>
+          </div>
+
+          <div style={{ display: "flex", gap: 8, padding: 12, alignItems: "center",
+            borderTop: "0.5px solid rgba(255,255,255,.08)" }}>
+            <input ref={fileRef} type="file" multiple style={{ display: "none" }}
+              onChange={(e) => { if (e.target.files?.length) uploadFiles([...e.target.files]); e.target.value = ""; }} />
+            <button onClick={() => fileRef.current?.click()} disabled={phase !== "live"}
+              title="Send a file to the watcher — a screenshot, a log; it can look at images. Or drop files anywhere on the panel."
+              style={{ background: "none", border: "none", cursor: "pointer",
+                color: "rgba(255,255,255,.5)", fontSize: 15, lineHeight: 1, padding: "0 2px" }}>
+              📎
+            </button>
+            <input value={input} onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && send()}
+              disabled={phase !== "live"}
+              placeholder={phase === "live" ? "ask the watcher…" : ""}
+              style={{ flex: 1, background: "#080706",
+                border: "0.5px solid rgba(255,255,255,.15)", borderRadius: 7,
+                padding: "9px 11px", color: "rgba(255,255,255,.85)", fontSize: 12,
+                outline: "none" }} />
+            <button onClick={send} disabled={phase !== "live"}
+              style={{ padding: "9px 14px", borderRadius: 7, cursor: "pointer",
+                background: GOLD + ".16)", border: `0.5px solid ${GOLD}.4)`,
+                color: GOLD + ".9)", fontSize: 11 }}>
+              →
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

@@ -11,3 +11,5 @@ deploy-logs/
 deploy-logs/
 .env
 cleanup_drafts.mjs
+*.bak
+*.bak-*

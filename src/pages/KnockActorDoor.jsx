@@ -26,11 +26,17 @@ export default function KnockActorDoor() {
 
   const [ctx, setCtx]         = useState(null);   // { world, user, sceneData }
   const [problem, setProblem] = useState(null);
-  const starting              = useRef(false);
+  const ctxRef   = useRef(null);   // so the unload handler sees the live encounter id
+  const endedRef = useRef(false);  // exactly one end per visit
 
-  // One knock per visit. Without this a reload would start a second encounter
-  // with the same person at the same door, and the first would be left running
-  // with nobody reading it.
+  // Session 153 — this cache is now a convenience, not a guard.
+  //
+  // It used to be the only thing stopping a reload starting a second encounter
+  // ("one knock per visit"), which was the right intent at the wrong layer:
+  // sessionStorage is per-tab, so a second WINDOW sailed straight past it and
+  // spawned a parallel conversation. The guard now lives in the simulator,
+  // where EncounterProcess is registered per (player, target) and a duplicate
+  // start rejoins the live one. All this keeps is the id, for leaving.
   const cacheKey = `knock:${worldId}:${actorId}`;
 
   useEffect(() => {
@@ -75,9 +81,43 @@ export default function KnockActorDoor() {
 
         const playerActorId = user?.worlds?.find(w => w.world_id === worldId)?.actor_id;
 
-        let encounter_id = sessionStorage.getItem(cacheKey);
-        if (!encounter_id && !starting.current) {
-          starting.current = true;
+        // Session 153 — always ask the server; never infer from the tab.
+        //
+        // This used to read a cached encounter id out of sessionStorage and
+        // treat its mere presence as "you are already here". A refresh then
+        // claimed you were mid-encounter and never knocked — and if that
+        // encounter had since died (a simulator restart is enough) you were
+        // left staring at a closed door with nothing in flight.
+        //
+        // The server dedupes by (player, target) now, so asking is always
+        // safe: a live encounter comes back with rejoined:true, and a dead one
+        // is simply replaced by a fresh knock. That is a question only the
+        // server can answer, so it is the server that answers it.
+        let encounter_id = null;
+        let rejoined = false;
+
+        // Session 154 - the Test Lab hands us an encounter it already built,
+        // with her decision authored into it. Starting our own would throw
+        // that away and knock for real, which is the one thing the lab exists
+        // to skip. Read the URL here, not at module scope: this is a
+        // single-page app, so a module-level location.search is whatever page
+        // the bundle first loaded on, not the one we navigated to.
+        const labEid = new URLSearchParams(window.location.search).get("eid");
+        if (labEid) {
+          // Confirm it is still alive before committing the scene to it. A
+          // fixture encounter can die between being built and being opened
+          // (a model host that has gone away takes the process with it), and
+          // an id we never check turns that into a doorway that is knocked on
+          // forever with nothing behind it. A dead sandbox has to LOOK dead.
+          const probe = await fetch(`/api/worlds/${worldId}/encounter/${labEid}`,
+                                    { credentials: "include" });
+          if (!probe.ok) { if (!dead) setProblem("world"); return; }
+          encounter_id = labEid;
+          rejoined = true;
+          sessionStorage.setItem(cacheKey, labEid);
+        }
+
+        if (!encounter_id) {
           const r = await fetch(`/api/worlds/${worldId}/encounter/start`, {
             method:  "POST",
             headers: { "Content-Type": "application/json" },
@@ -91,15 +131,18 @@ export default function KnockActorDoor() {
           });
           const data = await r.json().catch(() => ({}));
           encounter_id = data.encounter_id || null;
+          // Only the server's own answer counts as "already here".
+          rejoined = data.rejoined === true;
           if (encounter_id) sessionStorage.setItem(cacheKey, encounter_id);
         }
         if (dead) return;
 
+        ctxRef.current = { sceneData: { encounter_id } };
         setCtx({
           world,
           user,
           actor,
-          sceneData: { location, encounter_id, trigger: "knock", mode: "scene" },
+          sceneData: { location, encounter_id, trigger: "knock", mode: "scene", rejoined },
         });
       } catch {
         if (!dead) setProblem("world");
@@ -109,7 +152,38 @@ export default function KnockActorDoor() {
     return () => { dead = true; };
   }, [worldId, actorId]);
 
+  // Session 153 — leaving has to reach the simulator, not just the router.
+  //
+  // Walking away used to be a navigate() and nothing else, so the encounter
+  // stayed live on the server with nobody in it. That is where her memories
+  // were going: write_encounter_memories runs inside shutdown_encounter, and
+  // an encounter that is never ended is never shut down. Ten knocks last
+  // night produced one ending and zero memories of any of them — she has no
+  // record of a single visit, while remembering every text she sent.
+  const endEncounter = (beacon = false) => {
+    const id = ctxRef.current?.sceneData?.encounter_id;
+    if (!id || endedRef.current) return;
+    endedRef.current = true;
+    const url = `/api/worlds/${worldId}/encounter/${id}/end`;
+    // On the way out of the page a normal fetch is cancelled mid-flight;
+    // sendBeacon is the one request a browser promises to finish.
+    if (beacon && navigator.sendBeacon) navigator.sendBeacon(url);
+    else fetch(url, { method: "POST", credentials: "include", keepalive: true }).catch(() => {});
+  };
+
+  // Closing the window, quitting the app, or navigating away entirely.
+  // pagehide fires where beforeunload is unreliable, including bfcache.
+  useEffect(() => {
+    const bye = () => endEncounter(true);
+    window.addEventListener("pagehide", bye);
+    return () => {
+      window.removeEventListener("pagehide", bye);
+      endEncounter();          // and for leaving via the router
+    };
+  }, [worldId]);
+
   function handleLeave() {
+    endEncounter();
     sessionStorage.removeItem(cacheKey);
     // Stepping back from a door puts you on the street outside it, not out of
     // the world entirely.

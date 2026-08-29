@@ -13,6 +13,7 @@ import db from "./db.js";
 import { registerGenerate3DRoutes, deleteActorTmpFolder, appearanceHash } from "./generate3d.js";
 import { mergeAnimationIntoActorGlb, removeAnimationFromActorGlb, parseDufFrames } from "./animations.js";
 import { educationFromCv } from "./cv_edu.mjs";
+import { mount as mountTestLabRoutes } from "./testlab-routes.js";
 
 // Session 102 — drafts carry their wizard adjustment state (all morph
 // slider values, the named body sliders, pose values, reference URLs,
@@ -65,6 +66,13 @@ try { db.prepare(`ALTER TABLE users ADD COLUMN preferences TEXT`).run(); } catch
 // the nationality/language attributes ruled in: pins what the three
 // LLMs otherwise each infer differently from a name.
 try { db.prepare(`ALTER TABLE actors ADD COLUMN nationality TEXT`).run(); } catch {}
+// Session 152 — interests used to exist only as an INTERESTS section inside
+// the Haiku-generated CV, which the platform never even persisted (it lived in
+// wizard React state until deploy). Structured here so it can be edited, kept
+// across sessions, and — the point — reach the simulator's decision prompt via
+// lifestyle_context/2. Free text, comma-separated, matching the prose style of
+// diet and exercise_type on the same table.
+try { db.prepare(`ALTER TABLE actor_lifestyle ADD COLUMN interests TEXT`).run(); } catch {}
 // Session 107, landmine #3 from the same rebuild: the recreated actors
 // table lost PRIMARY KEY on id, which silently broke EVERY foreign key
 // referencing actors ("foreign key mismatch" on actor_media insert) and
@@ -172,52 +180,479 @@ app.use((req, res, next) => {
   next();
 });
 
-app.post("/api/enroll/start", (req, res) => {
-  const { user_id } = req.body;
-  if (!user_id) return res.status(400).json({ error: "user_id required" });
-  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(user_id);
+// ── Signup: admin invite → self-enrolment ────────────────────────────────────
+//
+// Accounts are created by someone who already has one, never by the public. The
+// created row is inert on its own: it has no secret, it is `status = 'invited'`
+// so the login picker does not list it, and the only thing that can bring it to
+// life is a single-use invite token handed to the new person out of band.
+//
+// The token is also what closes an account-takeover hole that predates it.
+// Enrolment used to take a bare `user_id` and nothing else, while
+// /api/orgs/:org/members published every id unauthenticated — and this host is
+// on the public internet over ngrok. Anyone could open /enroll?user_id=<id> for
+// any not-yet-enrolled account, scan the QR into their own authenticator, and
+// own that account. So enrolment now demands one of exactly two proofs:
+// a live invite token, or an existing session (re-enrolling your own phone).
+// Neither is something a stranger can produce.
+db.prepare(`CREATE TABLE IF NOT EXISTS user_invites (
+  token_hash  TEXT PRIMARY KEY,
+  user_id     TEXT NOT NULL,
+  created_by  TEXT NOT NULL,
+  expires_at  TEXT NOT NULL,
+  accepted_at TEXT,
+  inserted_at TEXT NOT NULL
+)`).run();
+
+const INVITE_TTL_DAYS = 7;
+
+const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
+
+// One live invite per user: minting a new one retires any unaccepted predecessor,
+// so a link that was mailed to the wrong address stops working the moment it is
+// re-issued.
+function mintInvite(userId, createdBy) {
+  const raw     = crypto.randomBytes(32).toString("hex");
+  const expires = new Date(Date.now() + INVITE_TTL_DAYS * 86400 * 1000).toISOString();
+  db.prepare(`DELETE FROM user_invites WHERE user_id = ? AND accepted_at IS NULL`).run(userId);
+  db.prepare(`INSERT INTO user_invites (token_hash, user_id, created_by, expires_at, inserted_at)
+              VALUES (?, ?, ?, ?, datetime('now'))`).run(sha256(raw), userId, createdBy, expires);
+  return { token: raw, expires_at: expires };
+}
+
+// Returns the users row an invite token unlocks, or null. Shape-checks the token
+// before it ever reaches the database.
+function userForInvite(token) {
+  if (!/^[a-f0-9]{64}$/.test(String(token || ""))) return null;
+  const row = db.prepare(`SELECT * FROM user_invites WHERE token_hash = ?`).get(sha256(token));
+  if (!row) return null;
+  if (row.accepted_at) return null;
+  if (new Date(row.expires_at) < new Date()) return null;
+  const user = db.prepare(`SELECT * FROM users WHERE id = ?`).get(row.user_id);
+  return user || null;
+}
+
+// Initials, the way every hand-made id on this system was already built
+// (Magnus Klack → mk). Numeric suffix only when that is taken.
+function allocateUserId(name) {
+  const base = (name.match(/\p{L}+/gu) || [])
+    .map(w => w[0].toLowerCase()).join("").slice(0, 2) || "u";
+  const taken = (id) => !!db.prepare(`SELECT 1 FROM users WHERE id = ?`).get(id);
+  if (!taken(base)) return base;
+  for (let n = 2; n < 100; n++) if (!taken(base + n)) return base + n;
+  return "u" + randomUUID().slice(0, 8);
+}
+
+// Which accounts may this caller administer? Their own org's members, plus the
+// members of any personal org their org provisioned — a private account created
+// from the People page would otherwise be unreachable the moment it existed,
+// with no way to re-issue an expired invite.
+function administrableOrgIds(caller) {
+  const own = caller.org_id;
+  if (!own) return [];
+  const provisioned = db.prepare(
+    `SELECT id FROM orgs WHERE created_by_org_id = ?`
+  ).all(own).map(o => o.id);
+  return [own, ...provisioned];
+}
+
+// Administering accounts takes three things, and all of them are load-bearing:
+//
+//   org.kind === "organization"   a private user's org holds only them
+//   user_type === "staff"         the tier
+//   org_role  === "admin"         the role — new, and the one that actually bites
+//
+// The role is what was missing. Until now "staff of an organization" was the
+// whole gate, which made every Anima employee an implicit administrator of the
+// company: anyone could invite, and shortly, erase.
+function requireOrgAdmin(req, res) {
+  const caller = authUser(req);
+  if (!caller) { res.status(401).json({ error: "not authenticated" }); return null; }
+  const org = db.prepare(`SELECT id, kind FROM orgs WHERE id = ?`).get(caller.org_id);
+  if (!org || org.kind !== "organization" || caller.user_type !== "staff") {
+    res.status(403).json({ error: "only staff of an organization can manage accounts" });
+    return null;
+  }
+  if (caller.org_role !== "admin") {
+    res.status(403).json({ error: "only an administrator of this organization can manage accounts" });
+    return null;
+  }
+  return { caller, org };
+}
+
+// What a person still holds that outlives their access. Used to decide whether
+// an account can be erased outright or only shut down, and to tell the admin
+// what they are about to leave behind either way.
+function belongingsOf(userId) {
+  const actors = db.prepare(`SELECT COUNT(*) n FROM actors WHERE owner_id = ?`).get(userId).n;
+  const worlds = db.prepare(`SELECT world_id, role FROM world_memberships WHERE user_id = ?`).all(userId);
+  const keys   = db.prepare(`SELECT COUNT(*) n FROM api_keys WHERE user_id = ? AND revoked_at IS NULL`).get(userId).n;
+  return { actors, worlds, api_keys: keys };
+}
+
+// ── POST /api/admin/users — create an account and mint its invite ────────────
+//
+// `tier` decides what kind of account this is:
+//   "staff"    — a colleague, joining the caller's own organization
+//   "personal" — a private person, who gets an org of their own containing only
+//                them. Provisioned by invite for now; when public registration
+//                opens, it calls exactly this path with no admin attached.
+app.post("/api/admin/users", (req, res) => {
+  const ctx = requireOrgAdmin(req, res);
+  if (!ctx) return;
+  const { caller } = ctx;
+
+  const name  = String(req.body?.name  || "").trim();
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const tier  = String(req.body?.tier || "staff").trim();
+  const gender = req.body?.gender ? String(req.body.gender).trim() : null;
+
+  if (!name)  return res.status(400).json({ error: "name required" });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "valid email required" });
+  if (!["staff", "personal"].includes(tier)) return res.status(400).json({ error: "tier must be staff or personal" });
+  // Email is unique platform-wide, not per-org: it is the handle a private user
+  // signs in with, so it has to resolve to one account without an org to scope it.
+  if (db.prepare(`SELECT 1 FROM users WHERE lower(email) = ?`).get(email))
+    return res.status(409).json({ error: "a user with that email already exists" });
+
+  const id = allocateUserId(name);
+
+  // A deleted user can leave its TOTP secret behind (there is one such orphan in
+  // this database), and ids are short enough to be handed out again. Reusing an
+  // id must never mean inheriting a stranger's second factor.
+  db.prepare(`DELETE FROM user_totp_secrets WHERE user_id = ?`).run(id);
+  db.prepare(`DELETE FROM user_invites      WHERE user_id = ?`).run(id);
+
+  let orgId = caller.org_id;
+  if (tier === "personal") {
+    orgId = `p-${randomUUID().slice(0, 8)}`;
+    db.prepare(`INSERT INTO orgs (id, name, kind, status, created_by_org_id, inserted_at, updated_at)
+                VALUES (?, ?, 'personal', 'active', ?, datetime('now'), datetime('now'))`)
+      .run(orgId, name, caller.org_id);
+  }
+
+  // Always a member. Promotion is a separate, deliberate act — an account is
+  // never born able to invite and erase.
+  db.prepare(`INSERT INTO users (id, name, email, status, user_type, gender, org_id, org_role, inserted_at, updated_at)
+              VALUES (?, ?, ?, 'invited', ?, ?, ?, 'member', datetime('now'), datetime('now'))`)
+    .run(id, name, email, tier === "personal" ? "personal" : "staff", gender, orgId);
+
+  const invite = mintInvite(id, caller.id);
+  res.json({
+    user: { id, name, email, status: "invited", user_type: tier === "personal" ? "personal" : "staff",
+            gender, org_id: orgId, tier },
+    // A path, not a URL: express sits behind nginx and an ngrok tunnel with no
+    // `trust proxy`, so req.protocol here says "http" for a link that is only
+    // ever handed out as https. The caller knows its own origin; let it say.
+    invite_path: `/invite/${invite.token}`,
+    expires_at: invite.expires_at,
+  });
+});
+
+// ── GET /api/admin/users — every account and where it is in the flow ─────────
+app.get("/api/admin/users", (req, res) => {
+  const ctx = requireOrgAdmin(req, res);
+  if (!ctx) return;
+  const orgIds = administrableOrgIds(ctx.caller);
+  const holes  = orgIds.map(() => "?").join(",");
+
+  const users = db.prepare(`
+    SELECT u.id, u.name, u.email, u.status, u.user_type, u.org_role, u.gender, u.photo_url, u.inserted_at,
+           u.org_id, o.name AS org_name, o.kind AS org_kind,
+           CASE WHEN t.enrolled_at IS NOT NULL THEN 1 ELSE 0 END AS enrolled,
+           i.expires_at AS invite_expires_at,
+           (SELECT COUNT(*) FROM actors a WHERE a.owner_id = u.id) AS owned_actors,
+           (SELECT COUNT(*) FROM world_memberships w WHERE w.user_id = u.id) AS world_count
+    FROM users u
+    JOIN orgs o                   ON o.id = u.org_id
+    LEFT JOIN user_totp_secrets t ON t.user_id = u.id
+    LEFT JOIN user_invites i      ON i.user_id = u.id AND i.accepted_at IS NULL
+    WHERE u.org_id IN (${holes})
+    ORDER BY o.kind, u.inserted_at DESC, u.name
+  `).all(...orgIds).map(u => ({
+    ...u,
+    enrolled: !!u.enrolled,
+    invite_state: u.enrolled ? "enrolled"
+      : !u.invite_expires_at ? "none"
+      : new Date(u.invite_expires_at) < new Date() ? "expired" : "pending",
+  }));
+  res.json(users);
+});
+
+// ── POST /api/admin/users/:id/invite — re-issue a link ───────────────────────
+app.post("/api/admin/users/:id/invite", (req, res) => {
+  const ctx = requireOrgAdmin(req, res);
+  if (!ctx) return;
+  const orgIds = administrableOrgIds(ctx.caller);
+  const holes  = orgIds.map(() => "?").join(",");
+
+  // 404 rather than 403 for an account outside the caller's reach: a wrong
+  // status code here would confirm that some other tenant's user id exists.
+  const user = db.prepare(`SELECT id FROM users WHERE id = ? AND org_id IN (${holes})`)
+    .get(req.params.id, ...orgIds);
   if (!user) return res.status(404).json({ error: "user not found" });
-  let row = db.prepare("SELECT * FROM user_totp_secrets WHERE user_id = ?").get(user_id);
+
+  const invite = mintInvite(user.id, ctx.caller.id);
+  res.json({
+    // A path, not a URL: express sits behind nginx and an ngrok tunnel with no
+    // `trust proxy`, so req.protocol here says "http" for a link that is only
+    // ever handed out as https. The caller knows its own origin; let it say.
+    invite_path: `/invite/${invite.token}`,
+    expires_at: invite.expires_at,
+  });
+});
+
+// ── PATCH /api/admin/users/:id/role — promote or demote ──────────────────────
+//
+// Without this the role would be a one-way door: the bootstrap makes exactly one
+// admin, and there would be no way to ever make a second except by hand-editing
+// SQLite. An organization with one administrator who loses their phone is an
+// organization nobody can administer.
+app.patch("/api/admin/users/:id/role", (req, res) => {
+  const ctx = requireOrgAdmin(req, res);
+  if (!ctx) return;
+  const role = String(req.body?.org_role || "").trim();
+  if (!["admin", "member"].includes(role)) return res.status(400).json({ error: "org_role must be admin or member" });
+
+  // Only within your OWN organization. A personal org provisioned by this one is
+  // administrable for invites, but its member is not a colleague to promote.
+  const target = db.prepare(`SELECT id, name, org_role FROM users WHERE id = ? AND org_id = ?`)
+    .get(req.params.id, ctx.caller.org_id);
+  if (!target) return res.status(404).json({ error: "user not found" });
+
+  if (target.id === ctx.caller.id && role === "member") {
+    return res.status(409).json({ error: "You cannot demote yourself — ask another administrator." });
+  }
+  if (target.org_role === "admin" && role === "member" && lastAdminOf(ctx.caller.org_id, target.id)) {
+    return res.status(409).json({ error: "This is the organization's only administrator." });
+  }
+
+  db.prepare(`UPDATE users SET org_role = ?, updated_at = datetime('now') WHERE id = ?`).run(role, target.id);
+  res.json({ ok: true, id: target.id, org_role: role });
+});
+
+// True when removing/demoting this user would leave the org with no admin.
+function lastAdminOf(orgId, excludingUserId) {
+  const others = db.prepare(
+    `SELECT COUNT(*) n FROM users
+      WHERE org_id = ? AND org_role = 'admin' AND status = 'active' AND id != ?`
+  ).get(orgId, excludingUserId).n;
+  return others === 0;
+}
+
+// ── DELETE /api/admin/users/:id — erase a member ─────────────────────────────
+//
+// Two strengths, because "erase" means two different things depending on what
+// the person left behind.
+//
+// Default: their ACCESS ends, completely and immediately — every session
+// revoked, the authenticator secret destroyed, invites and handoff tickets
+// dropped, API keys revoked, world memberships removed (and their player actor
+// erased in the simulator), status set to 'removed' so they vanish from the
+// sign-in list and every picker. The row stays, so the characters they authored
+// keep an owner and nothing they made becomes unattributable.
+//
+// ?purge=1: the row goes too. Allowed only when they own no characters —
+// otherwise the FK on actors.owner_id would either refuse or, with foreign_keys
+// off (which is the sqlite3 CLI default, and how the orphaned `as` TOTP secret
+// in this database came to exist), quietly orphan them.
+app.delete("/api/admin/users/:id", async (req, res) => {
+  const ctx = requireOrgAdmin(req, res);
+  if (!ctx) return;
+  const orgIds = administrableOrgIds(ctx.caller);
+  const holes  = orgIds.map(() => "?").join(",");
+
+  const target = db.prepare(
+    `SELECT id, name, email, org_id, org_role FROM users WHERE id = ? AND org_id IN (${holes})`
+  ).get(req.params.id, ...orgIds);
+  if (!target) return res.status(404).json({ error: "user not found" });
+
+  if (target.id === ctx.caller.id) {
+    return res.status(409).json({ error: "You cannot remove your own account." });
+  }
+  if (target.org_role === "admin" && lastAdminOf(target.org_id, target.id)) {
+    return res.status(409).json({ error: "This is the organization's only administrator. Promote someone else first." });
+  }
+
+  const purge = req.query.purge === "1" || req.query.purge === "true";
+  const held  = belongingsOf(target.id);
+  if (purge && held.actors > 0) {
+    return res.status(409).json({
+      error: `${target.name} still owns ${held.actors} character${held.actors === 1 ? "" : "s"}. Reassign or delete them first, or remove the account without purging.`,
+      belongings: held,
+    });
+  }
+
+  // World memberships first, because this is the only step that has to reach
+  // another service, and it is the one that can partially fail. Same contract as
+  // DELETE /api/worlds/:id/members/:user_id: the local row goes regardless — a
+  // person who has lost access must lose it even if the simulator is down — but
+  // the failure is reported, never assumed away.
+  const warnings = [];
+  for (const m of held.worlds) {
+    try {
+      const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${m.world_id}/members/${target.id}`, {
+        method: "DELETE", headers: { "X-Service-Token": SERVICE_TOKEN },
+      });
+      if (!r.ok) warnings.push(`World ${m.world_id}: simulator could not erase their player actor (HTTP ${r.status}).`);
+    } catch (e) {
+      warnings.push(`World ${m.world_id}: simulator unreachable (${e.message}) — their player actor may remain.`);
+    }
+    db.prepare(`DELETE FROM world_memberships WHERE user_id = ? AND world_id = ?`).run(target.id, m.world_id);
+  }
+
+  // Everything that could let them back in.
+  db.prepare(`UPDATE auth_tokens SET revoked_at = datetime('now') WHERE user_id = ? AND revoked_at IS NULL`).run(target.id);
+  db.prepare(`UPDATE api_keys    SET revoked_at = datetime('now') WHERE user_id = ? AND revoked_at IS NULL`).run(target.id);
+  db.prepare(`DELETE FROM user_totp_secrets     WHERE user_id = ?`).run(target.id);
+  db.prepare(`DELETE FROM user_invites          WHERE user_id = ?`).run(target.id);
+  db.prepare(`DELETE FROM auth_handoff_tickets  WHERE user_id = ?`).run(target.id);
+  db.prepare(`UPDATE users SET status = 'removed', updated_at = datetime('now') WHERE id = ?`).run(target.id);
+
+  if (!purge) {
+    return res.json({ ok: true, removed: target.id, purged: false, kept: held, warnings });
+  }
+
+  // Purge: nothing of theirs is left to orphan, so take the row and the shell of
+  // a personal org that existed only to hold them.
+  db.prepare(`DELETE FROM auth_tokens   WHERE user_id = ?`).run(target.id);
+  db.prepare(`DELETE FROM api_keys      WHERE user_id = ?`).run(target.id);
+  db.prepare(`DELETE FROM notifications WHERE user_id = ?`).run(target.id);
+  db.prepare(`DELETE FROM actor_shares  WHERE shared_with_id = ? OR owner_id = ?`).run(target.id, target.id);
+  db.prepare(`DELETE FROM registered_tools WHERE user_id = ?`).run(target.id);
+  db.prepare(`DELETE FROM users WHERE id = ?`).run(target.id);
+
+  const org = db.prepare(`SELECT id, kind FROM orgs WHERE id = ?`).get(target.org_id);
+  if (org?.kind === "personal") {
+    const left = db.prepare(`SELECT COUNT(*) n FROM users WHERE org_id = ?`).get(org.id).n;
+    if (left === 0) db.prepare(`DELETE FROM orgs WHERE id = ?`).run(org.id);
+  }
+
+  res.json({ ok: true, removed: target.id, purged: true, kept: { actors: 0, worlds: [], api_keys: 0 }, warnings });
+});
+
+// ── GET /api/invite/:token — what the invitee sees before enrolling ──────────
+app.get("/api/invite/:token", (req, res) => {
+  const user = userForInvite(req.params.token);
+  if (!user) return res.status(401).json({ error: "this invite is not valid — ask for a new link" });
+  res.json({ name: user.name, email: user.email });
+});
+
+// ── POST /api/invite/:token/profile — the invitee's own details ──────────────
+// The admin typed a name into a box; the person it belongs to gets the last word
+// on it. Email is not editable here: it is half of what the admin vouched for.
+app.post("/api/invite/:token/profile", (req, res) => {
+  const user = userForInvite(req.params.token);
+  if (!user) return res.status(401).json({ error: "this invite is not valid — ask for a new link" });
+  const name = String(req.body?.name || "").trim();
+  if (!name) return res.status(400).json({ error: "name required" });
+  db.prepare(`UPDATE users SET name = ?, updated_at = datetime('now') WHERE id = ?`).run(name, user.id);
+  res.json({ ok: true, name });
+});
+
+// Enrolment identifies its subject by invite token, or by an existing session
+// for someone re-enrolling themselves. `user_id` from the request body is not
+// among the accepted proofs — that was the hole.
+function enrollSubject(req) {
+  if (req.body?.token) return userForInvite(req.body.token);
+  const session = authUser(req);
+  if (!session) return null;
+  return db.prepare(`SELECT * FROM users WHERE id = ?`).get(session.id) || null;
+}
+
+app.post("/api/enroll/start", (req, res) => {
+  const user = enrollSubject(req);
+  if (!user) return res.status(401).json({ error: "a valid invite link or an active session is required" });
+  let row = db.prepare("SELECT * FROM user_totp_secrets WHERE user_id = ?").get(user.id);
   if (!row || row.enrolled_at) {
     const totp = new OTPAuth.TOTP({ issuer: "Anima", label: user.email, algorithm: "SHA1", digits: 6, period: 30 });
     const secret = totp.secret.base32;
-    db.prepare(`INSERT OR REPLACE INTO user_totp_secrets (id, user_id, secret, enrolled_at, inserted_at, updated_at) VALUES (?, ?, ?, NULL, datetime('now'), datetime('now'))`).run(randomUUID(), user_id, secret);
-    row = db.prepare("SELECT * FROM user_totp_secrets WHERE user_id = ?").get(user_id);
+    db.prepare(`INSERT OR REPLACE INTO user_totp_secrets (id, user_id, secret, enrolled_at, inserted_at, updated_at) VALUES (?, ?, ?, NULL, datetime('now'), datetime('now'))`).run(randomUUID(), user.id, secret);
+    row = db.prepare("SELECT * FROM user_totp_secrets WHERE user_id = ?").get(user.id);
   }
   const totp = new OTPAuth.TOTP({ issuer: "Anima", label: user.email, algorithm: "SHA1", digits: 6, period: 30, secret: OTPAuth.Secret.fromBase32(row.secret) });
   QRCode.toDataURL(totp.toString(), { width: 280, margin: 2 }, (err, url) => {
     if (err) return res.status(500).json({ error: "qr generation failed" });
-    res.json({ qr: url, email: user.email });
+    res.json({ qr: url, email: user.email, name: user.name });
   });
 });
 
 app.post("/api/enroll/confirm", (req, res) => {
-  const { user_id, code } = req.body;
-  if (!user_id || !code) return res.status(400).json({ error: "user_id and code required" });
-  const row = db.prepare("SELECT * FROM user_totp_secrets WHERE user_id = ?").get(user_id);
+  const user = enrollSubject(req);
+  if (!user) return res.status(401).json({ error: "a valid invite link or an active session is required" });
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: "code required" });
+  const row = db.prepare("SELECT * FROM user_totp_secrets WHERE user_id = ?").get(user.id);
   if (!row) return res.status(404).json({ error: "no secret found" });
   const totp = new OTPAuth.TOTP({ issuer: "Anima", algorithm: "SHA1", digits: 6, period: 30, secret: OTPAuth.Secret.fromBase32(row.secret) });
   const delta = totp.validate({ token: code, window: 1 });
   if (delta === null) return res.status(401).json({ error: "invalid code" });
-  db.prepare(`UPDATE user_totp_secrets SET enrolled_at = datetime('now'), updated_at = datetime('now') WHERE user_id = ?`).run(user_id);
+  db.prepare(`UPDATE user_totp_secrets SET enrolled_at = datetime('now'), updated_at = datetime('now') WHERE user_id = ?`).run(user.id);
+
+  // The account becomes real here, not at creation: this is the first moment
+  // anyone has proved they hold the second factor. Burning the invite is part of
+  // the same step, so a forwarded link cannot enrol a second authenticator.
+  db.prepare(`UPDATE users SET status = 'active', updated_at = datetime('now') WHERE id = ?`).run(user.id);
+  if (req.body?.token && /^[a-f0-9]{64}$/.test(req.body.token)) {
+    db.prepare(`UPDATE user_invites SET accepted_at = datetime('now')
+                WHERE token_hash = ? AND accepted_at IS NULL`).run(sha256(req.body.token));
+  }
+  db.prepare(`DELETE FROM user_invites WHERE expires_at < datetime('now', '-30 days')`).run();
   res.json({ ok: true });
 });
 
+// Two ways in, because there are two kinds of tenant:
+//
+//   { user_id, code }  an organization's member, picked off that org's list
+//   { email, code }    a private person, who is not on any list to be picked
+//
+// The email path answers 401 identically for an address that has no account, an
+// account that never enrolled, and a wrong code. A private account's existence
+// is exactly what must not be discoverable here — the org path can afford to be
+// more talkative only because its member list is public by design.
 app.post("/api/auth/verify", (req, res) => {
   const { user_id, code } = req.body;
-  if (!user_id || !code) return res.status(400).json({ error: "user_id and code required" });
-  const row = db.prepare("SELECT * FROM user_totp_secrets WHERE user_id = ? AND enrolled_at IS NOT NULL").get(user_id);
-  if (!row) return res.status(403).json({ error: "not enrolled" });
+  const email = req.body?.email ? String(req.body.email).trim().toLowerCase() : null;
+  if (!code || (!user_id && !email)) return res.status(400).json({ error: "user_id or email, and code, required" });
+
+  let userId = user_id;
+  if (!userId) {
+    const byEmail = db.prepare(`SELECT id FROM users WHERE lower(email) = ? AND status = 'active'`).get(email);
+    if (!byEmail) return res.status(401).json({ error: "invalid email or code" });
+    userId = byEmail.id;
+  }
+
+  const row = db.prepare("SELECT * FROM user_totp_secrets WHERE user_id = ? AND enrolled_at IS NOT NULL").get(userId);
+  if (!row) {
+    if (email) return res.status(401).json({ error: "invalid email or code" });
+    return res.status(403).json({ error: "not enrolled" });
+  }
   const totp = new OTPAuth.TOTP({ issuer: "Anima", algorithm: "SHA1", digits: 6, period: 30, secret: OTPAuth.Secret.fromBase32(row.secret) });
   const delta = totp.validate({ token: code, window: 1 });
-  if (delta === null) return res.status(401).json({ error: "invalid code" });
+  if (delta === null) return res.status(401).json({ error: email ? "invalid email or code" : "invalid code" });
   const raw = crypto.randomBytes(32).toString("hex");
   const hash = crypto.createHash("sha256").update(raw).digest("hex");
   const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-  db.prepare(`INSERT INTO auth_tokens (id, user_id, token_hash, expires_at, inserted_at) VALUES (?, ?, ?, ?, datetime('now'))`).run(randomUUID(), user_id, hash, expires);
+  db.prepare(`INSERT INTO auth_tokens (id, user_id, token_hash, expires_at, inserted_at) VALUES (?, ?, ?, ?, datetime('now'))`).run(randomUUID(), userId, hash, expires);
   res.setHeader("Set-Cookie", `anima_token=${raw}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=2592000`);
+
+  // Session 153 — the handoff ticket rides back with the login itself.
+  //
+  // The desktop app is opened by navigating to anima://, and a browser will
+  // only launch an external application while the user's click is still
+  // "live" — transient activation, a few seconds, easily spent. Minting the
+  // ticket in a SECOND round-trip put another request between the click and
+  // the launch for no reason. The user has just proved who they are one line
+  // above; there is nothing further to check, so the ticket comes back here
+  // and the page fires immediately.
+  const handoffRaw  = crypto.randomBytes(32).toString("hex");
+  const handoffHash = crypto.createHash("sha256").update(handoffRaw).digest("hex");
+  const handoffExp  = new Date(Date.now() + 60 * 1000).toISOString();
+  db.prepare(`INSERT INTO auth_handoff_tickets (ticket_hash, user_id, expires_at, inserted_at)
+              VALUES (?, ?, ?, datetime('now'))`).run(handoffHash, userId, handoffExp);
+
   // Push presence online to simulator
-  const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? LIMIT 1`).get(user_id);
+  const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? LIMIT 1`).get(userId);
   if (membership) {
     fetch(`${SIMULATOR_URL}/internal/presence/${membership.actor_id}`, {
       method: "POST",
@@ -225,7 +660,80 @@ app.post("/api/auth/verify", (req, res) => {
       body: JSON.stringify({ status: "online" })
     }).catch(() => {});
   }
-  res.json({ ok: true });
+  res.json({ ok: true, handoff: `anima://auth?ticket=${handoffRaw}` });
+});
+
+// ── Desktop handoff ──────────────────────────────────────────────────────────
+//
+// Session 153. Identity stays in the browser; the desktop app borrows it.
+//
+// The desktop shell has its own cookie jar and its own origin (it loads the
+// platform over an ssh tunnel at http://localhost:8899, because the session
+// cookie is `Secure` and a browser will not send one back over plain http to a
+// LAN IP). Rather than give it a second login screen — a second password path,
+// a second place to get 2FA wrong — the browser mints a short-lived ticket for
+// a session it already holds, and the app redeems it for a session of its own.
+//
+// The ticket is the secret, so it is stored hashed, single-use, and dead after
+// a minute. Redeem is deliberately a GET: it has to be a top-level navigation
+// so the Set-Cookie lands in the app's jar, which a fetch from another origin
+// could not do.
+db.prepare(`CREATE TABLE IF NOT EXISTS auth_handoff_tickets (
+  ticket_hash TEXT PRIMARY KEY,
+  user_id     TEXT NOT NULL,
+  expires_at  TEXT NOT NULL,
+  used_at     TEXT,
+  inserted_at TEXT NOT NULL
+)`).run();
+
+const HANDOFF_TTL_SECONDS = 60;
+
+app.post("/api/auth/handoff/ticket", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+
+  const raw  = crypto.randomBytes(32).toString("hex");
+  const hash = crypto.createHash("sha256").update(raw).digest("hex");
+  const expires = new Date(Date.now() + HANDOFF_TTL_SECONDS * 1000).toISOString();
+  db.prepare(`INSERT INTO auth_handoff_tickets (ticket_hash, user_id, expires_at, inserted_at)
+              VALUES (?, ?, ?, datetime('now'))`).run(hash, user.id, expires);
+
+  // Housekeeping: a ticket is worthless after a minute, so do not keep them.
+  db.prepare(`DELETE FROM auth_handoff_tickets WHERE expires_at < datetime('now', '-1 hour')`).run();
+
+  res.json({ ticket: raw, expires_in: HANDOFF_TTL_SECONDS,
+             url: `anima://auth?ticket=${raw}` });
+});
+
+app.get("/api/auth/handoff/redeem", (req, res) => {
+  const ticket = String(req.query.ticket || "");
+  // Only ever a path on this host. Without this the ticket becomes an open
+  // redirect that also hands the reader a live session.
+  let next = String(req.query.next || "/home");
+  if (!next.startsWith("/") || next.startsWith("//")) next = "/home";
+
+  if (!/^[a-f0-9]{64}$/.test(ticket)) return res.status(400).send("bad ticket");
+  const hash = crypto.createHash("sha256").update(ticket).digest("hex");
+
+  const row = db.prepare(`SELECT * FROM auth_handoff_tickets WHERE ticket_hash = ?`).get(hash);
+  if (!row)          return res.status(401).send("unknown ticket");
+  if (row.used_at)   return res.status(401).send("ticket already used");
+  if (new Date(row.expires_at) < new Date()) return res.status(401).send("ticket expired");
+
+  // Burn it before issuing anything, so a race cannot mint two sessions.
+  const burned = db.prepare(`UPDATE auth_handoff_tickets SET used_at = datetime('now')
+                             WHERE ticket_hash = ? AND used_at IS NULL`).run(hash);
+  if (burned.changes !== 1) return res.status(401).send("ticket already used");
+
+  // From here it is an ordinary session — the same shape /api/auth/verify issues.
+  const raw  = crypto.randomBytes(32).toString("hex");
+  const tokenHash = crypto.createHash("sha256").update(raw).digest("hex");
+  const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  db.prepare(`INSERT INTO auth_tokens (id, user_id, token_hash, expires_at, inserted_at)
+              VALUES (?, ?, ?, ?, datetime('now'))`).run(randomUUID(), row.user_id, tokenHash, expires);
+
+  res.setHeader("Set-Cookie", `anima_token=${raw}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=2592000`);
+  res.redirect(302, next);
 });
 
 app.get("/api/auth/check", (req, res) => {
@@ -238,16 +746,43 @@ app.get("/api/auth/check", (req, res) => {
   res.status(200).end();
 });
 
-// ── GET /api/orgs/:org/members — login page user list (unauthenticated, safe — no sensitive data) ─
+// ── GET /api/orgs — the tiles on the sign-in page ────────────────────────────
+//
+// Companies only. A private person's org is a real org with one member, and
+// listing those here would publish the existence of every consumer account on a
+// public page — so personal orgs are never enumerable, and their owners sign in
+// by email instead of by picking themselves off a list.
+app.get("/api/orgs", (req, res) => {
+  res.json(db.prepare(
+    `SELECT id, name FROM orgs WHERE kind = 'organization' AND status = 'active' ORDER BY name`
+  ).all());
+});
+
+// ── GET /api/orgs/:org/members — sign-in page account list ───────────────────
+//
+// Unauthenticated, and it stays that way: the sign-in page has to draw this
+// before anyone has proved anything. What changed is that `:org` now means
+// something. It was accepted and then ignored entirely — /api/orgs/zzz/members
+// returned every user on the platform — which was harmless only while exactly
+// one org existed. The moment a second tenant lands, an ignored scope is a
+// cross-tenant leak, so the fix belongs before the tenants, not after.
+//
+// Personal orgs are excluded rather than merely unlisted: otherwise guessing an
+// org id would confirm a private account exists and hand over its email.
 app.get("/api/orgs/:org/members", (req, res) => {
+  const org = db.prepare(
+    `SELECT id FROM orgs WHERE id = ? AND kind = 'organization' AND status = 'active'`
+  ).get(req.params.org);
+  if (!org) return res.status(404).json({ error: "no such organization" });
+
   const users = db.prepare(`
     SELECT u.id, u.name, u.email, u.photo_url,
            CASE WHEN t.enrolled_at IS NOT NULL THEN 1 ELSE 0 END as enrolled
     FROM users u
     LEFT JOIN user_totp_secrets t ON t.user_id = u.id
-    WHERE u.status = 'active'
+    WHERE u.status = 'active' AND u.org_id = ?
     ORDER BY u.name
-  `).all();
+  `).all(org.id);
   res.json(users);
 });
 
@@ -262,9 +797,15 @@ app.get("/api/users", (req, res) => {
   // character with yourself — the share endpoint rejects it with 400 — and you
   // are already the creator of a world you are making, so offering your own name
   // in either list is an invitation to an error.
+  //
+  // Session 156 — and never anyone outside your own org. Both callers offer
+  // these names as people you can hand a character or a world to; across a
+  // tenant boundary that is not a share target, it is a directory of strangers.
+  // A private user's org holds only them, so this correctly returns nothing.
   const users = db.prepare(
-    `SELECT id, name, email, photo_url FROM users WHERE status = 'active' AND id != ? ORDER BY name`
-  ).all(user.id);
+    `SELECT id, name, email, photo_url FROM users
+      WHERE status = 'active' AND id != ? AND org_id = ? ORDER BY name`
+  ).all(user.id, user.org_id);
   res.json(users);
 });
 
@@ -286,7 +827,12 @@ app.post("/api/worlds/:id/members", async (req, res) => {
   if (!["owner", "player"].includes(role)) {
     return res.status(400).json({ error: "role must be owner or player" });
   }
-  const target = db.prepare(`SELECT id, name, gender FROM users WHERE email = ? AND status = 'active'`).get(email);
+  // Same-org only. Knowing someone's email is not authority to pull them into a
+  // world across a tenant boundary, and an unscoped lookup here doubles as an
+  // oracle for whether an address has an account at all.
+  const target = db.prepare(
+    `SELECT id, name, gender FROM users WHERE email = ? AND status = 'active' AND org_id = ?`
+  ).get(email, ok.user.org_id);
   if (!target) return res.status(404).json({ error: "user not found" });
 
   const already = db.prepare(
@@ -442,13 +988,27 @@ app.get("/api/me", async (req, res) => {
   if (!match) return res.status(401).json({ error: "not authenticated" });
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
   const row = db.prepare(`
-    SELECT u.id, u.name, u.email, u.photo_url FROM auth_tokens t
+    SELECT u.id, u.name, u.email, u.photo_url, u.user_type, u.org_id, u.org_role,
+           o.name AS org_name, o.kind AS org_kind
+    FROM auth_tokens t
     JOIN users u ON u.id = t.user_id
+    LEFT JOIN orgs o ON o.id = u.org_id
     WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')
   `).get(hash);
   if (!row) return res.status(401).json({ error: "not authenticated" });
   const worlds = db.prepare(`SELECT world_id, actor_id, role FROM world_memberships WHERE user_id = ?`).all(row.id);
-  res.json({ id: row.id, name: row.name, email: row.email, photo_url: row.photo_url, worlds });
+  res.json({
+    id: row.id, name: row.name, email: row.email, photo_url: row.photo_url, worlds,
+    user_type: row.user_type,
+    org_role: row.org_role,
+    // The UI hides account management from anyone who cannot use it — a member
+    // is not an administrator, and a private user has no colleagues to invite.
+    // This is a convenience, not the control: the admin endpoints refuse them
+    // regardless of what the page renders.
+    org: row.org_id ? { id: row.org_id, name: row.org_name, kind: row.org_kind } : null,
+    can_manage_users: row.user_type === "staff" && row.org_kind === "organization"
+                      && row.org_role === "admin",
+  });
 });
 
 // ── GET /api/worlds ───────────────────────────────────────────────────────────
@@ -608,8 +1168,9 @@ app.put("/api/users/:user_id/gender", async (req, res) => {
   const auth = authUser(req);
   if (!auth) return res.status(401).json({ error: "unauthorized" });
 
-  // authUser returns only {id, name} — user_type is not on it, so checking
-  // auth.user_type directly would have been undefined and refused everyone.
+  // authUser used to return only {id, name}, so checking auth.user_type directly
+  // was undefined and refused everyone. It carries user_type and org_id now, but
+  // this re-query is left as the authority rather than trusted from the session.
   const caller = db.prepare(`SELECT user_type FROM users WHERE id = ?`).get(auth.id);
   if (caller?.user_type !== "staff") return res.status(403).json({ error: "staff only" });
 
@@ -1906,7 +2467,10 @@ app.post("/api/actors/:id/shares", (req, res) => {
     return res.status(403).json({ error: `You only have "${mine.level}" on this character, so you cannot grant "${permission}".` });
   }
   if (!email) return res.status(400).json({ error: "email required" });
-  const target = db.prepare(`SELECT id, name FROM users WHERE email = ?`).get(email);
+  // Same-org only — see the world-members lookup for why an unscoped email
+  // search is both a cross-tenant hole and an account-existence oracle.
+  const target = db.prepare(`SELECT id, name FROM users WHERE email = ? AND org_id = ?`)
+    .get(email, user.org_id);
   if (!target) return res.status(404).json({ error: "user not found" });
   if (target.id === user.id) return res.status(400).json({ error: "cannot share with yourself" });
   const now = new Date().toISOString();
@@ -3294,6 +3858,15 @@ app.post("/api/actors/:id/generate-cv", async (req, res) => {
 
   const { revenue_sources, career_level, world_id } = req.body;
   const primarySource = (revenue_sources || [])[0] || null;
+  // Session 152 — if the character has structured interests, the CV must agree
+  // with them rather than inventing a second, contradictory set. Wrapped
+  // because actor_lifestyle may legitimately have no row yet for a character
+  // still being built in the wizard.
+  let lifestyleInterests = "";
+  try {
+    lifestyleInterests =
+      db.prepare(`SELECT interests FROM actor_lifestyle WHERE actor_id = ?`).get(req.params.id)?.interests || "";
+  } catch {}
   // Session 150 — was `first_name || name`, so every generated CV was headed
   // with a bare first name ("LINDSEY"). Harmless-looking alone, but this CV is
   // exportable to PDF and re-importable through upload-cv, and on the way back
@@ -3360,7 +3933,9 @@ COURSES
 [1-3 relevant professional courses, certifications, or executive programs — real-sounding names and years, the kind a serious professional in this field would actually list]
 
 INTERESTS
-[2-4 personal interests that fit their Big5/attachment profile above — specific, not generic]
+${lifestyleInterests
+  ? `[use EXACTLY these, reworded only for CV phrasing: ${lifestyleInterests}]`
+  : "[2-4 personal interests that fit their Big5/attachment profile above — specific, not generic]"}
 
 LANGUAGES
 [their native language] (Native)
@@ -4357,8 +4932,19 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Platform API running on :${PORT}`);
+// Bound to loopback, not 0.0.0.0.
+//
+// Express serves /media and the built dist with no authentication of its own —
+// the auth rules live in nginx (auth_request plus an explicit allow list). While
+// this port was open on every interface, any host on the LAN could read every
+// actor's media directly and skip nginx entirely, including the body reference
+// photographs a likeness is built from.
+//
+// Nothing outside this machine needs the port: nginx proxies to
+// localhost:4002, ngrok tunnels to :80 (nginx), and the simulator fetches
+// platform media over http://192.168.1.59 — port 80, also nginx.
+server.listen(PORT, "127.0.0.1", () => {
+  console.log(`Platform API running on 127.0.0.1:${PORT}`);
   connectSimulatorEvents();
 });
 
@@ -4895,7 +5481,10 @@ function authUser(req) {
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (match) {
     const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
-    const row = db.prepare(`SELECT u.id, u.name FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+    // status must be checked here too: revoking an erased person's tokens stops
+    // the sessions that exist, but nothing else would stop a token minted before
+    // the erase from being honoured if one were somehow still live.
+    const row = db.prepare(`SELECT u.id, u.name, u.org_id, u.user_type, u.org_role FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now') AND u.status != 'removed'`).get(hash);
     if (row) return row;
   }
   // 2. API key auth (installed apps)
@@ -4905,7 +5494,7 @@ function authUser(req) {
     const keyRow = db.prepare(`SELECT user_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL`).get(keyHash);
     if (keyRow) {
       db.prepare(`UPDATE api_keys SET last_used_at = datetime('now') WHERE key_hash = ?`).run(keyHash);
-      return db.prepare(`SELECT id, name FROM users WHERE id = ?`).get(keyRow.user_id);
+      return db.prepare(`SELECT id, name, org_id, user_type, org_role FROM users WHERE id = ? AND status != 'removed'`).get(keyRow.user_id);
     }
   }
   return null;
@@ -5327,7 +5916,7 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/message", async (req, re
   const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
   const user = ok.user;
-  const { content } = req.body;
+  const { content, player_room } = req.body;
   if (!content) return res.status(400).json({ error: "content required" });
   try {
     const resp = await fetch(
@@ -5335,7 +5924,9 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/message", async (req, re
       {
         method:  "POST",
         headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
-        body:    JSON.stringify({ content })
+        // player_room: which part of the flat he is standing in, so she can
+        // answer "come over here" knowing where here is. Session 153.
+        body:    JSON.stringify({ content, player_room })
       }
     );
     res.json(await resp.json());
@@ -5343,6 +5934,10 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/message", async (req, re
 });
 
 // ── POST /api/worlds/:world_id/encounter/:encounter_id/typing ─────────────────
+// ── Test Lab ── lives in testlab-routes.js so whole-file writes here cannot drop
+// the /api/test/* proxies again (two stale-copy clobbers on 2026-08-29).
+mountTestLabRoutes(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser });
+
 app.post("/api/worlds/:world_id/encounter/:encounter_id/typing", async (req, res) => {
   const ok = requireWorld(req, res, worldIdOf(req), "player");
   if (!ok) return;
@@ -5354,6 +5949,25 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/typing", async (req, res
     ).catch(() => {});
     res.json({ ok: true });
   } catch { res.json({ ok: true }); }
+});
+
+// ── POST /api/worlds/:world_id/encounter/:encounter_id/resume ─────────────────
+// Session 154 — the 3D door scene declines the missing-media pause. That pause
+// exists for the video views (freeze, offer generation, resume on media_ready);
+// the door scene renders her as a GLB and uses no clips, so a pause there just
+// switches her silence initiative off forever — she answers but never speaks
+// first again. The scene resumes immediately when the server announces
+// missing media.
+app.post("/api/worlds/:world_id/encounter/:encounter_id/resume", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
+  if (!ok) return;
+  try {
+    const r = await fetch(
+      `${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/encounter/${req.params.encounter_id}/resume`,
+      { method: "POST", headers: { "X-Service-Token": SERVICE_TOKEN } }
+    );
+    res.status(r.status).json(await r.json().catch(() => ({})));
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
 });
 
 // ── POST /api/worlds/:world_id/leave — clear player location ─────────────────

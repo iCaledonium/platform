@@ -45,6 +45,7 @@ import fs from "fs";
 import crypto from "crypto";
 import sharp from "sharp";
 import express from "express";
+import { compressRuntimeGlb } from "./ktx2.js";
 const execAsync = promisify(exec);
 
 const CFG = {
@@ -2160,6 +2161,41 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser }) {
 
         console.log(`[runtime-glb] ${actorId}: built ${(req.body.length / 1e6).toFixed(1)}MB as ${name}`);
         res.json({ saved: true, url, hash });
+
+        // ── KTX2, after the response ─────────────────────────────────────────
+        //
+        // Session 152. The uncompressed file is already on disk and already
+        // answered for, so the browser is never held on a ~90s encode and the
+        // build cannot fail because of it. The compressor writes a temp file and
+        // renames over this one, so a deploy landing mid-encode reads a complete
+        // model either way — the older, heavier one, which still works.
+        //
+        // This is where the GPU cost actually gets paid down: the webp pass this
+        // export already does shrank the DOWNLOAD (92 -> 27 MB) but not one byte
+        // of VRAM, because textures are decoded to raw RGBA on upload. Measured
+        // here: ~725 MB of texture memory for one character, ~2.9 GB for four —
+        // past most integrated GPUs before any renderer is even chosen.
+        // See server/ktx2.js for the numbers and the two-pass reason.
+        // OFF BY DEFAULT — set KTX2_RUNTIME=1 to enable.
+        //
+        // Everything measurable about this is verified: structure is byte-for-byte
+        // equivalent (33 meshes / 33 skins / 295 nodes / both clips), all 15
+        // textures convert, and every payload passes `ktx validate`. What is NOT
+        // verified is a browser actually rendering one, because the session
+        // expired before that test could run.
+        //
+        // That gap matters more than it sounds. A GLTFLoader with no KTX2Loader
+        // attached does not degrade — it fails the entire parse. KTX2 support was
+        // added to all eight loader construction sites (lib/gltfKtx2.js) and
+        // compiles, but if it is wrong at runtime then every character breaks
+        // everywhere at once: door scene, model panel, wizard, mini viewer.
+        // Shipping that on a build-clean-but-unrendered basis is not a trade
+        // worth making silently, so it waits behind a flag until someone has
+        // watched a compressed character load.
+        if (process.env.KTX2_RUNTIME === "1") {
+          compressRuntimeGlb(path.join(dir, name))
+            .catch(err => console.warn(`[ktx2] ${actorId}: compression skipped — ${err.message}`));
+        }
       } catch (err) {
         console.error(`[runtime-glb] ${actorId}: failed:`, err);
         res.status(500).json({ error: "failed to save runtime glb" });

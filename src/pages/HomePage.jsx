@@ -113,9 +113,48 @@ export default function HomePage() {
       .catch(() => {});
   }
 
+  // Session 153 — hand this browser session to the desktop app.
+  //
+  // Identity lives here, in the browser: one place for the password, the 2FA
+  // and the revoke button. The app never gets a login screen — it gets a
+  // single-use ticket, good for sixty seconds, which it spends against its own
+  // origin so the cookie lands in its own jar. Minted on this host, spendable
+  // on the tunnel: that is how you get a browser login and LAN-speed loads at
+  // the same time.
+  //
+  // Hidden inside the app itself, where it would be a button offering to open
+  // the thing you are already in.
+  // Matches the PACKAGED app's user agent ("Anima/0.1.0 … Electron/44"), not the
+  // dev launch's ("anima-desktop"). Getting this wrong put an "Open in Anima"
+  // button inside Anima, offering to open the thing you are already in.
+  const isDesktopApp = typeof navigator !== "undefined" && /(^|\s)Anima\//.test(navigator.userAgent);
+
+  async function openInDesktopApp() {
+    try {
+      const r = await fetch("/api/auth/handoff/ticket", { method: "POST", credentials: "include" });
+      if (!r.ok) { alert("Could not start the handover — try signing in again."); return; }
+      const { url } = await r.json();
+      window.location.href = url;   // anima://auth?ticket=…
+    } catch {
+      alert("Could not reach the server to start the handover.");
+    }
+  }
+
+  // Session 153 — sign out stays in the app, and sends you back to the browser.
+  //
+  // Hiding it would have been the tidy-looking mistake: the app holds its OWN
+  // session — its own auth_tokens row, its own cookie, thirty days — and with
+  // no way to end it from the UI that session is effectively permanent, so
+  // anyone who opens the laptop is you. It has to be here.
+  //
+  // What it must NOT do is drop you on a login form inside the app. Identity
+  // lives in the browser; that is the whole point of the handover. So the app's
+  // session is cleared and the browser is opened at the sign-in page, which
+  // will hand a fresh session straight back when you are done. window.open is
+  // routed to the real browser by the shell's setWindowOpenHandler.
   async function signOut() {
     await fetch("/api/auth/signout", { method: "POST" }).catch(() => {});
-    window.location.href = "/login";
+    window.location.href = "/login";   // in the app, that page sends you to the browser
   }
 
   function openApp(app) {
@@ -186,6 +225,10 @@ export default function HomePage() {
                 onError={e => e.target.style.display="none"}
                 style={{width:32,height:32,borderRadius:"50%",objectFit:"cover",
                   objectPosition:"top center",border:"1.5px solid rgba(0,0,0,0.1)",flexShrink:0}}/>
+            )}
+            {!isDesktopApp && (
+              <button className={homeStyles.signOutBtn} onClick={openInDesktopApp}
+                title="Hand this session to the Anima desktop app">Open in Anima</button>
             )}
             <button className={homeStyles.signOutBtn} onClick={signOut}>Sign out</button>
           </div>
@@ -359,6 +402,27 @@ export default function HomePage() {
             <p className={homeStyles.toolName}>API keys</p>
             <p className={homeStyles.toolDesc}>Create and manage keys for your tools.</p>
           </div>
+          <div className={`${homeStyles.toolCard} ${homeStyles.toolCardLive}`} style={{cursor:"pointer"}} onClick={() => window.location.href="/lab/home"}>
+            <span className={homeStyles.liveBadge}>live</span>
+            <div className={homeStyles.toolIcon} style={{background:"rgba(201,151,58,.07)",border:"1px solid rgba(201,151,58,.13)"}}>
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M6.5 2h3M7 2v4.2L3.4 12a1.6 1.6 0 001.4 2.4h6.4a1.6 1.6 0 001.4-2.4L9 6.2V2" stroke="#c9973a" strokeWidth="1.1" strokeLinecap="round" strokeLinejoin="round"/><path d="M5 10.5h6" stroke="#c9973a" strokeWidth="1.1" strokeLinecap="round"/></svg>
+            </div>
+            <p className={homeStyles.toolName}>Test Lab</p>
+            <p className={homeStyles.toolDesc}>Author a past, test a scene from any stage.</p>
+          </div>
+          {/* Account management belongs to an organization. A private account is
+              an org of one, so there is nobody to invite — the endpoints refuse
+              them anyway; this just stops offering a door that does not open. */}
+          {user?.can_manage_users && (
+          <div className={`${homeStyles.toolCard} ${homeStyles.toolCardLive}`} style={{cursor:"pointer"}} onClick={() => window.location.href="/admin/users"}>
+            <span className={homeStyles.liveBadge}>live</span>
+            <div className={homeStyles.toolIcon} style={{background:"rgba(92,158,190,.07)",border:"1px solid rgba(92,158,190,.13)"}}>
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="6" cy="5" r="2.6" stroke="#5c9ebe" strokeWidth="1.1"/><path d="M1.6 14c0-2.4 2-4 4.4-4s4.4 1.6 4.4 4" stroke="#5c9ebe" strokeWidth="1.1" strokeLinecap="round"/><path d="M12.5 5.5v4M10.5 7.5h4" stroke="#5c9ebe" strokeWidth="1.1" strokeLinecap="round"/></svg>
+            </div>
+            <p className={homeStyles.toolName}>People</p>
+            <p className={homeStyles.toolDesc}>Create an account and issue its invite link.</p>
+          </div>
+          )}
         </div>
 
       </div>

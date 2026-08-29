@@ -7,6 +7,7 @@ import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { MeshBVH } from "three-mesh-bvh";
 import { applySkinLayers, suspendSkinLayers, fitOuterLayers } from "./bodyLayers.js";
+import { attachKtx2 } from "../lib/gltfKtx2.js";
 
 // Session 96: the three real, confirmed body-shape morphs (see
 // generate3d.js / favorite_morphs.json). Every GLB this pipeline
@@ -445,6 +446,7 @@ function ensurePoseCalibration(dialKey) {
   draco.setDecoderPath("https://www.gstatic.com/draco/versioned/decoders/1.5.6/");
   const loader = new GLTFLoader();
   loader.setDRACOLoader(draco);
+  attachKtx2(loader);   // runtime GLBs carry KTX2 textures — see lib/gltfKtx2.js
   const table = {};
   const sides = ["pos", "neg"].filter((side) => cfg[side]); // single-sided entries have neg: null
   let pending = sides.length;
@@ -1735,6 +1737,7 @@ function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loade
   return new Promise((resolve) => {
     const loader = new GLTFLoader();
     loader.setDRACOLoader(dracoLoader);
+    attachKtx2(loader);   // runtime GLBs carry KTX2 textures — see lib/gltfKtx2.js
     loader.load(
       accessoryUrl,
       (gltf) => {
@@ -2759,7 +2762,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
     dracoLoader.setDecoderPath("https://www.gstatic.com/draco/versioned/decoders/1.5.6/");
     const gltfLoader = new GLTFLoader();
     gltfLoader.setDRACOLoader(dracoLoader);
-
+    attachKtx2(gltfLoader);   // runtime GLBs carry KTX2 textures — see lib/gltfKtx2.js
     gltfLoader.load(
       glbUrl,
       (gltf) => {

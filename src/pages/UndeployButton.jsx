@@ -15,7 +15,7 @@ import { useState } from "react";
 // should read identically in all three places, or the third one looks like it
 // might do something else.
 const ERASE_NOTE =
-  "Her instance in that world is erased — relationships, memories, schedule, " +
+  "That world instance is erased — relationships, memories, schedule, " +
   "bank account. The profile is kept and can be deployed again.";
 
 const F = { fontFamily: "'DM Sans',system-ui,sans-serif" };
@@ -76,7 +76,7 @@ export default function UndeployButton({ actorId, worldId, worldName, name, onDo
             style={{ background: "rgba(255,255,255,.96)", border: "1px solid rgba(255,255,255,.95)",
               boxShadow: "0 8px 64px rgba(0,0,0,.14)", borderRadius: 18, maxWidth: 440, width: "100%", padding: "22px 24px" }}>
             <div style={{ fontFamily: "'Cormorant Garamond',Georgia,serif", fontSize: 19, fontWeight: 500, color: "#1a1814", marginBottom: 8 }}>
-              Remove {name || "her"} from {worldName || "this world"}?
+              Remove {name || "this character"} from {worldName || "this world"}?
             </div>
             <div style={{ ...F, fontSize: 13, color: "#6b6760", lineHeight: 1.55, marginBottom: 18 }}>
               {ERASE_NOTE}

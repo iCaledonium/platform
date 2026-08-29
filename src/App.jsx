@@ -1,8 +1,14 @@
 import { Routes, Route, Navigate, useLocation, useNavigate } from "react-router-dom";
 import { useState, useEffect, useRef, useCallback } from "react";
 import ReactDOM from "react-dom";
+import LabPage             from "./pages/LabPage.jsx";
+import LabHomePage         from "./pages/LabHomePage.jsx";
+import TransportLabPage    from "./pages/TransportLabPage.jsx";
+import WatcherPanel, { watcherIsFollowing } from "./components/WatcherPanel.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
 import EnrollPage from "./pages/EnrollPage.jsx";
+import InvitePage from "./pages/InvitePage.jsx";
+import AdminUsersPage from "./pages/AdminUsersPage.jsx";
 import HomePage from "./pages/HomePage.jsx";
 import DeveloperPage from "./pages/DeveloperPage.jsx";
 import MessagesPage from "./pages/MessagesPage.jsx";
@@ -19,6 +25,43 @@ import WorldPage       from "./pages/WorldPage.jsx";
 import KnockEncounterPage from "./pages/KnockEncounterPage.jsx";
 import KnockActorDoor      from "./pages/KnockActorDoor.jsx";
 import VenuePage from "./pages/VenuePage.jsx";
+
+// The Test Lab watcher rides ABOVE the router as an overlay, never inside a
+// page's view: it shows on any /lab route and on any door run carrying the
+// lab's ?eid=/?lab= params — and because it stays mounted across those
+// navigations, the attached watcher session (and its chat) survives walking
+// from the lab config page into the scene.
+//
+// Session 155 — the route test alone was not enough, and the way it failed was
+// invisible. The world enter scene is a bare /world/:id with NO query string,
+// so walking a run from the lab into the world made `show` false, unmounted the
+// panel and took a live watcher down with it — and nothing said so, because the
+// thing that would have reported the loss is the thing that disappeared.
+// Enumerating more routes would only move the edge: a run can continue to a
+// venue, to /messages, anywhere the developer needs to look.
+//
+// So an OPEN PANEL now keeps itself on screen (watcherIsFollowing, a per-tab
+// flag the panel sets while it is open and clears on ×). Route match is what
+// OFFERS the watcher on the lab's own pages; the flag is what KEEPS it once
+// somebody has attached one. Both are still gated by the bridge probe inside
+// the panel, so a machine with no local bridge renders nothing either way and
+// the public page is untouched.
+function LabWatcherOverlay() {
+  const location = useLocation();
+  const qs = new URLSearchParams(location.search);
+  // Magnus's rule (2026-08-29): the watcher lives in LAB TERRITORY ONLY —
+  // /lab pages and runs explicitly stamped ?lab=. And each surface BINDS its
+  // own conversation: the encounter lab must never host the transport watcher.
+  const show = location.pathname.startsWith("/lab") || qs.has("lab");
+  if (!show) return null;
+  let bound = null;
+  if (location.pathname.startsWith("/lab/actor/apartment/encounter")) bound = "Feature - Actor Apartment Encounter";
+  else if (location.pathname.startsWith("/lab/transport")) bound = "Runtime - Transport Engine";
+  else if (qs.get("lab") === "transport") bound = "Runtime - Transport Engine";
+  else if (qs.has("lab") && location.pathname.includes("/knock/")) bound = "Feature - Actor Apartment Encounter";
+  return <WatcherPanel bound={bound} />;
+}
+
 import "./pages/runtimeCheck.js";   // Session 152 — window.__checkRuntimeWalk
 
 const CONV_TO_TOOL = {
@@ -150,7 +193,12 @@ export default function App() {
   const [showCentre, setShowCentre]       = useState(false);
   const esRef                              = useRef(null);
   const location                           = useLocation();
-  const isAuthPage = ["/login", "/enroll"].includes(location.pathname);
+  // /invite carries a token in the path, so this cannot stay an exact-match
+  // list. Getting it wrong is not cosmetic: an invitee has no session, and the
+  // full shell immediately opens an SSE stream and polls notifications, both of
+  // which 401 in a loop behind the one page that must work signed out.
+  const isAuthPage = ["/login", "/enroll"].includes(location.pathname)
+                  || location.pathname.startsWith("/invite/");
 
   useEffect(() => {
     if (isAuthPage) return;
@@ -297,15 +345,17 @@ export default function App() {
   if (isAuthPage) {
     return (
       <Routes>
-        <Route path="/login"  element={<LoginPage />} />
-        <Route path="/enroll" element={<EnrollPage />} />
-        <Route path="*"       element={<Navigate to="/login" replace />} />
+        <Route path="/login"         element={<LoginPage />} />
+        <Route path="/enroll"        element={<EnrollPage />} />
+        <Route path="/invite/:token" element={<InvitePage />} />
+        <Route path="*"              element={<Navigate to="/login" replace />} />
       </Routes>
     );
   }
 
   return (
     <>
+      <LabWatcherOverlay />
       <Routes>
         <Route path="/home"         element={<HomePage />} />
         <Route path="/world/:worldId"                       element={<WorldPage />} />
@@ -313,9 +363,14 @@ export default function App() {
         <Route path="/my-worlds/:worldId"                   element={<WorldEditorPage />} />
         <Route path="/my-worlds/:worldId/actors/:actorId"   element={<WorldActorPage />} />
         <Route path="/developer"    element={<DeveloperPage />} />
+        <Route path="/admin/users"  element={<AdminUsersPage />} />
         <Route path="/messages"     element={<MessagesPage />} />
         <Route path="/calendar"     element={<CalendarPage />} />
         <Route path="/voicemail"    element={<VoicemailPage />} />
+        <Route path="/lab/home" element={<LabHomePage />} />
+        <Route path="/lab/actor/apartment/encounter" element={<LabPage />} />
+        <Route path="/lab/transport/actor" element={<TransportLabPage />} />
+        <Route path="/lab" element={<Navigate to="/lab/home" replace />} />
         <Route path="/actors"            element={<ActorsGalleryPage />} />
         <Route path="/actors/new"        element={<CharacterWizard />} />
         <Route path="/actors/:id"        element={<ActorsEditorPage />} />

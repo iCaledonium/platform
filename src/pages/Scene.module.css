@@ -403,3 +403,20 @@
 .photo {
   transition: opacity 0.3s ease;
 }
+
+/* Session 153 — she is typing.
+   Three dots on an iOS cadence: each rises and falls in turn across a 1.4s
+   loop, so the bubble reads as breath rather than as a spinner. A single
+   static ellipsis said 'working'; this says 'someone is choosing words'. */
+.typing { display: inline-flex; align-items: flex-end; gap: 5px; height: 9px; }
+.typingDot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: rgba(255, 255, 255, 0.62);
+  animation: animaTyping 1.4s infinite ease-in-out both;
+}
+.typingDot:nth-child(2) { animation-delay: 0.18s; }
+.typingDot:nth-child(3) { animation-delay: 0.36s; }
+@keyframes animaTyping {
+  0%, 70%, 100% { transform: translateY(0);    opacity: 0.35; }
+  35%           { transform: translateY(-5px); opacity: 0.95; }
+}

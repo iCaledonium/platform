@@ -11,6 +11,27 @@ db.pragma("foreign_keys = ON");
 // ── Schema ───────────────────────────────────────────────────────────────────
 
 db.exec(`
+  -- ── Tenancy ──────────────────────────────────────────────────────────────
+  -- Every user belongs to exactly one org. A company is an org with many
+  -- members; a private person is an org with exactly one. Making the solo case
+  -- a real org rather than a NULL is what keeps the scoping uniform: every
+  -- "who may this account see" query is org_id = ?, with no branch for the
+  -- consumer tier and no NULL to forget.
+  --
+  -- created_by_org_id is how a personal account provisioned by staff stays
+  -- administrable. Without it the account would vanish from its creator's own
+  -- People page the instant it was made, and an expired invite could never be
+  -- re-issued by anyone.
+  CREATE TABLE IF NOT EXISTS orgs (
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    kind              TEXT NOT NULL DEFAULT 'organization',
+    status            TEXT NOT NULL DEFAULT 'active',
+    created_by_org_id TEXT REFERENCES orgs(id),
+    inserted_at       TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS users (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
@@ -39,6 +60,10 @@ db.exec(`
     inserted_at TEXT NOT NULL
   );
 
+  -- DEAD TABLE — an abandoned first attempt at invites. Nothing reads or writes
+  -- it, it has never held a row, and it stores tokens in PLAINTEXT. The live
+  -- invite flow is user_invites (hashed, single-use), created in index.js. Do
+  -- not revive this; drop it once someone confirms nothing external expects it.
   CREATE TABLE IF NOT EXISTS enrollment_invites (
     id          TEXT PRIMARY KEY,
     user_id     TEXT NOT NULL REFERENCES users(id),
@@ -306,6 +331,48 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS actor_media_actor_id_idx ON actor_media (actor_id);
 `);
 
+// ── Tenancy migration ───────────────────────────────────────────────────────
+//
+// There is no migration framework here — the live `actors` table has picked up
+// a dozen columns by hand-run ALTERs that this file's CREATE never mentions. So
+// this does what the rest of the schema does, only explicitly: add the column
+// if it is missing, then backfill. Both halves are idempotent, because this runs
+// on every single boot.
+
+db.prepare(`INSERT OR IGNORE INTO orgs (id, name, kind, status, inserted_at, updated_at)
+            VALUES ('anima', 'Anima Systems AB', 'organization', 'active',
+                    datetime('now'), datetime('now'))`).run();
+
+const userCols = db.prepare(`PRAGMA table_info(users)`).all().map(c => c.name);
+if (!userCols.includes("org_id")) {
+  db.prepare(`ALTER TABLE users ADD COLUMN org_id TEXT REFERENCES orgs(id)`).run();
+}
+db.prepare(`CREATE INDEX IF NOT EXISTS users_org_id_idx ON users (org_id)`).run();
+
+// Everyone who predates orgs is Anima staff by definition — those four rows are
+// the company. A user with no org would be invisible to every scoped query, so
+// this must never be allowed to stay NULL.
+db.prepare(`UPDATE users SET org_id = 'anima', updated_at = datetime('now')
+            WHERE org_id IS NULL`).run();
+
+// ── Org role ────────────────────────────────────────────────────────────────
+//
+// admin runs the organization (invite, remove, promote); member simply uses it.
+// Before this, "staff of an organization" was the only gate on account
+// management, which made all four Anima employees implicit administrators.
+//
+// The seeding of the first admin happens ONLY inside the ALTER branch, and that
+// placement is the entire point. This file runs on every boot, so an
+// unconditional `UPDATE ... WHERE id = 'mk'` would silently re-promote Magnus
+// every restart and make a later demotion impossible to keep — precisely the
+// bug the removed world_membership seed below caused, where deleted rows came
+// back within two seconds of a restart. Bootstrap once, then never again.
+if (!db.prepare(`PRAGMA table_info(users)`).all().some(c => c.name === "org_role")) {
+  db.prepare(`ALTER TABLE users ADD COLUMN org_role TEXT`).run();
+  db.prepare(`UPDATE users SET org_role = 'admin' WHERE id = 'mk'`).run();
+}
+db.prepare(`UPDATE users SET org_role = 'member' WHERE org_role IS NULL`).run();
+
 // ── Seed Anima employees if not present ─────────────────────────────────────
 
 const employees = [
@@ -316,8 +383,8 @@ const employees = [
 ];
 
 const insert = db.prepare(`
-  INSERT OR IGNORE INTO users (id, name, email, status, user_type, inserted_at, updated_at)
-  VALUES (?, ?, ?, 'active', 'staff', datetime('now'), datetime('now'))
+  INSERT OR IGNORE INTO users (id, name, email, status, user_type, org_id, org_role, inserted_at, updated_at)
+  VALUES (?, ?, ?, 'active', 'staff', 'anima', 'member', datetime('now'), datetime('now'))
 `);
 
 for (const e of employees) {

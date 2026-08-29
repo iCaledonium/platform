@@ -13,6 +13,7 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import { NATIONALITIES, flagEmoji } from "./nationalities.js"; // Session 149 — moved out of this file so ActorsEditorPage.jsx can share it; see nationalities.js for Session 148 rationale.
+import { attachKtx2 } from "../lib/gltfKtx2.js";
 
 // Session 106 — self-generating home thumbnails. A static .jpg beside
 // the GLB (/media/homes/<name>.jpg) wins when present; otherwise the
@@ -31,6 +32,7 @@ async function renderHomeThumb(glbUrl) {
     const draco = new DRACOLoader();
     draco.setDecoderPath("https://www.gstatic.com/draco/versioned/decoders/1.5.6/");
     loader.setDRACOLoader(draco);
+    attachKtx2(loader);   // runtime GLBs carry KTX2 textures — see lib/gltfKtx2.js
     const gltf = await loader.loadAsync(glbUrl);
     const root = gltf.scene;
     const scene = new THREE.Scene();
@@ -388,7 +390,7 @@ export default function CharacterWizard({ user, worlds }) {
     disc:{ d:50, i:50, s:50, c:50 },
     hds:{ bold:30, cautious:30, colorful:30, diligent:30, dutiful:30, excitable:30, imaginative:30, leisurely:30, mischievous:30, reserved:30, skeptical:30 },
   });
-  const [lifestyle, setLifestyle] = useState({ alcohol_relationship:"rare", drug_use:"none", substance_context:"", sleep_pattern:"normal", sleep_quality:"good", exercise_habit:"regular", exercise_type:"", social_frequency:"weekly", diet:"", lifestyle_note:"" });
+  const [lifestyle, setLifestyle] = useState({ alcohol_relationship:"rare", drug_use:"none", substance_context:"", sleep_pattern:"normal", sleep_quality:"good", exercise_habit:"regular", exercise_type:"", social_frequency:"weekly", diet:"", interests:"", lifestyle_note:"" });
   const [economy, setEconomy]   = useState({ financial_situation:"stable", income_stability:"stable", spending_style:"balanced", savings_habit:"moderate", attitude_to_wealth:"practical", financial_anxiety:0.3, behavior_note:"" });
   // Session 106 — default home. Deliberately NOT inside the economy
   // object: economy is a psychological profile stored as JSON, while
@@ -961,7 +963,7 @@ export default function CharacterWizard({ user, worlds }) {
       disc:{ d:50, i:50, s:50, c:50 },
       hds:{ bold:30, cautious:30, colorful:30, diligent:30, dutiful:30, excitable:30, imaginative:30, leisurely:30, mischievous:30, reserved:30, skeptical:30 },
     });
-    setLifestyle(st.lifestyle || { alcohol_relationship:"rare", drug_use:"none", substance_context:"", sleep_pattern:"normal", sleep_quality:"good", exercise_habit:"regular", exercise_type:"", social_frequency:"weekly", diet:"", lifestyle_note:"" });
+    setLifestyle(st.lifestyle || { alcohol_relationship:"rare", drug_use:"none", substance_context:"", sleep_pattern:"normal", sleep_quality:"good", exercise_habit:"regular", exercise_type:"", social_frequency:"weekly", diet:"", interests:"", lifestyle_note:"" });
     // Session 150 — monthly_income_sek is stripped on load. Session 103 ruled
     // the amount is WORLD data, set at world-deploy, and excised it from this
     // wizard's prompt and form — but not from drafts already saved. The key
@@ -1298,7 +1300,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
   async function generateLifestyle() {
     setGenerating("lifestyle"); setError(null);
     try {
-      const aiResult = await callAI(`${charCtx()} Attachment: ${personality.attachment_style}. N=${personality.big5.neuroticism} E=${personality.big5.extraversion}.\nReturn ONLY valid JSON:\n{"alcohol_relationship":"non_drinker|rare|moderate|regular|heavy","drug_use":"none|cannabis_occasional|cannabis_regular|mixed_recreational|cocaine_occasional","substance_context":"","sleep_pattern":"early_riser|normal|night_owl|irregular","sleep_quality":"good|variable|poor","exercise_habit":"sedentary|occasional|regular|athlete","exercise_type":"","social_frequency":"rarely|monthly|weekly|daily","diet":"","lifestyle_note":""}`);
+      const aiResult = await callAI(`${charCtx()} Attachment: ${personality.attachment_style}. N=${personality.big5.neuroticism} E=${personality.big5.extraversion}.\nReturn ONLY valid JSON:\n{"alcohol_relationship":"non_drinker|rare|moderate|regular|heavy","drug_use":"none|cannabis_occasional|cannabis_regular|mixed_recreational|cocaine_occasional","substance_context":"","sleep_pattern":"early_riser|normal|night_owl|irregular","sleep_quality":"good|variable|poor","exercise_habit":"sedentary|occasional|regular|athlete","exercise_type":"","social_frequency":"rarely|monthly|weekly|daily","diet":"","interests":"3-4 specific personal interests, comma-separated, fitting the Big5/attachment profile — concrete things this character would actually choose to do, not generic labels","lifestyle_note":""}`);
       setLifestyle(p=>({...p,...parseJSON(aiResult)}));
     } catch (err) { console.error("[generateLifestyle] FAILED:", err); setError("Generation failed"); }
     setGenerating(null);
@@ -2740,6 +2742,15 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
               <Field label="Exercise Type"><AutoTextarea style={{...S.textarea,minHeight:44}} value={lifestyle.exercise_type} onChange={e=>updL("exercise_type",e.target.value)} placeholder="Running, yoga, gym…" /></Field>
               <Field label="Diet"><AutoTextarea style={{...S.textarea,minHeight:44}} value={lifestyle.diet} onChange={e=>updL("diet",e.target.value)} placeholder="Vegetarian, omnivore…" /></Field>
             </div>
+            {/* Session 152 — reaches the simulator's decision prompt through
+                lifestyle_context/2, so this is what makes her pick the gallery
+                over the bar. Comma-separated prose, not tags: it is written
+                straight into the prompt. */}
+            <Field label="Interests">
+              <AutoTextarea style={{...S.textarea,minHeight:44}} value={lifestyle.interests}
+                onChange={e=>updL("interests",e.target.value)}
+                placeholder="Architecture, true crime documentaries, long-distance hiking…" />
+            </Field>
           </>}
 
           {/* STEP 6: ECONOMY */}

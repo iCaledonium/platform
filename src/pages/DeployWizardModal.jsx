@@ -249,7 +249,7 @@ function StepWorld({ actor, state, setState }) {
         const taken   = !!alreadyIn[w.id];
         return (
           <div key={w.id} onClick={() => { if (!taken) setState(p => ({...p, world:w})); }}
-            title={taken ? `${actor?.first_name || "She"} is already deployed to ${w.name}` : undefined}
+            title={taken ? `${actor?.first_name || "This character"} is already deployed to ${w.name}` : undefined}
             style={{ padding:"10px 14px", borderRadius:12,
               border:`1.5px solid ${state.world?.id===w.id?"#1a1814":"rgba(0,0,0,.08)"}`,
               background: taken ? "rgba(0,0,0,.025)" : state.world?.id===w.id?"rgba(26,24,20,.04)":"rgba(255,255,255,.5)",
@@ -273,8 +273,8 @@ function StepWorld({ actor, state, setState }) {
       {worlds.length > 0 && worlds.every(w => alreadyIn[w.id]) && (
         <div style={{ ...S.sans, fontSize:12, color:"#6b6760", padding:"10px 12px", marginTop:2,
           background:"rgba(0,0,0,.02)", border:"1px solid rgba(0,0,0,.07)", borderRadius:10 }}>
-          {actor?.first_name || "She"} is already in every world you have. To change how she works in one,
-          edit her there instead of deploying again.
+          {actor?.first_name || "This character"} is already in every world you have. To change how they work
+          in one, edit them there instead of deploying again.
         </div>
       )}
 
@@ -290,7 +290,7 @@ function StepWorld({ actor, state, setState }) {
               {state.world.name} is stopped
             </div>
             <div style={{ ...S.sans, fontSize:11.5, color:"#6b6760", marginTop:1, lineHeight:1.5 }}>
-              She can't be deployed into a world that isn't running.
+              This character can't be deployed into a world that isn't running.
             </div>
           </div>
           <button onClick={() => startWorld(state.world)} disabled={startingWorld}
@@ -1022,7 +1022,7 @@ function StepEmployment({ actor, state, setState }) {
                     onChange={e => updateSource(src.id, { leave_days_per_year: e.target.value === "" ? null : Math.max(0, Math.min(365, parseInt(e.target.value, 10) || 0)) })}
                     style={{ width:64, fontSize:13, padding:"5px 8px", borderRadius:7, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.7)" }} />
                   <span style={{ ...S.sans, fontSize:11, color:"#a8a5a0" }}>
-                    days/year — what this job grants. Taking it is {actor?.first_name || "her"} decision, made in the world.
+                    days/year — what this job grants. Taking it is {actor?.first_name ? `${actor.first_name}'s` : "the character's"} decision, made in the world.
                   </span>
                 </div>
               </div>
@@ -1097,7 +1097,7 @@ function StepEmployment({ actor, state, setState }) {
 
         {(state.career?.fixed_expenses || []).length === 0 && (
           <div style={{ ...S.sans, fontSize:11, color:"#a8a5a0" }}>
-            Nothing leaves her account. Her balance will only ever grow, and financial runway can't be computed.
+            Nothing leaves this account. The balance will only ever grow, and financial runway can't be computed.
           </div>
         )}
 
@@ -1146,7 +1146,7 @@ function StepEmployment({ actor, state, setState }) {
               const net = spendable - m;
               return `${fmtAmount(m)} ${worldCurrency}/month out` +
                 (spendable > 0
-                  ? ` · ${fmtSigned(net)} ${worldCurrency} left${net < 0 ? " — she loses money every month" : ""}`
+                  ? ` · ${fmtSigned(net)} ${worldCurrency} left${net < 0 ? " — losing money every month" : ""}`
                   : "");
             })()}
           </div>
@@ -1203,8 +1203,8 @@ function StepEmployment({ actor, state, setState }) {
         </div>
         <div style={{ ...S.sans, fontSize:10, color:"#a8a5a0", marginTop:3 }}>
           {monthlyTotal > 0
-            ? `What she has in the bank on day one. ${fmtAmount(netTotal)} ${worldCurrency}/month take-home — the shortcuts set that many months of runway.`
-            : "What she has in the bank on day one. Rent is debited before the first salary lands, so zero means starting overdrawn."}
+            ? `What this character has in the bank on day one. ${fmtAmount(netTotal)} ${worldCurrency}/month take-home — the shortcuts set that many months of runway.`
+            : "What this character has in the bank on day one. Rent is debited before the first salary lands, so zero means starting overdrawn."}
         </div>
       </div>
     </div>
@@ -2234,7 +2234,7 @@ function StepDeploy({ actor, state }) {
     ["Fixed expenses", (() => {
       const per = { monthly: 1, quarterly: 1/3, annual: 1/12 };
       const list = (state.career?.fixed_expenses || []).filter(e => (e.name||"").trim() && Number(e.amount) > 0);
-      if (!list.length) return "None — nothing leaves her account";
+      if (!list.length) return "None — nothing leaves this account";
       const m = list.reduce((t, e) => t + (Number(e.amount)||0) * (per[e.cadence||"monthly"]||1), 0);
       return `${list.length} · ${fmtMoney(m, state.world?.currency)}/month`.trim();
     })()],
@@ -2254,7 +2254,7 @@ function StepDeploy({ actor, state }) {
       ))}
       <div style={{ marginTop:16, padding:"11px 13px", background:"rgba(0,0,0,.03)", borderRadius:10 }}>
         <p style={{ ...S.sans, fontSize:12, color:"#a8a5a0", margin:0 }}>
-          Once deployed, {actor?.first_name||actor?.name} will begin her schedule immediately. Seeded relationships allow the world engine to generate natural encounters.
+          Once deployed, {actor?.first_name||actor?.name} will begin their schedule immediately. Seeded relationships allow the world engine to generate natural encounters.
         </p>
       </div>
     </div>
@@ -2418,7 +2418,7 @@ export default function DeployWizardModal({ actor, onClose, onDeployed }) {
       // the actor's process tree is started by the world's supervisor, which
       // isn't running.
       if (state.world.status !== "running") return `${state.world.name} is stopped — start it to continue`;
-      if (!state.home?.place_id)  return "Set her home address";
+      if (!state.home?.place_id)  return "Set a home address";
       if (!isPreciseHome(state.home.types)) return "Add a house number — a street isn't an address";
       if (!state.home?.home_type) return "Choose apartment or house";
       return null;

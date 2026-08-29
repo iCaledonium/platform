@@ -244,14 +244,14 @@ function IdentityPanel({ actorId, worldId, canEdit = true }) {
   const { data, status, error, push, retry } = useLiveSection(url, next => ({ identity: next.identity }));
 
   if (data === undefined) return <p style={{ ...F, fontSize:13, color:"#a8a5a0" }}>Loading…</p>;
-  if (!data?.identity)    return <p style={{ ...F, fontSize:13, color:"#993c1d" }}>No identity row for her in this world.</p>;
+  if (!data?.identity)    return <p style={{ ...F, fontSize:13, color:"#993c1d" }}>No identity row for this character in this world.</p>;
 
   const set = (k, v) => push({ ...data, identity: { ...data.identity, [k]: v } });
   const i = data.identity;
 
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:16, maxWidth:620 }}>
-      {!canEdit && <ReadOnlyNotice what="her identity" />}
+      {!canEdit && <ReadOnlyNotice what="this identity" />}
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
         <TextRow label="First name" value={i.first_name} onCommit={v => set("first_name", v)} readOnly={!canEdit} />
         <TextRow label="Last name"  value={i.last_name}  onCommit={v => set("last_name", v)} readOnly={!canEdit} />
@@ -261,7 +261,7 @@ function IdentityPanel({ actorId, worldId, canEdit = true }) {
         <TextRow label="Nationality" value={i.nationality} onCommit={v => set("nationality", v)} readOnly={!canEdit} />
       </div>
       <TextRow label="Appearance" value={i.appearance} multiline onCommit={v => set("appearance", v)}
-        placeholder="How she looks, in this world" readOnly={!canEdit} />
+        placeholder="How they look, in this world" readOnly={!canEdit} />
       <p style={{ ...F, fontSize:11, color:"#a8a5a0", lineHeight:1.6, margin:0 }}>
         Editing here changes the deployed copy only. Her basic profile — the template a deploy ships from — is untouched.
       </p>
@@ -276,12 +276,12 @@ const BIG5 = [["openness","Openness"],["conscientiousness","Conscientiousness"],
               ["extraversion","Extraversion"],["agreeableness","Agreeableness"],
               ["neuroticism","Neuroticism"]];
 const PSYCH_TEXT = [
-  ["wound", "The wound"], ["what_they_want", "What she actually wants"],
+  ["wound", "The wound"], ["what_they_want", "What they actually want"],
   ["blindspot", "The blind spot"], ["contradiction", "The contradiction"],
   ["defenses", "Defenses"], ["coping_mechanisms", "Coping mechanisms"],
-  ["backstory", "Backstory"], ["self_view", "How she sees herself"],
-  ["others_view", "How others see her"], ["view_on_sex", "View on intimacy"],
-  ["family_model", "Family model"], ["relationship_read_pattern", "How she reads relationships"],
+  ["backstory", "Backstory"], ["self_view", "Self-view"],
+  ["others_view", "How others see them"], ["view_on_sex", "View on intimacy"],
+  ["family_model", "Family model"], ["relationship_read_pattern", "How they read relationships"],
 ];
 
 function PsychologyPanel({ actorId, worldId, canEdit = true }) {
@@ -290,14 +290,14 @@ function PsychologyPanel({ actorId, worldId, canEdit = true }) {
     next => ({ personality: next.personality, big5: next.big5, attachment: next.attachment }));
 
   if (data === undefined) return <p style={{ ...F, fontSize:13, color:"#a8a5a0" }}>Loading…</p>;
-  if (!data?.personality) return <p style={{ ...F, fontSize:13, color:"#993c1d" }}>No psychology rows for her in this world.</p>;
+  if (!data?.personality) return <p style={{ ...F, fontSize:13, color:"#993c1d" }}>No psychology rows for this character in this world.</p>;
 
   const setP = (k, v) => push({ ...data, personality: { ...data.personality, [k]: v } });
   const setB = (k, v) => push({ ...data, big5: { ...data.big5, [k]: v } });
 
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:20, maxWidth:620 }}>
-      {!canEdit && <ReadOnlyNotice what="her psychology" />}
+      {!canEdit && <ReadOnlyNotice what="this psychology" />}
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
         <Field label="Attachment style">
           <select disabled={!canEdit} value={data.attachment?.attachment_style || ""} style={inputS}
@@ -477,7 +477,7 @@ function MediaPanel({ actorId, worldId }) {
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:22, maxWidth:640 }}>
       <p style={{ ...F, fontSize:12, color:"#6b6760", margin:0, lineHeight:1.6 }}>
-        {d.count} item{d.count === 1 ? "" : "s"} the simulator holds for her here. Undeploying erases these;
+        {d.count} item{d.count === 1 ? "" : "s"} the simulator holds here. Undeploying erases these;
         the platform keeps its own archived copies.
       </p>
 
@@ -632,7 +632,7 @@ function EconomyPanel({ actorId, worldId, currency, canEdit = true }) {
   }, [actorId, worldId]);
 
   if (data === undefined) return <p style={{ ...F, fontSize:13, color:"#a8a5a0" }}>Loading…</p>;
-  if (data === null)      return <p style={{ ...F, fontSize:13, color:"#993c1d" }}>Couldn't load her economy — the simulator may be down.</p>;
+  if (data === null)      return <p style={{ ...F, fontSize:13, color:"#993c1d" }}>Couldn't load this economy — the simulator may be down.</p>;
 
   const cur = data.bank_account?.currency || currency || "SEK";
   const minor = 100;  // display only; the server owns the real minor-unit ratio
@@ -651,7 +651,7 @@ function EconomyPanel({ actorId, worldId, currency, canEdit = true }) {
 
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:22, maxWidth:640 }}>
-      {!canEdit && <ReadOnlyNotice what="her economy" />}
+      {!canEdit && <ReadOnlyNotice what="this economy" />}
 
       <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))", gap:10 }}>
         {/* Session 150 — salaries are entered gross and taxed on payday, so
@@ -802,7 +802,7 @@ function EconomyPanel({ actorId, worldId, currency, canEdit = true }) {
               <span>{fmtAmount(out)} {cur}/month out</span>
               <span style={{ color: net < 0 ? "#993c1d" : "#0F6E56" }}>
                 {fmtSigned(net)} {cur} left
-                {net < 0 ? " — she loses money every month" : ""}
+                {net < 0 ? " — losing money every month" : ""}
               </span>
               {runway !== null && <span style={{ color:"#a8a5a0" }}>{runway.toFixed(1)} months runway</span>}
             </div>
@@ -944,7 +944,7 @@ function HomePanel({ actorId, worldId }) {
       {home?.home_address
         ? <Card label="Home" title={home.home_address}
             sub={home.home_lat ? `${Number(home.home_lat).toFixed(4)}, ${Number(home.home_lng).toFixed(4)}` : null}
-            note="Move her on the world's Residences map." />
+            note="Move them on the world's Residences map." />
         : <Card label="Home" title="No home set in this world" note="Set one on the world's Residences map." />}
 
       {workplaces.length === 0

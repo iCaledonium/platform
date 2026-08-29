@@ -35,6 +35,7 @@ import AccessoryEditor, {
   ACCESSORY_REGION_CAMERA,
   stripV,
 } from "./AccessoryEditor";
+import { attachKtx2 } from "../lib/gltfKtx2.js";
 
 // The bones that must resolve for retargeting to be viable at all.
 const REQUIRED_BONES = [
@@ -658,6 +659,7 @@ export default function ActorModelPanel({ actorId }) {
   const roomRef = useRef(null);
   const proceduralRoomRef = useRef(null);
   const fpvControlsRef = useRef(null);
+  const fpvCleanupRef = useRef(null);
   const fpvRef = useRef(false);
   // Where she has decided to go, and when she will next feel like moving.
   const wanderRef = useRef({ target: null, waitUntil: 0 });
@@ -826,6 +828,19 @@ export default function ActorModelPanel({ actorId }) {
   const [roomInfo, setRoomInfo] = useState(null);
   const [fpv, setFpv] = useState(false);
   const [locked, setLocked] = useState(false);
+  // Session 153 — first person without pointer lock.
+  //
+  // This surface denies the pointer-lock permission outright (measured:
+  // featurePolicy.allowsFeature('pointer-lock') === false while 81 other
+  // features are granted), so isLocked can never become true. Everything here
+  // used to hang off it: the "Click to look around" prompt only cleared on
+  // lock, and stepPlayer refused to move without it — which is why first
+  // person stopped working entirely rather than degrading.
+  const [fpvEngaged, setFpvEngaged] = useState(false);
+  const fpvPointerRef = useRef(null);
+  const fpvEngagedRef = useRef(false);
+  const fpvOutsideRef = useRef(false);
+  const _fpvEuler = useRef(null);
   const [showRuler, setShowRuler] = useState(false);
   const [shadingAuto, setShadingAuto] = useState(false);
 
@@ -1008,7 +1023,7 @@ export default function ActorModelPanel({ actorId }) {
 
   async function buildRuntimeModel() {
     if (!exportGlbRef.current) {
-      setBuilding("The viewer has not finished loading her yet.");
+      setBuilding("The viewer has not finished loading this character yet.");
       return;
     }
     setBuilding("working");
@@ -1438,6 +1453,61 @@ export default function ActorModelPanel({ actorId }) {
     fpvControls.addEventListener("unlock", () => setLocked(false));
     fpvControlsRef.current = fpvControls;
 
+    // Mouse-look for when the lock is refused. PointerLockControls does this
+    // itself while locked, so both paths never run at once.
+    if (!_fpvEuler.current) _fpvEuler.current = new THREE.Euler(0, 0, 0, "YXZ");
+    const onFpvMove = (e) => {
+      // In first person AND engaged. Session 153: this was gated on fpv alone,
+      // so the camera swung the instant the cursor crossed the panel — before
+      // any click, with the "Click to look around" prompt still on screen
+      // asking for one. Entering a viewport is not an instruction to look.
+      if (!fpvRef.current || !fpvEngagedRef.current) return;
+      const r = renderer.domElement.getBoundingClientRect();
+      fpvPointerRef.current = { x: e.clientX - r.left, y: e.clientY - r.top, w: r.width, h: r.height };
+      fpvOutsideRef.current = false;
+      if (fpvControls.isLocked) return;
+      const el = _fpvEuler.current;
+      el.setFromQuaternion(camera.quaternion);
+      el.y -= (e.movementX || 0) * 0.0022;
+      el.x -= (e.movementY || 0) * 0.0022;
+      const lim = Math.PI / 2 - 0.02;
+      el.x = Math.max(-lim, Math.min(lim, el.x));
+      camera.quaternion.setFromEuler(el);
+    };
+    // Same rule as the knock scene: once the OS has the cursor, the look is
+    // over. The prompt comes back and one click resumes.
+    const fpvGone = () => {
+      fpvOutsideRef.current = true;
+      if (fpvEngagedRef.current) {
+        fpvEngagedRef.current = false;
+        setFpvEngaged(false);
+        keysRef.current.clear();
+      }
+    };
+    const fpvBack = () => { fpvOutsideRef.current = false; };
+    const onFpvContext = (e) => {
+      if (!fpvRef.current || !fpvEngagedRef.current) return;
+      e.preventDefault();
+      keysRef.current.clear();
+      fpvEngagedRef.current = false;
+      setFpvEngaged(false);
+      if (fpvControls.isLocked) fpvControls.unlock();
+    };
+    renderer.domElement.addEventListener("contextmenu", onFpvContext);
+    window.addEventListener("pointermove", onFpvMove);
+    document.addEventListener("mouseleave", fpvGone);
+    document.addEventListener("mouseenter", fpvBack);
+    window.addEventListener("blur", fpvGone);
+    window.addEventListener("focus", fpvBack);
+    fpvCleanupRef.current = () => {
+      renderer.domElement.removeEventListener("contextmenu", onFpvContext);
+      window.removeEventListener("pointermove", onFpvMove);
+      document.removeEventListener("mouseleave", fpvGone);
+      document.removeEventListener("mouseenter", fpvBack);
+      window.removeEventListener("blur", fpvGone);
+      window.removeEventListener("focus", fpvBack);
+    };
+
     // PBR expects an environment to reflect. Three point lights and nothing to
     // bounce off is why it read as vinyl — Blender always has a world.
     // RoomEnvironment is a neutral studio box, generated at runtime, no asset.
@@ -1473,6 +1543,7 @@ export default function ActorModelPanel({ actorId }) {
     key.shadow.bias = -0.0002;
     key.shadow.normalBias = 0.03;
     scene.add(key);
+    scene.add(key.target);      // a DirectionalLight aims at its target's world position
     keyLightRef.current = key;
     const rim = new THREE.DirectionalLight(0xaaccff, displayRef.current.rimIntensity);
     rim.position.set(-2, 1.5, -2);
@@ -1486,6 +1557,17 @@ export default function ActorModelPanel({ actorId }) {
     const onKeyDown = (e) => {
       const tag = document.activeElement?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
+      // Escape releases the look, as the on-screen hint has always promised.
+      // It used to rely on the browser's own pointer-lock release, which never
+      // fires when the lock was refused in the first place — so Escape did
+      // nothing and the cursor stayed hidden.
+      if (e.code === "Escape") {
+        keysRef.current.clear();
+        fpvEngagedRef.current = false;
+        setFpvEngaged(false);
+        if (fpvControlsRef.current?.isLocked) fpvControlsRef.current.unlock();
+        return;
+      }
       keysRef.current.add(e.code);
       if (e.code.startsWith("Arrow")) e.preventDefault();
     };
@@ -1528,6 +1610,7 @@ export default function ActorModelPanel({ actorId }) {
         );
       }
 
+      steerFpvLook(delta, camera);
       stepPlayer(delta, camera);
       stepLocomotion(delta, camera, controls);
 
@@ -1721,6 +1804,26 @@ export default function ActorModelPanel({ actorId }) {
     });
   }, [doubleSided, shading, matInfo]);
 
+  // Session 153 — the cursor hides while you are LOOKING, not merely while
+  // first person is on.
+  //
+  // Toggling this on `fpv` hid the pointer the instant you entered — before
+  // the click the prompt asks for, and across the whole page, including the
+  // "Leave first person" button. With nothing visible to aim at, there was no
+  // way back out. Engagement is the correct condition, and Escape or a
+  // right-click gives the cursor back without leaving the scene.
+  useEffect(() => {
+    const ID = "anima-walk-cursor";
+    if (!document.getElementById(ID)) {
+      const tag = document.createElement("style");
+      tag.id = ID;
+      tag.textContent = "html.anima-walking, html.anima-walking * { cursor: none !important; }";
+      document.head.appendChild(tag);
+    }
+    document.documentElement.classList.toggle("anima-walking", !!fpvEngaged);
+    return () => document.documentElement.classList.remove("anima-walking");
+  }, [fpvEngaged]);
+
   useEffect(() => {
     fpvRef.current = fpv;
     const controls = controlsRef.current;
@@ -1731,13 +1834,36 @@ export default function ActorModelPanel({ actorId }) {
     camera.fov = fpv ? FOV_FPV : FOV_ORBIT;
     camera.updateProjectionMatrix();
 
+    if (!fpv) { fpvEngagedRef.current = false; setFpvEngaged(false); fpvPointerRef.current = null; }
+
     if (fpv) {
-      // Stand the player in a corner looking across the room, rather than
-      // wherever the orbit camera happened to be.
+      // Session 153 — stand where a person would, not in a bounding-box corner.
+      //
+      // The old spawn was (minX + 0.6, minZ + 0.6): the corner of the room's
+      // AABB. In an L-shaped flat that corner is inside the bathroom, which is
+      // where first person kept starting — facing tiles, with the shower in
+      // your face. Stand a conversational distance from HER instead and look
+      // at her; she is the reason to be in the room at all. The room centre is
+      // the fallback when she has not loaded.
       const b = boundsRef.current;
       const eye = floorYRef.current + EYE_HEIGHT;
-      camera.position.set(b.minX + 0.6, eye, b.minZ + 0.6);
-      camera.lookAt((b.minX + b.maxX) / 2, eye * 0.9, (b.minZ + b.maxZ) / 2);
+      const centre = new THREE.Vector3((b.minX + b.maxX) / 2, 0, (b.minZ + b.maxZ) / 2);
+      const her = holderRef.current ? holderRef.current.position.clone() : centre.clone();
+      // Back off from her toward the middle of the room, so we never reverse
+      // into the wall she happens to be standing against.
+      const away = new THREE.Vector3().subVectors(centre, her).setY(0);
+      if (away.lengthSq() < 0.04) away.set(0, 0, 1);
+      away.normalize();
+      const stand = her.clone().addScaledVector(away, 2.2);
+      stand.x = Math.max(b.minX, Math.min(b.maxX, stand.x));
+      stand.z = Math.max(b.minZ, Math.min(b.maxZ, stand.z));
+      stand.y = eye;
+      // And do not start inside the sofa.
+      resolveCapsule(stand);
+      clampOutsideExclusions(stand);
+      camera.position.set(stand.x, eye, stand.z);
+      camera.lookAt(her.x, eye - 0.12, her.z);
+      console.log(`[ActorModelPanel] FPV spawn (${stand.x.toFixed(2)}, ${stand.z.toFixed(2)}), facing her at (${her.x.toFixed(2)}, ${her.z.toFixed(2)}).`);
       wanderRef.current = { target: null, waitUntil: 0 };
     } else {
       fpvControlsRef.current?.unlock();
@@ -2036,9 +2162,39 @@ export default function ActorModelPanel({ actorId }) {
 
   // Walking the player. Direction is taken from where the camera is looking,
   // so it behaves like any first-person control.
+  // Unbounded turning without a captured pointer: near an edge the camera
+  // keeps rotating, at full rate 100px before the border so nobody has to
+  // shove the cursor out of the window to look behind them.
+  function steerFpvLook(delta, camera) {
+    if (!fpvRef.current || !fpvEngagedRef.current) return;
+    if (fpvControlsRef.current?.isLocked || document.pointerLockElement) return;
+    const p = fpvPointerRef.current;
+    if (!p || fpvOutsideRef.current) return;
+    const EDGE = 240, FULL = 100, RATE = 2.2;
+    const ramp = (d) => {
+      if (d <= FULL) return 1;
+      if (d >= EDGE) return 0;
+      const t = (EDGE - d) / (EDGE - FULL);
+      return t * t;
+    };
+    const yawRate = (ramp(p.w - p.x) - ramp(p.x)) * RATE;
+    const pitchRate = (ramp(p.h - p.y) - ramp(p.y)) * RATE;
+    if (!yawRate && !pitchRate) return;
+    const el = _fpvEuler.current || (_fpvEuler.current = new THREE.Euler(0, 0, 0, "YXZ"));
+    el.setFromQuaternion(camera.quaternion);
+    el.y -= yawRate * delta;
+    el.x -= pitchRate * delta;
+    const lim = Math.PI / 2 - 0.02;
+    el.x = Math.max(-lim, Math.min(lim, el.x));
+    camera.quaternion.setFromEuler(el);
+  }
+
   function stepPlayer(delta, camera) {
-    const fpvControls = fpvControlsRef.current;
-    if (!fpvRef.current || !fpvControls?.isLocked) return;
+    // Gated on being IN first person, not on holding the pointer. The lock is
+    // a mouse concern; the keys are not.
+    if (!fpvRef.current) return;
+    const el0 = document.activeElement;
+    if (el0 && (el0.tagName === "INPUT" || el0.tagName === "TEXTAREA" || el0.isContentEditable)) return;
 
     const keys = keysRef.current;
     let forward = 0;
@@ -2547,6 +2703,7 @@ export default function ActorModelPanel({ actorId }) {
     try {
       const roomLoader = new GLTFLoader();
       if (dracoLoaderRef.current) roomLoader.setDRACOLoader(dracoLoaderRef.current);
+      attachKtx2(roomLoader);   // runtime GLBs carry KTX2 textures — see lib/gltfKtx2.js
       const gltf = await roomLoader.loadAsync(trackUrl(file));
       const root = gltf.scene;
 
@@ -2950,6 +3107,42 @@ export default function ActorModelPanel({ actorId }) {
         maxZ: grounded.max.z - inset,
       };
 
+      // Session 153 — her shadow was landing through the bathroom walls.
+      //
+      // The room casts (castShadow = true on every converted mesh), so a wall
+      // between the sun and the floor beyond it SHOULD block. It did not,
+      // because the key light's shadow camera is a fixed ±4m box around the
+      // origin: this flat is ~11m deep, so the walls at the far end were never
+      // drawn into the shadow map at all. Geometry outside the frustum cannot
+      // occlude, so the light passed straight through and only she was left
+      // casting. Size the box to the room it is actually lighting.
+      const kl = keyLightRef.current;
+      if (kl && kl.shadow) {
+        const halfX = Math.max(4, (grounded.max.x - grounded.min.x) / 2 + 1);
+        const halfZ = Math.max(4, (grounded.max.z - grounded.min.z) / 2 + 1);
+        const half = Math.max(halfX, halfZ);
+        kl.shadow.camera.left = -half;
+        kl.shadow.camera.right = half;
+        kl.shadow.camera.top = half;
+        kl.shadow.camera.bottom = -half;
+        kl.shadow.camera.far = Math.max(12, half * 3);
+        // A bigger box over the same 1024 map is a blurrier shadow, so buy the
+        // resolution back in proportion rather than trading one bug for a
+        // softer, mushier one.
+        const px = half > 6 ? 2048 : 1024;
+        if (kl.shadow.mapSize.x !== px) {
+          kl.shadow.mapSize.set(px, px);
+          kl.shadow.map?.dispose();
+          kl.shadow.map = null;
+        }
+        // Aim it at the middle of the room instead of the world origin.
+        kl.target.position.set((grounded.min.x + grounded.max.x) / 2, 0,
+                               (grounded.min.z + grounded.max.z) / 2);
+        kl.target.updateMatrixWorld();
+        kl.shadow.camera.updateProjectionMatrix();
+        console.log(`[ActorModelPanel] Shadow frustum sized to the room: ±${half.toFixed(1)}m, ${px}px map.`);
+      }
+
       // Put her at the verified-clear spawn point (not necessarily the
       // room's geometric centre anymore — see above), and keep the
       // camera from orbiting out through the walls.
@@ -3193,6 +3386,7 @@ export default function ActorModelPanel({ actorId }) {
       } else {
         const loader = new GLTFLoader();
         if (dracoLoaderRef.current) loader.setDRACOLoader(dracoLoaderRef.current);
+        attachKtx2(loader);   // runtime GLBs carry KTX2 textures — see lib/gltfKtx2.js
         loader.register((parser) => new VRMLoaderPlugin(parser));
         const gltf = await loader.loadAsync(trackUrl(file));
         vrm = gltf.userData.vrm ?? null;
@@ -3432,7 +3626,7 @@ export default function ActorModelPanel({ actorId }) {
           const homeName = homeUrl.split("/").pop() || "home.glb";
           await loadRoom(new File([homeBlob], homeName, { type: "model/gltf-binary" }));
         } catch (he) {
-          setError(`Character loaded, but her home did not: ${he?.message ?? String(he)}`);
+          setError(`Character loaded, but their home did not: ${he?.message ?? String(he)}`);
         }
       }
       // Session 152 — clear the overlay on SUCCESS, unconditionally.
@@ -3483,6 +3677,7 @@ export default function ActorModelPanel({ actorId }) {
       }
       const clipLoader = new GLTFLoader();
       if (dracoLoaderRef.current) clipLoader.setDRACOLoader(dracoLoaderRef.current);
+      attachKtx2(clipLoader);   // runtime GLBs carry KTX2 textures — see lib/gltfKtx2.js
       const gltf = await clipLoader.loadAsync(trackUrl(file));
       // GLTFLoader keeps clips beside the scene; put them on it so both asset
       // shapes look the same to the callers below.
@@ -3728,7 +3923,12 @@ export default function ActorModelPanel({ actorId }) {
             ref={mountRef}
             style={{ ...S.canvasMount, visibility: mode === "explore" ? "visible" : "hidden" }}
             onClick={() => {
-              if (fpvRef.current) fpvControlsRef.current?.lock();
+              if (!fpvRef.current) return;
+              fpvEngagedRef.current = true;
+              setFpvEngaged(true);
+              // Still worth asking — a browser that allows it gives a true
+              // trapped pointer, and steering stands down when it does.
+              fpvControlsRef.current?.lock();
             }}
           />
           {actorGlbUrl && (
@@ -3775,10 +3975,10 @@ export default function ActorModelPanel({ actorId }) {
               x={holderXZ.x.toFixed(2)} z={holderXZ.z.toFixed(2)}
             </div>
           )}
-          {fpv && !locked && (
+          {fpv && !locked && !fpvEngaged && (
             <div
               style={S.lockPrompt}
-              onClick={() => fpvControlsRef.current?.lock()}
+              onClick={() => { fpvEngagedRef.current = true; setFpvEngaged(true); fpvControlsRef.current?.lock(); }}
             >
               Click to look around
               <span style={S.lockHint}>
@@ -3805,7 +4005,7 @@ export default function ActorModelPanel({ actorId }) {
           </div>
           <div style={{ fontSize: 11.5, lineHeight: 1.5, color: "#666", marginBottom: 14 }}>
             {building === "working" ? (
-              <span>Building — folding in her sculpt, baking the wardrobe, rebinding the skeletons…</span>
+              <span>Building — folding in the sculpt, baking the wardrobe, rebinding the skeletons…</span>
             ) : typeof building === "string" ? (
               <span style={{ color: "#993c1d" }}>{building}</span>
             ) : !runtimeState ? (
@@ -3814,11 +4014,11 @@ export default function ActorModelPanel({ actorId }) {
               <span style={{ color: "#0F6E56" }}>Up to date — worlds will load this.</span>
             ) : runtimeState.builtHash ? (
               <span>
-                Out of date. She has been edited since this was built, so a world
-                would load the older her.
+                Out of date. This character has been edited since this was built,
+                so a world would load the older version.
               </span>
             ) : (
-              <span>Never built. Deploying her now would give a world nothing to load.</span>
+              <span>Never built. Deploying now would give a world nothing to load.</span>
             )}
           </div>
           {building !== "working" && (!runtimeState || !runtimeState.fresh) && (
@@ -3878,7 +4078,7 @@ export default function ActorModelPanel({ actorId }) {
           {error && <pre style={S.error}>{error}</pre>}
           {!report && !error && (
             <div style={LIGHT.hint}>
-              Load her to inspect animations and wardrobe.
+              Load the character to inspect animations and wardrobe.
             </div>
           )}
 
@@ -4084,7 +4284,7 @@ function WardrobeCard({
       )}
 
       {!actorGlbUrl ? (
-        <div style={LIGHT.hint}>Load her before editing wardrobe.</div>
+        <div style={LIGHT.hint}>Load the character before editing wardrobe.</div>
       ) : (
         <AccessoryEditor
           accessories={accessories} setAccessories={setAccessories}

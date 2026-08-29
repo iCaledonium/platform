@@ -89,8 +89,8 @@ function ShareModal({ actor, onClose }) {
   // Session 150 — the rungs, spelled out. "Can clone" used to be the only
   // alternative to read, and it granted a capability with no implementation.
   const PERM_HELP = {
-    read: "Can open her profile. Cannot deploy or change anything.",
-    use:  "Can deploy her into a world they own. Their world instance is theirs to edit; this profile is never touched.",
+    read: "Can open this profile. Cannot deploy or change anything.",
+    use:  "Can deploy this character into a world they own. Their world instance is theirs to edit; this profile is never touched.",
     copy: "Can take a full copy that becomes their own character, editable without limit and never synced back.",
   };
 
@@ -371,7 +371,7 @@ export default function ActorsGalleryPage() {
   // Session 150 — a character can be deployed to several worlds, so "undeploy"
   // is not a single action. With one world we still name it, because "this
   // world" told you nothing about which one you were about to erase her from.
-  const ERASE_NOTE = "Her instance in that world is erased — relationships, memories, schedule, bank account. The profile is kept and can be deployed again.";
+  const ERASE_NOTE = "That world instance is erased — relationships, memories, schedule, bank account. The profile is kept and can be deployed again.";
 
   // Called from a world chip, so the world is normally already known — the
   // picker below is the fallback for any caller that has not named one.
@@ -395,14 +395,14 @@ export default function ActorsGalleryPage() {
     }
     setConfirmAction({
       title: `Remove ${actor.name} from which world?`,
-      body: `She's deployed to ${ws.length} worlds. Removing her from one leaves the others untouched. ${ERASE_NOTE}`,
+      body: `Deployed to ${ws.length} worlds. Removing this character from one leaves the others untouched. ${ERASE_NOTE}`,
       choices: ws.map(w => ({ label: w.name, run: () => undeployActor(actor.id, w.id) })),
     });
   };
 
   const askDelete = (actor) => setConfirmAction({
     title: `Permanently delete ${actor.name}?`,
-    body: "This cannot be undone. The character and everything belonging to her are removed.",
+    body: "This cannot be undone. The character and everything belonging to them are removed.",
     label: "Delete permanently",
     danger: true,
     run: () => deleteActor(actor.id),

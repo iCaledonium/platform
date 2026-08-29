@@ -572,7 +572,7 @@ export default function MessagesPage() {
                       textTransform: "uppercase",
                       color: "#b05c08",
                       marginBottom: 4,
-                    }}>She remembers</p>
+                    }}>Remembers</p>
                     {context.memories.map(m => (
                       <div key={m.id} style={{
                         display: "flex",

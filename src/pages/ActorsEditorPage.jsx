@@ -375,6 +375,7 @@ function LifestylePanel({ d, editing, setEditData }) {
       <Field label="Alcohol"           value={l?.alcohol_relationship} />
       <Field label="Drug use"          value={l?.drug_use} />
       <Field label="Substance context" value={l?.substance_context} full tall />
+      <Field label="Interests"         value={l?.interests} full tall />
       <Field label="Note"              value={l?.lifestyle_note} full tall />
     </div>
   );
@@ -397,6 +398,7 @@ function LifestylePanel({ d, editing, setEditData }) {
           options={["none","cannabis_occasional","cannabis_regular","mdma_occasional","cannabis_mdma","cocaine_occasional","mixed_recreational","prescription_only"]} />
       </div>
       <EField label="Substance context" value={l?.substance_context} onChange={v=>upd("substance_context",v)} tall full />
+      <EField label="Interests"         value={l?.interests}         onChange={v=>upd("interests",v)}         tall full />
       <EField label="Lifestyle note"    value={l?.lifestyle_note}    onChange={v=>upd("lifestyle_note",v)}    tall full />
     </div>
   );
