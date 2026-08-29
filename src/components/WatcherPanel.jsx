@@ -66,7 +66,7 @@ export default function WatcherPanel({ bound = null }) {
   const modelRef = useRef(model); modelRef.current = model;
   const effortRef = useRef(effort); effortRef.current = effort;
   const [applied, setApplied] = useState(null); // what the bridge actually spawned with
-  const [showBrain, setShowBrain] = useState(false); // header badge → selects row
+  const [menu, setMenu] = useState(null); // "model" | "effort" | null — composer-footer popover
   const [minimized, setMinimized] = useState(false);
   const [watchers, setWatchers] = useState([]);
   const [watcherName, setWatcherName] = useState("");
@@ -302,6 +302,30 @@ export default function WatcherPanel({ bound = null }) {
     ws.send(JSON.stringify(attachPayload(name, true)));
   };
 
+  // Swap the session's brain: kill only the PROCESS (the conversation is
+  // kept), reconnect, and re-attach the same watcher — attachPayload reads
+  // the current model/effort selection, and the bridge persists it per
+  // watcher, so the choice sticks to the test case's conversation.
+  const reattach = () => {
+    const name = watcherName;
+    const t = readToken();
+    if (!name || !t) return;
+    killSession();
+    autoAttachName.current = name;
+    startSession(t);
+  };
+
+  // Claude-composer style: picking a different value applies it immediately
+  // by respawning the same conversation on the chosen brain.
+  const pickBrain = (kind, value) => {
+    setMenu(null);
+    const cur = kind === "model" ? model : effort;
+    if (kind === "model") { setModel(value); modelRef.current = value; }
+    else { setEffort(value); effortRef.current = value; }
+    try { localStorage.setItem(kind === "model" ? "watcherModel" : "watcherEffort", value); } catch {}
+    if (value !== cur && phase === "live" && watcherName) reattach();
+  };
+
   const openPanel = () => {
     setOpen(true);
     setMinimized(false);
@@ -442,14 +466,6 @@ export default function WatcherPanel({ bound = null }) {
             : phase === "connecting" ? "attaching"
             : phase === "dead" ? "session ended" : ""}
         </span>
-        {(phase === "live" || phase === "dead") && (
-          <button onClick={() => setShowBrain((s) => !s)}
-            title="Model & effort — pick, then re-attach to apply (the conversation is kept)"
-            style={{ background: "none", border: "none", cursor: "pointer", padding: 0,
-              ...label, fontSize: 8, color: GOLD + ".6)" }}>
-            {applied ? [applied.model, applied.effort].filter(Boolean).join(" · ") : "model ▾"}
-          </button>
-        )}
         <div style={{ flex: 1 }} />
         {phase === "live" && !busy && (
           <button title="Restart the whole scenario — the watcher snapshots, rebuilds the fixture from the first stage, and posts the new scene link"
@@ -478,6 +494,15 @@ export default function WatcherPanel({ bound = null }) {
             style={{ background: "none", border: "none", cursor: "pointer",
               color: GOLD + ".8)", fontSize: 10, letterSpacing: ".1em" }}>
             new watcher
+          </button>
+        )}
+        {(phase === "live" || phase === "dead") && (
+          <button onClick={() => setShowBrain((s) => !s)}
+            title="Model & effort for this watcher — change and re-attach"
+            style={{ background: "none", border: `0.5px solid ${GOLD}.35)`, borderRadius: 5,
+              cursor: "pointer", color: GOLD + ".8)", fontSize: 8.5,
+              letterSpacing: ".08em", padding: "3px 6px" }}>
+            {applied ? [applied.model || "default", applied.effort || "default"].join(" · ") : "brain"}
           </button>
         )}
         <button onClick={() => setMinimized(true)} title="Minimize — the watcher keeps running"
@@ -533,23 +558,6 @@ export default function WatcherPanel({ bound = null }) {
         </div>
       ) : (
         <>
-          {showBrain && (
-            <div style={{ display: "flex", gap: 8, padding: "10px 14px", alignItems: "flex-end",
-              borderBottom: "0.5px solid rgba(255,255,255,.08)" }}>
-              {brainSelects}
-              <button onClick={() => {
-                  setShowBrain(false);
-                  const t = readToken(); const n = watcherName;
-                  if (t && n) { autoAttachName.current = n; killSession(); startSession(t); }
-                }}
-                title="Respawn this watcher with the selected model/effort — the conversation is kept"
-                style={{ padding: "8px 12px", borderRadius: 7, cursor: "pointer",
-                  background: GOLD + ".16)", border: `0.5px solid ${GOLD}.4)`,
-                  color: GOLD + ".9)", fontSize: 10.5, whiteSpace: "nowrap" }}>
-                re-attach
-              </button>
-            </div>
-          )}
           <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", overflowX: "hidden",
             scrollbarWidth: "thin", padding: "12px 14px",
             display: "flex", flexDirection: "column", gap: 8 }}>
@@ -641,6 +649,33 @@ export default function WatcherPanel({ bound = null }) {
                 color: GOLD + ".9)", fontSize: 11, marginBottom: 3 }}>
               →
             </button>
+          </div>
+          <div style={{ position: "relative", display: "flex", justifyContent: "flex-end",
+            gap: 16, padding: "0 16px 9px" }}>
+            {menu && (
+              <div style={{ position: "absolute", bottom: 24, right: 12, zIndex: 10,
+                background: "#12100d", border: "0.5px solid rgba(255,255,255,.18)",
+                borderRadius: 8, padding: 4, boxShadow: "0 10px 30px rgba(0,0,0,.55)",
+                display: "flex", flexDirection: "column", minWidth: 92 }}>
+                {(menu === "model" ? MODELS : EFFORTS).map((o) => (
+                  <div key={o} onClick={() => pickBrain(menu, o)}
+                    style={{ padding: "6px 10px", borderRadius: 5, cursor: "pointer", fontSize: 11,
+                      color: o === (menu === "model" ? model : effort) ? GOLD + ".95)" : "rgba(255,255,255,.75)",
+                      background: o === (menu === "model" ? model : effort) ? GOLD + ".12)" : "transparent" }}>
+                    {o}
+                  </div>
+                ))}
+              </div>
+            )}
+            {[["model", model], ["effort", effort]].map(([kind, val]) => (
+              <span key={kind}
+                onClick={() => phase === "live" && setMenu(menu === kind ? null : kind)}
+                title={`${kind} — picking a different one re-attaches this watcher (conversation kept)`}
+                style={{ ...label, fontSize: 9, cursor: phase === "live" ? "pointer" : "default",
+                  color: GOLD + (phase === "live" ? ".65)" : ".35)") }}>
+                {val === "default" ? kind : val}
+              </span>
+            ))}
           </div>
         </>
       )}
