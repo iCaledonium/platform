@@ -53,6 +53,19 @@ export default function WatcherPanel({ bound = null }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  // Attachments are STAGED, not fired: picking/dropping files only queues
+  // them as chips; nothing reaches the watcher until → is pressed, so text
+  // and files always travel together as one message.
+  const [pending, setPending] = useState([]);
+  // Model/effort for the NEXT attach (a session's brain is fixed at spawn;
+  // change = re-attach). "default" = inherit the bridge's CLI default.
+  const MODELS = ["default", "fable", "opus", "sonnet", "haiku"];
+  const EFFORTS = ["default", "low", "medium", "high", "xhigh", "max"];
+  const [model, setModel] = useState(() => { try { return localStorage.getItem("watcherModel") || "default"; } catch { return "default"; } });
+  const [effort, setEffort] = useState(() => { try { return localStorage.getItem("watcherEffort") || "default"; } catch { return "default"; } });
+  const modelRef = useRef(model); modelRef.current = model;
+  const effortRef = useRef(effort); effortRef.current = effort;
+  const [applied, setApplied] = useState(null); // what the bridge actually spawned with
   const [minimized, setMinimized] = useState(false);
   const [watchers, setWatchers] = useState([]);
   const [watcherName, setWatcherName] = useState("");
@@ -106,6 +119,41 @@ export default function WatcherPanel({ bound = null }) {
   // Probe once: is a local bridge listening? If not, render nothing at all.
   const autoAttachName = useRef(null);
   const autoTried = useRef(false);
+  const pendingAsks = useRef([]);
+
+  useEffect(() => {
+    const onAsk = (e) => {
+      const text = e?.detail?.text;
+      if (!text) return;
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN && phaseRef.current === "live") {
+        push({ kind: "me", text });
+        ws.send(JSON.stringify({ type: "user", text }));
+        setBusy(true);
+      } else {
+        pendingAsks.current.push(text);
+        if (!openRef.current) openPanel();
+      }
+    };
+    window.addEventListener("watcher:ask", onAsk);
+    return () => window.removeEventListener("watcher:ask", onAsk);
+  }, []);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // live-phase mirror refs so the event handler sees current state
+  const phaseRef = useRef(phase); phaseRef.current = phase;
+  const openRef = useRef(open); openRef.current = open;
+
+  // deliver queued asks the moment the session is live
+  useEffect(() => {
+    if (phase !== "live" || pendingAsks.current.length === 0) return;
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    for (const text of pendingAsks.current.splice(0)) {
+      push({ kind: "me", text });
+      ws.send(JSON.stringify({ type: "user", text }));
+      setBusy(true);
+    }
+  }, [phase]);  // eslint-disable-line react-hooks/exhaustive-deps
   const boundRef = useRef(bound);
   boundRef.current = bound;
 
@@ -126,16 +174,18 @@ export default function WatcherPanel({ bound = null }) {
     try { ws = new WebSocket(BRIDGE_URL); } catch { return; }
     ws.onopen = () => {
       setReachable(true); ws.close();
-      // Start as an open, attached panel: resume the last watcher without
-      // making the developer click through pill → picker every page load.
+      // Watchers belong to TEST CASES (Magnus's rule, 2026-08-29): only a
+      // page that BINDS a conversation may auto-attach it. Unbound surfaces
+      // like /lab/home start as the pill and offer the picker on click —
+      // there is no "last used" fallback, because which watcher you touched
+      // most recently says nothing about the page you are on now.
       if (!autoTried.current) {
         autoTried.current = true;
         const t = readToken();
-        let last = null; try { last = localStorage.getItem("watcherLastName"); } catch {}
-        // The page's bound conversation wins: the encounter lab must never
-        // host the transport watcher, whatever was used last.
-        const want = boundRef.current || last;
-        if (t && want) { autoAttachName.current = want; setOpen(true); startSession(t); }
+        if (t && boundRef.current) {
+          autoAttachName.current = boundRef.current;
+          setOpen(true); startSession(t);
+        }
       }
     };
     ws.onerror = () => {};
@@ -201,10 +251,14 @@ export default function WatcherPanel({ bound = null }) {
         autoAttachName.current = null;
         if (auto && (msg.watchers || []).some(w => w.name === auto)) {
           setWatcherName(auto); setPhase("connecting");
-          ws.send(JSON.stringify({ type: "attach", name: auto, kickoff: true }));
+          ws.send(JSON.stringify(attachPayload(auto, true)));
         } else setPhase("pick");
       }
-      else if (msg.type === "init") { setPhase("live"); setBusy(true); if (msg.watcher) setWatcherName(msg.watcher); }
+      else if (msg.type === "init") {
+        setPhase("live"); setBusy(true);
+        if (msg.watcher) setWatcherName(msg.watcher);
+        setApplied(msg.model || msg.effort ? { model: msg.model, effort: msg.effort } : null);
+      }
       else if (msg.type === "text") appendDelta(msg.text);
       else if (msg.type === "assistant") settleBubble(msg.text);
       else if (msg.type === "tool") {
@@ -232,13 +286,19 @@ export default function WatcherPanel({ bound = null }) {
     ws.onerror = () => {};
   };
 
+  const attachPayload = (name, kickoff) => {
+    const p = { type: "attach", name, kickoff };
+    if (modelRef.current !== "default") p.model = modelRef.current;
+    if (effortRef.current !== "default") p.effort = effortRef.current;
+    return p;
+  };
+
   const attachWatcher = (name) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     setWatcherName(name);
     setPhase("connecting");
-    try { localStorage.setItem("watcherLastName", name); } catch {}
-    ws.send(JSON.stringify({ type: "attach", name, kickoff: true }));
+    ws.send(JSON.stringify(attachPayload(name, true)));
   };
 
   const openPanel = () => {
@@ -268,34 +328,43 @@ export default function WatcherPanel({ bound = null }) {
     } catch {}
   }, [open]);
 
-  const send = () => {
+  const send = async () => {
     const text = input.trim();
     const ws = wsRef.current;
-    if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
-    push({ kind: "me", text });
-    ws.send(JSON.stringify({ type: "user", text }));
-    setBusy(true);
+    if ((!text && pending.length === 0) || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const files = pending;
+    setPending([]);
     setInput("");
+    // Uploads travel first (defer: the bridge parks them), then the text —
+    // the bridge folds parked paths into this one user turn.
+    for (const f of files) {
+      const data = await new Promise((res) => {
+        const r = new FileReader();
+        r.onload = () => res(String(r.result).split(",")[1] || "");
+        r.onerror = () => res(null);
+        r.readAsDataURL(f);
+      });
+      if (data === null) { push({ kind: "sys", text: `${f.name}: read failed` }); continue; }
+      ws.send(JSON.stringify({ type: "upload", defer: true, name: f.name, mime: f.type, data }));
+    }
+    const shown = files.length
+      ? files.map((f) => `📎 ${f.name}`).join("  ") + (text ? "\n" + text : "")
+      : text;
+    push({ kind: "me", text: shown });
+    ws.send(JSON.stringify({ type: "user", text: text || "(see attached file(s))" }));
+    setBusy(true);
   };
 
   const fileRef = useRef(null);
 
-  const uploadFiles = (files) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN || phase !== "live") return;
+  const stageFiles = (files) => {
+    if (phase !== "live") return;
+    const ok = [];
     for (const f of files) {
       if (f.size > 25 * 1024 * 1024) { push({ kind: "sys", text: `${f.name}: too large (25MB max)` }); continue; }
-      const reader = new FileReader();
-      reader.onload = () => {
-        const data = String(reader.result).split(",")[1] || "";
-        ws.send(JSON.stringify({ type: "upload", name: f.name, mime: f.type, data,
-          note: input.trim() || undefined }));
-        push({ kind: "me", text: `📎 ${f.name} (${f.size > 1048576 ? (f.size / 1048576).toFixed(1) + " MB" : Math.ceil(f.size / 1024) + " KB"})` });
-        setBusy(true);
-        setInput("");
-      };
-      reader.readAsDataURL(f);
+      ok.push(f);
     }
+    if (ok.length) setPending((p) => [...p, ...ok]);
   };
 
   if (!reachable) return null;
@@ -340,7 +409,7 @@ export default function WatcherPanel({ bound = null }) {
   return (
     <div data-watcher-root
       onDragOver={(e) => { e.preventDefault(); }}
-      onDrop={(e) => { e.preventDefault(); if (e.dataTransfer?.files?.length) uploadFiles([...e.dataTransfer.files]); }}
+      onDrop={(e) => { e.preventDefault(); if (e.dataTransfer?.files?.length) stageFiles([...e.dataTransfer.files]); }}
       style={{ position: "fixed", ...panelPosStyle, zIndex: 100000,
       width: 400, height: "min(880px, calc(100vh - 130px))", overflow: "hidden",
       display: "flex", flexDirection: "column",
@@ -358,6 +427,11 @@ export default function WatcherPanel({ bound = null }) {
             : phase === "connecting" ? "attaching"
             : phase === "dead" ? "session ended" : ""}
         </span>
+        {applied && (
+          <span style={{ ...label, fontSize: 8, color: GOLD + ".55)" }}>
+            {[applied.model, applied.effort].filter(Boolean).join(" · ")}
+          </span>
+        )}
         <div style={{ flex: 1 }} />
         {phase === "live" && !busy && (
           <button title="Restart the whole scenario — the watcher snapshots, rebuilds the fixture from the first stage, and posts the new scene link"
@@ -402,13 +476,28 @@ export default function WatcherPanel({ bound = null }) {
 
       {phase === "pick" ? (
         <div style={{ padding: 18, display: "flex", flexDirection: "column", gap: 10, overflowY: "auto" }}>
+          <div style={{ display: "flex", gap: 8 }}>
+            {[["model", model, setModel, MODELS, "watcherModel"],
+              ["effort", effort, setEffort, EFFORTS, "watcherEffort"]].map(([cap, val, set, opts, key]) => (
+              <label key={cap} style={{ display: "flex", flexDirection: "column", gap: 4, flex: 1 }}>
+                <span style={label}>{cap}</span>
+                <select value={val}
+                  onChange={(e) => { set(e.target.value); try { localStorage.setItem(key, e.target.value); } catch {} }}
+                  style={{ background: "#080706", border: "0.5px solid rgba(255,255,255,.15)",
+                    borderRadius: 7, padding: "7px 9px", color: "rgba(255,255,255,.85)",
+                    fontSize: 11, outline: "none" }}>
+                  {opts.map((o) => <option key={o} value={o}>{o}</option>)}
+                </select>
+              </label>
+            ))}
+          </div>
           <span style={label}>ongoing watchers — pick a conversation</span>
           {watchers.map(w => (
             <button key={w.name} onClick={() => !w.live && attachWatcher(w.name)} disabled={w.live}
               style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 3,
                 padding: "10px 12px", borderRadius: 7, cursor: w.live ? "default" : "pointer",
                 background: "rgba(255,255,255,.03)", textAlign: "left",
-                border: `0.5px solid ${w.name === (localStorage.getItem("watcherLastName") || "") ? GOLD + ".4)" : "rgba(255,255,255,.1)"}`,
+                border: "0.5px solid rgba(255,255,255,.1)",
                 color: "rgba(255,255,255,.85)", fontFamily: "'DM Sans',system-ui,sans-serif" }}>
               <span style={{ fontSize: 12.5, color: w.live ? "rgba(255,255,255,.4)" : GOLD + ".9)" }}>{w.name}</span>
               <span style={{ fontSize: 9, color: "rgba(255,255,255,.35)" }}>
@@ -483,28 +572,52 @@ export default function WatcherPanel({ bound = null }) {
             <style>{`@keyframes watcherDot { 0%, 60%, 100% { opacity: .25; } 30% { opacity: 1; } }`}</style>
           </div>
 
-          <div style={{ display: "flex", gap: 8, padding: 12, alignItems: "center",
+          {pending.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "8px 12px 0" }}>
+              {pending.map((f, i) => (
+                <span key={i} style={{ display: "flex", alignItems: "center", gap: 5,
+                  fontSize: 10, color: "rgba(255,255,255,.7)",
+                  background: "rgba(255,255,255,.06)",
+                  border: "0.5px solid rgba(255,255,255,.12)",
+                  borderRadius: 999, padding: "3px 9px" }}>
+                  📎 {f.name}
+                  <span onClick={() => setPending((p) => p.filter((_, j) => j !== i))}
+                    title="Remove attachment"
+                    style={{ cursor: "pointer", color: "rgba(255,255,255,.45)" }}>×</span>
+                </span>
+              ))}
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 8, padding: 12, alignItems: "flex-end",
             borderTop: "0.5px solid rgba(255,255,255,.08)" }}>
             <input ref={fileRef} type="file" multiple style={{ display: "none" }}
-              onChange={(e) => { if (e.target.files?.length) uploadFiles([...e.target.files]); e.target.value = ""; }} />
+              onChange={(e) => { if (e.target.files?.length) stageFiles([...e.target.files]); e.target.value = ""; }} />
             <button onClick={() => fileRef.current?.click()} disabled={phase !== "live"}
-              title="Send a file to the watcher — a screenshot, a log; it can look at images. Or drop files anywhere on the panel."
+              title="Attach a file — it is sent together with your text when you press →. Or drop files anywhere on the panel."
               style={{ background: "none", border: "none", cursor: "pointer",
-                color: "rgba(255,255,255,.5)", fontSize: 15, lineHeight: 1, padding: "0 2px" }}>
+                color: "rgba(255,255,255,.5)", fontSize: 15, lineHeight: 1, padding: "0 2px 9px" }}>
               📎
             </button>
-            <input value={input} onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && send()}
+            <textarea value={input} rows={2}
+              onChange={(e) => {
+                setInput(e.target.value);
+                e.target.style.height = "auto";
+                e.target.style.height = Math.min(e.target.scrollHeight, 140) + "px";
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+              }}
               disabled={phase !== "live"}
-              placeholder={phase === "live" ? "ask the watcher…" : ""}
+              placeholder={phase === "live" ? "ask the watcher…  (Shift+Enter = new line)" : ""}
               style={{ flex: 1, background: "#080706",
                 border: "0.5px solid rgba(255,255,255,.15)", borderRadius: 7,
                 padding: "9px 11px", color: "rgba(255,255,255,.85)", fontSize: 12,
-                outline: "none" }} />
+                outline: "none", resize: "none", minHeight: 54, maxHeight: 140,
+                lineHeight: 1.5, fontFamily: "inherit" }} />
             <button onClick={send} disabled={phase !== "live"}
               style={{ padding: "9px 14px", borderRadius: 7, cursor: "pointer",
                 background: GOLD + ".16)", border: `0.5px solid ${GOLD}.4)`,
-                color: GOLD + ".9)", fontSize: 11 }}>
+                color: GOLD + ".9)", fontSize: 11, marginBottom: 3 }}>
               →
             </button>
           </div>
