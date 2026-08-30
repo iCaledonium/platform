@@ -15,6 +15,7 @@ import { mergeAnimationIntoActorGlb, removeAnimationFromActorGlb, parseDufFrames
 import { educationFromCv } from "./cv_edu.mjs";
 import { mount as mountTestLabRoutes } from "./testlab-routes.js";
 import { mount as mountSignupLabRoutes } from "./signuplab-routes.js";
+import { mount as mountShareLinkRoutes } from "./sharelinks-routes.js";
 
 // Session 102 — drafts carry their wizard adjustment state (all morph
 // slider values, the named body sliders, pose values, reference URLs,
@@ -6275,6 +6276,11 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/message", async (req, re
 // the /api/test/* proxies again (two stale-copy clobbers on 2026-08-29).
 mountTestLabRoutes(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser });
 mountSignupLabRoutes(app, { db, authUser, PORT });
+
+// Session 158 - cross-org character sharing by link. Its own file for the same
+// reason the lab routes are: a whole-file write to this 340KB index.js cannot
+// drop what is not in it.
+mountShareLinkRoutes(app, { db, authUser });
 
 app.post("/api/worlds/:world_id/encounter/:encounter_id/typing", async (req, res) => {
   const ok = requireWorld(req, res, worldIdOf(req), "player");

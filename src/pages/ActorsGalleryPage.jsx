@@ -44,6 +44,172 @@ const PERM_STYLE = {
   copy: { bg:"rgba(99,153,34,.1)",    fg:"#3b6d11", br:"rgba(99,153,34,.2)"   },
 };
 
+// ── Share by link ─────────────────────────────────────────────────────────────
+//
+// Session 158. The by-name control above cannot reach outside your organisation
+// - both the picker and the by-email lookup are org-scoped, deliberately, and
+// unscoping either one turns them into a directory of strangers and an
+// account-existence oracle. So sharing outward is a link: minted here, handed
+// over out of band, claimed at /share/:token by whoever opens it signed in.
+//
+// A link can only ever carry read or use. Never copy - it has no named
+// recipient, and ownership only crosses by an act aimed at a known person.
+const LINK_HELP = {
+  read: "They can open her profile. They cannot deploy or edit her.",
+  use:  "They can deploy her into a world they own. The original stays yours.",
+};
+
+function ShareLinkSection({ actor }) {
+  const [links, setLinks]   = useState([]);
+  const [perm, setPerm]     = useState("read");
+  const [days, setDays]     = useState(14);
+  const [seats, setSeats]   = useState("");
+  const [minted, setMinted] = useState(null);
+  const [busy, setBusy]     = useState(false);
+  const [err, setErr]       = useState(null);
+  const [copied, setCopied] = useState(false);
+  const [open, setOpen]     = useState(false);
+
+  const S = { fontFamily:"'DM Sans',system-ui,sans-serif" };
+
+  function load() {
+    fetch(`/api/actors/${actor.id}/share-links`)
+      .then(r => r.ok ? r.json() : [])
+      .then(setLinks)
+      .catch(() => {});
+  }
+  useEffect(() => { if (open) load(); }, [open, actor.id]);
+
+  async function mint() {
+    setBusy(true); setErr(null); setCopied(false);
+    try {
+      const r = await fetch(`/api/actors/${actor.id}/share-links`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ permission: perm, expires_in_days: Number(days), max_claims: seats === "" ? null : Number(seats) }),
+      });
+      const b = await r.json().catch(() => ({}));
+      if (!r.ok) { setErr(b.error || "Could not create the link."); return; }
+      // The server returns a PATH, never an absolute URL - express has no trust
+      // proxy here, so a server-composed URL goes out as http:// behind the
+      // https:// tunnel. The browser knows its own origin.
+      setMinted(window.location.origin + b.share_path);
+      load();
+    } finally { setBusy(false); }
+  }
+
+  async function revoke(id, alsoClaims) {
+    await fetch(`/api/actors/${actor.id}/share-links/${id}${alsoClaims ? "?revoke_claims=1" : ""}`, { method: "DELETE" });
+    load();
+  }
+
+  async function copy() {
+    try { await navigator.clipboard.writeText(minted); setCopied(true); }
+    catch { setErr("Could not reach the clipboard - select the link and copy it."); }
+  }
+
+  const STATE_STYLE = {
+    active:    { bg:"rgba(99,153,34,.1)",   fg:"#3b6d11" },
+    revoked:   { bg:"rgba(192,57,43,.09)",  fg:"#a8392f" },
+    expired:   { bg:"rgba(136,135,128,.1)", fg:"#5f5e5a" },
+    exhausted: { bg:"rgba(136,135,128,.1)", fg:"#5f5e5a" },
+  };
+
+  if (!open) {
+    return (
+      <button onClick={() => setOpen(true)}
+        style={{ ...S, fontSize:11, letterSpacing:".06em", textTransform:"uppercase", color:"#6b6760", background:"none", border:"1px solid rgba(0,0,0,.12)", borderRadius:9, padding:"8px 14px", cursor:"pointer" }}>
+        Share by link — outside your organisation
+      </button>
+    );
+  }
+
+  return (
+    <div>
+      <div style={{ ...S, fontSize:9, letterSpacing:".15em", textTransform:"uppercase", color:"#a8a5a0", marginBottom:8 }}>Share by link</div>
+      <div style={{ ...S, fontSize:11, color:"#a8a5a0", lineHeight:1.55, marginBottom:12 }}>
+        For someone outside your organisation. Anyone who opens the link while signed in gets access, so hand it over the way you would a key.
+      </div>
+
+      <div style={{ display:"flex", gap:7, alignItems:"center", flexWrap:"wrap", marginBottom:10 }}>
+        <select value={perm} onChange={e => setPerm(e.target.value)}
+          style={{ ...S, fontSize:12, padding:"8px 10px", borderRadius:10, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.8)", color:"#1a1814" }}>
+          <option value="read">Read</option>
+          <option value="use">Use</option>
+        </select>
+        <label style={{ ...S, fontSize:11, color:"#6b6760", display:"flex", alignItems:"center", gap:5 }}>
+          expires in
+          <input type="number" min="1" max="365" value={days} onChange={e => setDays(e.target.value)}
+            style={{ ...S, fontSize:12, width:52, padding:"7px 8px", borderRadius:9, border:"1px solid rgba(0,0,0,.1)" }} />
+          days
+        </label>
+        <label style={{ ...S, fontSize:11, color:"#6b6760", display:"flex", alignItems:"center", gap:5 }}>
+          max uses
+          <input type="number" min="1" placeholder="∞" value={seats} onChange={e => setSeats(e.target.value)}
+            style={{ ...S, fontSize:12, width:52, padding:"7px 8px", borderRadius:9, border:"1px solid rgba(0,0,0,.1)" }} />
+        </label>
+        <button onClick={mint} disabled={busy}
+          style={{ ...S, fontSize:11, letterSpacing:".06em", textTransform:"uppercase", padding:"8px 16px", borderRadius:10, background:"#1a1814", color:"#faf8f4", border:"none", cursor:"pointer", opacity: busy ? .4 : 1 }}>
+          {busy ? "..." : "Create link"}
+        </button>
+      </div>
+
+      <div style={{ ...S, fontSize:11, color:"#a8a5a0", marginBottom:12, lineHeight:1.55 }}>
+        <b style={{ fontWeight:500, color: PERM_STYLE[perm].fg }}>{perm}</b> — {LINK_HELP[perm]} A link can never grant <b style={{ fontWeight:500 }}>copy</b>; share by name for that.
+      </div>
+
+      {err && <div style={{ ...S, fontSize:12, color:"#c0392b", marginBottom:10 }}>{err}</div>}
+
+      {minted && (
+        <div style={{ background:"rgba(99,153,34,.07)", border:"1px solid rgba(99,153,34,.2)", borderRadius:10, padding:"10px 12px", marginBottom:12 }}>
+          <div style={{ ...S, fontSize:10, letterSpacing:".1em", textTransform:"uppercase", color:"#3b6d11", marginBottom:6 }}>
+            Copy it now — it is not shown again
+          </div>
+          <div style={{ display:"flex", gap:7, alignItems:"center" }}>
+            <input readOnly value={minted} onFocus={e => e.target.select()}
+              style={{ ...S, flex:1, fontSize:11, padding:"7px 9px", borderRadius:8, border:"1px solid rgba(0,0,0,.1)", background:"#fff", color:"#1a1814" }} />
+            <button onClick={copy}
+              style={{ ...S, fontSize:11, padding:"7px 12px", borderRadius:8, background:"#1a1814", color:"#faf8f4", border:"none", cursor:"pointer" }}>
+              {copied ? "Copied" : "Copy"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {links.map(l => {
+        const st = STATE_STYLE[l.state] || STATE_STYLE.expired;
+        return (
+          <div key={l.id} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:10, padding:"8px 0", borderBottom:"1px solid rgba(0,0,0,.05)" }}>
+            <div style={{ minWidth:0 }}>
+              <div style={{ ...S, fontSize:12, color:"#1a1814" }}>
+                {l.permission} · {l.claims_used}{l.max_claims != null ? `/${l.max_claims}` : ""} claimed
+              </div>
+              <div style={{ ...S, fontSize:10, color:"#a8a5a0", marginTop:2, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                {l.claimed_by?.length ? l.claimed_by.map(c => c.name).join(", ") : "nobody yet"}
+                {" · expires "}{(l.expires_at || "").slice(0, 10)}
+              </div>
+            </div>
+            <div style={{ display:"flex", alignItems:"center", gap:9, flexShrink:0 }}>
+              <span style={{ ...S, fontSize:9, letterSpacing:".07em", padding:"3px 8px", borderRadius:5, background:st.bg, color:st.fg }}>{l.state}</span>
+              {l.state === "active" && (
+                <button onClick={() => revoke(l.id, false)}
+                  style={{ ...S, fontSize:11, color:"#c0c0b8", background:"none", border:"none", cursor:"pointer", padding:0 }}>Revoke</button>
+              )}
+              {l.claimed_by?.length > 0 && (
+                <button onClick={() => revoke(l.id, true)} title="Revoke the link and remove everyone who came in through it"
+                  style={{ ...S, fontSize:11, color:"#c0392b", background:"none", border:"none", cursor:"pointer", padding:0 }}>Revoke + remove</button>
+              )}
+            </div>
+          </div>
+        );
+      })}
+      {links.length === 0 && (
+        <div style={{ ...S, fontSize:12, color:"#a8a5a0" }}>No links yet.</div>
+      )}
+    </div>
+  );
+}
+
 function ShareModal({ actor, onClose }) {
   const [shares, setShares]   = useState([]);
   const [users, setUsers]     = useState([]);
@@ -173,8 +339,8 @@ function ShareModal({ actor, onClose }) {
           )}
         </div>
 
-        <div style={{ padding:"10px 22px 20px", borderTop:"1px solid rgba(0,0,0,.05)" }}>
-          
+        <div style={{ padding:"14px 22px 20px", borderTop:"1px solid rgba(0,0,0,.05)" }}>
+          <ShareLinkSection actor={actor} />
         </div>
       </div>
     </div>

@@ -416,13 +416,30 @@ export default function LoginPage() {
     // cookie set by server
     setStep("success");
 
+    // Session 158 - somebody who opened a /share/:token link signed-out stashed
+    // it before being sent here. Return them to the claim rather than dropping
+    // them on /home with the token gone from the URL. Only ever an internal
+    // /share/ path: reading a redirect target out of storage and following it
+    // unchecked is an open redirect.
+    let next = "/home";
+    try {
+      const stashed = sessionStorage.getItem("anima_after_login");
+      if (stashed && stashed.startsWith("/share/")) {
+        next = stashed;
+        sessionStorage.removeItem("anima_after_login");
+      }
+    } catch { /* private mode */ }
+
     // Signing in from inside the app itself: there is nothing to hand over to.
     if (/(^|\s)Anima\//.test(navigator.userAgent)) {
-      setTimeout(() => { window.location.href = "/home"; }, 1400);
+      setTimeout(() => { window.location.href = next; }, 1400);
       return;
     }
 
-    if (body.handoff) {
+    // A pending share claim outranks the desktop handoff. They opened a link in
+    // THIS browser to accept a character; launching the app instead would drop
+    // the claim on the floor.
+    if (body.handoff && next === "/home") {
       setHandoffUrl(body.handoff);
       setHandedOver(true);
       // Immediately, off the back of the click that submitted the code — no
@@ -434,7 +451,7 @@ export default function LoginPage() {
       return;
     }
 
-    setTimeout(() => { window.location.href = "/home"; }, 1400);
+    setTimeout(() => { window.location.href = next; }, 1400);
   }
 
   if (inDesktopApp && step !== "success") {

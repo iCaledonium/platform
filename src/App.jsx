@@ -13,6 +13,7 @@ import WatcherPanel, { watcherIsFollowing } from "./components/WatcherPanel.jsx"
 import LoginPage from "./pages/LoginPage.jsx";
 import EnrollPage from "./pages/EnrollPage.jsx";
 import InvitePage from "./pages/InvitePage.jsx";
+import ClaimSharePage from "./pages/ClaimSharePage.jsx";
 import AdminUsersPage from "./pages/AdminUsersPage.jsx";
 import HomePage from "./pages/HomePage.jsx";
 import DeveloperPage from "./pages/DeveloperPage.jsx";
@@ -206,8 +207,13 @@ export default function App() {
   // list. Getting it wrong is not cosmetic: an invitee has no session, and the
   // full shell immediately opens an SSE stream and polls notifications, both of
   // which 401 in a loop behind the one page that must work signed out.
+  // Session 158 - /share/:token joins this list for exactly the reason above.
+  // A share link is opened by strangers, including people with no account on
+  // this platform at all; behind the full shell every one of them would sit
+  // through an SSE stream and a notification poll 401ing in a loop.
   const isAuthPage = ["/login", "/enroll"].includes(location.pathname)
-                  || location.pathname.startsWith("/invite/");
+                  || location.pathname.startsWith("/invite/")
+                  || location.pathname.startsWith("/share/");
 
   useEffect(() => {
     if (isAuthPage) return;
@@ -357,6 +363,7 @@ export default function App() {
         <Route path="/login"         element={<LoginPage />} />
         <Route path="/enroll"        element={<EnrollPage />} />
         <Route path="/invite/:token" element={<InvitePage />} />
+        <Route path="/share/:token"  element={<ClaimSharePage />} />
         <Route path="*"              element={<Navigate to="/login" replace />} />
       </Routes>
     );
