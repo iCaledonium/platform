@@ -24,6 +24,7 @@ export default function LabTestManagerPage() {
   const navigate = useNavigate();
 
   const [benches, setBenches] = useState([]);
+  const [coverage, setCoverage] = useState(null);
   const [targets, setTargets] = useState([]);
   const [worlds, setWorlds] = useState([]);
   const [actors, setActors] = useState([]);
@@ -76,7 +77,7 @@ export default function LabTestManagerPage() {
   useEffect(() => {
     fetch("/api/test/benches", { credentials: "include" })
       .then(r => { if (r.status === 401) setAuthed(false); return r.json(); })
-      .then(j => setBenches(Array.isArray(j.benches) ? j.benches : []))
+      .then(j => { setBenches(Array.isArray(j.benches) ? j.benches : []); setCoverage(j.coverage || null); })
       .catch(e => setError(String(e.message || e)));
     (async () => {
       try {
@@ -210,6 +211,32 @@ export default function LabTestManagerPage() {
               {targets.filter(t => t.enabled).length} pinned target(s) · {globals.length} global board(s)
             </span>
           </div>
+
+          {/* A board with a live /api/test/<key>/checks route that the sweep
+              knows nothing about. This is the failure that prompted the check:
+              two benches were added by other sessions and the manager kept
+              reporting a clean sweep while measuring a subset. */}
+          {coverage?.unwired?.length > 0 && (
+            <div style={{ fontSize: 11, lineHeight: 1.7, color: "#e0736b" }}>
+              Boards this sweep does NOT cover: {coverage.unwired.join(", ")}.
+              Each has a live scorecard route and no entry in the catalogue, so nothing
+              here measures it — add it to BENCHES in server/lab-incidents.js.
+            </div>
+          )}
+
+          {coverage?.missing?.length > 0 && (
+            <div style={{ fontSize: 11, lineHeight: 1.7, color: "#c96fd0" }}>
+              Catalogued but no longer served: {coverage.missing.join(", ")}.
+              A renamed or removed board would otherwise show up only as one that
+              mysteriously never fails.
+            </div>
+          )}
+
+          {coverage && !coverage.unwired?.length && !coverage.missing?.length && (
+            <div style={{ fontSize: 10.5, color: "rgba(150,210,150,.65)" }}>
+              Every scorecard route on this server is in the sweep ({coverage.detected.length} boards).
+            </div>
+          )}
 
           {benches.filter(b => b.scoped && !configured.has(b.key)).length > 0 && (
             <div style={{ fontSize: 11, lineHeight: 1.7, color: "#d9a441" }}>

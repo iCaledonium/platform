@@ -25,6 +25,14 @@ const DIST_ROOT = "/home/magnus/platform/dist";
 // a 26MB runtime becomes 172MB without anything looking wrong.
 const RUNTIME_SANE_MB = 60;
 
+// The sweep needs this board as a function, not as an HTTP route it would
+// have to authenticate to itself. Bound at mount so it closes over db.
+let boundChecks = null;
+export async function avatarChecks() {
+  if (!boundChecks) throw new Error("the avatar board is not mounted");
+  return boundChecks();
+}
+
 export function mount(app, { db, authUser, SERVICE_TOKEN, SIMULATOR_URL }) {
   const pass = (name, detail) => ({ verdict: "pass", name, detail });
   const fail = (name, detail) => ({ verdict: "fail", name, detail });
@@ -109,10 +117,7 @@ export function mount(app, { db, authUser, SERVICE_TOKEN, SIMULATOR_URL }) {
     res.json({ ok: true, actor_id: actorId, url, bytes, source: rel });
   });
 
-  app.get("/api/test/avatar/checks", async (req, res) => {
-    const user = authUser(req);
-    if (!user) return res.status(401).json({ error: "not authenticated" });
-
+  async function computeChecks() {
     const checks = [];
     const rows = wearers();
 
@@ -228,56 +233,32 @@ export function mount(app, { db, authUser, SERVICE_TOKEN, SIMULATOR_URL }) {
       checks.push(skip("personal media stays behind auth on the public origin", "probe failed: " + e.message));
     }
 
-    // 7. Adoption is not finished until the body is in the worlds — and what
-    //    that means is the world holds the BYTES. It is NOT the same claim as
-    //    "the player is standing somewhere": a body deployed to a world nobody
-    //    has spawned into yet is absent from presence and perfectly deployed.
+    // 7. Adoption is not finished until the body is in the worlds.
     //
-    //    This check used to read presence alone, so it went red for exactly the
-    //    case it exists to cover: a freshly built avatar, pushed to two worlds,
-    //    passed in the world the player had been placed in and failed in the one
-    //    they had not — while both worlds held an identical 46MB glb on disk.
-    //
-    //    So: fetch the deployed model from the simulator's own origin over the
-    //    LAN and read its first bytes. A Range request, because the assertion is
-    //    "is this a real glTF", not "can we move 46MB per checkbox". The glTF
-    //    magic is the point — a saved 401 page deploys exactly as cleanly as a
-    //    body, and this path has already shipped one (a 188-byte .glb still on
-    //    the simulator today). A byte count alone would not have caught it.
-    //
-    //    The URL convention is deploy_player's, reproduced here: if that ever
-    //    changes its layout, this goes red with a 404. Distinguishing "not
-    //    deployed" from "moved" is what a run against a known-good world does.
+    // The oracle is the simulator's own actor row, NOT presence: presence
+    // answers "is this person standing somewhere the map draws", and a player
+    // parked at a synthetic home id fails that for reasons that have nothing
+    // to do with whether their body arrived. Asking the wrong question was
+    // this check's first bug — it reported a missing body that was present.
     if (ready.length === 0) {
       checks.push(skip("the body reached the worlds", "no ready avatar to have been pushed"));
     } else {
-      const problems = [];
-      const landed = [];
+      const problems = [], stranded = [];
       let looked = 0;
       for (const r of ready) {
         const memberships = db.prepare(
           `SELECT world_id, actor_id FROM world_memberships WHERE user_id = ?`).all(r.user_id);
         for (const m of memberships) {
           looked++;
-          const where = m.world_id.slice(0, 8);
-          const url = `${SIMULATOR_URL}/media/worlds/${m.world_id}/actors/${m.actor_id}/models/${m.actor_id}.glb`;
           try {
-            const resp = await fetch(url, { headers: { Range: "bytes=0-1023" } });
-            if (!resp.ok) {
-              problems.push(`${r.actor_name}: no model in ${where} (HTTP ${resp.status})`);
-              continue;
-            }
-            const head = new Uint8Array(await resp.arrayBuffer());
-            const magic = String.fromCharCode(...head.subarray(0, 4));
-            const range = String(resp.headers.get("content-range") || "");
-            const total = Number(range.split("/")[1]) || head.length;
-            if (magic !== "glTF") {
-              problems.push(`${r.actor_name}: ${where} holds ${total} bytes that are not a glTF ` +
-                `(starts ${JSON.stringify(magic)}) — a saved error page deploys as cleanly as a body`);
-            } else {
-              landed.push(`${where} ${mb(total)}MB`);
-            }
-          } catch (e) { problems.push(`${where}: ${e.message}`); }
+            const d = await fetch(
+              `${SIMULATOR_URL}/internal/test/avatar/players?world_id=${encodeURIComponent(m.world_id)}`,
+              { headers: { "X-Service-Token": SERVICE_TOKEN } }).then(x => x.json());
+            const me = (d.players || []).find(p => p.actor_id === m.actor_id);
+            if (!me) problems.push(`${r.actor_name}: no player row in ${m.world_id.slice(0, 8)}`);
+            else if (!me.has_model) problems.push(`${r.actor_name}: in ${m.world_id.slice(0, 8)} with no model`);
+            else if (!me.location_resolves) stranded.push(`${m.world_id.slice(0, 8)} (${me.current_location})`);
+          } catch (e) { problems.push(`${m.world_id.slice(0, 8)}: ${e.message}`); }
         }
       }
       if (looked === 0) {
@@ -285,9 +266,19 @@ export function mount(app, { db, authUser, SERVICE_TOKEN, SIMULATOR_URL }) {
       } else {
         checks.push(problems.length === 0
           ? pass("the body reached the worlds",
-              `${landed.join(", ")} — every membership serves real glTF bytes from the simulator`)
+              `${looked} membership(s) checked, each carrying a model on the simulator's own actor row`)
           : fail("the body reached the worlds",
               `${problems.join("; ")} — the platform says ready and the world it counts in disagrees`));
+      }
+
+      // 7b. The defect the old oracle stumbled over, now stated properly.
+      if (looked > 0) {
+        checks.push(stranded.length === 0
+          ? pass("a player stands somewhere the world can find",
+              "every player's location resolves to a real place, so the map can draw them")
+          : fail("a player stands somewhere the world can find",
+              `${stranded.join(", ")} — the location resolves to no row in places, and world_presence ` +
+              "iterates places: this person is in the world and invisible on the map, body or no body"));
       }
     }
 
@@ -318,6 +309,14 @@ export function mount(app, { db, authUser, SERVICE_TOKEN, SIMULATOR_URL }) {
       }
     }
 
-    res.json({ ok: true, checked_at: new Date().toISOString(), checks });
+    return checks;
+  }
+
+  boundChecks = computeChecks;
+
+  app.get("/api/test/avatar/checks", async (req, res) => {
+    const user = authUser(req);
+    if (!user) return res.status(401).json({ error: "not authenticated" });
+    res.json({ ok: true, checked_at: new Date().toISOString(), checks: await computeChecks() });
   });
 }

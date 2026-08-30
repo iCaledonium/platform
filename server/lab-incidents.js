@@ -137,6 +137,34 @@ export const BENCHES = {
   },
 };
 
+// Which boards exist that this catalogue does not know about?
+//
+// BENCHES is a hardcoded list of other people's work, and on 2026-08-30 it
+// went stale twice in one evening: the avatar and wizard benches were added
+// by other sessions and the manager kept reporting a clean sweep while
+// measuring a subset. Silence is the defect there, not the missing entry.
+// Every bench exposes GET /api/test/<key>/checks, so diff the LIVE Express
+// route table against the catalogue instead of trusting anyone to remember.
+export function boardCoverage(app) {
+  const found = new Set();
+  const stack = app?._router?.stack || app?.router?.stack || [];
+  for (const layer of stack) {
+    const p = layer?.route?.path;
+    if (typeof p !== "string") continue;
+    const m = p.match(/^\/api\/test\/([A-Za-z0-9_-]+)\/checks$/);
+    if (m) found.add(m[1]);
+  }
+  const known = Object.keys(BENCHES);
+  return {
+    detected: [...found].sort(),
+    // A live board no sweep touches.
+    unwired: [...found].filter((k) => !known.includes(k)).sort(),
+    // A catalogued bench whose route has gone — a rename or removal, which
+    // would otherwise surface only as a board that mysteriously never fails.
+    missing: known.filter((k) => !found.has(k)).sort(),
+  };
+}
+
 export function fingerprintOf({ bench, check_name, world_id, actor_id }) {
   return [bench, check_name, world_id || "-", actor_id || "-"].join("|");
 }
@@ -417,14 +445,15 @@ export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN,
     }
 
     // Global, platform-local board.
-    if (bench === "signup") {
-      if (typeof signupChecks !== "function") {
+    if (spec.local) {
+      const board = localBoards[spec.local];
+      if (typeof board !== "function") {
         boards.push({ bench, label: spec.label, scope: "global", state: "not configured",
-          detail: "the signup board was not wired into this sweep" });
+          detail: `the ${bench} board was not wired into this sweep` });
         continue;
       }
       try {
-        const checks = await signupChecks();
+        const checks = await board();
         if (!Array.isArray(checks)) throw new Error("the board came back without a checks array");
         totals.boards_ok++;
         const tally = fileBoard({ bench, target: { world_id: null, actor_id: null }, checks, source });

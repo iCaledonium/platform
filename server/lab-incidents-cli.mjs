@@ -13,6 +13,8 @@
 // boundary, key-authed, and adds no new surface at all.
 //
 //   ssh mac-mini-ubuntu 'node ~/platform/server/lab-incidents-cli.mjs sweep --source routine:nightly'
+//     (delegates to the running platform-api over loopback, so it covers all
+//      six boards — including the three that only exist inside that process)
 //   ssh mac-mini-ubuntu 'node ~/platform/server/lab-incidents-cli.mjs report' < finding.json
 //   ssh mac-mini-ubuntu 'node ~/platform/server/lab-incidents-cli.mjs list --status unresolved'
 //
@@ -24,7 +26,9 @@
 // 2 = the store or the sweep itself failed.
 
 import { readFileSync } from "node:fs";
+import crypto from "node:crypto";
 import * as store from "./lab-incidents.js";
+import db from "./db.js";
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -40,20 +44,44 @@ function readStdin() {
 async function main() {
   switch (cmd) {
     case "sweep": {
-      const SIMULATOR_URL = process.env.SIMULATOR_URL || "http://192.168.1.58:4000";
-      const SERVICE_TOKEN = process.env.PLATFORM_SERVICE_TOKEN || readTokenFromUnit();
-      if (!SERVICE_TOKEN) {
-        console.error("no PLATFORM_SERVICE_TOKEN — the simulator boards cannot be read without it");
+      // Delegate to the RUNNING platform-api rather than sweeping in here.
+      //
+      // Three of the six boards (signup, wizard, avatar) are functions living
+      // inside that process; a sweep from out here can only report them "not
+      // configured", which is honest but useless for a nightly routine. Going
+      // through the process means the routine and the button run the identical
+      // code over the identical six boards.
+      const PORT = Number(process.env.PORT || 4002);
+      const source = flag("source", "routine:cli");
+      const token = crypto.randomBytes(16).toString("hex");
+      const hash = crypto.createHash("sha256").update(token).digest("hex");
+      const user = db.prepare(
+        `SELECT id FROM users WHERE status != 'removed' ORDER BY (id='mk') DESC LIMIT 1`).get();
+      if (!user) { console.error("no user to act as"); process.exit(2); }
+      db.prepare(`INSERT INTO auth_tokens (id, user_id, token_hash, expires_at, inserted_at)
+                  VALUES (lower(hex(randomblob(8))), ?, ?, datetime('now','+60 seconds'), datetime('now'))`)
+        .run(user.id, hash);
+      try {
+        const r = await fetch(`http://127.0.0.1:${PORT}/api/test/sweep/run`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Cookie": `anima_token=${token}` },
+          body: JSON.stringify({ source }),
+        });
+        const body = await r.json().catch(() => null);
+        if (!r.ok || !body?.ok) {
+          console.error(`the sweep endpoint refused: HTTP ${r.status} ${JSON.stringify(body)}`);
+          process.exit(2);
+        }
+        console.log(JSON.stringify(body, null, 2));
+        process.exit(0);
+      } catch (e) {
+        // A dead platform-api must be loud. Reporting nothing here would look
+        // exactly like a clean sweep to whatever reads this output.
+        console.error(`platform-api unreachable on 127.0.0.1:${PORT} — nothing was measured: ${e.message}`);
         process.exit(2);
+      } finally {
+        db.prepare(`DELETE FROM auth_tokens WHERE token_hash = ?`).run(hash);
       }
-      // The signup board lives inside the running platform-api process, not in
-      // this one. A CLI sweep therefore covers the three simulator benches and
-      // says so, rather than quietly reporting a bench it never read.
-      const out = await store.runSweep({
-        source: flag("source", "routine:cli"), SIMULATOR_URL, SERVICE_TOKEN,
-      });
-      console.log(JSON.stringify(out, null, 2));
-      process.exit(0);
     }
 
     case "report": {
@@ -90,21 +118,6 @@ async function main() {
       console.error(`usage: lab-incidents-cli.mjs <sweep|report|list|runs> [--source X] [--status X] [--bench X] [--limit N]`);
       process.exit(1);
   }
-}
-
-// index.js reads the token from PLATFORM_SERVICE_TOKEN, which the systemd unit
-// supplies as an `Environment=` line rather than from an env file. A CLI run by
-// hand or from cron has neither, so fall back to the unit itself.
-function readTokenFromUnit() {
-  for (const p of ["/etc/systemd/system/platform-api.service",
-                   "/lib/systemd/system/platform-api.service",
-                   `${process.env.HOME}/platform/.env`]) {
-    try {
-      const m = readFileSync(p, "utf8").match(/PLATFORM_SERVICE_TOKEN=([^\s"']+)/);
-      if (m) return m[1].trim();
-    } catch { /* not there */ }
-  }
-  return null;
 }
 
 main().catch((e) => { console.error(String(e.stack || e)); process.exit(2); });

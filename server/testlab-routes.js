@@ -117,9 +117,14 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
 
   app.get("/api/test/benches", (req, res) => {
     if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
-    res.json({ ok: true, benches: Object.entries(labIncidents.BENCHES).map(([key, b]) => ({
-      key, label: b.label, page: b.page, watcher: b.watcher,
-      side: b.side, scoped: !!b.scoped, needs_actor: !!b.needsActor })) });
+    res.json({ ok: true,
+      // Read from the LIVE route table, not from the catalogue: a bench another
+      // session adds shows up here as unwired instead of going unmeasured in
+      // silence, which is how the avatar and wizard boards were missed.
+      coverage: labIncidents.boardCoverage(app),
+      benches: Object.entries(labIncidents.BENCHES).map(([key, b]) => ({
+        key, label: b.label, page: b.page, watcher: b.watcher,
+        side: b.side, scoped: !!b.scoped, needs_actor: !!b.needsActor })) });
   });
 
   app.get("/api/test/incidents", (req, res) => {
@@ -212,7 +217,7 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
     });
     try {
       const out = await sweepInFlight;
-      res.json({ ok: true, ...out });
+      res.json({ ok: true, coverage: labIncidents.boardCoverage(app), ...out });
     } catch (e) {
       res.status(500).json({ error: "the sweep failed", detail: String(e.message || e).slice(0, 300) });
     } finally {
