@@ -111,7 +111,31 @@ export default function AvatarLabPage() {
         if (s.stage === "ready") break;
       }
 
-      // Only now is there a body to wear. Adoption pushes on its own.
+      // Finish the profile before wearing it. POST /api/actors with an id takes
+      // the finalize branch, moving draft -> ready_to_deploy.
+      //
+      // This is not bookkeeping. A draft is deliberately NOT a ready avatar —
+      // the wizard's own close dialog offers "discard changes" and leaves the
+      // draft standing, so treating a draft as finished would let somebody who
+      // walked away mid-authoring spawn in a body they never completed. This
+      // bench built one and adopted it unfinished until Session 160, which is
+      // how that hole was found.
+      setJob({ stage: "finalising", actor_id: id });
+      const finalised = await fetch("/api/actors", {
+        method: "POST", credentials: "include", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, identity: {
+          first_name: parts[0] || me.id,
+          last_name: parts.slice(1).join(" ") || null,
+          age: age === "" ? null : Number(age),
+          gender: me.gender || "male",
+        } }),
+      });
+      if (!finalised.ok) {
+        const d = await finalised.json().catch(() => ({}));
+        throw new Error(d.error || `could not finish the profile — HTTP ${finalised.status}`);
+      }
+
+      // Only now is there a finished body to wear. Adoption pushes on its own.
       const adopted = await fetch("/api/me/avatar", {
         method: "POST", credentials: "include", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ actor_id: id }),
@@ -180,7 +204,32 @@ export default function AvatarLabPage() {
         <div style={section}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
             <span style={label}>Your body, as the platform sees it</span>
-            <button onClick={refresh} style={{ ...chip(false), padding: "5px 12px" }}>Refresh</button>
+            <span style={{ display: "flex", gap: 8 }}>
+              {/* The bench reports a verdict; these are the two ways to act on it.
+                  Open goes where a person fixes it by hand — a draft is finished in
+                  the wizard, and nothing else on this page can finish one. */}
+              <button onClick={() => navigate("/me/avatar")} style={{ ...chip(true), padding: "5px 12px" }}
+                title="Open your 3D profile in the wizard — where a draft gets finished">
+                Open profile
+              </button>
+              <button style={{ ...chip(false), padding: "5px 12px" }}
+                title="Hand the current state to the watcher: read it, say what it means, act within charter"
+                onClick={() => window.dispatchEvent(new CustomEvent("watcher:ask", { detail: { text:
+                  `Developer pressed OPEN WITH WATCHER on the Avatar Lab state panel. GET /api/me/avatar ` +
+                  `currently reports: state=${avatar?.state ?? "no answer"}, ready=${avatar?.ready ?? "?"}, ` +
+                  `status=${avatar?.status ?? "?"}, actor=${avatar?.actor_id ?? "none"}, ` +
+                  `has_model=${avatar?.has_model ?? "?"}, has_runtime=${avatar?.has_runtime ?? "?"}. — ` +
+                  "Say what that state MEANS for whether this person can enter a world, and what the next " +
+                  "action is. avatarStateOf() in server/index.js is the oracle: ready requires a model file " +
+                  "AND a status that is not draft, so a draft carrying a 46MB glb is deliberately NOT ready. " +
+                  "Your beat spans BOTH hosts: the platform (mac-mini-ubuntu:~/platform, DB ~/platform_dev.db " +
+                  "— WAL, so back up with sqlite3 .backup, never a file copy) and the simulator side of the " +
+                  "push. Media lives under ~/platform/public/media, NOT ~/platform/media. Code changes via " +
+                  "node --check and the restart-flag protocol. Re-run GET /api/test/avatar/checks when done." } }))}>
+                Ask watcher
+              </button>
+              <button onClick={refresh} style={{ ...chip(false), padding: "5px 12px" }}>Refresh</button>
+            </span>
           </div>
           {!avatar && <span style={{ fontSize: 11, color: "rgba(255,255,255,.35)" }}>no answer from /api/me/avatar</span>}
           {avatar && (
@@ -193,8 +242,12 @@ export default function AvatarLabPage() {
                 {avatar.ready ? (avatar.has_runtime ? " · runtime model" : " · base model only") : ""}
               </span>
               <span style={{ fontSize: 10.5, color: "rgba(255,255,255,.35)", lineHeight: 1.6 }}>
-                "building" is the honest middle state: a profile exists and has no body yet. Spawning is
-                gated on this server-side — the disabled button on /home is an affordance, not the control.
+                Two honest middle states, and they need different actions: "building" means a profile exists
+                and the pipeline has not produced a body yet — wait. "draft" means a body exists and the
+                profile was never finished — open it and finish it. Neither is ready, because readiness is
+                not "a file exists": a draft carrying a full model is deliberately refused, or walking away
+                mid-wizard would leave somebody wearing a body they never completed. Spawning is gated on
+                this server-side — the disabled button on /home is an affordance, not the control.
               </span>
             </div>
           )}
