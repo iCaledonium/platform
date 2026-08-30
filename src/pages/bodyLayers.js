@@ -64,6 +64,19 @@ const ZONE_PATTERNS = [
 const COVERAGE = [
   { match: "/legs/pants/", zones: ["pelvis", "thigh", "calf"] },
   { match: "/torso/top/", zones: ["chest", "abdomen", "shoulder", "upperarm", "forearm"] },
+  // Session 160 — an underwear TOP is a top. The catalogue files shirts under
+  // /underwear/top/, which matched nothing here, so a shirt declared no
+  // coverage at all and this pass short-circuited to "no covering garments —
+  // full skin restored". Session 157 had just excluded that same shirt from
+  // shrinkwrap for tearing its shoulders, so the garment ended up with neither
+  // fitting nor culling and the body rendered straight through the fabric.
+  //
+  // Same zones as /torso/top/ because it is the same silhouette, and generous
+  // by the rule stated above: this is the gate, not the verdict — the raycast
+  // decides per vertex, so a bra listing shoulder and forearm keeps the bare
+  // skin the rays find. That per-vertex test plus BURIED_FABRIC is exactly the
+  // combination this module documents for a top that is never shrinkwrapped.
+  { match: "/underwear/top/", zones: ["chest", "abdomen", "shoulder", "upperarm", "forearm"] },
   { match: "/legs/shoes/", zones: ["foot", "calf"] },
 ];
 
