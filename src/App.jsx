@@ -72,6 +72,12 @@ function LabWatcherOverlay() {
   else if (location.pathname.startsWith("/lab/world/behavior")) bound = "Runtime - World Behaviour";
   else if (qs.get("lab") === "behavior") bound = "Runtime - World Behaviour";
   else if (qs.get("lab") === "transport") bound = "Runtime - Transport Engine";
+  // The avatar bench sends people to the WIZARD to finish a draft — the one
+  // place a draft can be finished, and not a /lab path. Stamping it ?lab=avatar
+  // is the sanctioned way in (see the rule above), but without a binding here it
+  // would arrive as bound=null and host whichever conversation was last open —
+  // which is the one thing that rule forbids.
+  else if (qs.get("lab") === "avatar") bound = "Feature - User Avatar";
   else if (qs.has("lab") && location.pathname.includes("/knock/")) bound = "Feature - Actor Apartment Encounter";
   return <WatcherPanel bound={bound} />;
 }

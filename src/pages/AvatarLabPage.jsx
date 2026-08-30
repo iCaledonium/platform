@@ -208,7 +208,7 @@ export default function AvatarLabPage() {
               {/* The bench reports a verdict; these are the two ways to act on it.
                   Open goes where a person fixes it by hand — a draft is finished in
                   the wizard, and nothing else on this page can finish one. */}
-              <button onClick={() => navigate("/me/avatar")} style={{ ...chip(true), padding: "5px 12px" }}
+              <button onClick={() => navigate("/me/avatar?lab=avatar")} style={{ ...chip(true), padding: "5px 12px" }}
                 title="Open your 3D profile in the wizard — where a draft gets finished">
                 Open profile
               </button>
