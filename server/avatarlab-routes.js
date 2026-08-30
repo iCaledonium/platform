@@ -228,32 +228,64 @@ export function mount(app, { db, authUser, SERVICE_TOKEN, SIMULATOR_URL }) {
       checks.push(skip("personal media stays behind auth on the public origin", "probe failed: " + e.message));
     }
 
-    // 7. Adoption is not finished until the body is in the worlds.
+    // 7. Adoption is not finished until the body is in the worlds — and what
+    //    that means is the world holds the BYTES. It is NOT the same claim as
+    //    "the player is standing somewhere": a body deployed to a world nobody
+    //    has spawned into yet is absent from presence and perfectly deployed.
+    //
+    //    This check used to read presence alone, so it went red for exactly the
+    //    case it exists to cover: a freshly built avatar, pushed to two worlds,
+    //    passed in the world the player had been placed in and failed in the one
+    //    they had not — while both worlds held an identical 46MB glb on disk.
+    //
+    //    So: fetch the deployed model from the simulator's own origin over the
+    //    LAN and read its first bytes. A Range request, because the assertion is
+    //    "is this a real glTF", not "can we move 46MB per checkbox". The glTF
+    //    magic is the point — a saved 401 page deploys exactly as cleanly as a
+    //    body, and this path has already shipped one (a 188-byte .glb still on
+    //    the simulator today). A byte count alone would not have caught it.
+    //
+    //    The URL convention is deploy_player's, reproduced here: if that ever
+    //    changes its layout, this goes red with a 404. Distinguishing "not
+    //    deployed" from "moved" is what a run against a known-good world does.
     if (ready.length === 0) {
       checks.push(skip("the body reached the worlds", "no ready avatar to have been pushed"));
     } else {
       const problems = [];
+      const landed = [];
       let looked = 0;
       for (const r of ready) {
         const memberships = db.prepare(
           `SELECT world_id, actor_id FROM world_memberships WHERE user_id = ?`).all(r.user_id);
         for (const m of memberships) {
           looked++;
+          const where = m.world_id.slice(0, 8);
+          const url = `${SIMULATOR_URL}/media/worlds/${m.world_id}/actors/${m.actor_id}/models/${m.actor_id}.glb`;
           try {
-            const p = await fetch(`${SIMULATOR_URL}/internal/worlds/${m.world_id}/presence`,
-              { headers: { "X-Service-Token": SERVICE_TOKEN } }).then(x => x.json());
-            const me = (p.locations || []).flatMap(l => l.actors || [])
-              .find(a => a.actor_id === m.actor_id);
-            if (!me) problems.push(`${r.actor_name}: not present in ${m.world_id.slice(0, 8)}`);
-            else if (!me.glb_url && !me.runtime_glb_url) problems.push(`${r.actor_name}: present in ${m.world_id.slice(0, 8)} with no model`);
-          } catch (e) { problems.push(`${m.world_id.slice(0, 8)}: ${e.message}`); }
+            const resp = await fetch(url, { headers: { Range: "bytes=0-1023" } });
+            if (!resp.ok) {
+              problems.push(`${r.actor_name}: no model in ${where} (HTTP ${resp.status})`);
+              continue;
+            }
+            const head = new Uint8Array(await resp.arrayBuffer());
+            const magic = String.fromCharCode(...head.subarray(0, 4));
+            const range = String(resp.headers.get("content-range") || "");
+            const total = Number(range.split("/")[1]) || head.length;
+            if (magic !== "glTF") {
+              problems.push(`${r.actor_name}: ${where} holds ${total} bytes that are not a glTF ` +
+                `(starts ${JSON.stringify(magic)}) — a saved error page deploys as cleanly as a body`);
+            } else {
+              landed.push(`${where} ${mb(total)}MB`);
+            }
+          } catch (e) { problems.push(`${where}: ${e.message}`); }
         }
       }
       if (looked === 0) {
         checks.push(skip("the body reached the worlds", "the wearer belongs to no worlds"));
       } else {
         checks.push(problems.length === 0
-          ? pass("the body reached the worlds", `${looked} membership(s) checked, each carrying a model in the simulator`)
+          ? pass("the body reached the worlds",
+              `${landed.join(", ")} — every membership serves real glTF bytes from the simulator`)
           : fail("the body reached the worlds",
               `${problems.join("; ")} — the platform says ready and the world it counts in disagrees`));
       }
