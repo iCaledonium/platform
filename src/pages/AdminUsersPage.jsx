@@ -38,6 +38,19 @@ export default function AdminUsersPage() {
 
   useEffect(() => { load(); fetch("/api/me").then(r => r.ok ? r.json() : null).then(setMe).catch(() => {}); }, []);
 
+  // Cuts only the tie to this organization; the account, its personal org and
+  // any other memberships survive.
+  async function leaveOrg(u) {
+    setError(null);
+    try {
+      const res = await fetch(`/api/admin/users/${u.id}/membership`, { method: "DELETE" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "Could not remove them from the organization.");
+      setNotice(`${u.name} is no longer a member of ${me?.org?.name || "this organization"}. Their account is untouched.`);
+      load();
+    } catch (e) { setError(e.message); }
+  }
+
   async function setRole(u, org_role) {
     setError(null);
     try {
@@ -95,6 +108,15 @@ export default function AdminUsersPage() {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || "Could not create the account.");
+      if (data.added_to_org) {
+        // One person, several organizations: the address already had an
+        // account, so it was added here as a member — no new invite to hand over.
+        setIssued(null);
+        setNotice(`${data.user.name} already had an account and is now a member of your organization.`);
+        setName(""); setEmail(""); setGender("");
+        load();
+        return;
+      }
       setIssued({
         name: data.user.name,
         tier: data.user.tier,
@@ -216,6 +238,7 @@ export default function AdminUsersPage() {
             {tier === "staff"
               ? "Joins your organization: they will see, and be seen by, your other members."
               : "A private account in an organization of its own. They share nothing with your org, appear on nobody's list, and sign in with their email rather than by picking a name."}
+            {tier === "staff" && " If the address already has an account, that person is added to your organization instead of being created again."}
           </p>
 
           <button className={styles.primaryBtn} disabled={!canCreate} onClick={createUser}>
@@ -245,7 +268,7 @@ export default function AdminUsersPage() {
           {users?.map(u => {
             const pill = PILL[u.invite_state] || PILL.none;
             return (
-              <div key={u.id} className={styles.row}>
+              <div key={`${u.id}:${u.org_id}`} className={styles.row}>
                 <div className={styles.avatar}>{initials(u.name)}</div>
                 <div className={styles.rowInfo}>
                   <p className={styles.rowName}>{u.name}</p>
@@ -274,9 +297,15 @@ export default function AdminUsersPage() {
                     {u.org_role === "admin" ? "Make member" : "Make admin"}
                   </button>
                 )}
+                {u.status !== "removed" && u.org_kind === "organization" && u.id !== me?.id && (
+                  <button className={styles.ghostBtn} onClick={() => leaveOrg(u)}
+                          title="Take them out of this organization; their account stays">
+                    Remove from org
+                  </button>
+                )}
                 {u.status !== "removed" && u.id !== me?.id && (
                   <button className={`${styles.ghostBtn} ${styles.dangerBtn}`} onClick={() => setConfirming(u)}>
-                    Remove
+                    Erase
                   </button>
                 )}
               </div>

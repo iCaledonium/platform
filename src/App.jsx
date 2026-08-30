@@ -3,6 +3,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import ReactDOM from "react-dom";
 import LabPage             from "./pages/LabPage.jsx";
 import LabHomePage         from "./pages/LabHomePage.jsx";
+import SignupLabPage       from "./pages/SignupLabPage.jsx";
 import TransportLabPage    from "./pages/TransportLabPage.jsx";
 import WatcherPanel, { watcherIsFollowing } from "./components/WatcherPanel.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
@@ -57,6 +58,7 @@ function LabWatcherOverlay() {
   let bound = null;
   if (location.pathname.startsWith("/lab/actor/apartment/encounter")) bound = "Feature - Actor Apartment Encounter";
   else if (location.pathname.startsWith("/lab/transport")) bound = "Runtime - Transport Engine";
+  else if (location.pathname.startsWith("/lab/user/signup")) bound = "Feature - User Signup and Creation";
   else if (qs.get("lab") === "transport") bound = "Runtime - Transport Engine";
   else if (qs.has("lab") && location.pathname.includes("/knock/")) bound = "Feature - Actor Apartment Encounter";
   return <WatcherPanel bound={bound} />;
@@ -370,6 +372,7 @@ export default function App() {
         <Route path="/lab/home" element={<LabHomePage />} />
         <Route path="/lab/actor/apartment/encounter" element={<LabPage />} />
         <Route path="/lab/transport/actor" element={<TransportLabPage />} />
+        <Route path="/lab/user/signup" element={<SignupLabPage />} />
         <Route path="/lab" element={<Navigate to="/lab/home" replace />} />
         <Route path="/actors"            element={<ActorsGalleryPage />} />
         <Route path="/actors/new"        element={<CharacterWizard />} />

@@ -14,6 +14,7 @@ import { registerGenerate3DRoutes, deleteActorTmpFolder, appearanceHash } from "
 import { mergeAnimationIntoActorGlb, removeAnimationFromActorGlb, parseDufFrames } from "./animations.js";
 import { educationFromCv } from "./cv_edu.mjs";
 import { mount as mountTestLabRoutes } from "./testlab-routes.js";
+import { mount as mountSignupLabRoutes } from "./signuplab-routes.js";
 
 // Session 102 — drafts carry their wizard adjustment state (all morph
 // slider values, the named body sliders, pose values, reference URLs,
@@ -219,6 +220,85 @@ db.prepare(`CREATE TABLE IF NOT EXISTS user_invites (
   inserted_at TEXT NOT NULL
 )`).run();
 
+// ── Memberships — a person belongs to many orgs, and one of them is their own ──
+//
+// Session 157 (watcher 'Feature - User Signup and Creation'). Until now a user
+// stood inside exactly one org, and a personal org's single occupant was born a
+// 'member' — an org nobody could ever administer. Two intentional rules
+// ("always born a member", "no org without an admin") only reconcile once the
+// personal org is the person's OWN: everyone owns one and is its admin, and
+// organization membership is the additive kind, born 'member'.
+//
+// users.org_id / org_role stay, redefined as the ACTIVE org — the one this
+// session acts in — mirrored from memberships. Every route that reads a scalar
+// org keeps working; role changes write memberships first and mirror back.
+db.prepare(`CREATE TABLE IF NOT EXISTS memberships (
+  user_id     TEXT NOT NULL REFERENCES users(id),
+  org_id      TEXT NOT NULL REFERENCES orgs(id),
+  role        TEXT NOT NULL DEFAULT 'member',
+  inserted_at TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  PRIMARY KEY (user_id, org_id)
+)`).run();
+db.prepare(`CREATE INDEX IF NOT EXISTS memberships_org_idx ON memberships (org_id)`).run();
+try { db.prepare(`ALTER TABLE users ADD COLUMN personal_org_id TEXT REFERENCES orgs(id)`).run(); } catch { /* exists */ }
+
+function addMembership(userId, orgId, role) {
+  db.prepare(`INSERT OR IGNORE INTO memberships (user_id, org_id, role, inserted_at, updated_at)
+              VALUES (?, ?, ?, datetime('now'), datetime('now'))`).run(userId, orgId, role);
+}
+function membershipOf(userId, orgId) {
+  return db.prepare(`SELECT role FROM memberships WHERE user_id = ? AND org_id = ?`).get(userId, orgId) || null;
+}
+function membershipsOf(userId) {
+  return db.prepare(`SELECT m.org_id, m.role, o.name, o.kind FROM memberships m JOIN orgs o ON o.id = m.org_id
+                     WHERE m.user_id = ? AND o.status = 'active' ORDER BY o.kind DESC, o.name`).all(userId);
+}
+// Mirror the active org onto the users row, so authUser and every scalar
+// reader stay honest. False when the user does not belong there.
+function activateOrg(userId, orgId) {
+  const m = membershipOf(userId, orgId);
+  if (!m) return false;
+  db.prepare(`UPDATE users SET org_id = ?, org_role = ?, updated_at = datetime('now') WHERE id = ?`).run(orgId, m.role, userId);
+  return true;
+}
+function setMembershipRole(userId, orgId, role) {
+  db.prepare(`UPDATE memberships SET role = ?, updated_at = datetime('now') WHERE user_id = ? AND org_id = ?`).run(role, userId, orgId);
+  db.prepare(`UPDATE users SET org_role = ?, updated_at = datetime('now') WHERE id = ? AND org_id = ?`).run(role, userId, orgId);
+}
+// user_type follows membership: 'staff' means "belongs to at least one organization".
+function syncUserType(userId) {
+  const n = db.prepare(`SELECT COUNT(*) n FROM memberships m JOIN orgs o ON o.id = m.org_id
+                        WHERE m.user_id = ? AND o.kind = 'organization'`).get(userId).n;
+  db.prepare(`UPDATE users SET user_type = ?, updated_at = datetime('now') WHERE id = ?`).run(n > 0 ? "staff" : "personal", userId);
+}
+function mintPersonalOrg(name, createdByOrgId) {
+  const orgId = `p-${randomUUID().slice(0, 8)}`;
+  db.prepare(`INSERT INTO orgs (id, name, kind, status, created_by_org_id, inserted_at, updated_at)
+              VALUES (?, ?, 'personal', 'active', ?, datetime('now'), datetime('now'))`).run(orgId, name, createdByOrgId || null);
+  return orgId;
+}
+
+// Boot migration, idempotent: every existing account gets its personal org and
+// an admin membership there; its current org_id/org_role becomes a membership.
+// An account that already lived in a personal org simply owns that one.
+db.transaction(() => {
+  for (const u of db.prepare(`SELECT u.*, o.kind AS org_kind FROM users u LEFT JOIN orgs o ON o.id = u.org_id`).all()) {
+    if (!u.personal_org_id) {
+      if (u.org_kind === "personal") {
+        addMembership(u.id, u.org_id, "admin");
+        db.prepare(`UPDATE memberships SET role = 'admin' WHERE user_id = ? AND org_id = ?`).run(u.id, u.org_id);
+        db.prepare(`UPDATE users SET personal_org_id = ?, org_role = 'admin' WHERE id = ?`).run(u.org_id, u.id);
+      } else {
+        const pid = mintPersonalOrg(u.name, u.org_id);
+        addMembership(u.id, pid, "admin");
+        db.prepare(`UPDATE users SET personal_org_id = ? WHERE id = ?`).run(pid, u.id);
+      }
+    }
+    if (u.org_id && u.org_kind === "organization") addMembership(u.id, u.org_id, u.org_role === "admin" ? "admin" : "member");
+  }
+})();
+
 const INVITE_TTL_DAYS = 7;
 
 const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
@@ -265,8 +345,15 @@ function allocateUserId(name) {
 function administrableOrgIds(caller) {
   const own = caller.org_id;
   if (!own) return [];
+  // Personal orgs this org provisioned — but only while their owner holds no
+  // organization membership. A colleague's own personal org is theirs alone;
+  // it is the truly private account that would otherwise be unreachable.
   const provisioned = db.prepare(
-    `SELECT id FROM orgs WHERE created_by_org_id = ?`
+    `SELECT o.id FROM orgs o
+      WHERE o.created_by_org_id = ? AND o.kind = 'personal'
+        AND NOT EXISTS (SELECT 1 FROM memberships m JOIN orgs o2 ON o2.id = m.org_id
+                         WHERE o2.kind = 'organization'
+                           AND m.user_id IN (SELECT user_id FROM memberships WHERE org_id = o.id))`
   ).all(own).map(o => o.id);
   return [own, ...provisioned];
 }
@@ -284,11 +371,12 @@ function requireOrgAdmin(req, res) {
   const caller = authUser(req);
   if (!caller) { res.status(401).json({ error: "not authenticated" }); return null; }
   const org = db.prepare(`SELECT id, kind FROM orgs WHERE id = ?`).get(caller.org_id);
-  if (!org || org.kind !== "organization" || caller.user_type !== "staff") {
+  if (!org || org.kind !== "organization") {
     res.status(403).json({ error: "only staff of an organization can manage accounts" });
     return null;
   }
-  if (caller.org_role !== "admin") {
+  // memberships is the authority; users.org_role is its mirror.
+  if (membershipOf(caller.id, caller.org_id)?.role !== "admin") {
     res.status(403).json({ error: "only an administrator of this organization can manage accounts" });
     return null;
   }
@@ -327,8 +415,24 @@ app.post("/api/admin/users", (req, res) => {
   if (!["staff", "personal"].includes(tier)) return res.status(400).json({ error: "tier must be staff or personal" });
   // Email is unique platform-wide, not per-org: it is the handle a private user
   // signs in with, so it has to resolve to one account without an org to scope it.
-  if (db.prepare(`SELECT 1 FROM users WHERE lower(email) = ?`).get(email))
-    return res.status(409).json({ error: "a user with that email already exists" });
+  const existing = db.prepare(`SELECT * FROM users WHERE lower(email) = ?`).get(email);
+  if (existing) {
+    // One person, several organizations. An address that already has an
+    // account is not refused — it is added to THIS org as a member: no new
+    // row, no new second factor, no invite. Nothing about the account changes
+    // except that it now also belongs here.
+    if (tier !== "staff") return res.status(409).json({ error: "a user with that email already exists" });
+    if (existing.status === "removed") return res.status(409).json({ error: "that account was removed — it cannot be re-added" });
+    if (membershipOf(existing.id, caller.org_id))
+      return res.status(409).json({ error: `${existing.name} is already a member of this organization` });
+    addMembership(existing.id, caller.org_id, "member");
+    syncUserType(existing.id);
+    return res.json({
+      user: { id: existing.id, name: existing.name, email: existing.email, status: existing.status,
+              user_type: "staff", gender: existing.gender, org_id: caller.org_id, tier },
+      added_to_org: true, invite_path: null, expires_at: null,
+    });
+  }
 
   const id = allocateUserId(name);
 
@@ -338,24 +442,26 @@ app.post("/api/admin/users", (req, res) => {
   db.prepare(`DELETE FROM user_totp_secrets WHERE user_id = ?`).run(id);
   db.prepare(`DELETE FROM user_invites      WHERE user_id = ?`).run(id);
 
-  let orgId = caller.org_id;
-  if (tier === "personal") {
-    orgId = `p-${randomUUID().slice(0, 8)}`;
-    db.prepare(`INSERT INTO orgs (id, name, kind, status, created_by_org_id, inserted_at, updated_at)
-                VALUES (?, ?, 'personal', 'active', ?, datetime('now'), datetime('now'))`)
-      .run(orgId, name, caller.org_id);
-  }
-
-  // Always a member. Promotion is a separate, deliberate act — an account is
-  // never born able to invite and erase.
-  db.prepare(`INSERT INTO users (id, name, email, status, user_type, gender, org_id, org_role, inserted_at, updated_at)
-              VALUES (?, ?, ?, 'invited', ?, ?, ?, 'member', datetime('now'), datetime('now'))`)
-    .run(id, name, email, tier === "personal" ? "personal" : "staff", gender, orgId);
+  // Everyone owns a personal org and administers it — an org of one has nobody
+  // else to invite or erase, so the role is harmless there and load-bearing
+  // nowhere else. Organization membership is the additive kind, born 'member':
+  // promotion is a separate, deliberate act — an account is never born able to
+  // invite and erase colleagues.
+  const personalOrgId = mintPersonalOrg(name, caller.org_id);
+  const orgId  = tier === "personal" ? personalOrgId : caller.org_id;
+  const role   = tier === "personal" ? "admin" : "member";
+  db.transaction(() => {
+    db.prepare(`INSERT INTO users (id, name, email, status, user_type, gender, org_id, org_role, personal_org_id, inserted_at, updated_at)
+                VALUES (?, ?, ?, 'invited', ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`)
+      .run(id, name, email, tier === "personal" ? "personal" : "staff", gender, orgId, role, personalOrgId);
+    addMembership(id, personalOrgId, "admin");
+    if (tier === "staff") addMembership(id, caller.org_id, "member");
+  })();
 
   const invite = mintInvite(id, caller.id);
   res.json({
     user: { id, name, email, status: "invited", user_type: tier === "personal" ? "personal" : "staff",
-            gender, org_id: orgId, tier },
+            gender, org_id: orgId, personal_org_id: personalOrgId, tier },
     // A path, not a URL: express sits behind nginx and an ngrok tunnel with no
     // `trust proxy`, so req.protocol here says "http" for a link that is only
     // ever handed out as https. The caller knows its own origin; let it say.
@@ -371,18 +477,23 @@ app.get("/api/admin/users", (req, res) => {
   const orgIds = administrableOrgIds(ctx.caller);
   const holes  = orgIds.map(() => "?").join(",");
 
+  // One row per membership in an administrable org: the same person in two of
+  // the caller's orgs is two rows, each with the role they hold THERE.
   const users = db.prepare(`
-    SELECT u.id, u.name, u.email, u.status, u.user_type, u.org_role, u.gender, u.photo_url, u.inserted_at,
-           u.org_id, o.name AS org_name, o.kind AS org_kind,
+    SELECT u.id, u.name, u.email, u.status, u.user_type, m.role AS org_role, u.gender, u.photo_url, u.inserted_at,
+           m.org_id, o.name AS org_name, o.kind AS org_kind, u.personal_org_id,
            CASE WHEN t.enrolled_at IS NOT NULL THEN 1 ELSE 0 END AS enrolled,
            i.expires_at AS invite_expires_at,
            (SELECT COUNT(*) FROM actors a WHERE a.owner_id = u.id) AS owned_actors,
-           (SELECT COUNT(*) FROM world_memberships w WHERE w.user_id = u.id) AS world_count
-    FROM users u
-    JOIN orgs o                   ON o.id = u.org_id
+           (SELECT COUNT(*) FROM world_memberships w WHERE w.user_id = u.id) AS world_count,
+           (SELECT COUNT(*) FROM memberships m2 JOIN orgs o2 ON o2.id = m2.org_id
+             WHERE m2.user_id = u.id AND o2.kind = 'organization') AS org_count
+    FROM memberships m
+    JOIN users u                  ON u.id = m.user_id
+    JOIN orgs o                   ON o.id = m.org_id
     LEFT JOIN user_totp_secrets t ON t.user_id = u.id
     LEFT JOIN user_invites i      ON i.user_id = u.id AND i.accepted_at IS NULL
-    WHERE u.org_id IN (${holes})
+    WHERE m.org_id IN (${holes})
     ORDER BY o.kind, u.inserted_at DESC, u.name
   `).all(...orgIds).map(u => ({
     ...u,
@@ -403,7 +514,8 @@ app.post("/api/admin/users/:id/invite", (req, res) => {
 
   // 404 rather than 403 for an account outside the caller's reach: a wrong
   // status code here would confirm that some other tenant's user id exists.
-  const user = db.prepare(`SELECT id FROM users WHERE id = ? AND org_id IN (${holes})`)
+  const user = db.prepare(`SELECT u.id FROM users u JOIN memberships m ON m.user_id = u.id
+                           WHERE u.id = ? AND m.org_id IN (${holes})`)
     .get(req.params.id, ...orgIds);
   if (!user) return res.status(404).json({ error: "user not found" });
 
@@ -431,8 +543,9 @@ app.patch("/api/admin/users/:id/role", (req, res) => {
 
   // Only within your OWN organization. A personal org provisioned by this one is
   // administrable for invites, but its member is not a colleague to promote.
-  const target = db.prepare(`SELECT id, name, org_role FROM users WHERE id = ? AND org_id = ?`)
-    .get(req.params.id, ctx.caller.org_id);
+  const target = db.prepare(`SELECT u.id, u.name, m.role AS org_role FROM users u
+                             JOIN memberships m ON m.user_id = u.id AND m.org_id = ? WHERE u.id = ?`)
+    .get(ctx.caller.org_id, req.params.id);
   if (!target) return res.status(404).json({ error: "user not found" });
 
   if (target.id === ctx.caller.id && role === "member") {
@@ -442,15 +555,15 @@ app.patch("/api/admin/users/:id/role", (req, res) => {
     return res.status(409).json({ error: "This is the organization's only administrator." });
   }
 
-  db.prepare(`UPDATE users SET org_role = ?, updated_at = datetime('now') WHERE id = ?`).run(role, target.id);
+  setMembershipRole(target.id, ctx.caller.org_id, role);
   res.json({ ok: true, id: target.id, org_role: role });
 });
 
 // True when removing/demoting this user would leave the org with no admin.
 function lastAdminOf(orgId, excludingUserId) {
   const others = db.prepare(
-    `SELECT COUNT(*) n FROM users
-      WHERE org_id = ? AND org_role = 'admin' AND status = 'active' AND id != ?`
+    `SELECT COUNT(*) n FROM memberships m JOIN users u ON u.id = m.user_id
+      WHERE m.org_id = ? AND m.role = 'admin' AND u.status = 'active' AND u.id != ?`
   ).get(orgId, excludingUserId).n;
   return others === 0;
 }
@@ -478,15 +591,22 @@ app.delete("/api/admin/users/:id", async (req, res) => {
   const holes  = orgIds.map(() => "?").join(",");
 
   const target = db.prepare(
-    `SELECT id, name, email, org_id, org_role FROM users WHERE id = ? AND org_id IN (${holes})`
+    `SELECT DISTINCT u.id, u.name, u.email, u.org_id, u.org_role, u.personal_org_id FROM users u
+      JOIN memberships m ON m.user_id = u.id WHERE u.id = ? AND m.org_id IN (${holes})`
   ).get(req.params.id, ...orgIds);
   if (!target) return res.status(404).json({ error: "user not found" });
 
   if (target.id === ctx.caller.id) {
     return res.status(409).json({ error: "You cannot remove your own account." });
   }
-  if (target.org_role === "admin" && lastAdminOf(target.org_id, target.id)) {
-    return res.status(409).json({ error: "This is the organization's only administrator. Promote someone else first." });
+  // Erasing ends EVERY membership, so the guard runs over every organization
+  // they administer, not just the one the caller is looking from.
+  const stranded = db.prepare(
+    `SELECT o.id, o.name FROM memberships m JOIN orgs o ON o.id = m.org_id
+      WHERE m.user_id = ? AND m.role = 'admin' AND o.kind = 'organization'`
+  ).all(target.id).filter(o => lastAdminOf(o.id, target.id));
+  if (stranded.length) {
+    return res.status(409).json({ error: `${target.name} is the only administrator of ${stranded.map(o => o.name).join(", ")}. Promote someone else first.` });
   }
 
   const purge = req.query.purge === "1" || req.query.purge === "true";
@@ -535,15 +655,46 @@ app.delete("/api/admin/users/:id", async (req, res) => {
   db.prepare(`DELETE FROM notifications WHERE user_id = ?`).run(target.id);
   db.prepare(`DELETE FROM actor_shares  WHERE shared_with_id = ? OR owner_id = ?`).run(target.id, target.id);
   db.prepare(`DELETE FROM registered_tools WHERE user_id = ?`).run(target.id);
+  db.prepare(`DELETE FROM memberships WHERE user_id = ?`).run(target.id);
   db.prepare(`DELETE FROM users WHERE id = ?`).run(target.id);
 
-  const org = db.prepare(`SELECT id, kind FROM orgs WHERE id = ?`).get(target.org_id);
-  if (org?.kind === "personal") {
-    const left = db.prepare(`SELECT COUNT(*) n FROM users WHERE org_id = ?`).get(org.id).n;
+  // The personal org existed only to hold them; take the shell once it is empty.
+  for (const orgId of new Set([target.personal_org_id, target.org_id].filter(Boolean))) {
+    const org = db.prepare(`SELECT id, kind FROM orgs WHERE id = ?`).get(orgId);
+    if (org?.kind !== "personal") continue;
+    const left = db.prepare(`SELECT (SELECT COUNT(*) FROM memberships WHERE org_id = ?)
+                                  + (SELECT COUNT(*) FROM users WHERE org_id = ? OR personal_org_id = ?) n`)
+      .get(org.id, org.id, org.id).n;
     if (left === 0) db.prepare(`DELETE FROM orgs WHERE id = ?`).run(org.id);
   }
 
   res.json({ ok: true, removed: target.id, purged: true, kept: { actors: 0, worlds: [], api_keys: 0 }, warnings });
+});
+
+// ── DELETE /api/admin/users/:id/membership — take someone out of THIS org ────
+//
+// The third erase strength, and the mildest: the person keeps their account,
+// their personal org and every other membership. Only the tie to the caller's
+// organization is cut. If that was the org they were acting in, they fall back
+// to their own.
+app.delete("/api/admin/users/:id/membership", (req, res) => {
+  const ctx = requireOrgAdmin(req, res);
+  if (!ctx) return;
+  const orgId  = ctx.caller.org_id;
+  const target = db.prepare(`SELECT u.id, u.name, u.org_id, u.personal_org_id, m.role FROM users u
+                             JOIN memberships m ON m.user_id = u.id AND m.org_id = ? WHERE u.id = ?`)
+    .get(orgId, req.params.id);
+  if (!target) return res.status(404).json({ error: "user not found" });
+  if (target.id === ctx.caller.id) {
+    return res.status(409).json({ error: "You cannot remove yourself from your own organization." });
+  }
+  if (target.role === "admin" && lastAdminOf(orgId, target.id)) {
+    return res.status(409).json({ error: "This is the organization's only administrator. Promote someone else first." });
+  }
+  db.prepare(`DELETE FROM memberships WHERE user_id = ? AND org_id = ?`).run(target.id, orgId);
+  if (target.org_id === orgId && target.personal_org_id) activateOrg(target.id, target.personal_org_id);
+  syncUserType(target.id);
+  res.json({ ok: true, id: target.id, left: orgId });
 });
 
 // ── GET /api/invite/:token — what the invitee sees before enrolling ──────────
@@ -794,8 +945,9 @@ app.get("/api/orgs/:org/members", (req, res) => {
     SELECT u.id, u.name, u.email, u.photo_url,
            CASE WHEN t.enrolled_at IS NOT NULL THEN 1 ELSE 0 END as enrolled
     FROM users u
+    JOIN memberships m            ON m.user_id = u.id AND m.org_id = ?
     LEFT JOIN user_totp_secrets t ON t.user_id = u.id
-    WHERE u.status = 'active' AND u.org_id = ?
+    WHERE u.status = 'active'
     ORDER BY u.name
   `).all(org.id);
   res.json(users);
@@ -818,9 +970,10 @@ app.get("/api/users", (req, res) => {
   // tenant boundary that is not a share target, it is a directory of strangers.
   // A private user's org holds only them, so this correctly returns nothing.
   const users = db.prepare(
-    `SELECT id, name, email, photo_url FROM users
-      WHERE status = 'active' AND id != ? AND org_id = ? ORDER BY name`
-  ).all(user.id, user.org_id);
+    `SELECT u.id, u.name, u.email, u.photo_url FROM users u
+      JOIN memberships m ON m.user_id = u.id AND m.org_id = ?
+      WHERE u.status = 'active' AND u.id != ? ORDER BY u.name`
+  ).all(user.org_id, user.id);
   res.json(users);
 });
 
@@ -846,8 +999,9 @@ app.post("/api/worlds/:id/members", async (req, res) => {
   // world across a tenant boundary, and an unscoped lookup here doubles as an
   // oracle for whether an address has an account at all.
   const target = db.prepare(
-    `SELECT id, name, gender FROM users WHERE email = ? AND status = 'active' AND org_id = ?`
-  ).get(email, ok.user.org_id);
+    `SELECT u.id, u.name, u.gender FROM users u JOIN memberships m ON m.user_id = u.id AND m.org_id = ?
+      WHERE u.email = ? AND u.status = 'active'`
+  ).get(ok.user.org_id, email);
   if (!target) return res.status(404).json({ error: "user not found" });
 
   const already = db.prepare(
@@ -1004,7 +1158,7 @@ app.get("/api/me", async (req, res) => {
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
   const row = db.prepare(`
     SELECT u.id, u.name, u.email, u.photo_url, u.user_type, u.org_id, u.org_role, u.gender, u.avatar_actor_id,
-           o.name AS org_name, o.kind AS org_kind
+           u.personal_org_id, o.name AS org_name, o.kind AS org_kind
     FROM auth_tokens t
     JOIN users u ON u.id = t.user_id
     LEFT JOIN orgs o ON o.id = u.org_id
@@ -1012,10 +1166,14 @@ app.get("/api/me", async (req, res) => {
   `).get(hash);
   if (!row) return res.status(401).json({ error: "not authenticated" });
   const worlds = db.prepare(`SELECT world_id, actor_id, role FROM world_memberships WHERE user_id = ?`).all(row.id);
+  const memberships = membershipsOf(row.id);
+  const active = memberships.find(m => m.org_id === row.org_id) || null;
   res.json({
     id: row.id, name: row.name, email: row.email, photo_url: row.photo_url, worlds,
     user_type: row.user_type,
-    org_role: row.org_role,
+    org_role: active ? active.role : row.org_role,
+    personal_org_id: row.personal_org_id,
+    memberships,
     gender: row.gender,
     avatar: avatarStateOf(row.avatar_actor_id),
     // The UI hides account management from anyone who cannot use it — a member
@@ -1023,9 +1181,21 @@ app.get("/api/me", async (req, res) => {
     // This is a convenience, not the control: the admin endpoints refuse them
     // regardless of what the page renders.
     org: row.org_id ? { id: row.org_id, name: row.org_name, kind: row.org_kind } : null,
-    can_manage_users: row.user_type === "staff" && row.org_kind === "organization"
-                      && row.org_role === "admin",
+    can_manage_users: row.org_kind === "organization" && active?.role === "admin",
   });
+});
+
+// ── POST /api/me/active-org — which of your orgs this session acts in ────────
+// The acting-as context. Everything scoped "same org" — the People page, the
+// share picker, world invites — reads the active org, so switching it is what
+// moves you between the organizations you belong to.
+app.post("/api/me/active-org", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "not authenticated" });
+  const orgId = String(req.body?.org_id || "").trim();
+  if (!orgId) return res.status(400).json({ error: "org_id required" });
+  if (!activateOrg(user.id, orgId)) return res.status(404).json({ error: "you are not a member of that organization" });
+  res.json({ ok: true, org_id: orgId, org_role: membershipOf(user.id, orgId).role });
 });
 
 // ── The user's own 3D profile ────────────────────────────────────────────────
@@ -1087,7 +1257,7 @@ async function deployAvatarToWorlds(user) {
   if (!state.ready) return { ok: false, reason: "avatar_not_ready", avatar: state, worlds: [] };
 
   const actor = db.prepare(
-    `SELECT id, appearance, glb_url, runtime_glb_url FROM actors WHERE id = ?`
+    `SELECT id, appearance, age, glb_url, runtime_glb_url FROM actors WHERE id = ?`
   ).get(state.actor_id);
 
   // ANIMA-INVARIANT (owner policy, Magnus 2026-08-25): personal media never
@@ -1114,7 +1284,7 @@ async function deployAvatarToWorlds(user) {
         `${SIMULATOR_URL}/internal/worlds/${m.world_id}/player/${m.actor_id}/deploy`,
         { method: "POST",
           headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
-          body: JSON.stringify({ appearance: actor.appearance || null, media }) }
+          body: JSON.stringify({ appearance: actor.appearance || null, age: actor.age || null, media }) }
       );
       const body = await r.json().catch(() => ({}));
       // Reported per world, never collapsed into one boolean: a body that
@@ -2631,8 +2801,9 @@ app.post("/api/actors/:id/shares", (req, res) => {
   if (!email) return res.status(400).json({ error: "email required" });
   // Same-org only — see the world-members lookup for why an unscoped email
   // search is both a cross-tenant hole and an account-existence oracle.
-  const target = db.prepare(`SELECT id, name FROM users WHERE email = ? AND org_id = ?`)
-    .get(email, user.org_id);
+  const target = db.prepare(`SELECT u.id, u.name FROM users u JOIN memberships m ON m.user_id = u.id AND m.org_id = ?
+                             WHERE u.email = ?`)
+    .get(user.org_id, email);
   if (!target) return res.status(404).json({ error: "user not found" });
   if (target.id === user.id) return res.status(400).json({ error: "cannot share with yourself" });
   const now = new Date().toISOString();
@@ -6103,6 +6274,7 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/message", async (req, re
 // ── Test Lab ── lives in testlab-routes.js so whole-file writes here cannot drop
 // the /api/test/* proxies again (two stale-copy clobbers on 2026-08-29).
 mountTestLabRoutes(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser });
+mountSignupLabRoutes(app, { db, authUser, PORT });
 
 app.post("/api/worlds/:world_id/encounter/:encounter_id/typing", async (req, res) => {
   const ok = requireWorld(req, res, worldIdOf(req), "player");

@@ -96,6 +96,26 @@ export default function UserMenu({ user, onSignOut, onUserChanged }) {
     }
   }
 
+  // Acting-as. Everything scoped "same org" reads the active org, so this is
+  // how you move between the organizations you belong to.
+  async function switchOrg(org_id) {
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await fetch("/api/me/active-org", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ org_id }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "Could not switch organization.");
+      onUserChanged?.();
+      window.location.reload();
+    } catch (e) {
+      setStatus({ kind: "err", text: e.message });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const roleLine = user.org
     ? <>{user.org.name}{user.org.kind === "organization" && user.org_role
         ? <> · <span className={user.org_role === "admin" ? styles.roleTag : styles.roleTagMember}>{user.org_role}</span></>
@@ -118,6 +138,21 @@ export default function UserMenu({ user, onSignOut, onUserChanged }) {
             <p className={styles.email}>{user.email}</p>
             {roleLine && <p className={styles.orgLine}>{roleLine}</p>}
           </div>
+
+          {user.memberships?.length > 1 && (
+            <div className={styles.fieldRow}>
+              <label className={styles.fieldLabel} htmlFor="um-org">Acting in</label>
+              <select id="um-org" className={styles.select} disabled={busy}
+                      value={user.org?.id || ""}
+                      onChange={e => switchOrg(e.target.value)}>
+                {user.memberships.map(m => (
+                  <option key={m.org_id} value={m.org_id}>
+                    {m.kind === "personal" ? "Personal" : m.name} · {m.role}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
           <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }}
                  onChange={e => uploadPhoto(e.target.files?.[0])} />
@@ -153,6 +188,23 @@ export default function UserMenu({ user, onSignOut, onUserChanged }) {
               {status.text}
             </p>
           )}
+
+          {/* Your body, next to your face — both are "what you look like", and
+              this is the only route back into the wizard once you have closed
+              it. The label carries the state so an unfinished profile says so
+              rather than looking like a finished one. */}
+          <button className={styles.item} onClick={() => { window.location.href = "/me/avatar"; }}>
+            <span className={styles.icon}>
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
+                <circle cx="8" cy="3.6" r="2.2" stroke="currentColor" strokeWidth="1.1"/>
+                <path d="M8 5.8v4.4M8 10.2L5.6 14M8 10.2L10.4 14M4.8 7.2L8 6.4l3.2.8"
+                      stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+            </span>
+            {user.avatar?.state === "ready" ? "3D profile"
+              : user.avatar?.state === "building" ? "Finish your 3D profile"
+              : "Create your 3D profile"}
+          </button>
 
           {user.can_manage_users && <>
             <div className={styles.sep} />
