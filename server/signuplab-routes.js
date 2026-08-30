@@ -12,6 +12,15 @@
 // admin" exemption that briefly lived here is superseded: a personal org has
 // its owner as admin by construction, so no exemption is needed.
 
+// The sweep (server/lab-incidents.js, driven from /lab/home/testmanager)
+// needs this board as a value, not as an HTTP route it would have to
+// authenticate to itself. Bound at mount so it closes over db and PORT.
+let boundChecks = null;
+export async function signupChecks() {
+  if (!boundChecks) throw new Error("the signup board is not mounted");
+  return boundChecks();
+}
+
 export function mount(app, { db, authUser, PORT }) {
   const pass = (name, detail) => ({ verdict: "pass", name, detail });
   const fail = (name, detail) => ({ verdict: "fail", name, detail });
@@ -24,10 +33,7 @@ export function mount(app, { db, authUser, PORT }) {
     } catch { return 0; }
   }
 
-  app.get("/api/test/signup/checks", async (req, res) => {
-    const user = authUser(req);
-    if (!user) return res.status(401).json({ error: "not authenticated" });
-
+  async function computeChecks() {
     const checks = [];
     const guarded = (name, fn) => { try { fn(); } catch (e) { checks.push(fail(name, "query failed: " + e.message)); } };
 
@@ -153,6 +159,14 @@ export function mount(app, { db, authUser, PORT }) {
       checks.push(pass("accepted invites on record", `${n} accepted and unexpired — informational; reuse is refused by userForInvite`));
     });
 
-    res.json({ ok: true, checked_at: new Date().toISOString(), checks });
+    return checks;
+  }
+
+  boundChecks = computeChecks;
+
+  app.get("/api/test/signup/checks", async (req, res) => {
+    const user = authUser(req);
+    if (!user) return res.status(401).json({ error: "not authenticated" });
+    res.json({ ok: true, checked_at: new Date().toISOString(), checks: await computeChecks() });
   });
 }

@@ -3,7 +3,11 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import ReactDOM from "react-dom";
 import LabPage             from "./pages/LabPage.jsx";
 import LabHomePage         from "./pages/LabHomePage.jsx";
+import LabIncidentsPage    from "./pages/LabIncidentsPage.jsx";
+import LabTestManagerPage  from "./pages/LabTestManagerPage.jsx";
 import SignupLabPage       from "./pages/SignupLabPage.jsx";
+import BehaviorLabPage     from "./pages/BehaviorLabPage.jsx";
+import AvatarLabPage       from "./pages/AvatarLabPage.jsx";
 import TransportLabPage    from "./pages/TransportLabPage.jsx";
 import WatcherPanel, { watcherIsFollowing } from "./components/WatcherPanel.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
@@ -57,8 +61,11 @@ function LabWatcherOverlay() {
   if (!show) return null;
   let bound = null;
   if (location.pathname.startsWith("/lab/actor/apartment/encounter")) bound = "Feature - Actor Apartment Encounter";
-  else if (location.pathname.startsWith("/lab/transport")) bound = "Runtime - Transport Engine";
+  else if (location.pathname.startsWith("/lab/transport") || location.pathname.startsWith("/lab/world/transport")) bound = "Runtime - Transport Engine";
   else if (location.pathname.startsWith("/lab/user/signup")) bound = "Feature - User Signup and Creation";
+  else if (location.pathname.startsWith("/lab/user/avatar")) bound = "Feature - User Avatar";
+  else if (location.pathname.startsWith("/lab/world/behavior")) bound = "Runtime - World Behaviour";
+  else if (qs.get("lab") === "behavior") bound = "Runtime - World Behaviour";
   else if (qs.get("lab") === "transport") bound = "Runtime - Transport Engine";
   else if (qs.has("lab") && location.pathname.includes("/knock/")) bound = "Feature - Actor Apartment Encounter";
   return <WatcherPanel bound={bound} />;
@@ -370,9 +377,17 @@ export default function App() {
         <Route path="/calendar"     element={<CalendarPage />} />
         <Route path="/voicemail"    element={<VoicemailPage />} />
         <Route path="/lab/home" element={<LabHomePage />} />
+        {/* Incidents and the manager span every bench, so they stay UNBOUND:
+            the panel falls back to last-used there, and the incident rows
+            navigate to the owning bench before handing anything over. */}
+        <Route path="/lab/home/incidents"   element={<LabIncidentsPage />} />
+        <Route path="/lab/home/testmanager" element={<LabTestManagerPage />} />
         <Route path="/lab/actor/apartment/encounter" element={<LabPage />} />
-        <Route path="/lab/transport/actor" element={<TransportLabPage />} />
+        <Route path="/lab/world/transport/actor" element={<TransportLabPage />} />
+        <Route path="/lab/transport/actor" element={<Navigate to="/lab/world/transport/actor" replace />} />
         <Route path="/lab/user/signup" element={<SignupLabPage />} />
+        <Route path="/lab/world/behavior" element={<BehaviorLabPage />} />
+        <Route path="/lab/user/avatar" element={<AvatarLabPage />} />
         <Route path="/lab" element={<Navigate to="/lab/home" replace />} />
         <Route path="/actors"            element={<ActorsGalleryPage />} />
         <Route path="/actors/new"        element={<CharacterWizard />} />

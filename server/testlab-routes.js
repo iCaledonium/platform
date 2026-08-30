@@ -2,6 +2,11 @@
 // concurrent whole-file writes to the 340KB index.js can no longer drop them.
 // Mounted once from index.js; keep new /api/test/* routes in here.
 
+// ESM only in here — server/package.json is "type": "module" and a require()
+// at module scope is a runtime ReferenceError that node --check will pass.
+import * as labIncidents from "./lab-incidents.js";
+import { signupChecks } from "./signuplab-routes.js";
+
 export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
   // ── Test Lab ─────────────────────────────────────────────────────────────────
   //
@@ -28,6 +33,8 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
     "transport/context": { method: "GET",  path: (req) => `/internal/test/transport/context?world_id=${encodeURIComponent(req.query.world_id || "")}&actor_id=${encodeURIComponent(req.query.actor_id || "")}` },
     "transport/checks":  { method: "GET",  path: (req) => `/internal/test/transport/checks?world_id=${encodeURIComponent(req.query.world_id || "")}&actor_id=${encodeURIComponent(req.query.actor_id || "")}` },
     "encounter/checks":  { method: "GET",  path: (req) => `/internal/test/encounter/checks?world_id=${encodeURIComponent(req.query.world_id || "")}&actor_id=${encodeURIComponent(req.query.actor_id || "")}` },
+    "behavior/pulse":    { method: "GET",  path: (req) => `/internal/test/behavior/pulse?world_id=${encodeURIComponent(req.query.world_id || "")}` },
+    "behavior/checks":   { method: "GET",  path: (req) => `/internal/test/behavior/checks?world_id=${encodeURIComponent(req.query.world_id || "")}` },
     "transport/garage":  { method: "POST", path: () => `/internal/test/transport/garage` },
     "transport/arm":     { method: "POST", path: () => `/internal/test/transport/arm` },
     "transport/disarm":  { method: "POST", path: () => `/internal/test/transport/disarm` },
@@ -67,10 +74,12 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
   app.post("/api/test/llm/canned",      (req, res) => testLabProxy(req, res, "llm/canned"));
   app.post("/api/test/llm/canned/clear",(req, res) => testLabProxy(req, res, "llm/canned/clear"));
 
-  // Transport bench — /lab/transport/actor
+  // Transport bench — /lab/world/transport/actor
   app.get ("/api/test/transport/context", (req, res) => testLabProxy(req, res, "transport/context"));
   app.get ("/api/test/transport/checks",  (req, res) => testLabProxy(req, res, "transport/checks"));
   app.get ("/api/test/encounter/checks",  (req, res) => testLabProxy(req, res, "encounter/checks"));
+  app.get ("/api/test/behavior/pulse",    (req, res) => testLabProxy(req, res, "behavior/pulse"));
+  app.get ("/api/test/behavior/checks",   (req, res) => testLabProxy(req, res, "behavior/checks"));
   app.post("/api/test/transport/garage",  (req, res) => testLabProxy(req, res, "transport/garage"));
   app.post("/api/test/transport/arm",     (req, res) => testLabProxy(req, res, "transport/arm"));
   app.post("/api/test/transport/disarm",  (req, res) => testLabProxy(req, res, "transport/disarm"));
@@ -91,6 +100,121 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
       res.status(r.status).json(await r.json());
     } catch {
       res.status(502).json({ error: "simulator unreachable" });
+    }
+  });
+
+  // ── Incidents + the test manager ─────────────────────────────────────────
+  //
+  // Every bench files what it found into one store, and the manager is the
+  // thing that walks all four boards and files for them. The store lives in
+  // server/lab-incidents.js; these routes are the session-authed door onto it.
+  // The machine-facing door is server/lab-incidents-cli.mjs over ssh — see the
+  // header there for why that is not an HTTP route.
+
+  let sweepInFlight = null;
+
+  app.get("/api/test/benches", (req, res) => {
+    if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
+    res.json({ ok: true, benches: Object.entries(labIncidents.BENCHES).map(([key, b]) => ({
+      key, label: b.label, page: b.page, watcher: b.watcher,
+      side: b.side, scoped: !!b.scoped, needs_actor: !!b.needsActor })) });
+  });
+
+  app.get("/api/test/incidents", (req, res) => {
+    if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
+    try {
+      res.json({ ok: true,
+        counts: labIncidents.counts(),
+        incidents: labIncidents.listIncidents({
+          status: req.query.status || "unresolved",
+          bench: req.query.bench || "all",
+          limit: req.query.limit }) });
+    } catch (e) {
+      res.status(500).json({ error: "incident store failed", detail: String(e.message || e).slice(0, 200) });
+    }
+  });
+
+  // Filing by hand — a bench's per-row Fix button, or a person recording
+  // something a board cannot see.
+  app.post("/api/test/incidents", (req, res) => {
+    const user = authUser(req);
+    if (!user) return res.status(401).json({ error: "not authenticated" });
+    const b = req.body || {};
+    if (!b.check_name) return res.status(400).json({ error: "check_name is required" });
+    try {
+      const r = labIncidents.report({
+        bench: b.bench || "manual", bench_label: b.bench_label, check_name: b.check_name,
+        world_id: b.world_id, actor_id: b.actor_id, scope_label: b.scope_label,
+        severity: b.severity || "fail", detail: b.detail,
+        source: b.source || `manual:${user.name || user.id}`,
+      });
+      res.json({ ok: true, ...r });
+    } catch (e) {
+      res.status(500).json({ error: "could not file", detail: String(e.message || e).slice(0, 200) });
+    }
+  });
+
+  app.post("/api/test/incidents/:id/status", (req, res) => {
+    const user = authUser(req);
+    if (!user) return res.status(401).json({ error: "not authenticated" });
+    try {
+      const ok = labIncidents.setStatus(req.params.id, (req.body || {}).status,
+        user.name || user.id, (req.body || {}).note);
+      if (!ok) return res.status(404).json({ error: "no such incident" });
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(400).json({ error: String(e.message || e).slice(0, 200) });
+    }
+  });
+
+  app.get("/api/test/sweep/targets", (req, res) => {
+    if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
+    res.json({ ok: true, targets: labIncidents.listTargets() });
+  });
+
+  app.post("/api/test/sweep/targets", (req, res) => {
+    if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
+    try {
+      res.json({ ok: true, targets: labIncidents.addTarget(req.body || {}) });
+    } catch (e) {
+      res.status(400).json({ error: String(e.message || e).slice(0, 200) });
+    }
+  });
+
+  app.post("/api/test/sweep/targets/:id/delete", (req, res) => {
+    if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
+    labIncidents.removeTarget(req.params.id);
+    res.json({ ok: true, targets: labIncidents.listTargets() });
+  });
+
+  app.post("/api/test/sweep/targets/:id/enabled", (req, res) => {
+    if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
+    labIncidents.setTargetEnabled(req.params.id, !!(req.body || {}).enabled);
+    res.json({ ok: true, targets: labIncidents.listTargets() });
+  });
+
+  app.get("/api/test/sweep/runs", (req, res) => {
+    if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
+    res.json({ ok: true, runs: labIncidents.listRuns(req.query.limit) });
+  });
+
+  // The manager's one button. Serialised: two sweeps at once would file the
+  // same board twice and race each other's auto-resolve pass.
+  app.post("/api/test/sweep/run", async (req, res) => {
+    const user = authUser(req);
+    if (!user) return res.status(401).json({ error: "not authenticated" });
+    if (sweepInFlight) return res.status(409).json({ error: "a sweep is already running" });
+    const source = (req.body || {}).source || `manual:${user.name || user.id}`;
+    sweepInFlight = labIncidents.runSweep({
+      source, SIMULATOR_URL, SERVICE_TOKEN, signupChecks,
+    });
+    try {
+      const out = await sweepInFlight;
+      res.json({ ok: true, ...out });
+    } catch (e) {
+      res.status(500).json({ error: "the sweep failed", detail: String(e.message || e).slice(0, 300) });
+    } finally {
+      sweepInFlight = null;
     }
   });
 }

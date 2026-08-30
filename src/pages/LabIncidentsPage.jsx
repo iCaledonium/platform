@@ -1,0 +1,290 @@
+import { useEffect, useState, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
+
+// ── Test Lab · Incidents ─────────────────────────────────────────────────────
+//
+// One board for everything every bench and every routine found. The store is
+// fingerprinted (server/lab-incidents.js), so a check that fails on ninety
+// nightly sweeps is ONE row seen ninety times — the occurrence count and the
+// first/last-seen pair are the history, not ninety rows of it.
+//
+// Three statuses exist for three different truths, and conflating them is what
+// makes a board like this stop being read:
+//   open / acknowledged — a fault, unfixed. Auto-resolves the moment its check
+//                         comes back green on a sweep.
+//   known               — red BY DESIGN. Three of the encounter board's checks
+//                         are deliberate standing evidence that the board CAN
+//                         go red; they keep counting occurrences but stay out
+//                         of the unresolved list, or the page ships permanently
+//                         red and stops meaning anything.
+//   wontfix             — judged and declined.
+
+const GOLD = "rgba(201,151,58,";
+
+const SEVERITY = {
+  fail:    { label: "fail",    color: "#e0736b" },
+  unknown: { label: "unknown", color: "#d9a441" },
+  error:   { label: "not measured", color: "#c96fd0" },
+};
+
+const STATUS = {
+  open:         { label: "open",         color: "#e0736b" },
+  acknowledged: { label: "acknowledged", color: "#d9a441" },
+  known:        { label: "known",        color: "rgba(255,255,255,.45)" },
+  resolved:     { label: "resolved",     color: "#7fc08a" },
+  wontfix:      { label: "won't fix",    color: "rgba(255,255,255,.35)" },
+};
+
+const FILTERS = [
+  { key: "unresolved", label: "Unresolved" },
+  { key: "open",       label: "Open" },
+  { key: "acknowledged", label: "Acknowledged" },
+  { key: "known",      label: "Known" },
+  { key: "resolved",   label: "Resolved" },
+  { key: "wontfix",    label: "Won't fix" },
+  { key: "all",        label: "All" },
+];
+
+const ago = (iso) => {
+  if (!iso) return "—";
+  const s = Math.max(0, (Date.now() - new Date(iso + (iso.endsWith("Z") ? "" : "Z")).getTime()) / 1000);
+  if (s < 90) return `${Math.round(s)}s ago`;
+  if (s < 5400) return `${Math.round(s / 60)}m ago`;
+  if (s < 172800) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+};
+
+export default function LabIncidentsPage() {
+  const navigate = useNavigate();
+  const [filter, setFilter] = useState("unresolved");
+  const [bench, setBench] = useState("all");
+  const [benches, setBenches] = useState([]);
+  const [rows, setRows] = useState(null);
+  const [counts, setCounts] = useState({});
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [open, setOpen] = useState({});
+
+  const label = { fontSize: 10, letterSpacing: ".16em", textTransform: "uppercase",
+    color: "rgba(255,255,255,.4)" };
+
+  const load = useCallback(async () => {
+    setBusy(true);
+    try {
+      const r = await fetch(`/api/test/incidents?status=${filter}&bench=${bench}`, { credentials: "include" });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      setRows(j.incidents || []);
+      setCounts(j.counts || {});
+      setError("");
+    } catch (e) {
+      // A failed load must not leave the previous filter's rows on screen
+      // pretending to be this one's.
+      setRows(null);
+      setError(String(e.message || e));
+    } finally { setBusy(false); }
+  }, [filter, bench]);
+
+  useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    fetch("/api/test/benches", { credentials: "include" })
+      .then(r => r.json()).then(j => setBenches(j.benches || [])).catch(() => {});
+  }, []);
+
+  async function setStatus(id, status) {
+    try {
+      const r = await fetch(`/api/test/incidents/${id}/status`, {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      load();
+    } catch (e) { setError(String(e.message || e)); }
+  }
+
+  // Hand a fault to the watcher that OWNS that bench. Watchers are bound per
+  // surface, so the ask is dispatched after navigating to the bench's own page
+  // — dispatching it here would land it in whatever conversation the unbound
+  // /lab/home panel happens to be holding.
+  function handToWatcher(inc) {
+    const page = benches.find(b => b.key === inc.bench)?.page;
+    const text =
+      `Incident from the Test Lab board — ${inc.bench_label || inc.bench}\n\n` +
+      `Check: ${inc.check_name}\n` +
+      `Scope: ${inc.scope_label || "global"}` +
+      (inc.world_id ? `\nworld_id: ${inc.world_id}` : "") +
+      (inc.actor_id ? `\nactor_id: ${inc.actor_id}` : "") +
+      `\nSeverity: ${inc.severity} · seen ${inc.occurrences}× · first ${inc.first_seen_at} · last ${inc.last_seen_at}\n\n` +
+      `Detail: ${inc.detail || "(none)"}\n\n` +
+      `Diagnose this. Read-only first: confirm the finding is real before proposing anything, ` +
+      `and remember a count or a grep returning 0 indicts the query before the code.`;
+    if (page) {
+      navigate(page);
+      setTimeout(() => window.dispatchEvent(new CustomEvent("watcher:ask", { detail: { text } })), 700);
+    } else {
+      window.dispatchEvent(new CustomEvent("watcher:ask", { detail: { text } }));
+    }
+  }
+
+  const chip = (active) => ({
+    padding: "5px 11px", borderRadius: 3, cursor: "pointer",
+    fontFamily: "'DM Sans',sans-serif", fontSize: 10.5,
+    background: active ? GOLD + ".14)" : "transparent",
+    border: `0.5px solid ${active ? GOLD + ".4)" : "rgba(255,255,255,.12)"}`,
+    color: active ? GOLD + ".95)" : "rgba(255,255,255,.5)",
+  });
+
+  const btn = (color) => ({
+    padding: "4px 9px", borderRadius: 3, cursor: "pointer", background: "transparent",
+    border: `0.5px solid ${color || "rgba(255,255,255,.16)"}`,
+    fontFamily: "'DM Sans',sans-serif", fontSize: 10,
+    color: color || "rgba(255,255,255,.55)",
+  });
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#0d0c0a", fontFamily: "'DM Sans',system-ui,sans-serif" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+        padding: "14px 24px", background: "#080706", borderBottom: "0.5px solid rgba(255,255,255,.08)" }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
+          <span onClick={() => navigate("/lab/home")} style={{ cursor: "pointer",
+            fontFamily: "'Cormorant Garamond',Georgia,serif", fontSize: 21, color: "rgba(255,255,255,.92)" }}>Test Lab</span>
+          <span style={{ ...label, color: GOLD + ".65)" }}>incidents</span>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => navigate("/lab/home/testmanager")} style={btn(GOLD + ".7)")}>Test manager</button>
+          <button onClick={load} style={btn()}>{busy ? "Loading…" : "Refresh"}</button>
+          <button onClick={() => navigate("/lab/home")} style={btn()}>Close</button>
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 1040, margin: "0 auto", padding: "24px 24px 80px",
+        display: "flex", flexDirection: "column", gap: 20 }}>
+
+        <div style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
+          {Object.entries(STATUS).map(([k, s]) => (
+            <div key={k} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+              <span style={{ fontSize: 20, color: s.color,
+                fontFamily: "'Cormorant Garamond',Georgia,serif" }}>{counts[k] ?? 0}</span>
+              <span style={{ ...label, fontSize: 9 }}>{s.label}</span>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center" }}>
+          {FILTERS.map(f => (
+            <span key={f.key} onClick={() => setFilter(f.key)} style={chip(filter === f.key)}>{f.label}</span>
+          ))}
+          <span style={{ width: 12 }} />
+          <span onClick={() => setBench("all")} style={chip(bench === "all")}>All benches</span>
+          {benches.map(b => (
+            <span key={b.key} onClick={() => setBench(b.key)} style={chip(bench === b.key)}>{b.label}</span>
+          ))}
+        </div>
+
+        {error && (
+          <div style={{ padding: "10px 14px", borderRadius: 4, fontSize: 11.5,
+            background: "rgba(224,115,107,.1)", border: "0.5px solid rgba(224,115,107,.35)", color: "#e0736b" }}>
+            The board could not be read — {error}. Nothing below is current.
+          </div>
+        )}
+
+        {rows === null && !error && <span style={{ ...label }}>Reading…</span>}
+
+        {rows && rows.length === 0 && (
+          <div style={{ padding: "20px 18px", borderRadius: 5, background: "rgba(255,255,255,.02)",
+            border: "0.5px solid rgba(255,255,255,.08)", fontSize: 12, color: "rgba(255,255,255,.45)", lineHeight: 1.7 }}>
+            Nothing filed under this filter.
+            {filter === "unresolved" && <> That is only evidence if a sweep has actually run — an empty
+              board and an unrun board look identical here. Check the last run on the{" "}
+              <span onClick={() => navigate("/lab/home/testmanager")}
+                style={{ color: GOLD + ".9)", cursor: "pointer" }}>test manager</span>.</>}
+          </div>
+        )}
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {(rows || []).map(inc => {
+            const sev = SEVERITY[inc.severity] || SEVERITY.fail;
+            const st = STATUS[inc.status] || STATUS.open;
+            const isOpen = !!open[inc.id];
+            return (
+              <div key={inc.id} style={{ padding: "12px 15px", borderRadius: 5,
+                background: "rgba(255,255,255,.022)",
+                borderLeft: `2px solid ${sev.color}`,
+                border: "0.5px solid rgba(255,255,255,.09)",
+                borderLeftWidth: 2, borderLeftColor: sev.color }}>
+
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 14, alignItems: "baseline" }}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0 }}>
+                    <span style={{ fontSize: 12.5, color: "rgba(255,255,255,.88)" }}>{inc.check_name}</span>
+                    <span style={{ fontSize: 10, color: "rgba(255,255,255,.4)" }}>
+                      {inc.bench_label || inc.bench} · {inc.scope_label || "global"} · seen {inc.occurrences}×
+                      {" · first "}{ago(inc.first_seen_at)}{" · last "}{ago(inc.last_seen_at)}
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", flexShrink: 0 }}>
+                    <span style={{ ...label, fontSize: 9, color: sev.color }}>{sev.label}</span>
+                    <span style={{ ...label, fontSize: 9, color: st.color }}>{st.label}</span>
+                  </div>
+                </div>
+
+                <div onClick={() => setOpen(o => ({ ...o, [inc.id]: !isOpen }))}
+                  style={{ marginTop: 7, fontSize: 11, lineHeight: 1.65, cursor: "pointer",
+                    color: "rgba(255,255,255,.5)",
+                    display: "-webkit-box", WebkitLineClamp: isOpen ? "unset" : 2,
+                    WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                  {inc.detail || "(no detail recorded)"}
+                </div>
+
+                {isOpen && (
+                  <div style={{ marginTop: 8, fontSize: 9.5, fontFamily: "ui-monospace,monospace",
+                    color: "rgba(255,255,255,.3)", lineHeight: 1.7 }}>
+                    <div>fingerprint {inc.fingerprint}</div>
+                    <div>source {inc.source} · first seen {inc.first_seen_at} · last seen {inc.last_seen_at}</div>
+                    {inc.resolved_at && <div>resolved {inc.resolved_at} by {inc.resolved_by}</div>}
+                    {inc.first_detail && inc.first_detail !== inc.detail &&
+                      <div style={{ marginTop: 5, whiteSpace: "pre-wrap" }}>first detail: {inc.first_detail}</div>}
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
+                  <button onClick={() => handToWatcher(inc)} style={btn(GOLD + ".8)")}>Hand to watcher</button>
+                  {benches.find(b => b.key === inc.bench)?.page && (
+                    <button onClick={() => navigate(benches.find(b => b.key === inc.bench).page)}
+                      style={btn()}>Open bench</button>
+                  )}
+                  {inc.status !== "acknowledged" && inc.status !== "resolved" &&
+                    <button onClick={() => setStatus(inc.id, "acknowledged")} style={btn()}>Acknowledge</button>}
+                  {inc.status !== "known" &&
+                    <button onClick={() => setStatus(inc.id, "known")} style={btn()}>Red by design</button>}
+                  {inc.status !== "resolved" &&
+                    <button onClick={() => setStatus(inc.id, "resolved")} style={btn("#7fc08a")}>Resolve</button>}
+                  {inc.status !== "wontfix" &&
+                    <button onClick={() => setStatus(inc.id, "wontfix")} style={btn()}>Won't fix</button>}
+                  {inc.status !== "open" &&
+                    <button onClick={() => setStatus(inc.id, "open")} style={btn()}>Reopen</button>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div style={{ fontSize: 10.5, lineHeight: 1.8, color: "rgba(255,255,255,.32)",
+          borderTop: "0.5px solid rgba(255,255,255,.07)", paddingTop: 14 }}>
+          An incident closes on its own the moment its check comes back <em>pass</em> on a sweep.
+          A check that merely <em>disappears</em> from its board is left open on purpose — its absence
+          is not a fix. A board that could not be read resolves nothing and files
+          “{"the bench answered"}” against itself instead, because an empty board and a clean
+          board are the same shape.
+          <br />
+          Routines file here over ssh:{" "}
+          <code style={{ color: "rgba(255,255,255,.45)" }}>
+            node ~/platform/server/lab-incidents-cli.mjs report --source routine:&lt;name&gt;
+          </code>
+        </div>
+      </div>
+    </div>
+  );
+}

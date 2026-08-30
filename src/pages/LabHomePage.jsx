@@ -8,6 +8,26 @@ import { useNavigate } from "react-router-dom";
 
 const GOLD = "rgba(201,151,58,";
 
+// The two cross-bench surfaces. They are not test cases themselves — one
+// runs every case, the other holds what the cases found — so they are
+// listed apart from the benches below.
+const BOARDS = [
+  {
+    path: "/lab/home/testmanager",
+    title: "Test manager",
+    blurb: "Runs every bench's scorecard against the pinned targets and files each failing row " +
+      "as an incident. Read-only: nothing here authors a past or wipes a memory, so it is safe " +
+      "on a world somebody is working in, and safe on a schedule.",
+  },
+  {
+    path: "/lab/home/incidents",
+    title: "Incidents",
+    blurb: "Everything every bench and every routine found, fingerprinted so a check that fails " +
+      "on ninety nightly runs is one incident seen ninety times. Closes itself when the check " +
+      "comes back green.",
+  },
+];
+
 const CASES = [
   {
     path: "/lab/actor/apartment/encounter",
@@ -19,7 +39,34 @@ const CASES = [
     live: true,
   },
   {
-    path: "/lab/transport/actor",
+    path: "/lab/user/signup",
+    subject: "User",
+    place: "Signup",
+    situation: "Creation",
+    blurb: "The invite → enroll → org pipeline, walked through the production endpoints " +
+      "with throwaway @lab.local people. Carries its own platform-side scorecard.",
+    live: true,
+  },
+  {
+    path: "/lab/user/avatar",
+    subject: "User",
+    place: "Avatar",
+    situation: "Body",
+    blurb: "Adopting a body and pushing it into your worlds — plus what the creation pipeline " +
+      "leaves behind: model files, sizes, likeness photos, the age floor.",
+    live: true,
+  },
+  {
+    path: "/lab/world/behavior",
+    subject: "World",
+    place: "—",
+    situation: "Behaviour",
+    blurb: "The autonomous layer — ticks, activities, needs, thoughts. Nothing here can be forced: " +
+      "take two samples with a clock between them and watch what the loop does on its own.",
+    live: true,
+  },
+  {
+    path: "/lab/world/transport/actor",
     subject: "Transport",
     place: "—",
     situation: "Actor",
@@ -58,6 +105,21 @@ export default function LabHomePage() {
 
       <div style={{ maxWidth: 880, margin: "0 auto", padding: "24px 24px 60px",
         display: "flex", flexDirection: "column", gap: 24 }}>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <span style={label}>Boards</span>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {BOARDS.map(b => (
+              <div key={b.path} onClick={() => navigate(b.path)}
+                style={{ ...card(true), flex: "1 1 340px" }}>
+                <span style={{ fontSize: 13.5, color: GOLD + ".95)" }}>{b.title}</span>
+                <span style={{ fontSize: 11, lineHeight: 1.6, color: "rgba(255,255,255,.45)" }}>{b.blurb}</span>
+                <span style={{ fontSize: 9.5, fontFamily: "ui-monospace,monospace",
+                  color: "rgba(255,255,255,.3)" }}>{b.path}</span>
+              </div>
+            ))}
+          </div>
+        </div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           <span style={label}>Test cases</span>
