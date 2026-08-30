@@ -57,6 +57,16 @@ const CASES = [
     live: true,
   },
   {
+    path: "/lab/character/wizard",
+    subject: "Character",
+    place: "Wizard",
+    situation: "Authoring",
+    blurb: "Building and re-opening a character — the autosave, the rename, the discard. Everything the " +
+      "wizard asks of the server it asks with a fetch that reports failure to a console, so this is where " +
+      "a save that never happened stops looking like one. Carries its own scorecard.",
+    live: true,
+  },
+  {
     path: "/lab/world/behavior",
     subject: "World",
     place: "—",

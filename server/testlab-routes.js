@@ -6,6 +6,8 @@
 // at module scope is a runtime ReferenceError that node --check will pass.
 import * as labIncidents from "./lab-incidents.js";
 import { signupChecks } from "./signuplab-routes.js";
+import { wizardChecks } from "./wizardlab-routes.js";
+import { avatarChecks } from "./avatarlab-routes.js";
 
 export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
   // ── Test Lab ─────────────────────────────────────────────────────────────────
@@ -206,7 +208,7 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
     if (sweepInFlight) return res.status(409).json({ error: "a sweep is already running" });
     const source = (req.body || {}).source || `manual:${user.name || user.id}`;
     sweepInFlight = labIncidents.runSweep({
-      source, SIMULATOR_URL, SERVICE_TOKEN, signupChecks,
+      source, SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks,
     });
     try {
       const out = await sweepInFlight;

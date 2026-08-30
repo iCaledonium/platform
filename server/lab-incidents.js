@@ -121,7 +121,19 @@ export const BENCHES = {
     label: "User · Signup · Creation",
     page: "/lab/user/signup",
     watcher: "Feature - User Signup and Creation",
-    side: "platform", scoped: false, needsActor: false,
+    side: "platform", scoped: false, needsActor: false, local: "signupChecks",
+  },
+  wizard: {
+    label: "Character · Wizard · Authoring",
+    page: "/lab/character/wizard",
+    watcher: "Feature - Character Wizard",
+    side: "platform", scoped: false, needsActor: false, local: "wizardChecks",
+  },
+  avatar: {
+    label: "User · Avatar · Body",
+    page: "/lab/user/avatar",
+    watcher: "Feature - User Avatar",
+    side: "platform", scoped: false, needsActor: false, local: "avatarChecks",
   },
 };
 
@@ -343,7 +355,12 @@ function fileBoard({ bench, target, checks, source }) {
 // `signupChecks` is injected rather than fetched over HTTP: the signup board is
 // this same process, and making it a self-request would mean minting a session
 // for the server to show to itself.
-export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN, signupChecks } = {}) {
+export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks } = {}) {
+  // Platform-local boards are values, not HTTP routes the server would have
+  // to authenticate to itself. The CLI cannot supply them — it runs outside
+  // the process — so a CLI sweep reports them "not configured" rather than
+  // green, which is the same rule as an unreachable simulator board.
+  const localBoards = { signupChecks, wizardChecks, avatarChecks };
   const runId = uid();
   const startedAt = now();
   db.prepare(`INSERT INTO lab_sweep_runs (id, source, started_at) VALUES (?,?,?)`)

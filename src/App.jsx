@@ -8,6 +8,7 @@ import LabTestManagerPage  from "./pages/LabTestManagerPage.jsx";
 import SignupLabPage       from "./pages/SignupLabPage.jsx";
 import BehaviorLabPage     from "./pages/BehaviorLabPage.jsx";
 import AvatarLabPage       from "./pages/AvatarLabPage.jsx";
+import WizardLabPage       from "./pages/WizardLabPage.jsx";
 import TransportLabPage    from "./pages/TransportLabPage.jsx";
 import WatcherPanel, { watcherIsFollowing } from "./components/WatcherPanel.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
@@ -67,6 +68,7 @@ function LabWatcherOverlay() {
   else if (location.pathname.startsWith("/lab/transport") || location.pathname.startsWith("/lab/world/transport")) bound = "Runtime - Transport Engine";
   else if (location.pathname.startsWith("/lab/user/signup")) bound = "Feature - User Signup and Creation";
   else if (location.pathname.startsWith("/lab/user/avatar")) bound = "Feature - User Avatar";
+  else if (location.pathname.startsWith("/lab/character/wizard")) bound = "Feature - Character Wizard";
   else if (location.pathname.startsWith("/lab/world/behavior")) bound = "Runtime - World Behaviour";
   else if (qs.get("lab") === "behavior") bound = "Runtime - World Behaviour";
   else if (qs.get("lab") === "transport") bound = "Runtime - Transport Engine";
@@ -398,6 +400,7 @@ export default function App() {
         <Route path="/lab/user/signup" element={<SignupLabPage />} />
         <Route path="/lab/world/behavior" element={<BehaviorLabPage />} />
         <Route path="/lab/user/avatar" element={<AvatarLabPage />} />
+        <Route path="/lab/character/wizard" element={<WizardLabPage />} />
         <Route path="/lab" element={<Navigate to="/lab/home" replace />} />
         {/* Session 159 - the public gallery. Signed-in tree, unlike /share:
             character media is served behind auth_request, so there is no such

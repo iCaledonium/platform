@@ -15,6 +15,8 @@ import { mergeAnimationIntoActorGlb, removeAnimationFromActorGlb, parseDufFrames
 import { educationFromCv } from "./cv_edu.mjs";
 import { mount as mountTestLabRoutes } from "./testlab-routes.js";
 import { mount as mountSignupLabRoutes } from "./signuplab-routes.js";
+import { mount as mountAvatarLabRoutes } from "./avatarlab-routes.js";
+import { mount as mountWizardLabRoutes } from "./wizardlab-routes.js";
 import { mount as mountShareLinkRoutes } from "./sharelinks-routes.js";
 
 // Session 102 — drafts carry their wizard adjustment state (all morph
