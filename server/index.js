@@ -6595,10 +6595,19 @@ Based on the visual reference, describe the fictional character's appearance. Re
 app.post("/api/actors", (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
-  const { id: existingId, identity, psychology, personality, lifestyle, economy, draft, default_home_template_url } = req.body;
+  const { id: existingId, identity, psychology, personality, lifestyle, economy, draft, default_home_template_url, appearance_fields } = req.body;
   if (!identity?.first_name) return res.status(400).json({ error: "first_name required" });
   const now  = new Date().toISOString();
   const name = [identity.first_name?.trim(), identity.last_name?.trim()].filter(Boolean).join(" ");
+  // Session 160 — the structured appearance map, stored as JSON beside the
+  // prose in actors.appearance. The character wizard's Appearance step and the
+  // profile editor's Appearance panel both author it (src/lib/appearance.js),
+  // and the wizard composes the prose from it before posting, so the two
+  // columns arrive together and agree. Either encoding is accepted.
+  const appearanceFieldsJson =
+    appearance_fields == null            ? null :
+    typeof appearance_fields === "string" ? appearance_fields :
+    JSON.stringify(appearance_fields);
 
   if (existingId) {
     // ── Finalize an existing draft: verify ownership, then UPDATE in place ──
@@ -6606,8 +6615,12 @@ app.post("/api/actors", (req, res) => {
     if (!actor) return res.status(404).json({ error: "not found" });
     const id = existingId;
     const run = db.transaction(() => {
-      db.prepare(`UPDATE actors SET name=?, first_name=?, last_name=?, age=?, gender=?, nationality=?, occupation=?, appearance=?, default_home_template_url=?, status=?, updated_at=? WHERE id=?`)
-        .run(name, identity.first_name?.trim(), identity.last_name?.trim()||null, identity.age||null, identity.gender||"female", identity.nationality||null, identity.occupation||null, identity.appearance||null, default_home_template_url||null, "ready_to_deploy", now, id);
+      // appearance_fields is COALESCEd, not assigned: a caller that does not
+      // speak this field must not blank a map the profile editor authored.
+      // NULL there is meaningful — the editor reads NULL-with-prose as a
+      // hand-written description and starts that character in manual mode.
+      db.prepare(`UPDATE actors SET name=?, first_name=?, last_name=?, age=?, gender=?, nationality=?, occupation=?, appearance=?, appearance_fields=COALESCE(?, appearance_fields), default_home_template_url=?, status=?, updated_at=? WHERE id=?`)
+        .run(name, identity.first_name?.trim(), identity.last_name?.trim()||null, identity.age||null, identity.gender||"female", identity.nationality||null, identity.occupation||null, identity.appearance||null, appearanceFieldsJson, default_home_template_url||null, "ready_to_deploy", now, id);
       // Session 103 — honest lifecycle (user law): draft -> ready_to_deploy
       // (Save) -> active (deploy). "active" used to mean only "left the
       // wizard", overloading it with "lives in a world"; the gallery
@@ -6661,8 +6674,8 @@ app.post("/api/actors", (req, res) => {
   const id = randomUUID();
   const mediaFolder = name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"") + "-" + id.slice(0,8);
   const run = db.transaction(() => {
-    db.prepare(`INSERT INTO actors (id, owner_id, name, first_name, last_name, age, gender, nationality, occupation, appearance, default_home_template_url, media_folder, status, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(id, user.id, name, identity.first_name?.trim(), identity.last_name?.trim()||null, identity.age||null, identity.gender||"female", identity.nationality||null, identity.occupation||null, identity.appearance||null, default_home_template_url||null, mediaFolder, draft ? "draft" : "ready_to_deploy", now, now);
+    db.prepare(`INSERT INTO actors (id, owner_id, name, first_name, last_name, age, gender, nationality, occupation, appearance, appearance_fields, default_home_template_url, media_folder, status, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, user.id, name, identity.first_name?.trim(), identity.last_name?.trim()||null, identity.age||null, identity.gender||"female", identity.nationality||null, identity.occupation||null, identity.appearance||null, appearanceFieldsJson, default_home_template_url||null, mediaFolder, draft ? "draft" : "ready_to_deploy", now, now);
     const p = psychology||{};
     // Same five columns as the UPDATE above — see the note there.
     db.prepare(`INSERT INTO actor_psychology (actor_id, attachment_style, wound, what_they_want, blindspot, defenses, contradiction, backstory, orientation, view_on_sex, marital_status, coping_mechanisms, self_view, others_view, family_model, relationship_read_pattern, identity_certainty, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)

@@ -14,6 +14,7 @@ import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import { NATIONALITIES, flagEmoji } from "./nationalities.js"; // Session 149 — moved out of this file so ActorsEditorPage.jsx can share it; see nationalities.js for Session 148 rationale.
 import { attachKtx2 } from "../lib/gltfKtx2.js";
+import { APP_SELECTS, FEMALE_FRAME, MALE_FRAME, emptyAppearanceFields, composeAppearance } from "../lib/appearance.js";
 
 // Session 106 — self-generating home thumbnails. A static .jpg beside
 // the GLB (/media/homes/<name>.jpg) wins when present; otherwise the
@@ -91,6 +92,8 @@ function HomeThumbnail({ glbUrl, name }) {
 
 
 const STEPS = ["Appearance", "Accessories", "Psychology", "Personality", "Lifestyle", "Economy", "Review"];
+// The gendered frame keys read better with a label than with the raw key.
+const APP_LABELS = { bust:"Bust", figure:"Silhouette", waist_hip_ratio:"Waist-hip ratio", legs:"Legs", physique:"Physique", shoulders:"Shoulders", height_dominance:"Height dominance" };
 
 // ACCESSORY_SCHEMA, OVERRIDDEN_BY_FULL_OUTFIT, OCCLUDES, defaultAccessories,
 // and ACCESSORY_CATEGORY_TO_SLOT moved to ./AccessoryEditor.jsx (Session
@@ -390,17 +393,18 @@ export default function CharacterWizard({ user, worlds, mode = "character" }) {
   const fileRef = useRef(null);
 
   const [identity, setIdentity] = useState({ first_name:"", last_name:"", age:"", gender:"", nationality:"", occupation:"", orientation:"", appearance:"" });
-  const [appearanceFields, setAppearanceFields] = useState({
-    // General — Haiku fills
-    height:"", build:"", body_shape:"", hair:"", eyes:"", face:"", style:"", notable:"",
-    presence:"", body_confidence:"", grooming:"", tension_markers:"",
-    // Women — Haiku fills
-    breasts:"", ass:"", waist_hip_ratio:"", legs:"",
-    // Men — Haiku fills
-    physique:"", shoulders:"", height_dominance:"",
-    // Manual only (red)
-    voice:"", sexual_presence:"", endowment:"",
-  });
+  // Session 160 — this state was declared and never written: there was no
+  // setAppearanceFields call anywhere in the file, so charCtx()'s "Physical:"
+  // line below was always empty and every character left this wizard with
+  // actors.appearance NULL. analyseAppearance() now fills it from the
+  // reference photos. The field set moved to ../lib/appearance.js because the
+  // profile editor's Appearance panel authors the same map — and two of the
+  // names here were wrong on top of being dead: `breasts`/`ass` are not in the
+  // JSON contract POST /api/generate/appearance asks Haiku for (it returns
+  // `bust`/`figure`), so those two would have stayed empty even once wired.
+  const [appearanceFields, setAppearanceFields] = useState(emptyAppearanceFields());
+  const appearanceAuto      = appearanceFields._auto !== false;
+  const appearanceHasFields = Object.entries(appearanceFields).some(([k,v]) => k !== "_auto" && v);
   const [psychology, setPsychology] = useState({ backstory:"", wound:"", what_they_want:"", blindspot:"", defenses:"", contradiction:"", coping_mechanisms:"", view_on_sex:"", marital_status:"single", self_view:"", others_view:"", family_model:"", relationship_read_pattern:"", identity_certainty:0.5 });
   const [personality, setPersonality] = useState({
     attachment_style:"secure",
@@ -561,6 +565,7 @@ export default function CharacterWizard({ user, worlds, mode = "character" }) {
     bodyType: false, legs: false, arms: false,
     torsoDetail: false, hipsGlutes: false,
     poseHead: false, poseTorso: false, poseArms: false, poseLegs: false,
+    appearance: false,
   });
   const toggleSection = (key) => setExpandedSections(prev => ({ ...prev, [key]: !prev[key] }));
   // Real feature (Session 101+) — replaces the old flat "Proportions"
@@ -715,6 +720,12 @@ export default function CharacterWizard({ user, worlds, mode = "character" }) {
       referenceMeasurements, referenceCalibration, // reference-image URLs deliberately NOT saved: load reads rows-from-disk only (Session 102 law); stored URLs caused two dangling-pointer bugs
       accessories, selectedAccessoryGlbUrls, accessoryScales, accessoryOffsets, accessoryRotations, accessoryParts, accessoryTints,
       showBodyPhotos,
+      // Session 160 — the structured appearance joins the draft lifecycle for
+      // the same reason psychology did: it costs an LLM run and a photo to
+      // produce, and losing it on a reload would mean paying for it twice.
+      // identity.appearance (the composed prose) already rides along inside
+      // identity above.
+      appearanceFields,
       // Session 103 — steps 3-6 enter the draft lifecycle: psychology
       // through economy autosave like everything else, so generated
       // profiles survive reloads and bug-hunt cycles instead of
@@ -945,6 +956,12 @@ export default function CharacterWizard({ user, worlds, mode = "character" }) {
     // fields and inherited the previous character's state). A draft
     // load is a full session replacement: absence means CLEARED,
     // never "keep the last character's".
+    // Session 160 — ABSOLUTE, like everything else here, and row-first like
+    // identity above: actors.appearance_fields exists for any character the
+    // profile editor has touched, draft_state does not.
+    let rowAppearanceFields = {};
+    try { rowAppearanceFields = JSON.parse(a.appearance_fields || "{}") || {}; } catch (e) { console.error("[CharacterWizard] loadDraft: appearance_fields parse failed:", e); }
+    setAppearanceFields({ ...emptyAppearanceFields(), ...rowAppearanceFields, ...(st.appearanceFields || {}) });
     setBodyHeightCm(st.bodyHeightCm != null ? st.bodyHeightCm : 170);
     setBodyHeight(st.bodyHeight || 0); setBodyTorsoLength(st.bodyTorsoLength || 0);
     setBodyArmsLength(st.bodyArmsLength || 0); setBodyLegsLength(st.bodyLegsLength || 0);
@@ -1112,7 +1129,7 @@ export default function CharacterWizard({ user, worlds, mode = "character" }) {
   const updI=upd(setIdentity), updP=upd(setPsychology), updL=upd(setLifestyle), updE=upd(setEconomy);
 
   const charCtx = () => {
-    const appCtx = Object.entries(appearanceFields).filter(([,v])=>v).map(([k,v])=>`${k.replace(/_/g," ")}: ${v}`).join(", ");
+    const appCtx = Object.entries(appearanceFields).filter(([k,v])=>k!=="_auto"&&v).map(([k,v])=>`${k.replace(/_/g," ")}: ${v}`).join(", ");
     // Session 103 — the BODY informs the psyche: height (with an
     // honest percentile cue the LLM can reason about), build signals
     // from the strongest body-type morphs, and current wardrobe. A
@@ -1333,6 +1350,96 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
     setGenerating(null);
   }
 
+  // Session 160 — hoisted out of handleSave so analyseAppearance shares it.
+  // The reference photos reach /api/generate/appearance as base64 inside a
+  // JSON body, and an unresized phone photo is several megabytes of it.
+  const resizeForUpload = (file) => new Promise((res) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const MAX = 1200;
+      const scale = Math.min(1, MAX / Math.max(img.width, img.height));
+      const canvas = document.createElement("canvas");
+      canvas.width  = Math.round(img.width  * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      canvas.toBlob(blob => res(new File([blob], file.name.replace(/\.\w+$/, ".jpg"), {type:"image/jpeg"})), "image/jpeg", 0.88);
+    };
+    img.onerror = () => res(file);
+    img.src = url;
+  });
+
+  // That route sniffs the JPEG magic prefix itself, so it wants raw base64
+  // with the data: URL header taken off.
+  const fileToBase64 = file => new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload  = () => resolve(String(r.result).split(",")[1] || "");
+    r.onerror = () => reject(new Error(`could not read ${file.name}`));
+    r.readAsDataURL(file);
+  });
+
+  // ── Appearance, read from the reference photos ────────────────────────────
+  //
+  // ONE write path, the same law the profile editor's Appearance panel
+  // follows: changing a field re-derives the prose unless the author has taken
+  // it over by editing it directly, which `_auto:false` records. Both surfaces
+  // honour that flag and both store the same map, so a description taken over
+  // here is still the author's in the editor and is not silently recomposed on
+  // the next dropdown change.
+  //
+  // The prose lands in identity.appearance because that is the field
+  // POST /api/actors already writes to actors.appearance — the only appearance
+  // the simulator reads. Until now nothing in this wizard ever wrote it, so
+  // the column was NULL for every character born here.
+  const setAppFields = next => {
+    setAppearanceFields(next);
+    if (next._auto !== false) setIdentity(p => ({ ...p, appearance: composeAppearance(next, (identity.gender||"").toLowerCase()) }));
+  };
+  const updApp     = (k, v) => setAppFields({ ...appearanceFields, [k]: v });
+  const setAppProse = v => { setAppearanceFields({ ...appearanceFields, _auto:false }); updI("appearance", v); };
+
+  const appSelect = (label, key) => (
+    <Field key={key} label={label}>
+      <select style={S.select} value={appearanceFields[key] || ""} onChange={e=>updApp(key, e.target.value)}>
+        <option value="">— Unset —</option>
+        {APP_SELECTS[key].map(v => <option key={v} value={v}>{v}</option>)}
+      </select>
+    </Field>
+  );
+  const appText = (label, key) => (
+    <Field key={key} label={label}>
+      <input style={S.input} value={appearanceFields[key] || ""} onChange={e=>updApp(key, e.target.value)} />
+    </Field>
+  );
+
+  async function analyseAppearance() {
+    const files = Object.values(photos).filter(Boolean);
+    if (!files.length) { setError("Add a reference photo first — this reads from the photos above."); return; }
+    setGenerating("appearance"); setError(null);
+    try {
+      const images = [];
+      for (const f of files) images.push(await fileToBase64(await resizeForUpload(f)));
+      const res = await fetch("/api/generate/appearance", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ images, name:(identity.first_name+" "+identity.last_name).trim(), gender:identity.gender, age:identity.age }),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.error) throw new Error(d.error || `server ${res.status}`);
+      // The route answers 200 with { fields: {} } when Haiku's reply will not
+      // parse, so a 200 is NOT proof it read anything. An empty map is
+      // reported rather than composing an empty description over whatever the
+      // author already had.
+      const { gender:_echoedBack, ...fields } = d.fields || {};
+      if (!Object.keys(fields).length) throw new Error("nothing usable came back for this photo");
+      setAppFields({ ...appearanceFields, ...fields });
+    } catch (err) {
+      console.error("[analyseAppearance] FAILED:", err);
+      setError(`Reading the appearance failed: ${err.message}`);
+    }
+    setGenerating(null);
+  }
+
   function handleSlotFile(slug, e) {
     e.preventDefault();
     const file = (e.dataTransfer?.files||e.target.files)?.[0];
@@ -1548,29 +1655,12 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
       const res = await fetch("/api/actors", {
         method: "POST",
         headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ id: isDraft ? actorId : undefined, identity, psychology:{...psychology, attachment_style:personality.attachment_style}, personality, lifestyle, economy, default_home_template_url: homeTemplate || null, draft:false, bodyHeightCm: bodyHeightCm || undefined }),
+        body: JSON.stringify({ id: isDraft ? actorId : undefined, identity, psychology:{...psychology, attachment_style:personality.attachment_style}, personality, lifestyle, economy, default_home_template_url: homeTemplate || null, draft:false, bodyHeightCm: bodyHeightCm || undefined, appearance_fields: JSON.stringify(appearanceFields) }),
       });
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || "Save failed");
       if (!isDraft) setActorId(data.id);
       savedActorId = data.id || actorId;
-
-      const resizeForUpload = (file) => new Promise((res) => {
-        const img = new Image();
-        const url = URL.createObjectURL(file);
-        img.onload = () => {
-          const MAX = 1200;
-          const scale = Math.min(1, MAX / Math.max(img.width, img.height));
-          const canvas = document.createElement("canvas");
-          canvas.width  = Math.round(img.width  * scale);
-          canvas.height = Math.round(img.height * scale);
-          canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
-          URL.revokeObjectURL(url);
-          canvas.toBlob(blob => res(new File([blob], file.name.replace(/\.\w+$/, ".jpg"), {type:"image/jpeg"})), "image/jpeg", 0.88);
-        };
-        img.onerror = () => res(file);
-        img.src = url;
-      });
 
       // 2. Upload photos — non-fatal, don't rollback for photo failures
       for (const [slug, file] of Object.entries(photos)) {
@@ -2154,6 +2244,61 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
                 {voiceSample ? "Replace voice sample" : "Drop or pick an audio file (mp3/wav)"}
                 <input type="file" accept="audio/*,.mp3,.wav,.m4a,.ogg" style={{display:"none"}} onChange={handleVoiceFile} />
               </label>
+            </div>}
+
+            {/* Session 160 — the step called "Appearance" finally produces
+                one. POST /api/generate/appearance has existed and worked
+                since Session 102 (server/index.js:6581) and nothing ever
+                called it; the fields it returns were declared in this file
+                and never written. The fields, and the composer that turns
+                them into the prose the simulator reads, are shared with the
+                profile editor's Appearance panel — ../lib/appearance.js. */}
+            <div style={{marginBottom:18}}>
+              <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:10,letterSpacing:"0.18em",textTransform:"uppercase",color:"#a8a5a0",marginBottom:8}}>Appearance Description</div>
+              <button
+                onClick={analyseAppearance}
+                disabled={!Object.keys(photos).length || generating==="appearance"}
+                style={{...S.btnAmberFull, marginBottom:8, opacity:(!Object.keys(photos).length || generating==="appearance")?0.6:1}}>
+                {generating==="appearance" ? "◈ Reading the photo…" : appearanceHasFields ? "◈ Re-read appearance from photos" : "◈ Read appearance from photos"}
+              </button>
+              {!Object.keys(photos).length && (
+                <div style={{...S.hint, marginTop:0, marginBottom:14}}>Add a reference photo above first — this reads from the photos you upload.</div>
+              )}
+
+              <Field label="Text the worlds read" hint={appearanceAuto
+                ? "Composed from the fields below. The first 150 characters are all another character is shown of this one across a table; encounters and the video prompt read the whole thing. Edit it directly to take it over."
+                : "Yours — the fields below no longer rewrite it."}>
+                <textarea style={{...S.textarea, minHeight:88}} value={identity.appearance} onChange={e=>setAppProse(e.target.value)}
+                  placeholder="Read it from a photo above, or write it here." />
+              </Field>
+              {!appearanceAuto && appearanceHasFields && (
+                <button onClick={()=>setAppFields({ ...appearanceFields, _auto:true })} style={{...S.btnAmber, marginBottom:14}}>Recompose from fields</button>
+              )}
+
+              <FoldableSection title="Appearance Fields" expanded={expandedSections.appearance} onToggle={()=>toggleSection("appearance")}>
+                <div style={S.row2}>
+                  {appSelect("Height","height")}
+                  {appSelect("Build","build")}
+                  {appSelect("Body shape","body_shape")}
+                  {identity.gender==="female" && FEMALE_FRAME.map(k => appSelect(APP_LABELS[k], k))}
+                  {identity.gender==="male"   && MALE_FRAME.map(k => appSelect(APP_LABELS[k], k))}
+                  {appSelect("Presence","presence")}
+                  {appSelect("Body confidence","body_confidence")}
+                  {appSelect("Grooming","grooming")}
+                </div>
+                {!identity.gender && (
+                  <div style={{...S.hint, marginTop:0, marginBottom:14}}>Set a gender above to get the rest of the frame.</div>
+                )}
+                {appText("Hair","hair")}
+                {appText("Eyes","eyes")}
+                {appText("Face","face")}
+                {appText("Notable features","notable")}
+                {appText("Dress style","style")}
+                {appText("Tension markers","tension_markers")}
+                {appText("Voice","voice")}
+                {appText("Sexual presence","sexual_presence")}
+                {appText("Endowment","endowment")}
+              </FoldableSection>
             </div>
 
 
