@@ -16,6 +16,7 @@ import InvitePage from "./pages/InvitePage.jsx";
 import ClaimSharePage from "./pages/ClaimSharePage.jsx";
 import GalleryPage from "./pages/GalleryPage.jsx";
 import AdminUsersPage from "./pages/AdminUsersPage.jsx";
+import ProfilePage from "./pages/ProfilePage.jsx";
 import HomePage from "./pages/HomePage.jsx";
 import DeveloperPage from "./pages/DeveloperPage.jsx";
 import MessagesPage from "./pages/MessagesPage.jsx";
@@ -381,6 +382,7 @@ export default function App() {
         <Route path="/my-worlds/:worldId/actors/:actorId"   element={<WorldActorPage />} />
         <Route path="/developer"    element={<DeveloperPage />} />
         <Route path="/admin/users"  element={<AdminUsersPage />} />
+        <Route path="/profile"     element={<ProfilePage />} />
         <Route path="/messages"     element={<MessagesPage />} />
         <Route path="/calendar"     element={<CalendarPage />} />
         <Route path="/voicemail"    element={<VoicemailPage />} />

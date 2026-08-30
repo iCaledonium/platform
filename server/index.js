@@ -1186,6 +1186,125 @@ app.get("/api/me", async (req, res) => {
   });
 });
 
+// ── Gender → every world the user plays in ───────────────────────────────────
+//
+// The simulator keeps its own copy on the player actor, so a gender written
+// only on the platform drifts silently. Both edit paths — an admin's
+// PUT /api/users/:id/gender and a person's own PATCH /api/me — push through
+// here; two copies of this loop would be two things to keep in step. Each world
+// is reported separately, because a partial success has to stay visible.
+async function syncGenderToWorlds(userId, gender) {
+  const memberships = db.prepare(
+    `SELECT world_id, actor_id FROM world_memberships WHERE user_id = ?`
+  ).all(userId);
+
+  const synced = [];
+  for (const m of memberships) {
+    try {
+      const r = await fetch(
+        `${SIMULATOR_URL}/internal/worlds/${m.world_id}/members/${userId}`,
+        {
+          method: "PATCH",
+          headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+          body: JSON.stringify({ actor_id: m.actor_id, gender }),
+        }
+      );
+      synced.push({ world_id: m.world_id, actor_id: m.actor_id, ok: r.ok, status: r.status });
+    } catch (e) {
+      synced.push({ world_id: m.world_id, actor_id: m.actor_id, ok: false, error: e.message });
+    }
+  }
+  return synced;
+}
+
+// ── PATCH /api/me — edit your own account ────────────────────────────────────
+//
+// Name, email and gender, for the person they belong to. Until now the only
+// self-service on an account was the photo: everything else was fixed at
+// creation by whoever typed it into /admin/users, so a typo in your own name
+// was permanent. Gender was reachable but staff-only, which left a private
+// user unable to set their own at all.
+//
+// Session cookie only, deliberately: authUser also accepts an API key, and an
+// installed app holding one has no business renaming its owner or moving their
+// email somewhere else. Editing who you are is an act a person performs at a
+// browser, so it is gated on the thing only a browser has.
+app.patch("/api/me", async (req, res) => {
+  const cookieHeader = req.headers["cookie"] || "";
+  const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
+  if (!match) return res.status(401).json({ error: "not authenticated" });
+  const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
+  const me = db.prepare(`
+    SELECT u.id, u.name, u.email, u.gender FROM auth_tokens t
+    JOIN users u ON u.id = t.user_id
+    WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')
+      AND u.status != 'removed'
+  `).get(hash);
+  if (!me) return res.status(401).json({ error: "not authenticated" });
+
+  // A field that was not sent is not an instruction to clear it — only what the
+  // body actually names is touched. Gender is why that distinction matters:
+  // there, "" is a real value ("no gender recorded") and not the same as absent.
+  const has = (k) => Object.prototype.hasOwnProperty.call(req.body || {}, k);
+  const sets = [];
+  const vals = [];
+
+  if (has("name")) {
+    const name = String(req.body.name || "").trim();
+    if (!name) return res.status(400).json({ error: "name cannot be empty" });
+    if (name.length > 80) return res.status(400).json({ error: "name is too long" });
+    sets.push("name = ?"); vals.push(name);
+  }
+
+  if (has("email")) {
+    const email = String(req.body.email || "").trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "valid email required" });
+    // Unique platform-wide rather than per-org: it is the handle a private
+    // account signs in with, so it has to resolve to one person with no
+    // organization around it to disambiguate.
+    const clash = db.prepare(`SELECT id FROM users WHERE lower(email) = ? AND id != ?`).get(email, me.id);
+    if (clash) return res.status(409).json({ error: "that email is already in use" });
+    sets.push("email = ?"); vals.push(email);
+  }
+
+  let gender;
+  if (has("gender")) {
+    const raw = req.body.gender;
+    gender = raw === null || raw === undefined || raw === "" ? null : String(raw).trim().toLowerCase();
+    // The set the simulator normalises to. Anything else is a 422 over there, so
+    // it is a 422 here — better than a value that saves and then cannot sync.
+    if (![null, "male", "female", "non-binary"].includes(gender)) {
+      return res.status(422).json({ error: "gender must be male, female, non-binary, or empty" });
+    }
+    sets.push("gender = ?"); vals.push(gender);
+  }
+
+  if (!sets.length) return res.status(400).json({ error: "nothing to update" });
+
+  sets.push("updated_at = ?"); vals.push(new Date().toISOString());
+  db.prepare(`UPDATE users SET ${sets.join(", ")} WHERE id = ?`).run(...vals, me.id);
+
+  // Gender rides out to the player actor in every world — unconditionally when
+  // it is named, even if the value did not change, because the push is
+  // idempotent and repairs drift the platform cannot see.
+  //
+  // A changed NAME does not ride out: the simulator's member PATCH understands
+  // gender and refuses anything else, so an actor keeps the name it was minted
+  // with. Reported rather than hidden, so the page can say so.
+  const worlds = has("gender") ? await syncGenderToWorlds(me.id, gender) : [];
+
+  const row = db.prepare(`SELECT id, name, email, gender, photo_url FROM users WHERE id = ?`).get(me.id);
+  res.json({
+    ok: true,
+    user: row,
+    // Not a 502: the account really did change. A world that refused the push is
+    // a partial result the caller has to see, not a save that did not happen.
+    worlds,
+    gender_synced: worlds.every(w => w.ok),
+    name_changed: has("name") && req.body.name.trim() !== me.name,
+  });
+});
+
 // ── POST /api/me/active-org — which of your orgs this session acts in ────────
 // The acting-as context. Everything scoped "same org" — the People page, the
 // share picker, world invites — reads the active org, so switching it is what
@@ -1522,26 +1641,8 @@ app.put("/api/users/:user_id/gender", async (req, res) => {
   db.prepare(`UPDATE users SET gender = ?, updated_at = ? WHERE id = ?`)
     .run(gender, new Date().toISOString(), user_id);
 
-  const memberships = db.prepare(
-    `SELECT world_id, actor_id FROM world_memberships WHERE user_id = ?`
-  ).all(user_id);
-
-  const synced = [];
-  for (const m of memberships) {
-    try {
-      const r = await fetch(
-        `${SIMULATOR_URL}/internal/worlds/${m.world_id}/members/${user_id}`,
-        {
-          method: "PATCH",
-          headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
-          body: JSON.stringify({ actor_id: m.actor_id, gender }),
-        }
-      );
-      synced.push({ world_id: m.world_id, actor_id: m.actor_id, ok: r.ok, status: r.status });
-    } catch (e) {
-      synced.push({ world_id: m.world_id, actor_id: m.actor_id, ok: false, error: e.message });
-    }
-  }
+  // Same push the self-service edit uses; see syncGenderToWorlds.
+  const synced = await syncGenderToWorlds(user_id, gender);
 
   const failed = synced.filter(s => !s.ok);
   res.status(failed.length ? 502 : 200).json({
