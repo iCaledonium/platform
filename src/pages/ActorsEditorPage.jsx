@@ -955,9 +955,28 @@ export default function ActorsEditorPage() {
     setStatus("saving"); setSaveError(null);
     try {
       for (const section of dirty) {
+        // draft_state is the 3D panel's territory — ~59KB of wardrobe, body
+        // morphs and accessory transforms that ActorModelPanel persists through
+        // its own endpoint. This editor never edits it, and sending it back
+        // does two kinds of harm:
+        //
+        //   Size. It pushes the request past fetch's 64KB keepalive ceiling.
+        //   Measured on an authored character: 65,628 bytes with it, 977
+        //   without. Over the limit the request never leaves — it rejects as a
+        //   bare "Failed to fetch" with no status to report, so the editor
+        //   could only say "Couldn't save" and not why.
+        //
+        //   Staleness. The copy it would send is whatever was loaded when the
+        //   page opened, so typing in any panel here could overwrite wardrobe
+        //   work done in the 3D panel since.
+        //
+        // Both stayed invisible until the is_owner fix in the server's PUT let
+        // an actor-section save reach the server at all.
+        const raw  = next[section];
+        const data = section === "actor" ? (({ draft_state, ...rest }) => rest)(raw) : raw;
         const r = await fetch(`/api/actors/${id}`, {
           method: "PUT", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ section, data: next[section] }), keepalive: true,
+          body: JSON.stringify({ section, data }), keepalive: true,
         });
         if (!r.ok) {
           if (live.current) { setSaveError(`Couldn't save ${section} — HTTP ${r.status}`); setStatus("error"); }
