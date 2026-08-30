@@ -5715,10 +5715,8 @@ app.post("/api/actors/:id/abandon-draft", (req, res) => {
   const actor = db.prepare(`SELECT id, media_folder FROM actors WHERE id = ? AND owner_id = ? AND status = 'draft'`).get(req.params.id, user.id);
   if (!actor) return res.status(204).end(); // not a draft (already finished, or gone) — nothing to do
 
+  // Read the urls before the transaction (it deletes the rows); unlink after it.
   const mediaFiles = db.prepare(`SELECT url FROM actor_media WHERE actor_id = ?`).all(req.params.id);
-  for (const m of mediaFiles) {
-    try { fs.unlinkSync(path.join(__dirname, "../public", m.url)); } catch {}
-  }
   const tables = ["actor_psychology","actor_big5","actor_disc","actor_hds","actor_economic",
     "actor_lifestyle","actor_mental_health","actor_education","actor_upbringing",
     "actor_diagnoses","actor_media","actor_shares","actor_assessment_results",
@@ -5733,11 +5731,27 @@ app.post("/api/actors/:id/abandon-draft", (req, res) => {
     // "magnus-klack-actor"), not characters — a blanket sweep by actor_id would
     // reach into a different kind of thing that merely shares a column name.
     // Hand-listed, but now checked against the schema rather than assumed.
-    "actor_expense_defaults","actor_deployments"];
+    // Session 161 — actor_share_links has a NO ACTION foreign key into actors
+    // and was in NEITHER delete path, so a character that had ever been shared
+    // by link could not be deleted at all: the DELETE raised exactly the way
+    // the avatar pointer did, after the media had already been unlinked.
+    "actor_expense_defaults","actor_deployments","actor_share_links"];
   db.transaction(() => {
     for (const t of tables) { try { db.prepare(`DELETE FROM ${t} WHERE actor_id = ?`).run(req.params.id); } catch {} }
+    // Avatar mode adopts the draft at CREATE, so the person may be WEARING the
+    // row about to be deleted. users.avatar_actor_id is a NO ACTION foreign key
+    // and foreign_keys is ON, so leaving it set makes this DELETE raise — and
+    // the media unlink used to run BEFORE this transaction, so the raise left a
+    // row whose files were already destroyed, still being worn. Clearing the
+    // pointer here puts it inside the same transaction: all of it, or none.
+    db.prepare(`UPDATE users SET avatar_actor_id = NULL, updated_at = datetime('now') WHERE avatar_actor_id = ?`).run(req.params.id);
     db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
   })();
+  // Disk only AFTER the commit. A transaction that raises must not leave a live
+  // row pointing at media that no longer exists.
+  for (const m of mediaFiles) {
+    try { fs.unlinkSync(path.join(__dirname, "../public", m.url)); } catch {}
+  }
   deleteActorTmpFolder(req.params.id); // not awaited — see comment in generate3d.js
   deleteActorMediaFolder(actor.media_folder); // the GLB itself — see function comment for why this was missing
   res.status(204).end();
@@ -5753,11 +5767,8 @@ app.delete("/api/actors/:id", (req, res) => {
   const deployment = db.prepare(`SELECT id FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL`).get(req.params.id);
   if (deployment) return res.status(409).json({ error: "actor is deployed — undeploy first" });
 
-  // Delete media files from disk using already-imported fs
+  // Read the urls before the transaction (it deletes the rows); unlink after it.
   const mediaFiles = db.prepare(`SELECT url FROM actor_media WHERE actor_id = ?`).all(req.params.id);
-  for (const m of mediaFiles) {
-    try { fs.unlinkSync(path.join(__dirname, "../public", m.url)); } catch {}
-  }
 
   const tables = ["actor_psychology","actor_big5","actor_disc","actor_hds","actor_economic",
     "actor_lifestyle","actor_mental_health","actor_education","actor_upbringing",
@@ -5773,15 +5784,31 @@ app.delete("/api/actors/:id", (req, res) => {
     // "magnus-klack-actor"), not characters — a blanket sweep by actor_id would
     // reach into a different kind of thing that merely shares a column name.
     // Hand-listed, but now checked against the schema rather than assumed.
-    "actor_expense_defaults","actor_deployments"];
+    // Session 161 — actor_share_links has a NO ACTION foreign key into actors
+    // and was in NEITHER delete path, so a character that had ever been shared
+    // by link could not be deleted at all: the DELETE raised exactly the way
+    // the avatar pointer did, after the media had already been unlinked.
+    "actor_expense_defaults","actor_deployments","actor_share_links"];
 
   db.transaction(() => {
     for (const t of tables) {
       try { db.prepare(`DELETE FROM ${t} WHERE actor_id = ?`).run(req.params.id); } catch {}
     }
     try { db.prepare(`DELETE FROM actor_deployments WHERE platform_actor_id = ?`).run(req.params.id); } catch {}
+    // Avatar mode adopts the draft at CREATE, so the person may be WEARING the
+    // row about to be deleted. users.avatar_actor_id is a NO ACTION foreign key
+    // and foreign_keys is ON, so leaving it set makes this DELETE raise — and
+    // the media unlink used to run BEFORE this transaction, so the raise left a
+    // row whose files were already destroyed, still being worn. Clearing the
+    // pointer here puts it inside the same transaction: all of it, or none.
+    db.prepare(`UPDATE users SET avatar_actor_id = NULL, updated_at = datetime('now') WHERE avatar_actor_id = ?`).run(req.params.id);
     db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
   })();
+  // Disk only AFTER the commit. A transaction that raises must not leave a live
+  // row pointing at media that no longer exists.
+  for (const m of mediaFiles) {
+    try { fs.unlinkSync(path.join(__dirname, "../public", m.url)); } catch {}
+  }
   deleteActorTmpFolder(req.params.id); // not awaited — see comment in generate3d.js
   deleteActorMediaFolder(actor.media_folder); // the GLB itself — see function comment for why this was missing
   res.json({ ok: true });
