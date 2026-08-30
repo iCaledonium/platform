@@ -72,6 +72,7 @@ export default function LabIncidentsPage() {
     setBusy(true);
     try {
       const r = await fetch(`/api/test/incidents?status=${filter}&bench=${bench}`, { credentials: "include" });
+      if (r.status === 401) throw new Error("not signed in on this origin — the API answered 401");
       const j = await r.json();
       if (!j.ok) throw new Error(j.error || `HTTP ${r.status}`);
       setRows(j.incidents || []);
@@ -89,7 +90,7 @@ export default function LabIncidentsPage() {
 
   useEffect(() => {
     fetch("/api/test/benches", { credentials: "include" })
-      .then(r => r.json()).then(j => setBenches(j.benches || [])).catch(() => {});
+      .then(r => r.json()).then(j => setBenches(Array.isArray(j.benches) ? j.benches : [])).catch(() => {});
   }, []);
 
   async function setStatus(id, status) {

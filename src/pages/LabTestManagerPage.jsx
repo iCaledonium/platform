@@ -31,6 +31,7 @@ export default function LabTestManagerPage() {
   const [result, setResult] = useState(null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
+  const [authed, setAuthed] = useState(true);
 
   const [bench, setBench] = useState("encounter");
   const [worldId, setWorldId] = useState("");
@@ -57,28 +58,39 @@ export default function LabTestManagerPage() {
 
   const loadTargets = useCallback(async () => {
     try {
-      const j = await fetch("/api/test/sweep/targets", { credentials: "include" }).then(r => r.json());
+      const r = await fetch("/api/test/sweep/targets", { credentials: "include" });
+      if (r.status === 401) { setAuthed(false); setTargets([]); return; }
+      const j = await r.json();
       if (!j.ok) throw new Error(j.error);
-      setTargets(j.targets || []);
+      setTargets(Array.isArray(j.targets) ? j.targets : []);
     } catch (e) { setError(String(e.message || e)); }
   }, []);
 
   const loadRuns = useCallback(async () => {
     try {
       const j = await fetch("/api/test/sweep/runs?limit=12", { credentials: "include" }).then(r => r.json());
-      setRuns(j.runs || []);
+      setRuns(Array.isArray(j.runs) ? j.runs : []);
     } catch { /* the history is a nicety; its absence is not a fault */ }
   }, []);
 
   useEffect(() => {
     fetch("/api/test/benches", { credentials: "include" })
-      .then(r => r.json()).then(j => setBenches(j.benches || [])).catch(e => setError(String(e)));
-    fetch("/api/worlds", { credentials: "include" })
-      .then(r => r.json()).then(ws => {
-        setWorlds(ws || []);
-        const running = (ws || []).find(w => w.status === "running") || (ws || [])[0];
+      .then(r => { if (r.status === 401) setAuthed(false); return r.json(); })
+      .then(j => setBenches(Array.isArray(j.benches) ? j.benches : []))
+      .catch(e => setError(String(e.message || e)));
+    (async () => {
+      try {
+        const r = await fetch("/api/worlds", { credentials: "include" });
+        if (r.status === 401) { setAuthed(false); setWorlds([]); return; }
+        const ws = await r.json();
+        // Anything that is not an array is not a world list. Storing one
+        // costs the whole app: there is no error boundary above this page.
+        if (!Array.isArray(ws)) { setWorlds([]); setError("the world list came back in a shape this page cannot read"); return; }
+        setWorlds(ws);
+        const running = ws.find(w => w.status === "running") || ws[0];
         if (running) setWorldId(running.id);
-      }).catch(() => {});
+      } catch (e) { setWorlds([]); setError(String(e.message || e)); }
+    })();
     loadTargets();
     loadRuns();
   }, [loadTargets, loadRuns]);
@@ -89,8 +101,10 @@ export default function LabTestManagerPage() {
     if (!worldId) { setActors([]); return; }
     (async () => {
       try {
-        const p = await fetch(`/api/worlds/${worldId}/presence`, { credentials: "include" }).then(r => r.json());
-        const list = (p?.locations || []).flatMap(l => (l.actors || [])
+        const pr = await fetch(`/api/worlds/${worldId}/presence`, { credentials: "include" });
+        if (pr.status === 401) { setAuthed(false); setActors([]); return; }
+        const p = await pr.json();
+        const list = (Array.isArray(p?.locations) ? p.locations : []).flatMap(l => (l.actors || [])
           .filter(a => !a.is_ambient && a.actor_type !== "ambient")
           .map(a => ({ id: a.actor_id, name: a.name })));
         const seen = new Set();
@@ -168,7 +182,16 @@ export default function LabTestManagerPage() {
           about to overwrite.
         </div>
 
-        {error && (
+        {!authed && (
+          <div style={{ padding: "10px 14px", borderRadius: 4, fontSize: 11.5, lineHeight: 1.7,
+            background: "rgba(217,164,65,.1)", border: "0.5px solid rgba(217,164,65,.35)", color: "#d9a441" }}>
+            Not signed in on this origin — the API answered 401. The pickers and the sweep
+            will stay empty until you log in; an empty picker here is not evidence that a
+            world has no actors.
+          </div>
+        )}
+
+        {error && authed && (
           <div style={{ padding: "10px 14px", borderRadius: 4, fontSize: 11.5,
             background: "rgba(224,115,107,.1)", border: "0.5px solid rgba(224,115,107,.35)", color: "#e0736b" }}>
             {error}
