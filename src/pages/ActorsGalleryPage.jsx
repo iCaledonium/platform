@@ -210,6 +210,130 @@ function ShareLinkSection({ actor }) {
   );
 }
 
+// ── Publish to the gallery ────────────────────────────────────────────────────
+//
+// Session 159. The sibling of ShareLinkSection: a link is handed to particular
+// people, this lists her for every signed-in account on the platform.
+//
+// Publishing grants nobody anything on its own - it offers, and a reader takes
+// with Adopt. Same cap as a link: read or use, never copy.
+function PublishSection({ actor }) {
+  const [state, setState] = useState(null);
+  const [perm, setPerm]   = useState("read");
+  const [note, setNote]   = useState("");
+  const [busy, setBusy]   = useState(false);
+  const [err, setErr]     = useState(null);
+
+  const S = { fontFamily:"'DM Sans',system-ui,sans-serif" };
+
+  function load() {
+    fetch(`/api/actors/${actor.id}/publish`)
+      .then(r => r.ok ? r.json() : null)
+      .then(s => {
+        if (!s) return;
+        setState(s);
+        if (s.permission) setPerm(s.permission);
+        if (s.note) setNote(s.note);
+      })
+      .catch(() => {});
+  }
+  useEffect(load, [actor.id]);
+
+  async function publish() {
+    setBusy(true); setErr(null);
+    try {
+      const r = await fetch(`/api/actors/${actor.id}/publish`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ permission: perm, note }),
+      });
+      const b = await r.json().catch(() => ({}));
+      if (!r.ok) { setErr(b.error || "Could not publish."); return; }
+      load();
+    } finally { setBusy(false); }
+  }
+
+  async function unpublish(alsoClaims) {
+    if (alsoClaims && !window.confirm(
+      `Remove ${actor.name} from the gallery AND withdraw her from everyone who adopted her?`
+    )) return;
+    setBusy(true); setErr(null);
+    try {
+      await fetch(`/api/actors/${actor.id}/publish${alsoClaims ? "?revoke_claims=1" : ""}`, { method: "DELETE" });
+      load();
+    } finally { setBusy(false); }
+  }
+
+  if (!state) return null;
+  const isPublic = state.visibility === "public";
+
+  return (
+    <div style={{ marginTop:18, paddingTop:16, borderTop:"1px solid rgba(0,0,0,.06)" }}>
+      <div style={{ ...S, fontSize:9, letterSpacing:".15em", textTransform:"uppercase", color:"#a8a5a0", marginBottom:8 }}>
+        Publish to the gallery
+      </div>
+
+      {!state.publishable ? (
+        <div style={{ ...S, fontSize:12, color:"#a8a5a0", lineHeight:1.55 }}>
+          She is still a draft. Finish her and she can be published.
+        </div>
+      ) : !isPublic ? (
+        <>
+          <div style={{ ...S, fontSize:11, color:"#a8a5a0", lineHeight:1.55, marginBottom:10 }}>
+            Lists her for everyone on the platform, in any organisation. A listing is an offer -
+            people choose to adopt her, and she stays yours.
+          </div>
+          <div style={{ display:"flex", gap:7, alignItems:"center", marginBottom:8, flexWrap:"wrap" }}>
+            <select value={perm} onChange={e => setPerm(e.target.value)}
+              style={{ ...S, fontSize:12, padding:"8px 10px", borderRadius:10, border:"1px solid rgba(0,0,0,.1)", background:"rgba(255,255,255,.8)", color:"#1a1814" }}>
+              <option value="read">Read</option>
+              <option value="use">Use</option>
+            </select>
+            <input value={note} onChange={e => setNote(e.target.value)} maxLength={280}
+              placeholder="A line about her (optional)"
+              style={{ ...S, flex:1, minWidth:180, fontSize:12, padding:"8px 10px", borderRadius:10, border:"1px solid rgba(0,0,0,.1)" }} />
+            <button onClick={publish} disabled={busy}
+              style={{ ...S, fontSize:11, letterSpacing:".06em", textTransform:"uppercase", padding:"8px 16px", borderRadius:10, background:"#1a1814", color:"#faf8f4", border:"none", cursor:"pointer", opacity: busy ? .4 : 1 }}>
+              {busy ? "..." : "Publish"}
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div style={{ display:"flex", alignItems:"center", gap:9, flexWrap:"wrap", marginBottom:8 }}>
+            <span style={{ ...S, fontSize:9, letterSpacing:".07em", padding:"3px 8px", borderRadius:5, background:"rgba(99,153,34,.1)", color:"#3b6d11", border:"1px solid rgba(99,153,34,.2)" }}>
+              in the gallery
+            </span>
+            <span style={{ ...S, fontSize:11, color:"#6b6760" }}>
+              offering <b style={{ fontWeight:500, color: PERM_STYLE[state.permission || "read"].fg }}>{state.permission}</b>
+              {" · "}{state.adopters?.length || 0} adopted
+            </span>
+          </div>
+          {state.adopters?.length > 0 && (
+            <div style={{ ...S, fontSize:11, color:"#a8a5a0", marginBottom:8 }}>
+              {state.adopters.map(a => a.name).join(", ")}
+            </div>
+          )}
+          <div style={{ display:"flex", gap:12, alignItems:"center" }}>
+            <button onClick={() => unpublish(false)} disabled={busy}
+              style={{ ...S, fontSize:11, color:"#6b6760", background:"none", border:"1px solid rgba(0,0,0,.12)", borderRadius:9, padding:"7px 13px", cursor:"pointer" }}>
+              Remove from gallery
+            </button>
+            {state.adopters?.length > 0 && (
+              <button onClick={() => unpublish(true)} disabled={busy}
+                title="Also withdraw her from everyone who adopted her"
+                style={{ ...S, fontSize:11, color:"#c0392b", background:"none", border:"none", cursor:"pointer", padding:0 }}>
+                Remove + withdraw
+              </button>
+            )}
+          </div>
+        </>
+      )}
+      {err && <div style={{ ...S, fontSize:12, color:"#c0392b", marginTop:8 }}>{err}</div>}
+    </div>
+  );
+}
+
 function ShareModal({ actor, onClose }) {
   const [shares, setShares]   = useState([]);
   const [users, setUsers]     = useState([]);
@@ -341,6 +465,7 @@ function ShareModal({ actor, onClose }) {
 
         <div style={{ padding:"14px 22px 20px", borderTop:"1px solid rgba(0,0,0,.05)" }}>
           <ShareLinkSection actor={actor} />
+          <PublishSection actor={actor} />
         </div>
       </div>
     </div>
@@ -605,7 +730,10 @@ export default function ActorsGalleryPage() {
             <span style={{ color:"#d1cfca", fontSize:14 }}>/</span>
             <span style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", fontSize:24, fontWeight:500, letterSpacing:".22em", textTransform:"uppercase", color:"#1a1814" }}>Character profiles</span>
           </div>
-          <button onClick={() => navigate("/actors/new")} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, letterSpacing:".06em", textTransform:"uppercase", padding:"10px 22px", borderRadius:10, background:"#1a1814", color:"#faf8f4", border:"none", cursor:"pointer" }}>New character +</button>
+          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+            <button onClick={() => navigate("/gallery")} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, letterSpacing:".06em", textTransform:"uppercase", padding:"10px 18px", borderRadius:10, background:"none", color:"#6b6760", border:"1px solid rgba(0,0,0,.12)", cursor:"pointer" }}>Gallery</button>
+            <button onClick={() => navigate("/actors/new")} style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, letterSpacing:".06em", textTransform:"uppercase", padding:"10px 22px", borderRadius:10, background:"#1a1814", color:"#faf8f4", border:"none", cursor:"pointer" }}>New character +</button>
+          </div>
         </div>
 
         {profiles.length > 0 && (

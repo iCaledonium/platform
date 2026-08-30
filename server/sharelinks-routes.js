@@ -1,6 +1,13 @@
-// ── Character share links ─────────────────────────────────────────────────────
+// ── Sharing a character outside your organisation ─────────────────────────────
 //
-// Session 158. Sharing a character with somebody OUTSIDE your organisation.
+// Session 158. Two ways out, and they are different products:
+//
+//   a LINK    - a secret handed to particular people, out of band  (session 158)
+//   the GALLERY - listed for every signed-in account on the platform (session 159)
+//
+// They share one set of rules about what a grant may be, so they share one
+// implementation of it: `grantShare()` below. Two copies of that logic would be
+// two things to keep in step, and the rules are the whole point of the feature.
 //
 // Why this is not just "drop the same-org scope from the email lookup".
 //
@@ -18,14 +25,15 @@
 // rest, expiring, single live secret, no mailer involved — this box has none.
 // No address is ever typed, so the oracle never reopens.
 //
-// ── The cap: a link can never carry "copy" ────────────────────────────────────
+// ── The cap: neither route can carry "copy" ───────────────────────────────────
 //
 // The in-org ladder is read < use < copy, where copy forks the character into
 // one the claimant owns outright — roughly 100 MB of somebody else's media
 // becoming permanently theirs. A link is aimed at NOBODY: at mint time you
-// cannot know who will open it, or which tenant they are in. So ownership must
-// not travel this path, and `permission` here is validated against {read, use}
-// only.
+// cannot know who will open it, or which tenant they are in. A gallery listing
+// is aimed at everybody, which is the same problem larger. So ownership must
+// not travel either path, and `permission` on both is validated against
+// {read, use} only.
 //
 // This needs no change to the fork endpoint. `POST /api/actors/:id/fork` already
 // requires `hasAccess(..., "copy")`, so a link-claimed holder is refused there by
@@ -81,6 +89,23 @@ export function mount(app, { db, authUser }) {
   // came in through which link and revoke a link's claims as a group.
   try { db.prepare(`ALTER TABLE actor_shares ADD COLUMN via_link_id TEXT REFERENCES actor_share_links(id)`).run(); } catch { /* exists */ }
 
+  // ── Publication (Session 159) ───────────────────────────────────────────────
+  //
+  // On `actors` rather than in a table of its own: a character has exactly one
+  // publication state, so a row per publication would only ever hold zero or one
+  // row per actor and buy nothing. Same idempotent conditional-ALTER pattern the
+  // rest of this schema uses — SQLite has no ADD COLUMN IF NOT EXISTS.
+  for (const ddl of [
+    `ALTER TABLE actors ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private'`,
+    `ALTER TABLE actors ADD COLUMN published_permission TEXT`,
+    `ALTER TABLE actors ADD COLUMN published_note TEXT`,
+    `ALTER TABLE actors ADD COLUMN published_at TEXT`,
+    // Distinguishes a gallery adoption from a link claim (via_link_id) and from
+    // a grant made by name (neither set), so unpublishing can withdraw exactly
+    // the access publication created and nothing a person was given directly.
+    `ALTER TABLE actor_shares ADD COLUMN via_public INTEGER NOT NULL DEFAULT 0`,
+  ]) { try { db.prepare(ddl).run(); } catch { /* exists */ } }
+
   // `can_reshare` has been read and written by the share endpoints since Session
   // 150 but was only ever added to the live DB by a hand-run ALTER — it is in
   // NEITHER db.js's CREATE TABLE nor any migration. A rebuild from code would
@@ -111,6 +136,42 @@ export function mount(app, { db, authUser }) {
       return null;
     }
     return { user, actor };
+  }
+
+  // ── The one place a share is granted to somebody who was not named ──────────
+  //
+  // Used by both the link claim and the gallery adoption. Everything the two
+  // routes must agree on lives here, so they cannot drift:
+  //
+  //   - can_reshare is ALWAYS 0. Never inherited, never configurable. Onward
+  //     re-sharing is a decision about a named person; neither of these routes
+  //     has one.
+  //   - an existing grant is never DOWNGRADED. Somebody given `copy` by name
+  //     does not lose it by opening a `read` link or adopting from the gallery.
+  //     `?? 99` is deliberate: copy and owner are not in LINK_RANK, and an
+  //     unknown rung must read as "more than this", never as zero.
+  //   - the CREATOR stays owner_id. A claim never reassigns a character's origin.
+  //
+  // Returns which of the three things happened, so the caller can report it and
+  // so a link only counts a seat for a genuinely new person.
+  function grantShare({ actorId, ownerId, userId, permission, viaLinkId = null, viaPublic = 0 }) {
+    const now = new Date().toISOString();
+    const existing = db.prepare(`SELECT * FROM actor_shares WHERE actor_id = ? AND shared_with_id = ?`)
+      .get(actorId, userId);
+
+    if (existing && (LINK_RANK[existing.permission] ?? 99) >= LINK_RANK[permission]) {
+      return { outcome: "already_had", permission: existing.permission };
+    }
+    if (existing) {
+      db.prepare(`UPDATE actor_shares SET permission = ?, via_link_id = ?, via_public = ?, updated_at = ? WHERE id = ?`)
+        .run(permission, viaLinkId, viaPublic, now, existing.id);
+      return { outcome: "upgraded", permission };
+    }
+    db.prepare(`INSERT INTO actor_shares
+      (id, actor_id, owner_id, shared_with_id, shared_with_type, permission, can_reshare, via_link_id, via_public, inserted_at, updated_at)
+      VALUES (?,?,?,?,'user',?,0,?,?,?,?)`)
+      .run(randomUUID(), actorId, ownerId, userId, permission, viaLinkId, viaPublic, now, now);
+    return { outcome: "created", permission };
   }
 
   function linkState(row, now) {
@@ -307,38 +368,196 @@ export function mount(app, { db, authUser }) {
       return res.status(400).json({ error: "This is already your character." });
     }
 
-    const existing = db.prepare(`SELECT * FROM actor_shares WHERE actor_id = ? AND shared_with_id = ?`)
-      .get(actor.id, user.id);
-
-    // Already have it at this level or better: say so and change nothing. Opening
-    // the link twice must not burn a second seat, and a link must never DOWNGRADE
-    // a grant somebody was given by name.
-    if (existing && (LINK_RANK[existing.permission] ?? 99) >= LINK_RANK[link.permission]) {
-      return res.json({ ok: true, actor_id: actor.id, name: actor.name,
-                        permission: existing.permission, already_had: true });
-    }
-
+    let r;
     db.transaction(() => {
-      if (existing) {
-        // An upgrade of a grant they already held. can_reshare is left exactly as
-        // the owner set it — the link is raising the rung, not re-deciding a
-        // decision the owner made by name.
-        db.prepare(`UPDATE actor_shares SET permission = ?, via_link_id = ?, updated_at = ? WHERE id = ?`)
-          .run(link.permission, link.id, now, existing.id);
-      } else {
-        // owner_id records the CREATOR, matching the by-name share endpoint, so a
-        // claim never reassigns the character's origin.
-        db.prepare(`INSERT INTO actor_shares
-          (id, actor_id, owner_id, shared_with_id, shared_with_type, permission, can_reshare, via_link_id, inserted_at, updated_at)
-          VALUES (?,?,?,?,'user',?,0,?,?,?)`)
-          .run(randomUUID(), actor.id, actor.owner_id, user.id, link.permission, link.id, now, now);
-        // Seats count PEOPLE the link let in, so an upgrade does not consume one.
+      r = grantShare({
+        actorId: actor.id, ownerId: actor.owner_id, userId: user.id,
+        permission: link.permission, viaLinkId: link.id,
+      });
+      // Seats count PEOPLE the link let in, so neither a re-open nor an upgrade
+      // consumes one.
+      if (r.outcome === "created") {
         db.prepare(`UPDATE actor_share_links SET claims_used = claims_used + 1, updated_at = ? WHERE id = ?`)
           .run(now, link.id);
       }
     })();
 
-    res.json({ ok: true, actor_id: actor.id, name: actor.name,
-               permission: link.permission, upgraded: !!existing });
+    res.json({ ok: true, actor_id: actor.id, name: actor.name, permission: r.permission,
+               already_had: r.outcome === "already_had", upgraded: r.outcome === "upgraded" });
+  });
+
+  // ══ THE PUBLIC GALLERY ══════════════════════════════════════════════════════
+  //
+  // Session 159. The other way a character leaves its org: listed for every
+  // signed-in account on the platform rather than handed to particular people.
+  //
+  // "Public" here means EVERY SIGNED-IN ACCOUNT, not the open internet, and that
+  // is a constraint rather than a preference. A character's photos and model
+  // live under /media/actors/, which nginx serves behind `auth_request
+  // /api/auth/check` — a stanza marked ANIMA-INVARIANT, the standing remediation
+  // for personal media having been publicly reachable. An anonymous gallery
+  // would be a page of broken images unless that control were weakened, so it
+  // is not on the table. A listing is platform-wide, which is already the thing
+  // org scoping prevented.
+  //
+  // Publication grants nothing by itself. It offers; the reader takes. That is
+  // what keeps `actor_shares` the single answer to "who has access": a browser
+  // of the gallery has no access to a character until they adopt it, and then
+  // they hold an ordinary share row like everybody else. The alternative —
+  // treating a listing as an implicit grant to all — would have meant a second
+  // branch in `actorAccess`, and every access question on the platform would
+  // have had two answers to reconcile forever.
+
+  function publicActorRow(a, viewerId) {
+    return {
+      id: a.id, name: a.name, age: a.age, gender: a.gender, occupation: a.occupation,
+      photo_url: a.photo_url, note: a.published_note, published_at: a.published_at,
+      permission: a.published_permission,
+      owner_name: a.owner_name,
+      is_mine: a.owner_id === viewerId,
+      already_have: a.my_permission ?? null,
+    };
+  }
+
+  // ── GET /api/actors/:id/publish — is she listed, and who took her ───────────
+  app.get("/api/actors/:id/publish", (req, res) => {
+    const ok = requireOwner(req, res);
+    if (!ok) return;
+    const a = db.prepare(`SELECT visibility, published_permission, published_note, published_at, status
+                          FROM actors WHERE id = ?`).get(req.params.id);
+    const adopters = db.prepare(`
+      SELECT u.id AS user_id, u.name, u.email, s.permission
+      FROM actor_shares s JOIN users u ON u.id = s.shared_with_id
+      WHERE s.actor_id = ? AND s.via_public = 1
+      ORDER BY s.inserted_at
+    `).all(req.params.id);
+    res.json({
+      visibility: a.visibility || "private",
+      permission: a.published_permission,
+      note: a.published_note,
+      published_at: a.published_at,
+      // The publish control needs to explain itself before the click, not after.
+      publishable: a.status !== "draft",
+      adopters,
+    });
+  });
+
+  // ── PUT /api/actors/:id/publish — list it ───────────────────────────────────
+  app.put("/api/actors/:id/publish", (req, res) => {
+    const ok = requireOwner(req, res);
+    if (!ok) return;
+    const { actor } = ok;
+
+    const permission = req.body?.permission ?? "read";
+    if (!LINK_PERMISSIONS.includes(permission)) {
+      if (permission === "copy") {
+        return res.status(400).json({
+          error: 'The gallery cannot offer "copy". A listing is aimed at everybody, and ownership only ever crosses by an act aimed at a known person — share by name for that.',
+        });
+      }
+      return res.status(400).json({ error: `permission must be ${LINK_PERMISSIONS.join(" or ")}` });
+    }
+
+    // A draft is a character mid-build: the wizard writes the row on the first
+    // step, long before there is a face, an age or a psychology. `status` is
+    // already the product's answer to "is this finished" — the deploy gallery
+    // has refused drafts since Session 103 for the same reason. Publishing one
+    // would put a half-typed stub in front of the whole platform, and (since the
+    // age floor binds only a SUPPLIED age) it is also the one state in which a
+    // character can still legitimately carry no age at all.
+    const full = db.prepare(`SELECT status, age FROM actors WHERE id = ?`).get(actor.id);
+    if (full.status === "draft") {
+      return res.status(400).json({ error: "This character is still a draft. Finish her before publishing." });
+    }
+
+    const note = typeof req.body?.note === "string" ? req.body.note.slice(0, 280).trim() || null : null;
+    const now = new Date().toISOString();
+    db.prepare(`UPDATE actors SET visibility = 'public', published_permission = ?, published_note = ?,
+                published_at = COALESCE(published_at, ?), updated_at = ? WHERE id = ?`)
+      .run(permission, note, now, now, actor.id);
+
+    res.json({ ok: true, visibility: "public", permission, note });
+  });
+
+  // ── DELETE /api/actors/:id/publish — take it back down ──────────────────────
+  //
+  // Same two meanings as revoking a link, and the same default. Unlisting stops
+  // NEW people finding her; the people who already adopted her keep what they
+  // took, because withdrawing something a person is already building on should
+  // be a deliberate act and not a side effect of tidying a listing.
+  // `?revoke_claims=1` is the deliberate act.
+  app.delete("/api/actors/:id/publish", (req, res) => {
+    const ok = requireOwner(req, res);
+    if (!ok) return;
+    const now = new Date().toISOString();
+    let removed = 0;
+    db.transaction(() => {
+      db.prepare(`UPDATE actors SET visibility = 'private', published_permission = NULL,
+                  published_note = NULL, published_at = NULL, updated_at = ? WHERE id = ?`)
+        .run(now, req.params.id);
+      if (req.query.revoke_claims === "1") {
+        // Only what publication created. A grant made by name, or through a
+        // link, was a separate decision and is not publication's to undo.
+        removed = db.prepare(`DELETE FROM actor_shares WHERE actor_id = ? AND via_public = 1`)
+          .run(req.params.id).changes;
+      }
+    })();
+    res.json({ ok: true, visibility: "private", revoked_claims: removed });
+  });
+
+  // ── GET /api/gallery — what everyone has published ──────────────────────────
+  app.get("/api/gallery", (req, res) => {
+    const user = authUser(req);
+    if (!user) return res.status(401).json({ error: "unauthorized" });
+
+    const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+    const like = `%${q.replace(/[%_]/g, m => "\\" + m)}%`;
+
+    const rows = db.prepare(`
+      SELECT a.id, a.name, a.age, a.gender, a.occupation, a.owner_id,
+             a.published_permission, a.published_note, a.published_at,
+             u.name AS owner_name,
+             s.permission AS my_permission,
+             (SELECT url FROM actor_media WHERE actor_id = a.id AND media_type = 'photo'
+                AND state_slug IN ('photo_close','profile') LIMIT 1) AS photo_url
+      FROM actors a
+      JOIN users u ON u.id = a.owner_id
+      LEFT JOIN actor_shares s ON s.actor_id = a.id AND s.shared_with_id = ?
+      WHERE a.visibility = 'public'
+        ${q ? `AND (a.name LIKE ? ESCAPE '\\' OR a.occupation LIKE ? ESCAPE '\\' OR a.published_note LIKE ? ESCAPE '\\')` : ""}
+      ORDER BY a.published_at DESC
+      LIMIT 200
+    `).all(...(q ? [user.id, like, like, like] : [user.id]));
+
+    res.json(rows.map(a => publicActorRow(a, user.id)));
+  });
+
+  // ── POST /api/gallery/:id/adopt — take what is offered ──────────────────────
+  app.post("/api/gallery/:id/adopt", (req, res) => {
+    const user = authUser(req);
+    if (!user) return res.status(401).json({ error: "unauthorized" });
+
+    const actor = db.prepare(`SELECT id, name, owner_id, visibility, published_permission FROM actors WHERE id = ?`)
+      .get(req.params.id);
+    // Unlisted and never-listed answer identically: the gallery is the only way
+    // this route knows about a character, so there is nothing to distinguish.
+    if (!actor || actor.visibility !== "public") {
+      return res.status(404).json({ error: "This character is not in the gallery." });
+    }
+    if (actor.owner_id === user.id) {
+      return res.status(400).json({ error: "This is already your character." });
+    }
+    // Belt and braces against a row that went public before the cap existed, or
+    // one edited by hand: the offered rung is re-validated at the point of grant,
+    // not trusted from storage.
+    const permission = LINK_PERMISSIONS.includes(actor.published_permission) ? actor.published_permission : "read";
+
+    const r = db.transaction(() => grantShare({
+      actorId: actor.id, ownerId: actor.owner_id, userId: user.id,
+      permission, viaPublic: 1,
+    }))();
+
+    res.json({ ok: true, actor_id: actor.id, name: actor.name, permission: r.permission,
+               already_had: r.outcome === "already_had", upgraded: r.outcome === "upgraded" });
   });
 }

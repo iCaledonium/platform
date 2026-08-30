@@ -14,6 +14,7 @@ import LoginPage from "./pages/LoginPage.jsx";
 import EnrollPage from "./pages/EnrollPage.jsx";
 import InvitePage from "./pages/InvitePage.jsx";
 import ClaimSharePage from "./pages/ClaimSharePage.jsx";
+import GalleryPage from "./pages/GalleryPage.jsx";
 import AdminUsersPage from "./pages/AdminUsersPage.jsx";
 import HomePage from "./pages/HomePage.jsx";
 import DeveloperPage from "./pages/DeveloperPage.jsx";
@@ -396,6 +397,10 @@ export default function App() {
         <Route path="/lab/world/behavior" element={<BehaviorLabPage />} />
         <Route path="/lab/user/avatar" element={<AvatarLabPage />} />
         <Route path="/lab" element={<Navigate to="/lab/home" replace />} />
+        {/* Session 159 - the public gallery. Signed-in tree, unlike /share:
+            character media is served behind auth_request, so there is no such
+            thing as an anonymous view of it. */}
+        <Route path="/gallery"           element={<GalleryPage />} />
         <Route path="/actors"            element={<ActorsGalleryPage />} />
         <Route path="/actors/new"        element={<CharacterWizard />} />
         {/* The same wizard in avatar mode: your own body, three steps. */}
