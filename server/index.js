@@ -58,6 +58,12 @@ try { db.prepare(`ALTER TABLE actors ADD COLUMN runtime_glb_hash TEXT`).run(); }
 // index.js:3276). Restored here so a rebuilt DB self-heals instead of
 // mining itself.
 try { db.prepare(`ALTER TABLE actors ADD COLUMN appearance TEXT`).run(); } catch {}
+// The structured appearance the profile editor's Appearance panel writes, as
+// JSON. `appearance` above stays the prose the SIMULATOR reads (it slices it to
+// 150 chars into a meeting prompt and feeds it to the video prompt builder), so
+// the structured map cannot live there; this column holds it losslessly and the
+// panel composes the prose from it.
+try { db.prepare(`ALTER TABLE actors ADD COLUMN appearance_fields TEXT`).run(); } catch {}
 // Session 147 — per-user preferences (first consumer: Explore display
 // sliders). One TEXT JSON column, namespaced object inside (e.g.
 // { exploreDisplay: {...} }) so future preference groups merge rather
@@ -5887,7 +5893,19 @@ app.put("/api/actors/:id", (req, res) => {
 
   // photo_url lives in actor_media, not actors table — handle separately
   const photoUrl = (section === "actor") ? data.photo_url : undefined;
-  const fields = Object.keys(data).filter(k => k !== target.pk && k !== "inserted_at" && k !== "photo_url");
+  // Only real columns of the target table may be written. The editor round-trips
+  // whatever GET /api/actors/:id handed it, and that payload carries computed
+  // fields that are not columns — `is_owner` (Session 150) and, for a shared
+  // character, `permission`. A blind Object.keys() therefore built
+  // `SET is_owner = ?` and EVERY Identity save died with
+  // "no such column: is_owner", HTTP 500; the editor showed "Couldn't save
+  // actor — HTTP 500" and the name never changed. Deriving the allowlist from
+  // the schema means the next computed field added to the GET cannot break
+  // saves again. updated_at is dropped too — it is appended explicitly below,
+  // and passing it through produced a duplicate assignment in the same SET.
+  const columns = new Set(db.prepare(`PRAGMA table_info(${target.table})`).all().map(c => c.name));
+  const fields = Object.keys(data).filter(k =>
+    columns.has(k) && k !== target.pk && k !== "inserted_at" && k !== "updated_at" && k !== "photo_url");
 
   if (fields.length > 0) {
     const sets   = fields.map(f => `${f} = ?`).join(", ");

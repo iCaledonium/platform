@@ -1,10 +1,11 @@
 import UndeployButton from "./UndeployButton.jsx";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { useParams, useNavigate, useLocation } from "react-router-dom";
 import DeployWizardModal from "./DeployWizardModal.jsx";
 import ActorModelPanel from "./ActorModelPanel.jsx";
 import { NATIONALITIES, flagEmoji } from "./nationalities.js";
 import { fmtAmount } from "../lib/money.js";
+import { APP_SELECTS, composeAppearance } from "../lib/appearance.js";
 
 const STYLE_COLOR = {
   fearful_avoidant:  { bg: "rgba(55,138,221,.10)",  border: "rgba(55,138,221,.2)",  text: "#185fa5", init: "rgba(55,138,221,.15)" },
@@ -49,7 +50,17 @@ function ESelect({ label, value, onChange, options }) {
       <label style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".16em", textTransform:"uppercase", color:"#a8a5a0", display:"block", marginBottom:5 }}>{label}</label>
       <select value={value||""} onChange={e=>onChange(e.target.value)}
         style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, color:"#1a1814", background:"rgba(255,255,255,.8)", border:"1px solid rgba(176,92,8,.25)", borderRadius:8, padding:"8px 12px", width:"100%", outline:"none", appearance:"none" }}>
-        {options.map(o => <option key={o.value||o} value={o.value||o}>{o.label||o}</option>)}
+        {options.map(o => {
+          // `o.value || o` fell back to the OBJECT whenever value was the empty
+          // string, so an "— Optional —" entry rendered value="[object Object]"
+          // and picking it wrote that string to the column. Identity's
+          // Nationality select has carried that entry all along; Appearance
+          // needs a clearable value in every select, so the helper is fixed
+          // rather than worked around.
+          const val = typeof o === "string" ? o : o.value;
+          const lab = typeof o === "string" ? o : (o.label ?? o.value);
+          return <option key={val} value={val}>{lab}</option>;
+        })}
       </select>
     </div>
   );
@@ -99,6 +110,12 @@ function EFieldInspire({ label, fieldKey, value, onChange, tall, context }) {
       <textarea value={value||""} onChange={e=>onChange(e.target.value)} rows={tall?4:3}
         style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, color:"#1a1814", background:"rgba(255,255,255,.8)", border:"1px solid rgba(176,92,8,.25)", borderRadius:8, padding:"10px 12px", width:"100%", resize:"vertical", lineHeight:1.6, outline:"none" }} />
     </div>
+  );
+}
+
+function SubHead({ label }) {
+  return (
+    <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".16em", textTransform:"uppercase", color:"#b05c08", margin:"22px 0 10px", paddingBottom:5, borderBottom:"1px solid rgba(176,92,8,.15)" }}>{label}</div>
   );
 }
 
@@ -179,6 +196,141 @@ function IdentityPanel({ d, editing, setEditData }) {
           options={["single","casually_dating","in_relationship","married","separated","divorced","widowed"]} />
       </div>
       <EField label="View on intimacy" value={p?.view_on_sex} onChange={v=>upd("psychology.view_on_sex",v)} tall full />
+    </div>
+  );
+}
+
+// ── Panel: Appearance ───────────────────────────────────────────────
+//
+// The field set, the two columns it writes, and the composer that turns one
+// into the other all live in ../lib/appearance.js. CharacterWizard's Appearance
+// step authors the same map from the reference photos, so neither file owns it;
+// read that header for why `appearance` and `appearance_fields` are separate
+// columns and what `_auto: false` protects.
+const opts = key => [{ value:"", label:"— Unset —" }, ...APP_SELECTS[key].map(v => ({ value:v, label:v }))];
+
+// The description, with the slice another character actually sees marked off.
+function ProseReadout({ text, label = "Description" }) {
+  const t = text || "";
+  return (
+    <div style={{ marginBottom:14 }}>
+      <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".16em", textTransform:"uppercase", color:"#a8a5a0", marginBottom:5 }}>{label}</div>
+      <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:13, lineHeight:1.65, color: t ? "#1a1814" : "#c8c5c0", background:"rgba(255,255,255,.55)", border:"1px solid rgba(0,0,0,.07)", borderRadius:8, padding:"10px 12px" }}>
+        {t ? <>{t.slice(0,150)}<span style={{ color:"#a8a5a0" }}>{t.slice(150)}</span></> : "—"}
+      </div>
+      {!!t && (
+        <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#a8a5a0", marginTop:5, lineHeight:1.5 }}>
+          The first 150 characters (in black) are all another character is shown of this one across a table. Encounters and the video prompt read the whole thing.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AppearancePanel({ d, editing, setEditData }) {
+  const a = d.actor || {};
+  const f = useMemo(() => {
+    let parsed = {};
+    try { parsed = JSON.parse(a.appearance_fields || "{}") || {}; } catch { parsed = {}; }
+    // A character that already has prose but no structured fields — anything
+    // authored before this panel existed, or written straight into the column —
+    // starts as MANUAL. Otherwise the first dropdown change would compose over
+    // the only copy of that description and there would be no way back.
+    if (a.appearance_fields == null && (a.appearance || "").trim()) parsed._auto = false;
+    return parsed;
+  }, [a.appearance_fields, a.appearance]);
+  const auto      = f._auto !== false;
+  const gender    = (a.gender || "").toLowerCase();
+  // Recomposing from an empty field set would just erase the description, so
+  // the button that offers it only appears when there is something to compose.
+  const hasFields = Object.entries(f).some(([k,v]) => k !== "_auto" && v);
+
+  // One write path. Changing a field re-derives the prose unless the author has
+  // taken it over; gender is read off the actor being written, so switching it
+  // on the Identity panel and coming back recomposes with the right block.
+  const setFields = next => setEditData(prev => {
+    const actor = { ...prev.actor, appearance_fields: JSON.stringify(next) };
+    if (next._auto !== false) actor.appearance = composeAppearance(next, (actor.gender || "").toLowerCase());
+    return { ...prev, actor };
+  });
+  const upd = (k, v) => setFields({ ...f, [k]: v });
+  const setProse = v => setEditData(prev => ({
+    ...prev,
+    actor: { ...prev.actor, appearance: v, appearance_fields: JSON.stringify({ ...f, _auto:false }) },
+  }));
+
+  const S = (label, key) => <ESelect key={key} label={label} value={f[key]} onChange={v=>upd(key,v)} options={opts(key)} />;
+  const T = (label, key, tall) => <EField key={key} label={label} value={f[key]} onChange={v=>upd(key,v)} tall={tall} full={tall} />;
+
+  if (!editing) {
+    const shown = Object.entries(f).filter(([k,v]) => k !== "_auto" && v);
+    return (
+      <div>
+        <ProseReadout text={a.appearance} />
+        {shown.length > 0 && (
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14, marginTop:18 }}>
+            {shown.map(([k,v]) => <Field key={k} label={k.replace(/_/g," ")} value={v} />)}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <SubHead label="Frame" />
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14 }}>
+        {S("Height","height")}
+        {S("Build","build")}
+        {S("Body shape","body_shape")}
+        {gender === "female" && S("Bust","bust")}
+        {gender === "female" && S("Silhouette","figure")}
+        {gender === "female" && S("Waist-hip ratio","waist_hip_ratio")}
+        {gender === "female" && S("Legs","legs")}
+        {gender === "male"   && S("Physique","physique")}
+        {gender === "male"   && S("Shoulders","shoulders")}
+        {gender === "male"   && S("Height dominance","height_dominance")}
+      </div>
+      {!gender && (
+        <p style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, color:"#a8a5a0", marginTop:-4, marginBottom:14 }}>
+          Set a gender on Identity to get the rest of the frame.
+        </p>
+      )}
+
+      <SubHead label="Features" />
+      {T("Hair","hair")}
+      {T("Eyes","eyes")}
+      {T("Face","face", true)}
+      {T("Notable features","notable", true)}
+
+      <SubHead label="Bearing" />
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14 }}>
+        {S("Presence","presence")}
+        {S("Body confidence","body_confidence")}
+        {S("Grooming","grooming")}
+      </div>
+      {T("Dress style","style")}
+      {T("Tension markers","tension_markers")}
+      {T("Voice","voice")}
+
+      <SubHead label="Intimate" />
+      {T("Sexual presence","sexual_presence")}
+      {T("Endowment","endowment")}
+
+      <SubHead label="Description" />
+      <p style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, color:"#6b6760", margin:"0 0 10px", lineHeight:1.6, maxWidth:640 }}>
+        {auto
+          ? "Written from the fields above, and the only part of this page the worlds read. Edit it directly to take it over."
+          : "Yours — the fields above no longer rewrite it."}
+        {!auto && hasFields && (
+          <button onClick={() => setFields({ ...f, _auto:true })}
+            style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".08em", textTransform:"uppercase", padding:"4px 10px", borderRadius:6, background:"rgba(176,92,8,.08)", border:"1px solid rgba(176,92,8,.2)", color:"#b05c08", cursor:"pointer", marginLeft:10 }}>
+            Recompose from fields
+          </button>
+        )}
+      </p>
+      <EField label="Text the worlds read" value={a.appearance} onChange={setProse} tall full />
+      <ProseReadout text={a.appearance} label="As another character receives it" />
     </div>
   );
 }
@@ -671,6 +823,7 @@ function InPlayPanel({ actorId, actorName }) {
 const NAV = [
   { section: "Profile" },
   { id: "identity",    label: "Identity",             doneKey: () => true },
+  { id: "appearance",  label: "Appearance",            doneKey: d => !!d?.actor?.appearance },
   { id: "psych",       label: "Psychological profile", doneKey: d => !!d?.psychology?.wound },
   { section: "Assessments" },
   { id: "assessments", label: "Personality",           doneKey: d => d?.big5?.openness != null },
@@ -862,6 +1015,7 @@ export default function ActorsEditorPage() {
 
   const panels = {
     identity:    <IdentityPanel    d={viewData} editing={editing} setEditData={updateEditData} />,
+    appearance:  <AppearancePanel  d={viewData} editing={editing} setEditData={updateEditData} />,
     psych:       <PsychPanel       d={viewData} editing={editing} setEditData={updateEditData} />,
     assessments: <AssessmentsPanel d={viewData} editing={editing} setEditData={updateEditData} actorId={id} />,
     mental:      <MentalPanel      d={viewData} editing={editing} setEditData={updateEditData} />,
