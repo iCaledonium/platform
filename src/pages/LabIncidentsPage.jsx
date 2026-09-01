@@ -209,13 +209,15 @@ export default function LabIncidentsPage() {
           {(rows || []).map(inc => {
             const sev = SEVERITY[inc.severity] || SEVERITY.fail;
             const st = STATUS[inc.status] || STATUS.open;
+            // Settled: the severity is history now, not a live verdict.
+            const settled = inc.status === "resolved" || inc.status === "wontfix";
             const isOpen = !!open[inc.id];
             return (
               <div key={inc.id} style={{ padding: "12px 15px", borderRadius: 5,
                 background: "rgba(255,255,255,.022)",
                 borderLeft: `2px solid ${sev.color}`,
                 border: "0.5px solid rgba(255,255,255,.09)",
-                borderLeftWidth: 2, borderLeftColor: sev.color }}>
+                borderLeftWidth: 2, borderLeftColor: settled ? st.color : sev.color }}>
 
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 14, alignItems: "baseline" }}>
                   <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0 }}>
@@ -226,7 +228,7 @@ export default function LabIncidentsPage() {
                     </span>
                   </div>
                   <div style={{ display: "flex", gap: 8, alignItems: "center", flexShrink: 0 }}>
-                    <span style={{ ...label, fontSize: 9, color: sev.color }}>{sev.label}</span>
+                    {!settled && <span style={{ ...label, fontSize: 9, color: sev.color }}>{sev.label}</span>}
                     <span style={{ ...label, fontSize: 9, color: st.color }}>{st.label}</span>
                   </div>
                 </div>
@@ -243,6 +245,7 @@ export default function LabIncidentsPage() {
                   <div style={{ marginTop: 8, fontSize: 9.5, fontFamily: "ui-monospace,monospace",
                     color: "rgba(255,255,255,.3)", lineHeight: 1.7 }}>
                     <div>fingerprint {inc.fingerprint}</div>
+                    <div>recorded as {sev.label}{settled ? " when it was last seen" : ""}</div>
                     <div>source {inc.source} · first seen {inc.first_seen_at} · last seen {inc.last_seen_at}</div>
                     {inc.resolved_at && <div>resolved {inc.resolved_at} by {inc.resolved_by}</div>}
                     {inc.first_detail && inc.first_detail !== inc.detail &&
