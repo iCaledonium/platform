@@ -199,12 +199,16 @@ export default function LabCaseAdmin() {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
       <div style={{ display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap" }}>
+        {/* The order IS the hierarchy: a suite holds categories, a category
+            holds test cases. Listing them as three peers hid that. */}
         <span onClick={() => setTab("suites")} style={chip(tab === "suites")}>Suites ({suites.length})</span>
-        <span onClick={() => setTab("cases")} style={chip(tab === "cases")}>
-          Test cases{cases ? ` (${cases.length})` : ""}
-        </span>
+        <span style={{ color: "rgba(255,255,255,.2)", fontSize: 11 }}>›</span>
         <span onClick={() => setTab("categories")} style={chip(tab === "categories")}>
           Categories ({cats.length})
+        </span>
+        <span style={{ color: "rgba(255,255,255,.2)", fontSize: 11 }}>›</span>
+        <span onClick={() => setTab("cases")} style={chip(tab === "cases")}>
+          Test cases{cases ? ` (${cases.length})` : ""}
         </span>
         <span onClick={() => { setTab("author"); setDraft({ kind: "query", op: "eq", expected: 0, probe_method: "GET" }); setTryResult(null); }}
           style={chip(tab === "author")}>Write a test case</span>
