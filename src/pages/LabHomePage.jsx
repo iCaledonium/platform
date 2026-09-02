@@ -32,17 +32,6 @@ const BOARDS = [
 
 const CASES = [
   {
-    path: "/lab/home/testmanager",
-    key: "authored",
-    subject: "Authored",
-    place: "—",
-    situation: "Test cases",
-    blurb: "Test cases written in the manager rather than in code — a query compared to a number, " +
-      "or an anonymous probe compared to a status. They sweep like any other category. Queries run " +
-      "on a read-only connection, so SQLite refuses anything that writes.",
-    live: true,
-  },
-  {
     path: "/lab/actor/apartment/encounter",
     key: "encounter",
     subject: "Actor",
@@ -60,6 +49,15 @@ const CASES = [
     situation: "Creation",
     blurb: "The invite → enroll → org pipeline, walked through the production endpoints " +
       "with throwaway @lab.local people. Carries its own platform-side scorecard.",
+    live: true,
+  },
+  {
+    path: "/lab/user/signin",
+    subject: "User",
+    place: "Sign in",
+    situation: "Session",
+    blurb: "The door \u2014 TOTP, the session it mints, the desktop handoff, sign-out. " +
+      "Walked server-side against a throwaway account, because a test login in your browser would sign YOU out.",
     live: true,
   },
   {
