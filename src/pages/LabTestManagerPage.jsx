@@ -154,6 +154,7 @@ export default function LabTestManagerPage() {
   }
 
   const globals = benches.filter(b => !b.scoped);
+  const enabledTargets = targets.filter(t => t.enabled).length;
   const configured = new Set(targets.filter(t => t.enabled).map(t => t.bench));
 
   return (
@@ -209,8 +210,13 @@ export default function LabTestManagerPage() {
               style={{ ...btn(GOLD + ".85)", running), padding: "9px 20px", fontSize: 12 }}>
               {running ? "Sweeping…" : "Run all boards"}
             </button>
+            {/* One board RUN per enabled target, plus one per global board.
+                That sum is the "N board(s)" every run reports, so show the
+                addition rather than leaving two different units side by side. */}
             <span style={{ fontSize: 11, color: "rgba(255,255,255,.4)" }}>
-              {targets.filter(t => t.enabled).length} pinned target(s) · {globals.length} global board(s)
+              {enabledTargets + globals.length} board{enabledTargets + globals.length === 1 ? "" : "s"} will run
+              {" — "}{enabledTargets} world-scoped (one per pinned target below)
+              {" · "}{globals.length} global (platform-wide, no target needed)
             </span>
           </div>
 
@@ -352,7 +358,8 @@ export default function LabTestManagerPage() {
 
           {targets.length === 0 && (
             <span style={{ fontSize: 11, color: "rgba(255,255,255,.35)" }}>
-              Nothing pinned yet — the three world-scoped boards cannot run without a target.
+              Nothing pinned yet — a world-scoped board cannot run until you point it at a world.
+              The global boards below still run without one.
             </span>
           )}
 
@@ -418,8 +425,8 @@ export default function LabTestManagerPage() {
           <code style={{ color: "rgba(255,255,255,.45)" }}>
             ssh mac-mini-ubuntu 'node ~/platform/server/lab-incidents-cli.mjs sweep --source routine:nightly'
           </code>
-          {" "}— that path covers the three simulator boards; the signup board lives inside the
-          running platform-api process and is swept by the button above.
+          {" "}— that runs the same sweep as the button above, over every board, by asking the
+          platform-api process to do it rather than duplicating it out of process.
         </div>
       </div>
     </div>
