@@ -10,6 +10,7 @@ import { wizardChecks } from "./wizardlab-routes.js";
 import { avatarChecks } from "./avatarlab-routes.js";
 import { shareChecks } from "./sharelab-routes.js";
 import { deployChecks } from "./deploylab-routes.js";
+import { signinChecks } from "./signinlab-routes.js";
 import * as cases from "./lab-cases.js";
 
 export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
@@ -129,7 +130,7 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
   // it can close over the dependencies the runs need.
   labIncidents.startScheduler({
     SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks,
-    shareChecks, deployChecks, authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
+    shareChecks, deployChecks, signinChecks, authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
   });
 
   app.get("/api/test/benches", (req, res) => {
@@ -229,7 +230,7 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
     const source = (req.body || {}).source || `manual:${user.name || user.id}`;
     sweepInFlight = labIncidents.runSweep({
       source, SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks,
-      shareChecks, deployChecks,
+      shareChecks, deployChecks, signinChecks,
       authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
     });
     try {
@@ -314,7 +315,7 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
 
   const RUN_DEPS = () => ({
     SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks,
-    shareChecks, deployChecks, authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
+    shareChecks, deployChecks, signinChecks, authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
   });
 
   app.get("/api/test/suites", (req, res) => {

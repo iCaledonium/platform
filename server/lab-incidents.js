@@ -49,6 +49,7 @@ db.exec(`
     last_seen_at  TEXT NOT NULL,
     resolved_at   TEXT,
     resolved_by   TEXT,
+    last_pass_at  TEXT,
     updated_at    TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_lab_incidents_open ON lab_incidents(status, last_seen_at DESC);
@@ -83,6 +84,16 @@ db.exec(`
     detail          TEXT
   );
 `);
+
+// Added 2026-09-02. A pass against a STICKY row (known / wontfix) writes here.
+// Auto-resolve deliberately skips those two — a red-by-design check that goes
+// green must not silently un-stick itself — but until now a `known` row whose
+// check had started passing and one still failing rendered IDENTICALLY, which
+// is the empty-board/clean-board shape this store guards against everywhere
+// else. Both timestamps come off the same clock in the same format, so
+// last_pass_at later than last_seen_at means "green at the last look".
+// Nothing else about the row changes: only a person un-sticks it.
+try { db.exec(`ALTER TABLE lab_incidents ADD COLUMN last_pass_at TEXT`); } catch { /* already there */ }
 
 const now = () => new Date().toISOString();
 const uid = () => crypto.randomBytes(9).toString("hex");
@@ -129,6 +140,12 @@ export const BENCHES = {
     page: "/lab/character/wizard",
     watcher: "Feature - Character Wizard",
     side: "platform", scoped: false, needsActor: false, local: "wizardChecks",
+  },
+  signin: {
+    label: "User · Sign in · Session",
+    page: "/lab/user/signin",
+    watcher: "Feature - User Sign In",
+    side: "platform", scoped: false, needsActor: false, local: "signinChecks",
   },
   avatar: {
     label: "User · Avatar · Body",
@@ -408,6 +425,17 @@ function fileBoard({ bench, target, checks, source }) {
         .run(t, source, t, row.id);
       tally.resolved++;
     }
+
+    // The sticky pair get the SAME pass recorded, without their status moving.
+    // This is the only thing a pass does to a known/wontfix row, and it is what
+    // makes "this red is by design" distinguishable from "this red is by design
+    // and stopped being red three weeks ago".
+    db.prepare(`
+      UPDATE lab_incidents SET last_pass_at = ?, updated_at = ?
+       WHERE bench = ? AND world_id IS ? AND actor_id IS ?
+         AND status IN ('known','wontfix')
+         AND check_name IN (${placeholders})
+    `).run(t, t, bench, target.world_id || null, target.actor_id || null, ...passedNames);
   }
 
   // The bench answered, so its own unreachable incident (if any) is fixed.
@@ -428,7 +456,7 @@ function fileBoard({ bench, target, checks, source }) {
 // `signupChecks` is injected rather than fetched over HTTP: the signup board is
 // this same process, and making it a self-request would mean minting a session
 // for the server to show to itself.
-export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks, authoredChecks, only = null, suite_id = null, targets: suppliedTargets = null } = {}) {
+export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks, authoredChecks, signinChecks, only = null, suite_id = null, targets: suppliedTargets = null } = {}) {
   // `only` limits the run to a set of categories — what a suite needs. null
   // means every category, which is the plain sweep.
   const wanted = only ? new Set(only) : null;
@@ -436,7 +464,7 @@ export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN,
   // to authenticate to itself. The CLI cannot supply them — it runs outside
   // the process — so a CLI sweep reports them "not configured" rather than
   // green, which is the same rule as an unreachable simulator board.
-  const localBoards = { signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks, authoredChecks };
+  const localBoards = { signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks, authoredChecks, signinChecks };
   const runId = uid();
   const startedAt = now();
   try { db.exec(`ALTER TABLE lab_sweep_runs ADD COLUMN suite_id TEXT`); } catch { /* already there */ }
