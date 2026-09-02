@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import DoorScene3D from "./DoorScene3D.jsx";
+import { labReturnPath } from "../labReturn.js";
 
 // ── KnockActorDoor ────────────────────────────────────────────────────────────
 //
@@ -187,7 +188,7 @@ export default function KnockActorDoor() {
     sessionStorage.removeItem(cacheKey);
     // Stepping back from a door puts you on the street outside it, not out of
     // the world entirely.
-    navigate(`/world/${worldId}`);
+    navigate(labReturnPath() || `/world/${worldId}`);
   }
 
   if (problem) {
@@ -231,6 +232,10 @@ export default function KnockActorDoor() {
       actorName={ctx.actor?.name}
       actorId={ctx.actor?.actor_id}
       glbUrl={ctx.actor?.runtime_glb_url || ctx.actor?.glb_url}
+      // Runtime build ONLY. The raw player export is ~93 MB against her
+      // 26 MB runtime, and fetching it from the page fails outright —
+      // third person runs camera-only rather than hang on it.
+      playerGlbUrl={ctx.user?.runtime_glb_url || null}
       onLeave={handleLeave}
     />
   );
