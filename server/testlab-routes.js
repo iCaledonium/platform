@@ -118,6 +118,13 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
 
   let sweepInFlight = null;
 
+  // Targets used to be a global list. Fold any that survive into an "All tests"
+  // suite once, so nothing that was being measured quietly stops being measured.
+  try {
+    const m = cases.migrateGlobalTargets(Object.keys(labIncidents.BENCHES));
+    if (m) console.log(`[lab] migrated global targets into a suite: ${m.categories} categories, ${m.targets} target(s)`);
+  } catch { /* never block boot over a migration */ }
+
   // One timer for the whole process, started here rather than at import so
   // it can close over the dependencies the runs need.
   labIncidents.startScheduler({
@@ -184,32 +191,6 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
     }
   });
 
-  app.get("/api/test/sweep/targets", (req, res) => {
-    if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
-    res.json({ ok: true, targets: labIncidents.listTargets() });
-  });
-
-  app.post("/api/test/sweep/targets", (req, res) => {
-    if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
-    try {
-      res.json({ ok: true, targets: labIncidents.addTarget(req.body || {}) });
-    } catch (e) {
-      res.status(400).json({ error: String(e.message || e).slice(0, 200) });
-    }
-  });
-
-  app.post("/api/test/sweep/targets/:id/delete", (req, res) => {
-    if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
-    labIncidents.removeTarget(req.params.id);
-    res.json({ ok: true, targets: labIncidents.listTargets() });
-  });
-
-  app.post("/api/test/sweep/targets/:id/enabled", (req, res) => {
-    if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
-    labIncidents.setTargetEnabled(req.params.id, !!(req.body || {}).enabled);
-    res.json({ ok: true, targets: labIncidents.listTargets() });
-  });
-
   app.get("/api/test/sweep/runs", (req, res) => {
     if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
     res.json({ ok: true, runs: labIncidents.listRuns(req.query.limit) });
@@ -217,6 +198,30 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
 
   // The manager's one button. Serialised: two sweeps at once would file the
   // same board twice and race each other's auto-resolve pass.
+  // "Run everything" is now "run every enabled suite" — one execution path, so
+  // there is no second home for targets and no category that runs outside a
+  // suite. Categories in NO suite are reported rather than silently skipped.
+  app.post("/api/test/suites/run-all", async (req, res) => {
+    const u = admin(req, res); if (!u) return;
+    if (sweepInFlight) return res.status(409).json({ error: "a run is already in progress" });
+    const suites = cases.listSuites().filter((s) => s.enabled);
+    sweepInFlight = (async () => {
+      const results = [];
+      for (const s of suites) {
+        try { results.push(await labIncidents.runSuite(s.id, { ...RUN_DEPS(), source: `manual:${u.name || u.id}` })); }
+        catch (e) { results.push({ suite: s.name, suite_id: s.id, error: String(e.message || e).slice(0, 200) }); }
+      }
+      return results;
+    })();
+    try {
+      const results = await sweepInFlight;
+      const known = Object.keys(labIncidents.BENCHES);
+      res.json({ ok: true, results, uncovered: cases.uncoveredCategories(known) });
+    } catch (e) {
+      res.status(500).json({ error: String(e.message || e).slice(0, 300) });
+    } finally { sweepInFlight = null; }
+  });
+
   app.post("/api/test/sweep/run", async (req, res) => {
     const user = authUser(req);
     if (!user) return res.status(401).json({ error: "not authenticated" });
@@ -331,6 +336,14 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
     if (!admin(req, res)) return;
     cases.deleteSuite(req.params.id);
     res.json({ ok: true, suites: cases.listSuites() });
+  });
+
+  app.post("/api/test/suites/:id/targets", (req, res) => {
+    if (!admin(req, res)) return;
+    try {
+      const suite = cases.setSuiteTargets(req.params.id, (req.body || {}).targets);
+      res.json({ ok: true, suite, suites: cases.listSuites() });
+    } catch (e) { res.status(400).json({ error: String(e.message || e).slice(0, 250) }); }
   });
 
   app.post("/api/test/suites/:id/members", (req, res) => {

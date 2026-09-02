@@ -100,6 +100,17 @@ db.exec(`
     inserted_at    TEXT NOT NULL
   );
 
+  -- Which world (and actor) a suite runs its SCOPED categories against.
+  -- A suite with only platform-wide categories needs none of these.
+  CREATE TABLE IF NOT EXISTS lab_suite_targets (
+    id        TEXT PRIMARY KEY,
+    suite_id  TEXT NOT NULL REFERENCES lab_suites(id) ON DELETE CASCADE,
+    world_id  TEXT NOT NULL,
+    actor_id  TEXT,
+    label     TEXT,
+    UNIQUE(suite_id, world_id, actor_id)
+  );
+
   CREATE TABLE IF NOT EXISTS lab_suite_members (
     id         TEXT PRIMARY KEY,
     suite_id   TEXT NOT NULL REFERENCES lab_suites(id) ON DELETE CASCADE,
@@ -366,14 +377,44 @@ export const SCHEDULE_KINDS = ["manual", "interval", "daily"];
 export function listSuites() {
   const suites = db.prepare(`SELECT * FROM lab_suites ORDER BY name`).all();
   const members = db.prepare(`SELECT * FROM lab_suite_members`).all();
+  const targets = db.prepare(`SELECT * FROM lab_suite_targets`).all();
   return suites.map((s) => ({
     ...s,
     enabled: !!s.enabled,
     last_result: s.last_result ? JSON.parse(s.last_result) : null,
     members: members.filter((m) => m.suite_id === s.id)
       .map((m) => ({ kind: m.kind, source: m.source, check_name: m.check_name })),
+    targets: targets.filter((t) => t.suite_id === s.id)
+      .map((t) => ({ id: t.id, world_id: t.world_id, actor_id: t.actor_id, label: t.label })),
     next_run_at: nextRunAt(s),
   }));
+}
+
+export function setSuiteTargets(suite_id, targets) {
+  if (!db.prepare(`SELECT id FROM lab_suites WHERE id = ?`).get(suite_id)) throw new Error("no such suite");
+  const tx = db.transaction(() => {
+    db.prepare(`DELETE FROM lab_suite_targets WHERE suite_id = ?`).run(suite_id);
+    const ins = db.prepare(`INSERT OR IGNORE INTO lab_suite_targets (id, suite_id, world_id, actor_id, label)
+                            VALUES (?,?,?,?,?)`);
+    for (const t of targets || []) {
+      if (!t?.world_id) continue;
+      ins.run(uid(), suite_id, t.world_id, t.actor_id || null, t.label || null);
+    }
+  });
+  tx();
+  return listSuites().find((s) => s.id === suite_id);
+}
+
+// Categories that no suite covers. The analogue of the unwired-source check:
+// a category nothing runs is not a passing category, and the only thing worse
+// than an untested area is an untested area nobody mentions.
+export function uncoveredCategories(allCategories) {
+  const covered = new Set();
+  for (const s of listSuites()) {
+    if (!s.enabled) continue;
+    for (const m of s.members) covered.add(m.source);
+  }
+  return (allCategories || []).filter((c) => !covered.has(c)).sort();
 }
 
 export function saveSuite({ id, name, description, schedule_kind, schedule_value, enabled }) {
@@ -490,4 +531,34 @@ export function dueSuites() {
     }
     return false;
   });
+}
+
+// ── Migration: the old global target list becomes a suite ────────────────────
+//
+// Targets used to sit in lab_sweep_targets, global to every run. Moving them
+// onto the suite would otherwise silently stop measuring whatever was pinned,
+// so the old rows are folded into an "All tests" suite once — covering every
+// category, carrying the same targets, and left for the owner to edit or
+// delete like any other suite.
+export function migrateGlobalTargets(allCategories) {
+  try {
+    const haveSuites = db.prepare(`SELECT COUNT(*) c FROM lab_suites`).get().c;
+    if (haveSuites > 0) return null;
+    const old = db.prepare(`SELECT * FROM lab_sweep_targets WHERE enabled = 1`).all();
+    const id = saveSuite({ name: "All tests", description:
+      "Every category. Created automatically when targets moved from a global list onto suites." });
+    setSuiteMembers(id, (allCategories || []).map((c) => ({ kind: "category", source: c })));
+    // Distinct worlds/actors: the old table keyed targets by category, but a
+    // suite's targets are the run configuration, not per-category rows.
+    const seen = new Set();
+    const targets = [];
+    for (const t of old) {
+      const k = `${t.world_id}|${t.actor_id || ""}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      targets.push({ world_id: t.world_id, actor_id: t.actor_id, label: t.label });
+    }
+    if (targets.length) setSuiteTargets(id, targets);
+    return { id, targets: targets.length, categories: (allCategories || []).length };
+  } catch { return null; }
 }

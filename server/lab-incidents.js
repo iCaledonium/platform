@@ -428,7 +428,7 @@ function fileBoard({ bench, target, checks, source }) {
 // `signupChecks` is injected rather than fetched over HTTP: the signup board is
 // this same process, and making it a self-request would mean minting a session
 // for the server to show to itself.
-export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks, authoredChecks, only = null, suite_id = null } = {}) {
+export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks, authoredChecks, only = null, suite_id = null, targets: suppliedTargets = null } = {}) {
   // `only` limits the run to a set of categories — what a suite needs. null
   // means every category, which is the plain sweep.
   const wanted = only ? new Set(only) : null;
@@ -454,19 +454,31 @@ export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN,
     totals.recurred += t.recurred; totals.resolved += t.resolved;
   };
 
-  const targets = listTargets().filter((t) => t.enabled);
+  // Supplied by the caller — a suite's run configuration. A run with no
+  // targets simply cannot measure the scoped categories, and says so.
+  const targets = suppliedTargets || [];
 
   for (const bench of Object.keys(BENCHES)) {
     if (wanted && !wanted.has(bench)) continue;
     const spec = BENCHES[bench];
 
     if (spec.scoped) {
-      const mine = targets.filter((t) => t.bench === bench);
+      // A suite's targets are the run configuration, not per-category rows:
+      // every scoped category runs against each of them. A category needing an
+      // actor takes only the targets that name one; a world-only category
+      // DEDUPES BY WORLD, or two targets in the same world would run it twice
+      // and file the same finding against itself.
+      const mine = spec.needsActor
+        ? targets.filter((t) => t.actor_id)
+        : targets.filter((t, i, a) => a.findIndex((x) => x.world_id === t.world_id) === i)
+                 .map((t) => ({ ...t, actor_id: null }));
       if (!mine.length) {
         // Not a pass and not a failure — nothing was measured. Say so loudly
         // rather than letting an unconfigured bench read as a clean one.
         boards.push({ bench, label: spec.label, scope: "—", state: "not configured",
-          detail: "no enabled target — this bench was not measured" });
+          detail: spec.needsActor
+            ? "this category needs a world AND an actor, and the suite supplies none — it was not measured"
+            : "this category needs a world, and the suite supplies none — it was not measured" });
         continue;
       }
       for (const t of mine) {
@@ -569,6 +581,7 @@ export async function runSuite(suiteId, deps = {}) {
     source: deps.source || `suite:${suite.name}`,
     only: categories,
     suite_id: suiteId,
+    targets: suite.targets || [],
   });
 
   // Filter the roll down to this suite's members.

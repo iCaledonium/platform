@@ -42,6 +42,11 @@ export default function LabCaseAdmin() {
   const [running, setRunning] = useState(null);
   const [runResult, setRunResult] = useState(null);
 
+  const [worlds, setWorlds] = useState([]);
+  const [actors, setActors] = useState([]);
+  const [tWorld, setTWorld] = useState("");
+  const [tActor, setTActor] = useState("");
+  const [uncovered, setUncovered] = useState([]);
   const [draft, setDraft] = useState(null);
   const [tryResult, setTryResult] = useState(null);
 
@@ -72,6 +77,31 @@ export default function LabCaseAdmin() {
     } catch (e) { setCases(null); setErr(String(e.message || e)); }
   }, []);
   useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    fetch("/api/worlds", { credentials: "include" }).then(r => r.json())
+      .then(ws => setWorlds(Array.isArray(ws) ? ws : []))
+      .catch(() => setWorlds([]));
+  }, []);
+
+  // Same ambient filter the category pages use: ambient people populate venues,
+  // have no home and no schedule, and were never addressable.
+  useEffect(() => {
+    if (!tWorld) { setActors([]); return; }
+    (async () => {
+      try {
+        const r = await fetch(`/api/worlds/${tWorld}/presence`, { credentials: "include" });
+        if (!r.ok) { setActors([]); return; }
+        const p = await r.json();
+        const list = (Array.isArray(p?.locations) ? p.locations : []).flatMap(l => (l.actors || [])
+          .filter(a => !a.is_ambient && a.actor_type !== "ambient")
+          .map(a => ({ id: a.actor_id, name: a.name })));
+        const seen = new Set();
+        setActors(list.filter(a => !seen.has(a.id) && seen.add(a.id))
+          .sort((a, b) => (a.name || "").localeCompare(b.name || "")));
+      } catch { setActors([]); }
+    })();
+  }, [tWorld]);
 
   async function post(url, body) {
     const r = await fetch(url, { method: "POST", credentials: "include",
@@ -160,7 +190,29 @@ export default function LabCaseAdmin() {
               try { const j = await post("/api/test/suites", { name: newSuite });
                 setSuites(j.suites); setNewSuite(""); } catch (e) { setErr(String(e.message || e)); }
             }}>Create suite</button>
+            <button style={btn(GOLD + ".85)")} disabled={!!running}
+              onClick={async () => {
+                setRunning("all"); setRunResult(null); setErr("");
+                try {
+                  const j = await post("/api/test/suites/run-all", {});
+                  setUncovered(j.uncovered || []);
+                  setRunResult({ suite: `${j.results.length} suite(s)`,
+                    passed: j.results.reduce((a, r) => a + (r.passed || 0), 0),
+                    failed: j.results.reduce((a, r) => a + (r.failed || 0), 0),
+                    skipped: j.results.reduce((a, r) => a + (r.skipped || 0), 0),
+                    muted: j.results.reduce((a, r) => a + (r.muted || 0), 0), cases: [] });
+                  load();
+                } catch (e) { setErr(String(e.message || e)); }
+                finally { setRunning(null); }
+              }}>{running === "all" ? "Running…" : "Run every suite"}</button>
           </div>
+
+          {uncovered.length > 0 && (
+            <div style={{ fontSize: 11, lineHeight: 1.7, color: "#d9a441" }}>
+              In no suite, so nothing runs them: {uncovered.join(", ")}.
+              A category no suite covers is not a passing category.
+            </div>
+          )}
 
           {scheduler && (
             <div style={{ fontSize: 10.5, color: scheduler.running ? "rgba(150,210,150,.7)" : "#d9a441" }}>
@@ -232,6 +284,62 @@ export default function LabCaseAdmin() {
                     {s.next_run_at && s.enabled ? ` · next ${ago(s.next_run_at)}` : ""}
                   </span>
                 </div>
+
+                {/* Run configuration: which world (and actor) the SCOPED
+                    categories run against. A suite of only platform-wide
+                    categories never needs one, so it is not shown. */}
+                {cats.concat(cs).some(m => ["encounter", "transport", "behavior"].includes(m.source)) && (
+                  <div style={{ paddingTop: 8, borderTop: "0.5px solid rgba(255,255,255,.06)" }}>
+                    <div style={{ ...label, fontSize: 9, marginBottom: 6 }}>runs against</div>
+                    {(s.targets || []).length === 0 && (
+                      <div style={{ fontSize: 10.5, color: "#d9a441", marginBottom: 6 }}>
+                        No world set — this suite's world-scoped categories cannot run and will report
+                        “not measured”, which is not the same as passing.
+                      </div>
+                    )}
+                    {(s.targets || []).map(t => (
+                      <div key={t.id} style={{ display: "flex", gap: 8, alignItems: "baseline", marginBottom: 4 }}>
+                        <span style={{ fontSize: 10.5, color: "rgba(255,255,255,.7)" }}>
+                          {t.label || `world ${t.world_id.slice(0, 8)}`}
+                          {t.actor_id ? "" : " · no actor (world-only categories)"}
+                        </span>
+                        <button style={btn(null, true)} onClick={async () => {
+                          try {
+                            const j = await post(`/api/test/suites/${s.id}/targets`,
+                              { targets: (s.targets || []).filter(x => x.id !== t.id) });
+                            setSuites(j.suites);
+                          } catch (e) { setErr(String(e.message || e)); }
+                        }}>remove</button>
+                      </div>
+                    ))}
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 4 }}>
+                      <select value={tWorld} onChange={e => setTWorld(e.target.value)}
+                        style={{ ...input, padding: "3px 6px", fontSize: 10 }}>
+                        <option value="" style={{ background: "#151310" }}>— world —</option>
+                        {worlds.map(w => <option key={w.id} value={w.id} style={{ background: "#151310" }}>
+                          {w.name}{w.status === "running" ? " · running" : ` · ${w.status}`}</option>)}
+                      </select>
+                      <select value={tActor} onChange={e => setTActor(e.target.value)}
+                        style={{ ...input, padding: "3px 6px", fontSize: 10 }}>
+                        <option value="" style={{ background: "#151310" }}>— actor (optional) —</option>
+                        {actors.map(a => <option key={a.id} value={a.id} style={{ background: "#151310" }}>{a.name}</option>)}
+                      </select>
+                      <button style={btn(null, true)} disabled={!tWorld} onClick={async () => {
+                        if (!tWorld) return;
+                        const w = worlds.find(x => x.id === tWorld);
+                        const a = actors.find(x => x.id === tActor);
+                        try {
+                          const j = await post(`/api/test/suites/${s.id}/targets`, { targets: [
+                            ...(s.targets || []).map(({ id, ...rest }) => rest),
+                            { world_id: tWorld, actor_id: tActor || null,
+                              label: [w?.name, a?.name].filter(Boolean).join(" · ") },
+                          ] });
+                          setSuites(j.suites);
+                        } catch (e) { setErr(String(e.message || e)); }
+                      }}>add target</button>
+                    </div>
+                  </div>
+                )}
 
                 {lr && (
                   <div style={{ fontSize: 10.5, display: "flex", gap: 12 }}>
