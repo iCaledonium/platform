@@ -5,6 +5,7 @@ import LabPage             from "./pages/LabPage.jsx";
 import LabHomePage         from "./pages/LabHomePage.jsx";
 import LabIncidentsPage    from "./pages/LabIncidentsPage.jsx";
 import LabTestManagerPage  from "./pages/LabTestManagerPage.jsx";
+import { ShareLabPage, DeployLabPage } from "./pages/GlobalBoardPage.jsx";
 import SignupLabPage       from "./pages/SignupLabPage.jsx";
 import BehaviorLabPage     from "./pages/BehaviorLabPage.jsx";
 import AvatarLabPage       from "./pages/AvatarLabPage.jsx";
@@ -69,6 +70,8 @@ function LabWatcherOverlay() {
   else if (location.pathname.startsWith("/lab/user/signup")) bound = "Feature - User Signup and Creation";
   else if (location.pathname.startsWith("/lab/user/avatar")) bound = "Feature - User Avatar";
   else if (location.pathname.startsWith("/lab/character/wizard")) bound = "Feature - Character Wizard";
+  else if (location.pathname.startsWith("/lab/character/share")) bound = "Feature - Character Sharing";
+  else if (location.pathname.startsWith("/lab/character/deploy")) bound = "Feature - Character Deploy";
   else if (location.pathname.startsWith("/lab/world/behavior")) bound = "Runtime - World Behaviour";
   else if (qs.get("lab") === "behavior") bound = "Runtime - World Behaviour";
   else if (qs.get("lab") === "transport") bound = "Runtime - Transport Engine";
@@ -78,6 +81,10 @@ function LabWatcherOverlay() {
   // would arrive as bound=null and host whichever conversation was last open —
   // which is the one thing that rule forbids.
   else if (qs.get("lab") === "avatar") bound = "Feature - User Avatar";
+  // Same reason as the avatar branch above: the wizard bench hands off to the
+  // REAL wizard at /actors/new, which is not a /lab path. Without this the
+  // panel would arrive unbound on the exact screen under test.
+  else if (qs.get("lab") === "wizard") bound = "Feature - Character Wizard";
   else if (qs.has("lab") && location.pathname.includes("/knock/")) bound = "Feature - Actor Apartment Encounter";
   return <WatcherPanel bound={bound} />;
 }
@@ -407,6 +414,8 @@ export default function App() {
         <Route path="/lab/world/behavior" element={<BehaviorLabPage />} />
         <Route path="/lab/user/avatar" element={<AvatarLabPage />} />
         <Route path="/lab/character/wizard" element={<WizardLabPage />} />
+        <Route path="/lab/character/share"  element={<ShareLabPage />} />
+        <Route path="/lab/character/deploy" element={<DeployLabPage />} />
         <Route path="/lab" element={<Navigate to="/lab/home" replace />} />
         {/* Session 159 - the public gallery. Signed-in tree, unlike /share:
             character media is served behind auth_request, so there is no such

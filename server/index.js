@@ -18,6 +18,8 @@ import { mount as mountSignupLabRoutes } from "./signuplab-routes.js";
 import { mount as mountAvatarLabRoutes } from "./avatarlab-routes.js";
 import { mount as mountWizardLabRoutes } from "./wizardlab-routes.js";
 import { mount as mountShareLinkRoutes } from "./sharelinks-routes.js";
+import { mount as mountShareLabRoutes } from "./sharelab-routes.js";
+import { mount as mountDeployLabRoutes } from "./deploylab-routes.js";
 
 // Session 102 — drafts carry their wizard adjustment state (all morph
 // slider values, the named body sliders, pose values, reference URLs,
@@ -1340,13 +1342,26 @@ function avatarStateOf(actorId) {
   // The pointer outlived the actor — treat it as absent rather than serving a
   // dangling id the UI would try to load.
   if (!a) return { actor_id: null, ready: false, state: "none" };
-  const ready = !!(a.runtime_glb_url || a.glb_url);
+  // A model file is necessary but not sufficient. `status` was being SELECTed
+  // here and never read, so a DRAFT carrying a body counted as a finished
+  // avatar and opened the spawn gate. That is reachable by ordinary use, not
+  // just by a lab: closing the wizard offers "discard changes", which leaves
+  // the draft exactly as it was last saved — so somebody can walk away
+  // mid-authoring and still be wearing a body they never finished.
+  const hasModel = !!(a.runtime_glb_url || a.glb_url);
+  const isDraft = a.status === "draft";
+  const ready = hasModel && !isDraft;
   return {
     actor_id: a.id,
     name: a.name,
     ready,
-    // "building" is the honest middle state: you made one, it has no body yet.
-    state: ready ? "ready" : "building",
+    // Three not-ready states, kept apart because each needs a different action:
+    //   none     — no profile at all
+    //   building — a profile exists, the pipeline has not produced a body yet
+    //   draft    — a body exists, the profile was never finished
+    state: ready ? "ready" : hasModel ? "draft" : "building",
+    status: a.status,
+    has_model: hasModel,
     has_runtime: !!a.runtime_glb_url,
   };
 }
@@ -1365,6 +1380,8 @@ function requireReadyAvatar(req, res, user) {
   res.status(403).json({
     error: avatar.state === "building"
       ? "Your 3D profile has no model yet. Finish it before entering a world."
+      : avatar.state === "draft"
+      ? "Your 3D profile is still a draft. Finish it before entering a world."
       : "You need a 3D profile before you can enter a world.",
     reason: "avatar_required",
     avatar,
@@ -5877,6 +5894,38 @@ app.get("/api/actors/:id", (req, res) => {
   res.json({ actor, psychology, big5, disc, hds, lifestyle, economic, mental, upbringing, education, diagnoses, expenses, mediaPhotos, measurements });
 });
 
+// ── The age floor, in ONE place because age has TWO write paths ──────────────
+//
+// POST /api/actors sets age when it creates and when it finalizes; PUT
+// /api/actors/:id sets any column on the actors row, age included. A floor on
+// only the first is not a floor, so both call this.
+//
+// Until 2026-08-30 nothing bounded age anywhere. The only restraint in the
+// product was min={18} on the wizard's Age input, which constrains a native
+// form submission and does nothing to a React state value posted by script.
+// Age is not decoration: it is pushed onto the player's row in every world by
+// deployAvatarToWorlds() and interpolated straight into an NPC's prompt by the
+// simulator's visitor_block/1.
+//
+// An ABSENT age stays legal — the wizard saves drafts long before Age is filled
+// in, and failing those would break creation to enforce a rule about content.
+// Only a SUPPLIED age is bound.
+//
+// Scope, stated because a broader rule would be wrong: this binds characters
+// authored on the platform. It does NOT reach the simulator's ambient cast,
+// which is seeded on the other host and legitimately includes children.
+//
+// Returns an error string, or null when the value is acceptable.
+const AGE_FLOOR = 18, AGE_CEILING = 120;
+function ageFloorError(value) {
+  if (value === undefined || value === null || String(value).trim() === "") return null;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < AGE_FLOOR || n > AGE_CEILING) {
+    return `age must be a whole number between ${AGE_FLOOR} and ${AGE_CEILING}`;
+  }
+  return null;
+}
+
 // ── PUT /api/actors/:id — update canonical profile ────────────────────────────
 app.put("/api/actors/:id", (req, res) => {
   const user = authUser(req);
@@ -5902,6 +5951,12 @@ app.put("/api/actors/:id", (req, res) => {
   }
   const actor = owned;
   if (!actor) return res.status(404).json({ error: "not found" });
+
+  // Section "actor" writes the actors row itself, so it can set age.
+  if (section === "actor") {
+    const bad = ageFloorError(data?.age);
+    if (bad) return res.status(400).json({ error: bad, field: "age", received: data?.age });
+  }
 
   const now = new Date().toISOString();
 
@@ -6424,6 +6479,10 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/message", async (req, re
 // the /api/test/* proxies again (two stale-copy clobbers on 2026-08-29).
 mountTestLabRoutes(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser });
 mountSignupLabRoutes(app, { db, authUser, PORT });
+mountAvatarLabRoutes(app, { db, authUser, SERVICE_TOKEN, SIMULATOR_URL });
+mountWizardLabRoutes(app, { db, authUser, PORT });
+mountShareLabRoutes(app, { db, authUser, PORT });
+mountDeployLabRoutes(app, { db, authUser, PORT });
 
 // Session 158 - cross-org character sharing by link. Its own file for the same
 // reason the lab routes are: a whole-file write to this 340KB index.js cannot
@@ -6624,6 +6683,13 @@ app.post("/api/actors", (req, res) => {
   if (!user) return res.status(401).json({ error: "unauthorized" });
   const { id: existingId, identity, psychology, personality, lifestyle, economy, draft, default_home_template_url, appearance_fields } = req.body;
   if (!identity?.first_name) return res.status(400).json({ error: "first_name required" });
+
+  // Bound here because this endpoint writes age in BOTH branches below — the
+  // finalize UPDATE and the create INSERT. See ageFloorError's own comment.
+  {
+    const bad = ageFloorError(identity.age);
+    if (bad) return res.status(400).json({ error: bad, field: "age", received: identity.age });
+  }
   const now  = new Date().toISOString();
   const name = [identity.first_name?.trim(), identity.last_name?.trim()].filter(Boolean).join(" ");
   // Session 160 — the structured appearance map, stored as JSON beside the

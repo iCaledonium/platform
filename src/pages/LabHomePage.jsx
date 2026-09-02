@@ -57,6 +57,24 @@ const CASES = [
     live: true,
   },
   {
+    path: "/lab/character/share",
+    subject: "Character",
+    place: "Sharing",
+    situation: "Link",
+    blurb: "The two ways a character leaves its org — a share link aimed at whoever holds the URL, " +
+      "and the public gallery aimed at every signed-in account. Neither may carry \u201ccopy\u201d: " +
+      "ownership only ever crosses by an act aimed at a known person.",
+    live: true,
+  },
+  {
+    path: "/lab/character/deploy",
+    subject: "Character",
+    place: "Deploy",
+    situation: "World",
+    blurb: "Putting a character into a world. Asserts the outcome rather than the code path \u2014 what is standing in a world right now, and how old it is.",
+    live: true,
+  },
+  {
     path: "/lab/character/wizard",
     subject: "Character",
     place: "Wizard",
