@@ -31,6 +31,7 @@ export default function LabTestManagerPage() {
   const [runs, setRuns] = useState([]);
   const [result, setResult] = useState(null);
   const [running, setRunning] = useState(false);
+  const [openBoards, setOpenBoards] = useState({});
   const [error, setError] = useState("");
   const [authed, setAuthed] = useState(true);
 
@@ -146,6 +147,7 @@ export default function LabTestManagerPage() {
     try {
       const j = await post("/api/test/sweep/run", {});
       setResult(j);
+      setOpenBoards({});
       loadRuns();
     } catch (e) { setError(String(e.message || e)); }
     finally { setRunning(false); }
@@ -265,21 +267,49 @@ export default function LabTestManagerPage() {
                 ))}
               </div>
 
-              {(result.boards || []).map((b, i) => (
-                <div key={i} style={{ display: "flex", justifyContent: "space-between", gap: 12,
-                  padding: "9px 12px", borderRadius: 4, background: "rgba(255,255,255,.02)",
-                  border: "0.5px solid rgba(255,255,255,.08)", fontSize: 11 }}>
-                  <span style={{ color: "rgba(255,255,255,.75)" }}>
-                    {b.label} <span style={{ color: "rgba(255,255,255,.35)" }}>· {b.scope}</span>
-                  </span>
-                  <span style={{ color: b.state === "read" ? "rgba(255,255,255,.5)"
-                    : b.state === "unreachable" ? "#c96fd0" : "#d9a441", textAlign: "right" }}>
-                    {b.state === "read"
-                      ? `${b.passed} pass · ${b.failed} fail · ${b.skipped} skip`
-                      : `${b.state} — ${b.detail}`}
-                  </span>
-                </div>
-              ))}
+              {(result.boards || []).map((b, i) => {
+                const rollable = b.state === "read" && Array.isArray(b.roll) && b.roll.length > 0;
+                const isOpen = !!openBoards[i];
+                const vc = { pass: "#7fc08a", fail: "#e0736b", skip: "rgba(255,255,255,.4)" };
+                return (
+                  <div key={i} style={{ borderRadius: 4, background: "rgba(255,255,255,.02)",
+                    border: "0.5px solid rgba(255,255,255,.08)", fontSize: 11 }}>
+                    <div onClick={() => rollable && setOpenBoards(o => ({ ...o, [i]: !isOpen }))}
+                      style={{ display: "flex", justifyContent: "space-between", gap: 12,
+                        padding: "9px 12px", cursor: rollable ? "pointer" : "default" }}>
+                      <span style={{ color: "rgba(255,255,255,.75)" }}>
+                        {rollable && <span style={{ color: "rgba(255,255,255,.3)", marginRight: 6 }}>{isOpen ? "\u25be" : "\u25b8"}</span>}
+                        {b.label} <span style={{ color: "rgba(255,255,255,.35)" }}>\u00b7 {b.scope}</span>
+                      </span>
+                      <span style={{ color: b.state === "read" ? "rgba(255,255,255,.5)"
+                        : b.state === "unreachable" ? "#c96fd0" : "#d9a441", textAlign: "right" }}>
+                        {b.state === "read"
+                          ? `${b.passed} pass \u00b7 ${b.failed} fail \u00b7 ${b.skipped} skip`
+                          : `${b.state} \u2014 ${b.detail}`}
+                      </span>
+                    </div>
+
+                    {/* Every assertion this board makes, passes included. The
+                        incident page shows only what failed; this is the board. */}
+                    {isOpen && (
+                      <div style={{ borderTop: "0.5px solid rgba(255,255,255,.07)", padding: "4px 0" }}>
+                        {b.roll.map((c, j) => (
+                          <div key={j} style={{ display: "flex", gap: 10, padding: "6px 12px 6px 26px",
+                            alignItems: "baseline" }}>
+                            <span style={{ ...label, fontSize: 8.5, minWidth: 34, flexShrink: 0,
+                              color: vc[c.verdict] || "#d9a441" }}>{c.verdict}</span>
+                            <div style={{ display: "flex", flexDirection: "column", gap: 3, minWidth: 0 }}>
+                              <span style={{ color: "rgba(255,255,255,.72)", fontSize: 10.5 }}>{c.name}</span>
+                              {c.detail && <span style={{ color: "rgba(255,255,255,.35)", fontSize: 9.5,
+                                lineHeight: 1.55 }}>{c.detail}</span>}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
 
               <button onClick={() => navigate("/lab/home/incidents")}
                 style={{ ...btn(GOLD + ".8)"), alignSelf: "flex-start" }}>

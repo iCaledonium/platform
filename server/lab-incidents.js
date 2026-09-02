@@ -323,10 +323,16 @@ function fileBoard({ bench, target, checks, source }) {
                   opened: 0, reopened: 0, recurred: 0, resolved: 0 };
   const scope_label = scopeLabel(bench, target);
   const passedNames = [];
+  // Every check this board ran, by name — what the manager shows when a board
+  // row is expanded. Passes included: a board is its whole set of assertions,
+  // and the incident page can only ever show the ones that failed.
+  const roll = [];
 
   for (const c of checks) {
     const name = c?.name || "unnamed check";
     const verdict = c?.verdict;
+    roll.push({ name, verdict: verdict || "unknown",
+                detail: c?.detail == null ? "" : String(c.detail).slice(0, 600) });
     if (verdict === "pass") { tally.passed++; passedNames.push(name); continue; }
     if (verdict === "skip") { tally.skipped++; continue; }
 
@@ -375,7 +381,7 @@ function fileBoard({ bench, target, checks, source }) {
     tally.resolved++;
   }
 
-  return tally;
+  return { ...tally, roll };
 }
 
 // Run every configured board once and file what they say.
@@ -482,7 +488,10 @@ export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN,
     WHERE id=?
   `).run(finishedAt, totals.boards_ok, totals.boards_errored, totals.checks_total,
     totals.passed, totals.failed, totals.skipped, totals.opened, totals.reopened,
-    totals.recurred, totals.resolved, JSON.stringify(boards).slice(0, 20000), runId);
+    totals.recurred, totals.resolved,
+    // Strip the per-check roll before persisting: six boards of check text
+    // would exceed the column's 20k cap and truncate the JSON into garbage.
+    JSON.stringify(boards.map(({ roll, ...rest }) => rest)).slice(0, 20000), runId);
 
   return { run_id: runId, source, started_at: startedAt, finished_at: finishedAt, ...totals, boards };
 }
