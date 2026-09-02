@@ -210,8 +210,6 @@ export default function LabCaseAdmin() {
         <span onClick={() => setTab("cases")} style={chip(tab === "cases")}>
           Test cases{cases ? ` (${cases.length})` : ""}
         </span>
-        <span onClick={() => { setTab("author"); setDraft({ kind: "query", op: "eq", expected: 0, probe_method: "GET" }); setTryResult(null); }}
-          style={chip(tab === "author")}>Write a test case</span>
         {editing && <span onClick={() => setTab("compose")} style={chip(tab === "compose")}>
           Composing: {editing.name}</span>}
         <button onClick={load} style={{ ...btn(), marginLeft: "auto" }}>Reload</button>
@@ -535,9 +533,84 @@ export default function LabCaseAdmin() {
         <>
           <div style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center" }}>
             <input value={q} onChange={e => setQ(e.target.value)} placeholder="search test cases…" style={{ ...input, width: 220 }} />
+            <button style={btn(GOLD + ".8)")} onClick={() => {
+              setDraft({ kind: "query", op: "eq", expected: 0, probe_method: "GET" }); setTryResult(null);
+            }}>Write a test case</button>
             <span onClick={() => setCatFilter("all")} style={chip(catFilter === "all")}>all categories</span>
             {categories.map(c => <span key={c} onClick={() => setCatFilter(c)} style={chip(catFilter === c)}>{c} ({countIn(c)})</span>)}
           </div>
+
+{/* Writing a test case is an action ON test cases, so it lives here. */}
+          {draft && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: "14px 16px",
+              borderRadius: 5, background: "rgba(255,255,255,.02)", border: "0.5px solid rgba(255,255,255,.08)" }}>
+              <div style={{ fontSize: 11, lineHeight: 1.7, color: "rgba(255,255,255,.45)" }}>
+                A test case asks a question and compares the answer to a number. A <strong>query</strong> runs
+                SQL on a <strong>read-only</strong> connection — SQLite itself refuses anything that writes.
+                A <strong>probe</strong> makes an anonymous request to a path here and compares the status.
+                An authored case is <em>run</em> from the authored board, but it belongs to whichever
+                category you put it in — provenance and subject are different things.
+              </div>
+              <input value={draft.name || ""} onChange={e => setDraft({ ...draft, name: e.target.value })}
+                placeholder="what it asserts — e.g. no share names its own owner" style={input} />
+              <div style={{ display: "flex", gap: 7, alignItems: "center" }}>
+                <span style={{ ...label, fontSize: 9 }}>category</span>
+                <select value={draft.category_id || ""} onChange={e => setDraft({ ...draft, category_id: e.target.value })}
+                  style={input}>
+                  <option value="" style={{ background: "#151310" }}>— what is it about? —</option>
+                  {cats.map(c => <option key={c.id} value={c.id} style={{ background: "#151310" }}>{c.name}</option>)}
+                </select>
+              </div>
+              <div style={{ display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap" }}>
+                <select value={draft.kind} onChange={e => setDraft({ ...draft, kind: e.target.value })} style={input}>
+                  <option value="query" style={{ background: "#151310" }}>query</option>
+                  <option value="probe" style={{ background: "#151310" }}>probe</option>
+                </select>
+                <select value={draft.op} onChange={e => setDraft({ ...draft, op: e.target.value })} style={input}>
+                  {[["eq", "="], ["ne", "≠"], ["lt", "<"], ["lte", "≤"], ["gt", ">"], ["gte", "≥"]]
+                    .map(([k, s]) => <option key={k} value={k} style={{ background: "#151310" }}>{s}</option>)}
+                </select>
+                <input value={draft.expected} onChange={e => setDraft({ ...draft, expected: e.target.value })}
+                  style={{ ...input, width: 80 }} />
+                <span style={{ fontSize: 10.5, color: "rgba(255,255,255,.35)" }}>
+                  {draft.kind === "query" ? "← what the query returns" : "← the status the path answers"}
+                </span>
+              </div>
+              {draft.kind === "query" ? (
+                <textarea value={draft.sql || ""} onChange={e => setDraft({ ...draft, sql: e.target.value })}
+                  rows={4} spellCheck={false} placeholder="SELECT COUNT(*) FROM actor_shares WHERE shared_with_id = owner_id"
+                  style={{ ...input, fontFamily: "ui-monospace,monospace", fontSize: 10.5, resize: "vertical" }} />
+              ) : (
+                <div style={{ display: "flex", gap: 7 }}>
+                  <select value={draft.probe_method} onChange={e => setDraft({ ...draft, probe_method: e.target.value })} style={input}>
+                    <option style={{ background: "#151310" }}>GET</option>
+                    <option style={{ background: "#151310" }}>POST</option>
+                  </select>
+                  <input value={draft.probe_path || ""} onChange={e => setDraft({ ...draft, probe_path: e.target.value })}
+                    placeholder="/api/gallery" style={{ ...input, flex: 1 }} />
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 7 }}>
+                <button style={btn()} onClick={async () => {
+                  setTryResult(null);
+                  try { const j = await post("/api/test/cases/authored/try", draft); setTryResult(j.result); }
+                  catch (e) { setTryResult({ verdict: "error", detail: String(e.message || e) }); }
+                }}>Try it</button>
+                <button style={btn(GOLD + ".8)")} onClick={async () => {
+                  try { await post("/api/test/cases/authored", draft); setDraft(null); load(); }
+                  catch (e) { setErr(String(e.message || e)); }
+                }}>Save</button>
+                <button style={btn()} onClick={() => setDraft(null)}>Cancel</button>
+              </div>
+              {tryResult && (
+                <div style={{ padding: "9px 12px", borderRadius: 4, fontSize: 11, lineHeight: 1.6,
+                  background: "rgba(255,255,255,.03)", border: `0.5px solid ${V[tryResult.verdict] || "#e0736b"}`,
+                  color: V[tryResult.verdict] || "#e0736b" }}>
+                  <strong>{tryResult.verdict}</strong> — {tryResult.detail}
+                </div>
+              )}
+            </div>
+          )}
 
           {cases && cases.length === 0 && (
             <div style={{ padding: "16px", borderRadius: 5, fontSize: 11.5, lineHeight: 1.7,
@@ -625,77 +698,6 @@ export default function LabCaseAdmin() {
         </>
       )}
 
-      {/* ── AUTHORING ─────────────────────────────────────────────────────── */}
-      {tab === "author" && draft && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: "14px 16px",
-          borderRadius: 5, background: "rgba(255,255,255,.02)", border: "0.5px solid rgba(255,255,255,.08)" }}>
-          <div style={{ fontSize: 11, lineHeight: 1.7, color: "rgba(255,255,255,.45)" }}>
-            A test case asks a question and compares the answer to a number. A <strong>query</strong> runs
-            SQL on a <strong>read-only</strong> connection — SQLite itself refuses anything that writes.
-            A <strong>probe</strong> makes an anonymous request to a path here and compares the status.
-            An authored case is <em>run</em> from the authored board, but it belongs to whichever
-            category you put it in — provenance and subject are different things.
-          </div>
-          <input value={draft.name || ""} onChange={e => setDraft({ ...draft, name: e.target.value })}
-            placeholder="what it asserts — e.g. no share names its own owner" style={input} />
-          <div style={{ display: "flex", gap: 7, alignItems: "center" }}>
-            <span style={{ ...label, fontSize: 9 }}>category</span>
-            <select value={draft.category_id || ""} onChange={e => setDraft({ ...draft, category_id: e.target.value })}
-              style={input}>
-              <option value="" style={{ background: "#151310" }}>— what is it about? —</option>
-              {cats.map(c => <option key={c.id} value={c.id} style={{ background: "#151310" }}>{c.name}</option>)}
-            </select>
-          </div>
-          <div style={{ display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap" }}>
-            <select value={draft.kind} onChange={e => setDraft({ ...draft, kind: e.target.value })} style={input}>
-              <option value="query" style={{ background: "#151310" }}>query</option>
-              <option value="probe" style={{ background: "#151310" }}>probe</option>
-            </select>
-            <select value={draft.op} onChange={e => setDraft({ ...draft, op: e.target.value })} style={input}>
-              {[["eq", "="], ["ne", "≠"], ["lt", "<"], ["lte", "≤"], ["gt", ">"], ["gte", "≥"]]
-                .map(([k, s]) => <option key={k} value={k} style={{ background: "#151310" }}>{s}</option>)}
-            </select>
-            <input value={draft.expected} onChange={e => setDraft({ ...draft, expected: e.target.value })}
-              style={{ ...input, width: 80 }} />
-            <span style={{ fontSize: 10.5, color: "rgba(255,255,255,.35)" }}>
-              {draft.kind === "query" ? "← what the query returns" : "← the status the path answers"}
-            </span>
-          </div>
-          {draft.kind === "query" ? (
-            <textarea value={draft.sql || ""} onChange={e => setDraft({ ...draft, sql: e.target.value })}
-              rows={4} spellCheck={false} placeholder="SELECT COUNT(*) FROM actor_shares WHERE shared_with_id = owner_id"
-              style={{ ...input, fontFamily: "ui-monospace,monospace", fontSize: 10.5, resize: "vertical" }} />
-          ) : (
-            <div style={{ display: "flex", gap: 7 }}>
-              <select value={draft.probe_method} onChange={e => setDraft({ ...draft, probe_method: e.target.value })} style={input}>
-                <option style={{ background: "#151310" }}>GET</option>
-                <option style={{ background: "#151310" }}>POST</option>
-              </select>
-              <input value={draft.probe_path || ""} onChange={e => setDraft({ ...draft, probe_path: e.target.value })}
-                placeholder="/api/gallery" style={{ ...input, flex: 1 }} />
-            </div>
-          )}
-          <div style={{ display: "flex", gap: 7 }}>
-            <button style={btn()} onClick={async () => {
-              setTryResult(null);
-              try { const j = await post("/api/test/cases/authored/try", draft); setTryResult(j.result); }
-              catch (e) { setTryResult({ verdict: "error", detail: String(e.message || e) }); }
-            }}>Try it</button>
-            <button style={btn(GOLD + ".8)")} onClick={async () => {
-              try { await post("/api/test/cases/authored", draft); setDraft(null); setTab("cases"); load(); }
-              catch (e) { setErr(String(e.message || e)); }
-            }}>Save</button>
-            <button style={btn()} onClick={() => { setDraft(null); setTab("cases"); }}>Cancel</button>
-          </div>
-          {tryResult && (
-            <div style={{ padding: "9px 12px", borderRadius: 4, fontSize: 11, lineHeight: 1.6,
-              background: "rgba(255,255,255,.03)", border: `0.5px solid ${V[tryResult.verdict] || "#e0736b"}`,
-              color: V[tryResult.verdict] || "#e0736b" }}>
-              <strong>{tryResult.verdict}</strong> — {tryResult.detail}
-            </div>
-          )}
-        </div>
-      )}
     </div>
   );
 }
