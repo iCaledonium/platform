@@ -155,6 +155,11 @@ export const BENCHES = {
     page: "/lab/home/testmanager",
     watcher: null,
     side: "platform", scoped: false, needsActor: false, local: "authoredChecks",
+    // No /api/test/authored/checks route exists and none should: this source is
+    // assembled in-process from lab_test_cases. Marked virtual so the coverage
+    // check does not report it missing forever — a detector that cries wolf
+    // every single run is a detector nobody reads.
+    virtual: true,
   },
 };
 
@@ -182,7 +187,8 @@ export function boardCoverage(app) {
     unwired: [...found].filter((k) => !known.includes(k)).sort(),
     // A catalogued bench whose route has gone — a rename or removal, which
     // would otherwise surface only as a board that mysteriously never fails.
-    missing: known.filter((k) => !found.has(k)).sort(),
+    // Virtual sources have no route by design, so their absence is not a gap.
+    missing: known.filter((k) => !found.has(k) && !BENCHES[k].virtual).sort(),
   };
 }
 
