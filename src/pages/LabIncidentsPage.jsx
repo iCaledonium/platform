@@ -65,6 +65,19 @@ export default function LabIncidentsPage() {
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState({});
 
+  // Every source that either RUNS (a category with a scorecard) or has FILED
+  // (a routine). Built from both, because a routine has no category entry and
+  // would otherwise be filterable by nothing at all; and it keeps its own
+  // bench_label, so a routine names itself rather than showing a bare key.
+  const sources = (() => {
+    const byKey = new Map();
+    for (const b of benches) byKey.set(b.key, { key: b.key, label: b.label });
+    for (const i of rows || []) {
+      if (!byKey.has(i.bench)) byKey.set(i.bench, { key: i.bench, label: i.bench_label || i.bench });
+    }
+    return [...byKey.values()].sort((a, b) => a.label.localeCompare(b.label));
+  })();
+
   const label = { fontSize: 10, letterSpacing: ".16em", textTransform: "uppercase",
     color: "rgba(255,255,255,.4)" };
 
@@ -179,9 +192,9 @@ export default function LabIncidentsPage() {
             <span key={f.key} onClick={() => setFilter(f.key)} style={chip(filter === f.key)}>{f.label}</span>
           ))}
           <span style={{ width: 12 }} />
-          <span onClick={() => setBench("all")} style={chip(bench === "all")}>All benches</span>
-          {benches.map(b => (
-            <span key={b.key} onClick={() => setBench(b.key)} style={chip(bench === b.key)}>{b.label}</span>
+          <span onClick={() => setBench("all")} style={chip(bench === "all")}>All sources</span>
+          {sources.map(s => (
+            <span key={s.key} onClick={() => setBench(s.key)} style={chip(bench === s.key)}>{s.label}</span>
           ))}
         </div>
 
