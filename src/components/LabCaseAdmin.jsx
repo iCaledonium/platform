@@ -1,38 +1,47 @@
 import { useEffect, useState, useCallback } from "react";
 
-// ── Test-case administration ─────────────────────────────────────────────────
+// ── Test administration ──────────────────────────────────────────────────────
 //
-// The vocabulary, settled:
-//   TEST CASE — one assertion. Either BUILT-IN (a source returns it, defined in
-//               code) or AUTHORED (written here).
-//   SOURCE    — where a built-in case comes from. Nine of them.
-//   BOARD     — a named set of test cases you compose. A VIEW: the same case in
-//               five boards is one case with one incident.
+//   TEST CASE — one assertion. Built-in (a category returns it, defined in
+//               code) or authored (written here).
+//   CATEGORY  — where built-in cases come from: encounter, deploy, share…
+//   SUITE     — a named set of test cases AND/OR whole categories.
+//   RUNNER    — runs a suite, manually or on a schedule.
 //
-// The catalogue is learned, not declared — it fills in as sweeps observe what
-// each source returns. So a case you add in code appears here after the next
-// sweep with no registration step, and this panel says as much rather than
-// showing an empty list that looks like a bug.
+// A category can be a member of a suite in its own right, which matters: it
+// means a case added to that category later is already in the suite, instead
+// of the suite quietly going stale the way a hand-picked list does.
 
 const GOLD = "rgba(201,151,58,";
-
 const V = { pass: "#7fc08a", fail: "#e0736b", skip: "rgba(255,255,255,.4)",
             muted: "rgba(255,255,255,.3)", unknown: "#d9a441" };
 
-export default function LabCaseAdmin({ onChanged }) {
+const ago = (iso) => {
+  if (!iso) return "never";
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 0) return `in ${Math.round(-s / 60)}m`;
+  if (s < 90) return `${Math.round(s)}s ago`;
+  if (s < 5400) return `${Math.round(s / 60)}m ago`;
+  if (s < 172800) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+};
+
+export default function LabCaseAdmin() {
   const [cases, setCases] = useState(null);
-  const [boards, setBoards] = useState([]);
+  const [suites, setSuites] = useState([]);
+  const [scheduler, setScheduler] = useState(null);
   const [err, setErr] = useState("");
-  const [tab, setTab] = useState("cases");
+  const [tab, setTab] = useState("suites");
   const [q, setQ] = useState("");
-  const [srcFilter, setSrcFilter] = useState("all");
+  const [catFilter, setCatFilter] = useState("all");
 
-  // board composer
-  const [activeBoard, setActiveBoard] = useState(null);
-  const [picked, setPicked] = useState(new Set());
-  const [newBoardName, setNewBoardName] = useState("");
+  const [editing, setEditing] = useState(null);       // suite being composed
+  const [pickedCases, setPickedCases] = useState(new Set());
+  const [pickedCats, setPickedCats] = useState(new Set());
+  const [newSuite, setNewSuite] = useState("");
+  const [running, setRunning] = useState(null);
+  const [runResult, setRunResult] = useState(null);
 
-  // authoring
   const [draft, setDraft] = useState(null);
   const [tryResult, setTryResult] = useState(null);
 
@@ -42,10 +51,8 @@ export default function LabCaseAdmin({ onChanged }) {
     border: "0.5px solid rgba(255,255,255,.12)", color: "rgba(255,255,255,.85)",
     fontFamily: "'DM Sans',sans-serif", fontSize: 11, outline: "none" };
   const btn = (c, small) => ({ padding: small ? "4px 9px" : "7px 13px", borderRadius: 3,
-    cursor: "pointer", background: "transparent",
-    border: `0.5px solid ${c || "rgba(255,255,255,.16)"}`,
-    fontFamily: "'DM Sans',sans-serif", fontSize: small ? 10 : 11,
-    color: c || "rgba(255,255,255,.6)" });
+    cursor: "pointer", background: "transparent", border: `0.5px solid ${c || "rgba(255,255,255,.16)"}`,
+    fontFamily: "'DM Sans',sans-serif", fontSize: small ? 10 : 11, color: c || "rgba(255,255,255,.6)" });
   const chip = (on) => ({ padding: "5px 11px", borderRadius: 3, cursor: "pointer", fontSize: 10.5,
     background: on ? GOLD + ".14)" : "transparent",
     border: `0.5px solid ${on ? GOLD + ".4)" : "rgba(255,255,255,.12)"}`,
@@ -56,14 +63,14 @@ export default function LabCaseAdmin({ onChanged }) {
       const r = await fetch("/api/test/cases", { credentials: "include" });
       if (r.status === 401) throw new Error("not signed in on this origin");
       const j = await r.json();
-      if (!j.ok) throw new Error(j.error || `HTTP ${r.status}`);
-      setCases(Array.isArray(j.cases) ? j.cases : []);
-      const b = await fetch("/api/test/boards", { credentials: "include" }).then(x => x.json());
-      setBoards(Array.isArray(b.boards) ? b.boards : []);
+      if (!j.ok) throw new Error(j.error);
+      setCases(j.cases || []);
+      const s = await fetch("/api/test/suites", { credentials: "include" }).then(x => x.json());
+      setSuites(s.suites || []);
+      setScheduler(s.scheduler || null);
       setErr("");
     } catch (e) { setCases(null); setErr(String(e.message || e)); }
   }, []);
-
   useEffect(() => { load(); }, [load]);
 
   async function post(url, body) {
@@ -74,218 +81,326 @@ export default function LabCaseAdmin({ onChanged }) {
     return j;
   }
 
-  async function setSetting(c, patch) {
-    try {
-      const j = await post("/api/test/cases/settings",
-        { source: c.source, check_name: c.check_name, ...patch });
-      setCases(j.cases); onChanged?.();
-    } catch (e) { setErr(String(e.message || e)); }
-  }
-
-  const sources = [...new Set((cases || []).map(c => c.source))].sort();
+  const categories = [...new Set((cases || []).map(c => c.source))].sort();
+  const countIn = (cat) => (cases || []).filter(c => c.source === cat).length;
   const shown = (cases || []).filter(c =>
-    (srcFilter === "all" || c.source === srcFilter) &&
-    (!q || c.check_name.toLowerCase().includes(q.toLowerCase()) || c.source.includes(q.toLowerCase())));
+    (catFilter === "all" || c.source === catFilter) &&
+    (!q || c.check_name.toLowerCase().includes(q.toLowerCase())));
+  const ckey = (c) => `${c.source}|${c.check_name}`;
 
-  const key = (c) => `${c.source}|${c.check_name}`;
-
-  // ── board composing ────────────────────────────────────────────────────────
-  function openBoard(b) {
-    setActiveBoard(b);
-    setPicked(new Set((b.members || []).map(m => `${m.source}|${m.check_name}`)));
-    setTab("cases");
+  function compose(s) {
+    setEditing(s);
+    setPickedCats(new Set((s.members || []).filter(m => m.kind === "category").map(m => m.source)));
+    setPickedCases(new Set((s.members || []).filter(m => m.kind === "case").map(m => `${m.source}|${m.check_name}`)));
+    setTab("compose");
   }
+
   async function saveMembers() {
     try {
-      const members = [...picked].map(k => {
-        const i = k.indexOf("|");
-        return { source: k.slice(0, i), check_name: k.slice(i + 1) };
-      });
-      const j = await post(`/api/test/boards/${activeBoard.id}/members`, { members });
-      setBoards(j.boards);
-      setActiveBoard(j.boards.find(b => b.id === activeBoard.id) || null);
+      const members = [
+        ...[...pickedCats].map(source => ({ kind: "category", source })),
+        ...[...pickedCases].map(k => {
+          const i = k.indexOf("|");
+          return { kind: "case", source: k.slice(0, i), check_name: k.slice(i + 1) };
+        }),
+      ];
+      const j = await post(`/api/test/suites/${editing.id}/members`, { members });
+      setSuites(j.suites);
+      setEditing(j.suites.find(s => s.id === editing.id));
     } catch (e) { setErr(String(e.message || e)); }
   }
+
+  async function runSuite(s) {
+    setRunning(s.id); setRunResult(null); setErr("");
+    try {
+      const j = await post(`/api/test/suites/${s.id}/run`, {});
+      setRunResult(j.result); load();
+    } catch (e) { setErr(String(e.message || e)); }
+    finally { setRunning(null); }
+  }
+
+  async function saveSchedule(s, patch) {
+    try {
+      const j = await post("/api/test/suites", { id: s.id, name: s.name,
+        description: s.description, schedule_kind: s.schedule_kind,
+        schedule_value: s.schedule_value, enabled: s.enabled, ...patch });
+      setSuites(j.suites);
+    } catch (e) { setErr(String(e.message || e)); }
+  }
+
+  const describeSchedule = (s) =>
+    s.schedule_kind === "interval" ? `every ${s.schedule_value} min`
+    : s.schedule_kind === "daily" ? `daily at ${s.schedule_value}`
+    : "manual only";
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
       <div style={{ display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap" }}>
+        <span onClick={() => setTab("suites")} style={chip(tab === "suites")}>Suites ({suites.length})</span>
         <span onClick={() => setTab("cases")} style={chip(tab === "cases")}>
           Test cases{cases ? ` (${cases.length})` : ""}
         </span>
-        <span onClick={() => setTab("boards")} style={chip(tab === "boards")}>
-          Boards ({boards.length})
-        </span>
         <span onClick={() => { setTab("author"); setDraft({ kind: "query", op: "eq", expected: 0, probe_method: "GET" }); setTryResult(null); }}
           style={chip(tab === "author")}>Write a test case</span>
+        {editing && <span onClick={() => setTab("compose")} style={chip(tab === "compose")}>
+          Composing: {editing.name}</span>}
         <button onClick={load} style={{ ...btn(), marginLeft: "auto" }}>Reload</button>
       </div>
 
       {err && <div style={{ padding: "9px 13px", borderRadius: 4, fontSize: 11,
-        background: "rgba(224,115,107,.1)", border: "0.5px solid rgba(224,115,107,.35)",
-        color: "#e0736b" }}>{err}</div>}
+        background: "rgba(224,115,107,.1)", border: "0.5px solid rgba(224,115,107,.35)", color: "#e0736b" }}>{err}</div>}
+
+      {/* ── SUITES + RUNNER ───────────────────────────────────────────────── */}
+      {tab === "suites" && (
+        <>
+          <div style={{ display: "flex", gap: 7 }}>
+            <input value={newSuite} onChange={e => setNewSuite(e.target.value)}
+              placeholder="new suite — e.g. Pre-deploy checks" style={{ ...input, width: 300 }} />
+            <button style={btn()} onClick={async () => {
+              try { const j = await post("/api/test/suites", { name: newSuite });
+                setSuites(j.suites); setNewSuite(""); } catch (e) { setErr(String(e.message || e)); }
+            }}>Create suite</button>
+          </div>
+
+          {scheduler && (
+            <div style={{ fontSize: 10.5, color: scheduler.running ? "rgba(150,210,150,.7)" : "#d9a441" }}>
+              Scheduler {scheduler.running ? "running" : "NOT running"} · {scheduler.scheduled.length} suite(s) on a schedule
+            </div>
+          )}
+
+          {suites.length === 0 && (
+            <div style={{ fontSize: 11.5, lineHeight: 1.7, color: "rgba(255,255,255,.45)" }}>
+              No suites yet. A suite is a named set of test cases and/or whole categories — put a
+              category in and every case added to it later is already covered. Then run it here, or
+              give it a schedule.
+            </div>
+          )}
+
+          {suites.map(s => {
+            const cats = s.members.filter(m => m.kind === "category");
+            const cs = s.members.filter(m => m.kind === "case");
+            const lr = s.last_result;
+            return (
+              <div key={s.id} style={{ padding: "12px 14px", borderRadius: 5,
+                background: "rgba(255,255,255,.022)", border: "0.5px solid rgba(255,255,255,.09)",
+                display: "flex", flexDirection: "column", gap: 9 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "baseline" }}>
+                  <div>
+                    <div style={{ fontSize: 12.5, color: "rgba(255,255,255,.88)" }}>{s.name}</div>
+                    <div style={{ fontSize: 10, color: "rgba(255,255,255,.4)", marginTop: 3 }}>
+                      {cats.length ? `${cats.length} categor${cats.length === 1 ? "y" : "ies"}` : ""}
+                      {cats.length && cs.length ? " + " : ""}
+                      {cs.length ? `${cs.length} test case(s)` : ""}
+                      {!cats.length && !cs.length ? "empty — measures nothing" : ""}
+                      {cats.length ? ` · ${cats.map(c => c.source).join(", ")}` : ""}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                    <button style={btn(GOLD + ".85)", true)} disabled={!!running}
+                      onClick={() => runSuite(s)}>{running === s.id ? "Running…" : "Run"}</button>
+                    <button style={btn(null, true)} onClick={() => compose(s)}>Pick cases</button>
+                    <button style={btn("#e0736b", true)} onClick={async () => {
+                      try { const j = await post(`/api/test/suites/${s.id}/delete`); setSuites(j.suites); }
+                      catch (e) { setErr(String(e.message || e)); }
+                    }}>Delete</button>
+                  </div>
+                </div>
+
+                {/* the runner's schedule for this suite */}
+                <div style={{ display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap",
+                  paddingTop: 8, borderTop: "0.5px solid rgba(255,255,255,.06)" }}>
+                  <span style={{ ...label, fontSize: 9 }}>runs</span>
+                  <select value={s.schedule_kind} style={{ ...input, padding: "3px 6px", fontSize: 10 }}
+                    onChange={e => saveSchedule(s, { schedule_kind: e.target.value,
+                      schedule_value: e.target.value === "interval" ? "60" : e.target.value === "daily" ? "03:00" : null })}>
+                    <option value="manual" style={{ background: "#151310" }}>manually only</option>
+                    <option value="interval" style={{ background: "#151310" }}>every N minutes</option>
+                    <option value="daily" style={{ background: "#151310" }}>daily at</option>
+                  </select>
+                  {s.schedule_kind !== "manual" && (
+                    <input defaultValue={s.schedule_value || ""} style={{ ...input, width: 70, padding: "3px 6px", fontSize: 10 }}
+                      placeholder={s.schedule_kind === "interval" ? "60" : "03:00"}
+                      onBlur={e => saveSchedule(s, { schedule_value: e.target.value })} />
+                  )}
+                  {s.schedule_kind !== "manual" && (
+                    <button style={btn(null, true)} onClick={() => saveSchedule(s, { enabled: !s.enabled })}>
+                      {s.enabled ? "pause" : "resume"}
+                    </button>
+                  )}
+                  <span style={{ fontSize: 10, color: "rgba(255,255,255,.35)" }}>
+                    {describeSchedule(s)} · last run {ago(s.last_run_at)}
+                    {s.next_run_at && s.enabled ? ` · next ${ago(s.next_run_at)}` : ""}
+                  </span>
+                </div>
+
+                {lr && (
+                  <div style={{ fontSize: 10.5, display: "flex", gap: 12 }}>
+                    <span style={{ color: V.pass }}>{lr.passed} pass</span>
+                    <span style={{ color: lr.failed ? V.fail : "rgba(255,255,255,.35)" }}>{lr.failed} fail</span>
+                    <span style={{ color: "rgba(255,255,255,.35)" }}>{lr.skipped} skip</span>
+                    {lr.muted ? <span style={{ color: V.muted }}>{lr.muted} muted</span> : null}
+                    {lr.empty && <span style={{ color: "#d9a441" }}>empty — measured nothing</span>}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          {runResult && (
+            <div style={{ padding: "12px 14px", borderRadius: 5, background: "rgba(255,255,255,.03)",
+              border: `0.5px solid ${runResult.failed ? V.fail : V.pass}` }}>
+              <div style={{ fontSize: 12, color: "rgba(255,255,255,.85)", marginBottom: 8 }}>
+                {runResult.suite} — {runResult.passed} pass · {runResult.failed} fail · {runResult.skipped} skip
+                {runResult.muted ? ` · ${runResult.muted} muted` : ""}
+                {runResult.unreadable ? ` · ${runResult.unreadable} category unreadable` : ""}
+              </div>
+              {(runResult.cases || []).map((c, i) => (
+                <div key={i} style={{ display: "flex", gap: 9, padding: "3px 0", alignItems: "baseline" }}>
+                  <span style={{ ...label, fontSize: 8.5, minWidth: 34, color: V[c.verdict] || V.unknown }}>{c.verdict}</span>
+                  <span style={{ fontSize: 10.5, color: "rgba(255,255,255,.7)" }}>{c.name}</span>
+                  <span style={{ ...label, fontSize: 8 }}>{c.source}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+
+      {/* ── COMPOSE ───────────────────────────────────────────────────────── */}
+      {tab === "compose" && editing && (
+        <>
+          <div style={{ padding: "10px 13px", borderRadius: 4, fontSize: 11,
+            background: GOLD + ".08)", border: `0.5px solid ${GOLD}.3)`, color: GOLD + ".95)",
+            display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+            <span><strong>{editing.name}</strong> — {pickedCats.size} categor{pickedCats.size === 1 ? "y" : "ies"} + {pickedCases.size} case(s)</span>
+            <span style={{ display: "flex", gap: 6 }}>
+              <button onClick={saveMembers} style={btn(GOLD + ".8)", true)}>Save</button>
+              <button onClick={() => { setEditing(null); setTab("suites"); }} style={btn(null, true)}>Done</button>
+            </span>
+          </div>
+
+          <div>
+            <span style={label}>Whole categories</span>
+            <div style={{ fontSize: 10.5, color: "rgba(255,255,255,.4)", margin: "5px 0 8px", lineHeight: 1.6 }}>
+              Picking a category includes every case in it — <em>and every case added to it later</em>.
+              That is the difference between a suite that stays current and a hand-picked list that
+              silently goes stale.
+            </div>
+            <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+              {categories.map(cat => (
+                <span key={cat} style={chip(pickedCats.has(cat))}
+                  onClick={() => setPickedCats(p => { const n = new Set(p); n.has(cat) ? n.delete(cat) : n.add(cat); return n; })}>
+                  {cat} ({countIn(cat)})
+                </span>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ marginTop: 6 }}>
+            <span style={label}>Individual test cases</span>
+            <div style={{ display: "flex", gap: 7, margin: "8px 0", flexWrap: "wrap" }}>
+              <input value={q} onChange={e => setQ(e.target.value)} placeholder="search…" style={{ ...input, width: 200 }} />
+              <span onClick={() => setCatFilter("all")} style={chip(catFilter === "all")}>all</span>
+              {categories.map(c => <span key={c} onClick={() => setCatFilter(c)} style={chip(catFilter === c)}>{c}</span>)}
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 3, maxHeight: 340, overflowY: "auto" }}>
+              {shown.map(c => {
+                const covered = pickedCats.has(c.source);
+                return (
+                  <label key={ckey(c)} style={{ display: "flex", gap: 9, alignItems: "baseline",
+                    padding: "5px 8px", borderRadius: 3, cursor: covered ? "default" : "pointer",
+                    background: covered ? GOLD + ".06)" : "transparent" }}>
+                    <input type="checkbox" disabled={covered}
+                      checked={covered || pickedCases.has(ckey(c))}
+                      onChange={() => setPickedCases(p => {
+                        const n = new Set(p); const k = ckey(c); n.has(k) ? n.delete(k) : n.add(k); return n; })} />
+                    <span style={{ fontSize: 10.5, color: "rgba(255,255,255,.75)" }}>{c.check_name}</span>
+                    <span style={{ ...label, fontSize: 8 }}>{c.source}</span>
+                    {covered && <span style={{ ...label, fontSize: 8, color: GOLD + ".8)" }}>via category</span>}
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        </>
+      )}
 
       {/* ── CATALOGUE ─────────────────────────────────────────────────────── */}
       {tab === "cases" && (
         <>
-          {activeBoard && (
-            <div style={{ padding: "10px 13px", borderRadius: 4, fontSize: 11,
-              background: GOLD + ".08)", border: `0.5px solid ${GOLD}.3)`, color: GOLD + ".95)",
-              display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-              <span>Composing <strong>{activeBoard.name}</strong> — {picked.size} test case(s) picked</span>
-              <span style={{ display: "flex", gap: 6 }}>
-                <button onClick={saveMembers} style={btn(GOLD + ".8)", true)}>Save board</button>
-                <button onClick={() => { setActiveBoard(null); setPicked(new Set()); }} style={btn(null, true)}>Done</button>
-              </span>
-            </div>
-          )}
-
           <div style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center" }}>
-            <input value={q} onChange={e => setQ(e.target.value)} placeholder="search test cases…"
-              style={{ ...input, width: 220 }} />
-            <span onClick={() => setSrcFilter("all")} style={chip(srcFilter === "all")}>all sources</span>
-            {sources.map(s => <span key={s} onClick={() => setSrcFilter(s)} style={chip(srcFilter === s)}>{s}</span>)}
+            <input value={q} onChange={e => setQ(e.target.value)} placeholder="search test cases…" style={{ ...input, width: 220 }} />
+            <span onClick={() => setCatFilter("all")} style={chip(catFilter === "all")}>all categories</span>
+            {categories.map(c => <span key={c} onClick={() => setCatFilter(c)} style={chip(catFilter === c)}>{c} ({countIn(c)})</span>)}
           </div>
-
-          {cases === null && !err && <span style={label}>Loading…</span>}
 
           {cases && cases.length === 0 && (
             <div style={{ padding: "16px", borderRadius: 5, fontSize: 11.5, lineHeight: 1.7,
               background: "rgba(255,255,255,.02)", border: "0.5px solid rgba(255,255,255,.08)",
               color: "rgba(255,255,255,.45)" }}>
-              The catalogue is empty because it is <em>learned, not declared</em> — it fills in with
-              whatever each source actually returns, so nothing here is hardcoded and nothing goes
-              stale. Run a sweep once and every built-in test case appears.
+              The catalogue is <em>learned, not declared</em> — it fills in with whatever each category
+              actually returns. Run a sweep once and every test case appears.
             </div>
           )}
 
           <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-            {shown.map(c => {
-              const k = key(c);
-              const on = picked.has(k);
-              return (
-                <div key={k} style={{ padding: "9px 12px", borderRadius: 4,
-                  background: c.enabled ? "rgba(255,255,255,.022)" : "rgba(255,255,255,.008)",
-                  border: "0.5px solid rgba(255,255,255,.08)",
-                  borderLeftWidth: 2, borderLeftStyle: "solid",
-                  borderLeftColor: c.enabled ? (V[c.last_verdict] || "rgba(255,255,255,.15)") : "rgba(255,255,255,.12)",
-                  display: "flex", gap: 10, alignItems: "flex-start" }}>
-
-                  {activeBoard && (
-                    <input type="checkbox" checked={on} style={{ marginTop: 3, cursor: "pointer" }}
-                      onChange={() => setPicked(p => {
-                        const n = new Set(p); n.has(k) ? n.delete(k) : n.add(k); return n; })} />
-                  )}
-
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: "flex", gap: 8, alignItems: "baseline", flexWrap: "wrap" }}>
-                      <span style={{ fontSize: 11.5,
-                        color: c.enabled ? "rgba(255,255,255,.85)" : "rgba(255,255,255,.35)" }}>
-                        {c.check_name}
-                      </span>
-                      <span style={{ ...label, fontSize: 8.5 }}>{c.source}</span>
-                      {c.authored && <span style={{ ...label, fontSize: 8.5, color: GOLD + ".8)" }}>authored</span>}
-                      {!c.enabled && <span style={{ ...label, fontSize: 8.5, color: "#d9a441" }}>muted</span>}
-                      {c.severity === "advisory" && <span style={{ ...label, fontSize: 8.5 }}>advisory</span>}
-                      {c.last_verdict && <span style={{ ...label, fontSize: 8.5, color: V[c.last_verdict] }}>
-                        last: {c.last_verdict}</span>}
-                    </div>
-                    {c.last_detail && <div style={{ marginTop: 4, fontSize: 10,
-                      color: "rgba(255,255,255,.38)", lineHeight: 1.5 }}>{c.last_detail.slice(0, 160)}</div>}
+            {shown.map(c => (
+              <div key={ckey(c)} style={{ padding: "9px 12px", borderRadius: 4,
+                background: c.enabled ? "rgba(255,255,255,.022)" : "rgba(255,255,255,.008)",
+                border: "0.5px solid rgba(255,255,255,.08)", borderLeftWidth: 2, borderLeftStyle: "solid",
+                borderLeftColor: c.enabled ? (V[c.last_verdict] || "rgba(255,255,255,.15)") : "rgba(255,255,255,.12)",
+                display: "flex", gap: 10, alignItems: "flex-start" }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "baseline", flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 11.5, color: c.enabled ? "rgba(255,255,255,.85)" : "rgba(255,255,255,.35)" }}>
+                      {c.check_name}</span>
+                    <span style={{ ...label, fontSize: 8.5 }}>{c.source}</span>
+                    {c.authored && <span style={{ ...label, fontSize: 8.5, color: GOLD + ".8)" }}>authored</span>}
+                    {!c.enabled && <span style={{ ...label, fontSize: 8.5, color: "#d9a441" }}>muted</span>}
+                    {c.severity === "advisory" && <span style={{ ...label, fontSize: 8.5 }}>advisory</span>}
+                    {c.last_verdict && <span style={{ ...label, fontSize: 8.5, color: V[c.last_verdict] }}>last: {c.last_verdict}</span>}
                   </div>
-
-                  <div style={{ display: "flex", gap: 5, flexShrink: 0, alignItems: "center" }}>
-                    <select value={c.severity} onChange={e => setSetting(c, { severity: e.target.value })}
-                      style={{ ...input, padding: "3px 5px", fontSize: 9.5 }}>
-                      <option value="blocking" style={{ background: "#151310" }}>blocking</option>
-                      <option value="advisory" style={{ background: "#151310" }}>advisory</option>
-                    </select>
-                    <button onClick={() => setSetting(c, { enabled: !c.enabled })} style={btn(null, true)}>
-                      {c.enabled ? "Mute" : "Unmute"}
-                    </button>
-                    {c.authored && (
-                      <button style={btn("#e0736b", true)}
-                        onClick={async () => {
-                          try { await post(`/api/test/cases/authored/${c.id}/delete`); load(); }
-                          catch (e) { setErr(String(e.message || e)); }
-                        }}>Delete</button>
-                    )}
-                  </div>
+                  {c.last_detail && <div style={{ marginTop: 4, fontSize: 10, color: "rgba(255,255,255,.38)", lineHeight: 1.5 }}>
+                    {c.last_detail.slice(0, 160)}</div>}
                 </div>
-              );
-            })}
-          </div>
-
-          {cases && cases.length > 0 && (
-            <div style={{ fontSize: 10, lineHeight: 1.7, color: "rgba(255,255,255,.3)" }}>
-              A muted test case files no incident and fails no run — but it is still counted and still
-              shown as muted, because a board that reads green only because three cases were turned off
-              is not a green board.
-            </div>
-          )}
-        </>
-      )}
-
-      {/* ── BOARDS ────────────────────────────────────────────────────────── */}
-      {tab === "boards" && (
-        <>
-          <div style={{ display: "flex", gap: 7 }}>
-            <input value={newBoardName} onChange={e => setNewBoardName(e.target.value)}
-              placeholder="new board name — e.g. release checklist" style={{ ...input, width: 280 }} />
-            <button style={btn()} onClick={async () => {
-              try { const j = await post("/api/test/boards", { name: newBoardName });
-                setBoards(j.boards); setNewBoardName(""); } catch (e) { setErr(String(e.message || e)); }
-            }}>Create</button>
-          </div>
-
-          {boards.length === 0 && (
-            <div style={{ fontSize: 11.5, lineHeight: 1.7, color: "rgba(255,255,255,.45)" }}>
-              No boards yet. A board is a named set of test cases drawn from any source — a release
-              checklist, the things you care about before a deploy. It is a <em>view</em>: a case in
-              five boards is still one case with one incident.
-            </div>
-          )}
-
-          {boards.map(b => (
-            <div key={b.id} style={{ padding: "11px 13px", borderRadius: 4,
-              background: "rgba(255,255,255,.022)", border: "0.5px solid rgba(255,255,255,.08)",
-              display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-              <div>
-                <div style={{ fontSize: 12, color: "rgba(255,255,255,.85)" }}>{b.name}</div>
-                <div style={{ fontSize: 10, color: "rgba(255,255,255,.4)", marginTop: 3 }}>
-                  {(b.members || []).length} test case(s)
-                  {b.members?.length ? ` · ${[...new Set(b.members.map(m => m.source))].join(", ")}` : ""}
+                <div style={{ display: "flex", gap: 5, flexShrink: 0, alignItems: "center" }}>
+                  <select value={c.severity} style={{ ...input, padding: "3px 5px", fontSize: 9.5 }}
+                    onChange={async e => {
+                      try { const j = await post("/api/test/cases/settings",
+                        { source: c.source, check_name: c.check_name, severity: e.target.value });
+                        setCases(j.cases); } catch (x) { setErr(String(x.message || x)); }
+                    }}>
+                    <option value="blocking" style={{ background: "#151310" }}>blocking</option>
+                    <option value="advisory" style={{ background: "#151310" }}>advisory</option>
+                  </select>
+                  <button style={btn(null, true)} onClick={async () => {
+                    try { const j = await post("/api/test/cases/settings",
+                      { source: c.source, check_name: c.check_name, enabled: !c.enabled });
+                      setCases(j.cases); } catch (x) { setErr(String(x.message || x)); }
+                  }}>{c.enabled ? "Mute" : "Unmute"}</button>
+                  {c.authored && <button style={btn("#e0736b", true)} onClick={async () => {
+                    try { await post(`/api/test/cases/authored/${c.id}/delete`); load(); }
+                    catch (x) { setErr(String(x.message || x)); }
+                  }}>Delete</button>}
                 </div>
               </div>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button style={btn(GOLD + ".8)", true)} onClick={() => openBoard(b)}>Pick test cases</button>
-                <button style={btn("#e0736b", true)} onClick={async () => {
-                  try { const j = await post(`/api/test/boards/${b.id}/delete`); setBoards(j.boards); }
-                  catch (e) { setErr(String(e.message || e)); }
-                }}>Delete</button>
-              </div>
-            </div>
-          ))}
+            ))}
+          </div>
         </>
       )}
 
       {/* ── AUTHORING ─────────────────────────────────────────────────────── */}
       {tab === "author" && draft && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 10,
-          padding: "14px 16px", borderRadius: 5, background: "rgba(255,255,255,.02)",
-          border: "0.5px solid rgba(255,255,255,.08)" }}>
-
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: "14px 16px",
+          borderRadius: 5, background: "rgba(255,255,255,.02)", border: "0.5px solid rgba(255,255,255,.08)" }}>
           <div style={{ fontSize: 11, lineHeight: 1.7, color: "rgba(255,255,255,.45)" }}>
             A test case asks a question and compares the answer to a number. A <strong>query</strong> runs
-            SQL on a <strong>read-only</strong> connection to the platform database — SQLite itself refuses
-            anything that writes, so this is not a keyword filter you could word your way around. A{" "}
-            <strong>probe</strong> makes an anonymous request to a path on this server and compares the
-            status code, which is how every “this door refuses strangers” case in the lab is written.
+            SQL on a <strong>read-only</strong> connection — SQLite itself refuses anything that writes.
+            A <strong>probe</strong> makes an anonymous request to a path here and compares the status.
+            Authored cases land in the <code>authored</code> category.
           </div>
-
           <input value={draft.name || ""} onChange={e => setDraft({ ...draft, name: e.target.value })}
-            placeholder="what it asserts — e.g. no membership points at a ghost" style={input} />
-
+            placeholder="what it asserts — e.g. no share names its own owner" style={input} />
           <div style={{ display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap" }}>
             <select value={draft.kind} onChange={e => setDraft({ ...draft, kind: e.target.value })} style={input}>
               <option value="query" style={{ background: "#151310" }}>query</option>
@@ -296,21 +411,18 @@ export default function LabCaseAdmin({ onChanged }) {
                 .map(([k, s]) => <option key={k} value={k} style={{ background: "#151310" }}>{s}</option>)}
             </select>
             <input value={draft.expected} onChange={e => setDraft({ ...draft, expected: e.target.value })}
-              style={{ ...input, width: 80 }} placeholder="0" />
+              style={{ ...input, width: 80 }} />
             <span style={{ fontSize: 10.5, color: "rgba(255,255,255,.35)" }}>
-              {draft.kind === "query" ? "← the number the query returns" : "← the HTTP status the path answers"}
+              {draft.kind === "query" ? "← what the query returns" : "← the status the path answers"}
             </span>
           </div>
-
           {draft.kind === "query" ? (
             <textarea value={draft.sql || ""} onChange={e => setDraft({ ...draft, sql: e.target.value })}
-              rows={4} spellCheck={false}
-              placeholder="SELECT COUNT(*) FROM actor_shares WHERE shared_with_id = owner_id"
+              rows={4} spellCheck={false} placeholder="SELECT COUNT(*) FROM actor_shares WHERE shared_with_id = owner_id"
               style={{ ...input, fontFamily: "ui-monospace,monospace", fontSize: 10.5, resize: "vertical" }} />
           ) : (
             <div style={{ display: "flex", gap: 7 }}>
-              <select value={draft.probe_method} onChange={e => setDraft({ ...draft, probe_method: e.target.value })}
-                style={input}>
+              <select value={draft.probe_method} onChange={e => setDraft({ ...draft, probe_method: e.target.value })} style={input}>
                 <option style={{ background: "#151310" }}>GET</option>
                 <option style={{ background: "#151310" }}>POST</option>
               </select>
@@ -318,7 +430,6 @@ export default function LabCaseAdmin({ onChanged }) {
                 placeholder="/api/gallery" style={{ ...input, flex: 1 }} />
             </div>
           )}
-
           <div style={{ display: "flex", gap: 7 }}>
             <button style={btn()} onClick={async () => {
               setTryResult(null);
@@ -331,11 +442,9 @@ export default function LabCaseAdmin({ onChanged }) {
             }}>Save</button>
             <button style={btn()} onClick={() => { setDraft(null); setTab("cases"); }}>Cancel</button>
           </div>
-
           {tryResult && (
             <div style={{ padding: "9px 12px", borderRadius: 4, fontSize: 11, lineHeight: 1.6,
-              background: "rgba(255,255,255,.03)",
-              border: `0.5px solid ${V[tryResult.verdict] || "#e0736b"}`,
+              background: "rgba(255,255,255,.03)", border: `0.5px solid ${V[tryResult.verdict] || "#e0736b"}`,
               color: V[tryResult.verdict] || "#e0736b" }}>
               <strong>{tryResult.verdict}</strong> — {tryResult.detail}
             </div>

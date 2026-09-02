@@ -118,6 +118,13 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
 
   let sweepInFlight = null;
 
+  // One timer for the whole process, started here rather than at import so
+  // it can close over the dependencies the runs need.
+  labIncidents.startScheduler({
+    SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks,
+    shareChecks, deployChecks, authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
+  });
+
   app.get("/api/test/benches", (req, res) => {
     if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
     res.json({ ok: true,
@@ -293,30 +300,64 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
     } catch (e) { res.status(400).json({ error: String(e.message || e).slice(0, 300) }); }
   });
 
-  app.get("/api/test/boards", (req, res) => {
-    if (!admin(req, res)) return;
-    res.json({ ok: true, boards: cases.listBoards() });
+  // ── Suites and the runner ────────────────────────────────────────────────
+  //
+  // A SUITE is a named set of test cases and/or whole CATEGORIES. Running one
+  // sweeps the categories it touches (a scorecard is all-or-nothing) and
+  // filters the report to the suite's own members. Incidents are unaffected by
+  // suite membership: one fault is one incident however many suites watch it.
+
+  const RUN_DEPS = () => ({
+    SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks,
+    shareChecks, deployChecks, authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
   });
 
-  app.post("/api/test/boards", (req, res) => {
+  app.get("/api/test/suites", (req, res) => {
+    if (!admin(req, res)) return;
+    res.json({ ok: true, suites: cases.listSuites(),
+      schedule_kinds: cases.SCHEDULE_KINDS,
+      scheduler: labIncidents.schedulerStatus() });
+  });
+
+  app.post("/api/test/suites", (req, res) => {
     if (!admin(req, res)) return;
     try {
-      const id = cases.saveBoard(req.body || {});
-      res.json({ ok: true, id, boards: cases.listBoards() });
-    } catch (e) { res.status(400).json({ error: String(e.message || e).slice(0, 200) }); }
+      const id = cases.saveSuite(req.body || {});
+      res.json({ ok: true, id, suites: cases.listSuites() });
+    } catch (e) { res.status(400).json({ error: String(e.message || e).slice(0, 250) }); }
   });
 
-  app.post("/api/test/boards/:id/delete", (req, res) => {
+  app.post("/api/test/suites/:id/delete", (req, res) => {
     if (!admin(req, res)) return;
-    cases.deleteBoard(req.params.id);
-    res.json({ ok: true, boards: cases.listBoards() });
+    cases.deleteSuite(req.params.id);
+    res.json({ ok: true, suites: cases.listSuites() });
   });
 
-  app.post("/api/test/boards/:id/members", (req, res) => {
+  app.post("/api/test/suites/:id/members", (req, res) => {
     if (!admin(req, res)) return;
     try {
-      const board = cases.setBoardMembers(req.params.id, (req.body || {}).members);
-      res.json({ ok: true, board, boards: cases.listBoards() });
-    } catch (e) { res.status(400).json({ error: String(e.message || e).slice(0, 200) }); }
+      const suite = cases.setSuiteMembers(req.params.id, (req.body || {}).members);
+      res.json({ ok: true, suite, suites: cases.listSuites() });
+    } catch (e) { res.status(400).json({ error: String(e.message || e).slice(0, 250) }); }
+  });
+
+  // Manual run of one suite. Serialised with the plain sweep for the same
+  // reason: two runs at once race each other's auto-resolve pass.
+  app.post("/api/test/suites/:id/run", async (req, res) => {
+    const u = admin(req, res); if (!u) return;
+    if (sweepInFlight) return res.status(409).json({ error: "a run is already in progress" });
+    sweepInFlight = labIncidents.runSuite(req.params.id, {
+      ...RUN_DEPS(), source: `manual:${u.name || u.id}`,
+    });
+    try {
+      res.json({ ok: true, result: await sweepInFlight });
+    } catch (e) {
+      res.status(400).json({ error: String(e.message || e).slice(0, 300) });
+    } finally { sweepInFlight = null; }
+  });
+
+  app.get("/api/test/scheduler", (req, res) => {
+    if (!admin(req, res)) return;
+    res.json({ ok: true, ...labIncidents.schedulerStatus() });
   });
 }

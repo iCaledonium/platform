@@ -84,19 +84,29 @@ db.exec(`
     updated_at   TEXT NOT NULL
   );
 
-  CREATE TABLE IF NOT EXISTS lab_boards (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL UNIQUE,
-    description TEXT,
-    inserted_at TEXT NOT NULL
+  -- A SUITE is a named set of test cases. A member is either one CASE or a
+  -- whole CATEGORY — "everything the deploy category asserts" should not have
+  -- to be re-picked every time somebody adds a case to it, which is the point
+  -- of letting a category be a member in its own right.
+  CREATE TABLE IF NOT EXISTS lab_suites (
+    id             TEXT PRIMARY KEY,
+    name           TEXT NOT NULL UNIQUE,
+    description    TEXT,
+    schedule_kind  TEXT NOT NULL DEFAULT 'manual',   -- 'manual' | 'interval' | 'daily'
+    schedule_value TEXT,                             -- interval: minutes; daily: "HH:MM"
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    last_run_at    TEXT,
+    last_result    TEXT,
+    inserted_at    TEXT NOT NULL
   );
 
-  CREATE TABLE IF NOT EXISTS lab_board_members (
+  CREATE TABLE IF NOT EXISTS lab_suite_members (
     id         TEXT PRIMARY KEY,
-    board_id   TEXT NOT NULL REFERENCES lab_boards(id) ON DELETE CASCADE,
+    suite_id   TEXT NOT NULL REFERENCES lab_suites(id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL DEFAULT 'case',          -- 'case' | 'category'
     source     TEXT NOT NULL,
-    check_name TEXT NOT NULL,
-    UNIQUE(board_id, source, check_name)
+    check_name TEXT,                                  -- NULL when kind='category'
+    UNIQUE(suite_id, kind, source, check_name)
   );
 `);
 
@@ -349,47 +359,135 @@ export async function tryAuthored(draft, { PORT = 4002 } = {}) {
   return runCase({ ...draft, name, expected: Number(draft.expected || 0), op: draft.op || "eq" }, { PORT });
 }
 
-// ── Composed boards ──────────────────────────────────────────────────────────
+// ── Suites ───────────────────────────────────────────────────────────────────
 
-export function listBoards() {
-  const boards = db.prepare(`SELECT * FROM lab_boards ORDER BY name`).all();
-  const members = db.prepare(`SELECT * FROM lab_board_members`).all();
-  return boards.map((b) => ({
-    ...b,
-    members: members.filter((m) => m.board_id === b.id)
-      .map((m) => ({ source: m.source, check_name: m.check_name })),
+export const SCHEDULE_KINDS = ["manual", "interval", "daily"];
+
+export function listSuites() {
+  const suites = db.prepare(`SELECT * FROM lab_suites ORDER BY name`).all();
+  const members = db.prepare(`SELECT * FROM lab_suite_members`).all();
+  return suites.map((s) => ({
+    ...s,
+    enabled: !!s.enabled,
+    last_result: s.last_result ? JSON.parse(s.last_result) : null,
+    members: members.filter((m) => m.suite_id === s.id)
+      .map((m) => ({ kind: m.kind, source: m.source, check_name: m.check_name })),
+    next_run_at: nextRunAt(s),
   }));
 }
 
-export function saveBoard({ id, name, description }) {
+export function saveSuite({ id, name, description, schedule_kind, schedule_value, enabled }) {
   const n = String(name || "").trim();
-  if (!n) throw new Error("a board needs a name");
+  if (!n) throw new Error("a suite needs a name");
+  const kind = schedule_kind || "manual";
+  if (!SCHEDULE_KINDS.includes(kind)) throw new Error(`schedule must be ${SCHEDULE_KINDS.join(", ")}`);
+  if (kind === "interval") {
+    const m = Number(schedule_value);
+    if (!Number.isFinite(m) || m < 5) throw new Error("an interval is a whole number of minutes, 5 or more");
+  }
+  if (kind === "daily" && !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(schedule_value || ""))) {
+    throw new Error("a daily schedule needs a time as HH:MM");
+  }
+  const en = enabled === undefined ? 1 : (enabled ? 1 : 0);
   if (id) {
-    db.prepare(`UPDATE lab_boards SET name=?, description=? WHERE id=?`).run(n, description || null, id);
+    db.prepare(`UPDATE lab_suites SET name=?, description=?, schedule_kind=?, schedule_value=?, enabled=? WHERE id=?`)
+      .run(n, description || null, kind, schedule_value == null ? null : String(schedule_value), en, id);
     return id;
   }
-  const bid = uid();
-  db.prepare(`INSERT INTO lab_boards (id, name, description, inserted_at) VALUES (?,?,?,?)`)
-    .run(bid, n, description || null, now());
-  return bid;
+  const sid = uid();
+  db.prepare(`INSERT INTO lab_suites (id,name,description,schedule_kind,schedule_value,enabled,inserted_at)
+              VALUES (?,?,?,?,?,?,?)`)
+    .run(sid, n, description || null, kind, schedule_value == null ? null : String(schedule_value), en, now());
+  return sid;
 }
 
-export function deleteBoard(id) {
-  return db.prepare(`DELETE FROM lab_boards WHERE id = ?`).run(id).changes > 0;
+export function deleteSuite(id) {
+  return db.prepare(`DELETE FROM lab_suites WHERE id = ?`).run(id).changes > 0;
 }
 
-// Replace a board's contents wholesale — the picker sends the full selection,
-// so a diff here would only be a chance to get it wrong.
-export function setBoardMembers(board_id, members) {
-  if (!db.prepare(`SELECT id FROM lab_boards WHERE id = ?`).get(board_id)) throw new Error("no such board");
+export function setSuiteMembers(suite_id, members) {
+  if (!db.prepare(`SELECT id FROM lab_suites WHERE id = ?`).get(suite_id)) throw new Error("no such suite");
   const tx = db.transaction(() => {
-    db.prepare(`DELETE FROM lab_board_members WHERE board_id = ?`).run(board_id);
-    const ins = db.prepare(`INSERT OR IGNORE INTO lab_board_members (id, board_id, source, check_name) VALUES (?,?,?,?)`);
+    db.prepare(`DELETE FROM lab_suite_members WHERE suite_id = ?`).run(suite_id);
+    const ins = db.prepare(`INSERT OR IGNORE INTO lab_suite_members (id, suite_id, kind, source, check_name)
+                            VALUES (?,?,?,?,?)`);
     for (const m of members || []) {
-      if (!m?.source || !m?.check_name) continue;
-      ins.run(uid(), board_id, m.source, m.check_name);
+      if (!m?.source) continue;
+      const kind = m.kind === "category" ? "category" : "case";
+      if (kind === "case" && !m.check_name) continue;
+      ins.run(uid(), suite_id, kind, m.source, kind === "category" ? null : m.check_name);
     }
   });
   tx();
-  return listBoards().find((b) => b.id === board_id);
+  return listSuites().find((s) => s.id === suite_id);
+}
+
+// Which CATEGORIES a suite needs run. A category member pulls its whole
+// category; a case member pulls the one it belongs to. Running is per-category
+// because a scorecard endpoint is all-or-nothing — it cannot be asked for one
+// case — so the suite is applied as a filter over what comes back.
+export function suiteCategories(suite) {
+  return [...new Set((suite.members || []).map((m) => m.source))];
+}
+
+// Does this suite include a given case? A category member includes everything
+// in it, INCLUDING cases added to that category later — which is the whole
+// reason a category can be a member.
+export function suiteIncludes(suite, source, check_name) {
+  for (const m of suite.members || []) {
+    if (m.kind === "category" && m.source === source) return true;
+    if (m.kind === "case" && m.source === source && m.check_name === check_name) return true;
+  }
+  return false;
+}
+
+export function recordSuiteRun(id, result) {
+  db.prepare(`UPDATE lab_suites SET last_run_at = ?, last_result = ? WHERE id = ?`)
+    .run(now(), JSON.stringify(result).slice(0, 4000), id);
+}
+
+// ── Scheduling ───────────────────────────────────────────────────────────────
+//
+// Deliberately a small vocabulary rather than cron: "every N minutes" and
+// "daily at HH:MM" cover what this lab needs, and both are unambiguous to read
+// off the page. Next-run is COMPUTED from last_run_at rather than stored, so a
+// restart cannot lose a schedule or fire a backlog of missed runs at boot.
+
+export function nextRunAt(s) {
+  if (!s || !s.enabled || s.schedule_kind === "manual") return null;
+  const last = s.last_run_at ? new Date(s.last_run_at).getTime() : null;
+  if (s.schedule_kind === "interval") {
+    const ms = Math.max(5, Number(s.schedule_value || 60)) * 60_000;
+    return new Date((last || Date.now()) + ms).toISOString();
+  }
+  if (s.schedule_kind === "daily") {
+    const [hh, mm] = String(s.schedule_value || "03:00").split(":").map(Number);
+    const now_ = new Date();
+    const next = new Date(now_);
+    next.setHours(hh, mm, 0, 0);
+    if (next.getTime() <= now_.getTime()) next.setDate(next.getDate() + 1);
+    return next.toISOString();
+  }
+  return null;
+}
+
+export function dueSuites() {
+  const t = Date.now();
+  return listSuites().filter((s) => {
+    if (!s.enabled || s.schedule_kind === "manual") return false;
+    if (s.schedule_kind === "interval") {
+      const ms = Math.max(5, Number(s.schedule_value || 60)) * 60_000;
+      if (!s.last_run_at) return true;
+      return t - new Date(s.last_run_at).getTime() >= ms;
+    }
+    if (s.schedule_kind === "daily") {
+      const [hh, mm] = String(s.schedule_value || "03:00").split(":").map(Number);
+      const now_ = new Date(t);
+      const todayAt = new Date(now_); todayAt.setHours(hh, mm, 0, 0);
+      if (now_ < todayAt) return false;
+      // Due if it has not already run since today's slot came round.
+      return !s.last_run_at || new Date(s.last_run_at) < todayAt;
+    }
+    return false;
+  });
 }

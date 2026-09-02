@@ -428,7 +428,10 @@ function fileBoard({ bench, target, checks, source }) {
 // `signupChecks` is injected rather than fetched over HTTP: the signup board is
 // this same process, and making it a self-request would mean minting a session
 // for the server to show to itself.
-export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks, authoredChecks } = {}) {
+export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks, authoredChecks, only = null, suite_id = null } = {}) {
+  // `only` limits the run to a set of categories — what a suite needs. null
+  // means every category, which is the plain sweep.
+  const wanted = only ? new Set(only) : null;
   // Platform-local boards are values, not HTTP routes the server would have
   // to authenticate to itself. The CLI cannot supply them — it runs outside
   // the process — so a CLI sweep reports them "not configured" rather than
@@ -436,8 +439,9 @@ export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN,
   const localBoards = { signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks, authoredChecks };
   const runId = uid();
   const startedAt = now();
-  db.prepare(`INSERT INTO lab_sweep_runs (id, source, started_at) VALUES (?,?,?)`)
-    .run(runId, source, startedAt);
+  try { db.exec(`ALTER TABLE lab_sweep_runs ADD COLUMN suite_id TEXT`); } catch { /* already there */ }
+  db.prepare(`INSERT INTO lab_sweep_runs (id, source, started_at, suite_id) VALUES (?,?,?,?)`)
+    .run(runId, source, startedAt, suite_id);
 
   const totals = { boards_ok: 0, boards_errored: 0, checks_total: 0, passed: 0, failed: 0,
                    skipped: 0, muted: 0, opened: 0, reopened: 0, recurred: 0, resolved: 0 };
@@ -453,6 +457,7 @@ export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN,
   const targets = listTargets().filter((t) => t.enabled);
 
   for (const bench of Object.keys(BENCHES)) {
+    if (wanted && !wanted.has(bench)) continue;
     const spec = BENCHES[bench];
 
     if (spec.scoped) {
@@ -533,10 +538,103 @@ export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN,
     // would exceed the column's 20k cap and truncate the JSON into garbage.
     JSON.stringify(boards.map(({ roll, ...rest }) => rest)).slice(0, 20000), runId);
 
-  return { run_id: runId, source, started_at: startedAt, finished_at: finishedAt, ...totals, boards };
+  return { run_id: runId, source, suite_id, started_at: startedAt, finished_at: finishedAt, ...totals, boards };
 }
 
 export function listRuns(limit = 25) {
   return db.prepare(`SELECT * FROM lab_sweep_runs ORDER BY started_at DESC LIMIT ?`)
     .all(Math.min(Number(limit) || 25, 200));
+}
+
+// ── The runner ───────────────────────────────────────────────────────────────
+
+// Run ONE suite. Its categories are swept in full (a scorecard cannot be asked
+// for a subset), incidents are filed for everything they returned, and the
+// RESULT is filtered down to the suite's own members so the report answers
+// "did my suite pass" rather than "what happened everywhere".
+export async function runSuite(suiteId, deps = {}) {
+  const suite = cases.listSuites().find((s) => s.id === suiteId);
+  if (!suite) throw new Error("no such suite");
+  const categories = cases.suiteCategories(suite);
+  if (categories.length === 0) {
+    // An empty suite must not report a clean pass. It measured nothing.
+    const empty = { suite_id: suiteId, suite: suite.name, empty: true,
+      passed: 0, failed: 0, skipped: 0, muted: 0, cases: [] };
+    cases.recordSuiteRun(suiteId, empty);
+    return empty;
+  }
+
+  const sweep = await runSweep({
+    ...deps,
+    source: deps.source || `suite:${suite.name}`,
+    only: categories,
+    suite_id: suiteId,
+  });
+
+  // Filter the roll down to this suite's members.
+  const mine = [];
+  for (const b of sweep.boards) {
+    for (const c of (b.roll || [])) {
+      if (cases.suiteIncludes(suite, b.bench, c.name)) mine.push({ ...c, source: b.bench });
+    }
+  }
+  const tally = mine.reduce((a, c) => {
+    const v = c.muted ? "muted" : c.verdict;
+    a[v] = (a[v] || 0) + 1; return a;
+  }, {});
+
+  const result = {
+    suite_id: suiteId, suite: suite.name, run_id: sweep.run_id,
+    categories, ran_at: sweep.finished_at,
+    total: mine.length,
+    passed: tally.pass || 0, failed: tally.fail || 0,
+    skipped: tally.skip || 0, muted: tally.muted || 0,
+    unreadable: sweep.boards_errored,
+    cases: mine,
+  };
+  cases.recordSuiteRun(suiteId, { ...result, cases: undefined });
+  return result;
+}
+
+// ── The scheduler ────────────────────────────────────────────────────────────
+//
+// One timer, started at boot, that runs whatever is due. Deliberately serial:
+// two suites firing at once would race each other's auto-resolve pass, the same
+// reason the manual sweep holds an in-process lock.
+let schedulerTimer = null;
+let schedulerBusy = false;
+
+export function startScheduler(deps = {}, everyMs = 60_000) {
+  if (schedulerTimer) return schedulerTimer;
+  schedulerTimer = setInterval(async () => {
+    if (schedulerBusy) return;
+    let due = [];
+    try { due = cases.dueSuites(); } catch { return; }
+    if (!due.length) return;
+    schedulerBusy = true;
+    try {
+      for (const s of due) {
+        try {
+          const r = await runSuite(s.id, { ...deps, source: `schedule:${s.name}` });
+          console.log(`[lab] scheduled suite "${s.name}": ${r.passed} pass, ${r.failed} fail, ${r.skipped} skip`);
+        } catch (e) {
+          console.log(`[lab] scheduled suite "${s.name}" failed: ${e.message}`);
+        }
+      }
+    } finally { schedulerBusy = false; }
+  }, everyMs);
+  if (schedulerTimer.unref) schedulerTimer.unref();
+  return schedulerTimer;
+}
+
+export function schedulerStatus() {
+  return {
+    running: !!schedulerTimer,
+    busy: schedulerBusy,
+    scheduled: cases.listSuites()
+      .filter((s) => s.enabled && s.schedule_kind !== "manual")
+      .map((s) => ({ id: s.id, name: s.name, kind: s.schedule_kind,
+                     value: s.schedule_value, last_run_at: s.last_run_at,
+                     next_run_at: s.next_run_at })),
+  };
 }
