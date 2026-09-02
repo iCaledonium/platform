@@ -13,8 +13,12 @@
 // boundary, key-authed, and adds no new surface at all.
 //
 //   ssh mac-mini-ubuntu 'node ~/platform/server/lab-incidents-cli.mjs sweep --source routine:nightly'
-//     (delegates to the running platform-api over loopback, so it covers all
-//      six boards — including the three that only exist inside that process)
+//     (delegates to the running platform-api over loopback: it runs every
+//      enabled SUITE, each with its own targets, so it measures exactly what
+//      the button measures. Add --suite <id> to run one.)
+//
+// Exit codes for cron: 0 all passed, 1 something failed, 2 nothing measured
+// or the service was unreachable.
 //   ssh mac-mini-ubuntu 'node ~/platform/server/lab-incidents-cli.mjs report' < finding.json
 //   ssh mac-mini-ubuntu 'node ~/platform/server/lab-incidents-cli.mjs list --status unresolved'
 //
@@ -62,7 +66,14 @@ async function main() {
                   VALUES (lower(hex(randomblob(8))), ?, ?, datetime('now','+60 seconds'), datetime('now'))`)
         .run(user.id, hash);
       try {
-        const r = await fetch(`http://127.0.0.1:${PORT}/api/test/sweep/run`, {
+        // Every enabled suite, which is the only execution path: a suite
+        // carries its own targets, so a run out here measures exactly what
+        // the button measures. `--suite <id>` runs just one.
+        const suiteId = flag("suite", null);
+        const url = suiteId
+          ? `http://127.0.0.1:${PORT}/api/test/suites/${suiteId}/run`
+          : `http://127.0.0.1:${PORT}/api/test/suites/run-all`;
+        const r = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json", "Cookie": `anima_token=${token}` },
           body: JSON.stringify({ source }),
@@ -73,7 +84,16 @@ async function main() {
           process.exit(2);
         }
         console.log(JSON.stringify(body, null, 2));
-        process.exit(0);
+        // A run that measured NOTHING is not a pass. Exit non-zero so a cron
+        // job cannot read silence as success.
+        const rs = body.results || (body.result ? [body.result] : []);
+        const measured = rs.reduce((a, x) => a + (x.total || 0), 0);
+        const failed = rs.reduce((a, x) => a + (x.failed || 0), 0);
+        if (rs.length && measured === 0) {
+          console.error("nothing was measured — every suite was empty or had no target");
+          process.exit(2);
+        }
+        process.exit(failed > 0 ? 1 : 0);
       } catch (e) {
         // A dead platform-api must be loud. Reporting nothing here would look
         // exactly like a clean sweep to whatever reads this output.

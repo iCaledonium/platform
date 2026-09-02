@@ -26,9 +26,6 @@ export default function LabTestManagerPage() {
 
   const [benches, setBenches] = useState([]);
   const [coverage, setCoverage] = useState(null);
-  const [targets, setTargets] = useState([]);
-  const [worlds, setWorlds] = useState([]);
-  const [actors, setActors] = useState([]);
   const [runs, setRuns] = useState([]);
   const [result, setResult] = useState(null);
   const [running, setRunning] = useState(false);
@@ -39,7 +36,6 @@ export default function LabTestManagerPage() {
   const [bench, setBench] = useState("encounter");
   const [worldId, setWorldId] = useState("");
   const [actorId, setActorId] = useState("");
-  const [tLabel, setTLabel] = useState("");
 
   const label = { fontSize: 10, letterSpacing: ".16em", textTransform: "uppercase",
     color: "rgba(255,255,255,.4)" };
@@ -58,16 +54,6 @@ export default function LabTestManagerPage() {
   };
 
   const spec = benches.find(b => b.key === bench);
-
-  const loadTargets = useCallback(async () => {
-    try {
-      const r = await fetch("/api/test/sweep/targets", { credentials: "include" });
-      if (r.status === 401) { setAuthed(false); setTargets([]); return; }
-      const j = await r.json();
-      if (!j.ok) throw new Error(j.error);
-      setTargets(Array.isArray(j.targets) ? j.targets : []);
-    } catch (e) { setError(String(e.message || e)); }
-  }, []);
 
   const loadRuns = useCallback(async () => {
     try {
@@ -94,30 +80,11 @@ export default function LabTestManagerPage() {
         if (running) setWorldId(running.id);
       } catch (e) { setWorlds([]); setError(String(e.message || e)); }
     })();
-    loadTargets();
     loadRuns();
-  }, [loadTargets, loadRuns]);
+  }, [loadRuns]);
 
   // Same ambient filter the other benches use: the ambient cast populates
   // venues, has no home and no schedule, and was never knock-on-able.
-  useEffect(() => {
-    if (!worldId) { setActors([]); return; }
-    (async () => {
-      try {
-        const pr = await fetch(`/api/worlds/${worldId}/presence`, { credentials: "include" });
-        if (pr.status === 401) { setAuthed(false); setActors([]); return; }
-        const p = await pr.json();
-        const list = (Array.isArray(p?.locations) ? p.locations : []).flatMap(l => (l.actors || [])
-          .filter(a => !a.is_ambient && a.actor_type !== "ambient")
-          .map(a => ({ id: a.actor_id, name: a.name })));
-        const seen = new Set();
-        const uniq = list.filter(a => !seen.has(a.id) && seen.add(a.id))
-                         .sort((a, b) => (a.name || "").localeCompare(b.name || ""));
-        setActors(uniq);
-        if (uniq.length && !uniq.some(a => a.id === actorId)) setActorId(uniq[0].id);
-      } catch { setActors([]); }
-    })();
-  }, [worldId]);
 
   async function post(url, body) {
     const r = await fetch(url, {
@@ -128,19 +95,6 @@ export default function LabTestManagerPage() {
     const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
     if (!j.ok) throw new Error(j.error || `HTTP ${r.status}`);
     return j;
-  }
-
-  async function addTarget() {
-    try {
-      const w = worlds.find(x => x.id === worldId);
-      const a = actors.find(x => x.id === actorId);
-      const j = await post("/api/test/sweep/targets", {
-        bench, world_id: worldId,
-        actor_id: spec?.needs_actor ? actorId : null,
-        label: tLabel || [w?.name, spec?.needs_actor ? a?.name : null].filter(Boolean).join(" · "),
-      });
-      setTargets(j.targets); setTLabel(""); setError("");
-    } catch (e) { setError(String(e.message || e)); }
   }
 
   async function runSweep() {
@@ -155,8 +109,6 @@ export default function LabTestManagerPage() {
   }
 
   const globals = benches.filter(b => !b.scoped);
-  const enabledTargets = targets.filter(t => t.enabled).length;
-  const configured = new Set(targets.filter(t => t.enabled).map(t => t.bench));
 
   return (
     <div style={{ minHeight: "100vh", background: "#0d0c0a", fontFamily: "'DM Sans',system-ui,sans-serif" }}>
