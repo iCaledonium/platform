@@ -48,6 +48,8 @@ export default function LabCaseAdmin() {
   const [tActor, setTActor] = useState("");
   const [uncovered, setUncovered] = useState([]);
   const [coverage, setCoverage] = useState(null);
+  // key -> display name, from the same place /lab/home gets them.
+  const [catLabels, setCatLabels] = useState({});
   const [draft, setDraft] = useState(null);
   const [tryResult, setTryResult] = useState(null);
 
@@ -76,6 +78,7 @@ export default function LabCaseAdmin() {
       setScheduler(s.scheduler || null);
       const b = await fetch("/api/test/benches", { credentials: "include" }).then(x => x.json()).catch(() => null);
       setCoverage(b?.coverage || null);
+      setCatLabels(Object.fromEntries((b?.benches || []).map(x => [x.key, x.label])));
       // Derived here rather than waiting for a run: a category in no suite is
       // a gap whether or not anybody has pressed anything today.
       const covered = new Set((s.suites || []).filter(x => x.enabled)
@@ -119,6 +122,10 @@ export default function LabCaseAdmin() {
     return j;
   }
 
+  // Fall back to the key: a category the catalogue knows but /api/test/benches
+  // does not is exactly the gap the coverage check reports, and showing a bare
+  // key there is more honest than inventing a name for it.
+  const catName = (k) => catLabels[k] || k;
   const categories = [...new Set((cases || []).map(c => c.source))].sort();
   const countIn = (cat) => (cases || []).filter(c => c.source === cat).length;
   const shown = (cases || []).filter(c =>
@@ -218,19 +225,19 @@ export default function LabCaseAdmin() {
           {/* Two different gaps, both of which would otherwise be silent. */}
           {coverage?.unwired?.length > 0 && (
             <div style={{ fontSize: 11, lineHeight: 1.7, color: "#e0736b" }}>
-              Live scorecard routes with no entry in the catalogue: {coverage.unwired.join(", ")}.
+              Live scorecard routes with no entry in the catalogue: {coverage.unwired.map(catName).join(", ")}.
               Nothing can run these until they are added to BENCHES in server/lab-incidents.js.
             </div>
           )}
           {coverage?.missing?.length > 0 && (
             <div style={{ fontSize: 11, lineHeight: 1.7, color: "#c96fd0" }}>
-              Catalogued but no longer served: {coverage.missing.join(", ")}. A renamed or removed
+              Catalogued but no longer served: {coverage.missing.map(catName).join(", ")}. A renamed or removed
               category would otherwise show up only as one that mysteriously never fails.
             </div>
           )}
           {uncovered.length > 0 && (
             <div style={{ fontSize: 11, lineHeight: 1.7, color: "#d9a441" }}>
-              In no suite, so nothing runs them: {uncovered.join(", ")}.
+              In no suite, so nothing runs them: {uncovered.map(catName).join(", ")}.
               A category no suite covers is not a passing category.
             </div>
           )}
@@ -270,7 +277,7 @@ export default function LabCaseAdmin() {
                       {cats.length && cs.length ? " + " : ""}
                       {cs.length ? `${cs.length} test case(s)` : ""}
                       {!cats.length && !cs.length ? "empty — measures nothing" : ""}
-                      {cats.length ? ` · ${cats.map(c => c.source).join(", ")}` : ""}
+                      {cats.length ? ` · ${cats.map(c => catName(c.source)).join(", ")}` : ""}
                     </div>
                   </div>
                   <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
@@ -392,7 +399,7 @@ export default function LabCaseAdmin() {
                 <div key={i} style={{ display: "flex", gap: 9, padding: "3px 0", alignItems: "baseline" }}>
                   <span style={{ ...label, fontSize: 8.5, minWidth: 34, color: V[c.verdict] || V.unknown }}>{c.verdict}</span>
                   <span style={{ fontSize: 10.5, color: "rgba(255,255,255,.7)" }}>{c.name}</span>
-                  <span style={{ ...label, fontSize: 8 }}>{c.source}</span>
+                  <span style={{ ...label, fontSize: 8 }}>{catName(c.source)}</span>
                 </div>
               ))}
             </div>
@@ -424,7 +431,7 @@ export default function LabCaseAdmin() {
               {categories.map(cat => (
                 <span key={cat} style={chip(pickedCats.has(cat))}
                   onClick={() => setPickedCats(p => { const n = new Set(p); n.has(cat) ? n.delete(cat) : n.add(cat); return n; })}>
-                  {cat} ({countIn(cat)})
+                  {catName(cat)} ({countIn(cat)})
                 </span>
               ))}
             </div>
@@ -435,7 +442,7 @@ export default function LabCaseAdmin() {
             <div style={{ display: "flex", gap: 7, margin: "8px 0", flexWrap: "wrap" }}>
               <input value={q} onChange={e => setQ(e.target.value)} placeholder="search…" style={{ ...input, width: 200 }} />
               <span onClick={() => setCatFilter("all")} style={chip(catFilter === "all")}>all</span>
-              {categories.map(c => <span key={c} onClick={() => setCatFilter(c)} style={chip(catFilter === c)}>{c}</span>)}
+              {categories.map(c => <span key={c} onClick={() => setCatFilter(c)} style={chip(catFilter === c)}>{catName(c)}</span>)}
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 3, maxHeight: 340, overflowY: "auto" }}>
               {shown.map(c => {
@@ -449,7 +456,7 @@ export default function LabCaseAdmin() {
                       onChange={() => setPickedCases(p => {
                         const n = new Set(p); const k = ckey(c); n.has(k) ? n.delete(k) : n.add(k); return n; })} />
                     <span style={{ fontSize: 10.5, color: "rgba(255,255,255,.75)" }}>{c.check_name}</span>
-                    <span style={{ ...label, fontSize: 8 }}>{c.source}</span>
+                    <span style={{ ...label, fontSize: 8 }}>{catName(c.source)}</span>
                     {covered && <span style={{ ...label, fontSize: 8, color: GOLD + ".8)" }}>via category</span>}
                   </label>
                 );
@@ -465,7 +472,7 @@ export default function LabCaseAdmin() {
           <div style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center" }}>
             <input value={q} onChange={e => setQ(e.target.value)} placeholder="search test cases…" style={{ ...input, width: 220 }} />
             <span onClick={() => setCatFilter("all")} style={chip(catFilter === "all")}>all categories</span>
-            {categories.map(c => <span key={c} onClick={() => setCatFilter(c)} style={chip(catFilter === c)}>{c} ({countIn(c)})</span>)}
+            {categories.map(c => <span key={c} onClick={() => setCatFilter(c)} style={chip(catFilter === c)}>{catName(c)} ({countIn(c)})</span>)}
           </div>
 
           {cases && cases.length === 0 && (
@@ -488,7 +495,7 @@ export default function LabCaseAdmin() {
                   <div style={{ display: "flex", gap: 8, alignItems: "baseline", flexWrap: "wrap" }}>
                     <span style={{ fontSize: 11.5, color: c.enabled ? "rgba(255,255,255,.85)" : "rgba(255,255,255,.35)" }}>
                       {c.check_name}</span>
-                    <span style={{ ...label, fontSize: 8.5 }}>{c.source}</span>
+                    <span style={{ ...label, fontSize: 8.5 }}>{catName(c.source)}</span>
                     {c.authored && <span style={{ ...label, fontSize: 8.5, color: GOLD + ".8)" }}>authored</span>}
                     {!c.enabled && <span style={{ ...label, fontSize: 8.5, color: "#d9a441" }}>muted</span>}
                     {c.severity === "advisory" && <span style={{ ...label, fontSize: 8.5 }}>advisory</span>}
@@ -531,7 +538,7 @@ export default function LabCaseAdmin() {
             A test case asks a question and compares the answer to a number. A <strong>query</strong> runs
             SQL on a <strong>read-only</strong> connection — SQLite itself refuses anything that writes.
             A <strong>probe</strong> makes an anonymous request to a path here and compares the status.
-            Authored cases land in the <code>authored</code> category.
+            Authored cases land in the <em>{catName("authored")}</em> category.
           </div>
           <input value={draft.name || ""} onChange={e => setDraft({ ...draft, name: e.target.value })}
             placeholder="what it asserts — e.g. no share names its own owner" style={input} />

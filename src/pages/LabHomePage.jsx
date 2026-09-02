@@ -32,6 +32,17 @@ const BOARDS = [
 
 const CASES = [
   {
+    path: "/lab/home/testmanager",
+    key: "authored",
+    subject: "Authored",
+    place: "—",
+    situation: "Test cases",
+    blurb: "Test cases written in the manager rather than in code — a query compared to a number, " +
+      "or an anonymous probe compared to a status. They sweep like any other category. Queries run " +
+      "on a read-only connection, so SQLite refuses anything that writes.",
+    live: true,
+  },
+  {
     path: "/lab/actor/apartment/encounter",
     key: "encounter",
     subject: "Actor",
@@ -186,7 +197,8 @@ export default function LabHomePage() {
               <div key={c.path} onClick={() => c.live && navigate(c.path)} style={card(c.live)}>
                 <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12 }}>
                   <span style={{ fontSize: 13.5, color: c.live ? GOLD + ".95)" : "rgba(255,255,255,.3)" }}>
-                    {c.subject} · {c.place} · {c.situation}
+                    {[c.subject, c.place, c.situation]
+                      .filter(x => x && x !== "\u2014").join(" \u00b7 ")}
                   </span>
                   <span style={{ display: "flex", gap: 10, alignItems: "baseline", flexShrink: 0 }}>
                     {counts[c.key] != null && (
