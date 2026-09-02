@@ -50,6 +50,10 @@ export default function LabCaseAdmin() {
   const [coverage, setCoverage] = useState(null);
   // key -> display name, from the same place /lab/home gets them.
   const [catLabels, setCatLabels] = useState({});
+  const [cats, setCats] = useState([]);          // the managed categories
+  const [newCat, setNewCat] = useState("");
+  const [selected, setSelected] = useState(new Set());  // cases picked for a move
+  const [moveTo, setMoveTo] = useState("");
   const [draft, setDraft] = useState(null);
   const [tryResult, setTryResult] = useState(null);
 
@@ -79,6 +83,9 @@ export default function LabCaseAdmin() {
       const b = await fetch("/api/test/benches", { credentials: "include" }).then(x => x.json()).catch(() => null);
       setCoverage(b?.coverage || null);
       setCatLabels(Object.fromEntries((b?.benches || []).map(x => [x.key, x.label])));
+      const cc = await fetch("/api/test/categories", { credentials: "include" })
+        .then(x => x.json()).catch(() => null);
+      setCats(cc?.categories || []);
       // Derived here rather than waiting for a run: a category in no suite is
       // a gap whether or not anybody has pressed anything today.
       const covered = new Set((s.suites || []).filter(x => x.enabled)
@@ -126,10 +133,21 @@ export default function LabCaseAdmin() {
   // does not is exactly the gap the coverage check reports, and showing a bare
   // key there is more honest than inventing a name for it.
   const catName = (k) => catLabels[k] || k;
-  const categories = [...new Set((cases || []).map(c => c.source))].sort();
-  const countIn = (cat) => (cases || []).filter(c => c.source === cat).length;
+  // Does this suite touch a board that needs a world? Resolved through the
+  // catalogue, since a category can now draw cases from several boards.
+  const SCOPED = ["encounter", "transport", "behavior"];
+  const suiteNeedsWorld = (s) => (s.members || []).some(m => {
+    if (m.kind === "case") return SCOPED.includes(m.source);
+    const name = cats.find(x => x.id === m.source)?.name;
+    return (cases || []).some(c => c.category === name && SCOPED.includes(c.source));
+  });
+  // Organised by what a case is ABOUT. `source` is still shown on each row,
+  // because which board runs it is worth knowing and is no longer the same
+  // question.
+  const categories = [...new Set((cases || []).map(c => c.category).filter(Boolean))].sort();
+  const countIn = (cat) => (cases || []).filter(c => c.category === cat).length;
   const shown = (cases || []).filter(c =>
-    (catFilter === "all" || c.source === catFilter) &&
+    (catFilter === "all" || c.category === catFilter) &&
     (!q || c.check_name.toLowerCase().includes(q.toLowerCase())));
   const ckey = (c) => `${c.source}|${c.check_name}`;
 
@@ -184,6 +202,9 @@ export default function LabCaseAdmin() {
         <span onClick={() => setTab("suites")} style={chip(tab === "suites")}>Suites ({suites.length})</span>
         <span onClick={() => setTab("cases")} style={chip(tab === "cases")}>
           Test cases{cases ? ` (${cases.length})` : ""}
+        </span>
+        <span onClick={() => setTab("categories")} style={chip(tab === "categories")}>
+          Categories ({cats.length})
         </span>
         <span onClick={() => { setTab("author"); setDraft({ kind: "query", op: "eq", expected: 0, probe_method: "GET" }); setTryResult(null); }}
           style={chip(tab === "author")}>Write a test case</span>
@@ -262,7 +283,7 @@ export default function LabCaseAdmin() {
           )}
 
           {suites.map(s => {
-            const cats = s.members.filter(m => m.kind === "category");
+            const scats = s.members.filter(m => m.kind === "category");
             const cs = s.members.filter(m => m.kind === "case");
             const lr = s.last_result;
             return (
@@ -273,11 +294,11 @@ export default function LabCaseAdmin() {
                   <div>
                     <div style={{ fontSize: 12.5, color: "rgba(255,255,255,.88)" }}>{s.name}</div>
                     <div style={{ fontSize: 10, color: "rgba(255,255,255,.4)", marginTop: 3 }}>
-                      {cats.length ? `${cats.length} categor${cats.length === 1 ? "y" : "ies"}` : ""}
-                      {cats.length && cs.length ? " + " : ""}
+                      {scats.length ? `${scats.length} categor${scats.length === 1 ? "y" : "ies"}` : ""}
+                      {scats.length && cs.length ? " + " : ""}
                       {cs.length ? `${cs.length} test case(s)` : ""}
-                      {!cats.length && !cs.length ? "empty — measures nothing" : ""}
-                      {cats.length ? ` · ${cats.map(c => catName(c.source)).join(", ")}` : ""}
+                      {!scats.length && !cs.length ? "empty — measures nothing" : ""}
+                      {scats.length ? ` · ${scats.map(m => cats.find(x => x.id === m.source)?.name || m.source).join(", ")}` : ""}
                     </div>
                   </div>
                   <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
@@ -321,7 +342,7 @@ export default function LabCaseAdmin() {
                 {/* Run configuration: which world (and actor) the SCOPED
                     categories run against. A suite of only platform-wide
                     categories never needs one, so it is not shown. */}
-                {cats.concat(cs).some(m => ["encounter", "transport", "behavior"].includes(m.source)) && (
+                {suiteNeedsWorld(s) && (
                   <div style={{ paddingTop: 8, borderTop: "0.5px solid rgba(255,255,255,.06)" }}>
                     <div style={{ ...label, fontSize: 9, marginBottom: 6 }}>runs against</div>
                     {(s.targets || []).length === 0 && (
@@ -428,10 +449,10 @@ export default function LabCaseAdmin() {
               silently goes stale.
             </div>
             <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
-              {categories.map(cat => (
-                <span key={cat} style={chip(pickedCats.has(cat))}
-                  onClick={() => setPickedCats(p => { const n = new Set(p); n.has(cat) ? n.delete(cat) : n.add(cat); return n; })}>
-                  {catName(cat)} ({countIn(cat)})
+              {cats.map(cat => (
+                <span key={cat.id} style={chip(pickedCats.has(cat.id))}
+                  onClick={() => setPickedCats(p => { const n = new Set(p); n.has(cat.id) ? n.delete(cat.id) : n.add(cat.id); return n; })}>
+                  {cat.name} ({countIn(cat.name)})
                 </span>
               ))}
             </div>
@@ -442,11 +463,11 @@ export default function LabCaseAdmin() {
             <div style={{ display: "flex", gap: 7, margin: "8px 0", flexWrap: "wrap" }}>
               <input value={q} onChange={e => setQ(e.target.value)} placeholder="search…" style={{ ...input, width: 200 }} />
               <span onClick={() => setCatFilter("all")} style={chip(catFilter === "all")}>all</span>
-              {categories.map(c => <span key={c} onClick={() => setCatFilter(c)} style={chip(catFilter === c)}>{catName(c)}</span>)}
+              {categories.map(c => <span key={c} onClick={() => setCatFilter(c)} style={chip(catFilter === c)}>{c}</span>)}
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 3, maxHeight: 340, overflowY: "auto" }}>
               {shown.map(c => {
-                const covered = pickedCats.has(c.source);
+                const covered = [...pickedCats].some(id => cats.find(x => x.id === id)?.name === c.category);
                 return (
                   <label key={ckey(c)} style={{ display: "flex", gap: 9, alignItems: "baseline",
                     padding: "5px 8px", borderRadius: 3, cursor: covered ? "default" : "pointer",
@@ -466,13 +487,52 @@ export default function LabCaseAdmin() {
         </>
       )}
 
+      {/* ── CATEGORIES ────────────────────────────────────────────────────── */}
+      {tab === "categories" && (
+        <>
+          <div style={{ fontSize: 11, lineHeight: 1.7, color: "rgba(255,255,255,.45)" }}>
+            A category is what a test case is <em>about</em>. It is not the board that runs it —
+            that is provenance, shown on each case as its source, and the two need not stay the
+            same. One category is seeded per board so nothing moves on its own; make your own and
+            move cases into it from the test-case list.
+          </div>
+          <div style={{ display: "flex", gap: 7 }}>
+            <input value={newCat} onChange={e => setNewCat(e.target.value)}
+              placeholder="new category — e.g. Security" style={{ ...input, width: 280 }} />
+            <button style={btn()} onClick={async () => {
+              try { const j = await post("/api/test/categories", { name: newCat });
+                setCats(j.categories); setNewCat(""); } catch (e) { setErr(String(e.message || e)); }
+            }}>Create category</button>
+          </div>
+          {cats.map(c => (
+            <div key={c.id} style={{ display: "flex", justifyContent: "space-between", gap: 12,
+              alignItems: "center", padding: "9px 12px", borderRadius: 4,
+              background: "rgba(255,255,255,.022)", border: "0.5px solid rgba(255,255,255,.08)" }}>
+              <div>
+                <div style={{ fontSize: 11.5, color: "rgba(255,255,255,.85)" }}>{c.name}</div>
+                <div style={{ fontSize: 9.5, color: "rgba(255,255,255,.35)", marginTop: 3 }}>
+                  {countIn(c.name)} test case(s)
+                  {c.builtin_source ? ` · seeded from the ${c.builtin_source} board` : " · yours"}
+                </div>
+              </div>
+              {!c.builtin_source && (
+                <button style={btn("#e0736b", true)} onClick={async () => {
+                  try { const j = await post(`/api/test/categories/${c.id}/delete`); setCats(j.categories); }
+                  catch (e) { setErr(String(e.message || e)); }
+                }}>Delete</button>
+              )}
+            </div>
+          ))}
+        </>
+      )}
+
       {/* ── CATALOGUE ─────────────────────────────────────────────────────── */}
       {tab === "cases" && (
         <>
           <div style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center" }}>
             <input value={q} onChange={e => setQ(e.target.value)} placeholder="search test cases…" style={{ ...input, width: 220 }} />
             <span onClick={() => setCatFilter("all")} style={chip(catFilter === "all")}>all categories</span>
-            {categories.map(c => <span key={c} onClick={() => setCatFilter(c)} style={chip(catFilter === c)}>{catName(c)} ({countIn(c)})</span>)}
+            {categories.map(c => <span key={c} onClick={() => setCatFilter(c)} style={chip(catFilter === c)}>{c} ({countIn(c)})</span>)}
           </div>
 
           {cases && cases.length === 0 && (
@@ -484,6 +544,32 @@ export default function LabCaseAdmin() {
             </div>
           )}
 
+          {/* Move whatever is ticked into a category — this is "add existing
+              test cases", and it works for built-in and authored alike. */}
+          {selected.size > 0 && (
+            <div style={{ display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap",
+              padding: "9px 12px", borderRadius: 4, background: GOLD + ".08)",
+              border: `0.5px solid ${GOLD}.3)` }}>
+              <span style={{ fontSize: 11, color: GOLD + ".95)" }}>{selected.size} selected — move to</span>
+              <select value={moveTo} onChange={e => setMoveTo(e.target.value)}
+                style={{ ...input, padding: "3px 6px", fontSize: 10 }}>
+                <option value="" style={{ background: "#151310" }}>— category —</option>
+                {cats.map(c => <option key={c.id} value={c.id} style={{ background: "#151310" }}>{c.name}</option>)}
+              </select>
+              <button style={btn(GOLD + ".8)", true)} disabled={!moveTo} onClick={async () => {
+                try {
+                  const picks = [...selected].map(k => {
+                    const i = k.indexOf("|");
+                    return { source: k.slice(0, i), check_name: k.slice(i + 1) };
+                  });
+                  const j = await post(`/api/test/categories/${moveTo}/assign`, { cases: picks });
+                  setCases(j.cases); setSelected(new Set()); setMoveTo("");
+                } catch (e) { setErr(String(e.message || e)); }
+              }}>Move</button>
+              <button style={btn(null, true)} onClick={() => setSelected(new Set())}>Clear</button>
+            </div>
+          )}
+
           <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
             {shown.map(c => (
               <div key={ckey(c)} style={{ padding: "9px 12px", borderRadius: 4,
@@ -491,11 +577,16 @@ export default function LabCaseAdmin() {
                 border: "0.5px solid rgba(255,255,255,.08)", borderLeftWidth: 2, borderLeftStyle: "solid",
                 borderLeftColor: c.enabled ? (V[c.last_verdict] || "rgba(255,255,255,.15)") : "rgba(255,255,255,.12)",
                 display: "flex", gap: 10, alignItems: "flex-start" }}>
+                <input type="checkbox" style={{ marginTop: 3, cursor: "pointer" }}
+                  checked={selected.has(ckey(c))}
+                  onChange={() => setSelected(p => {
+                    const n = new Set(p); const k = ckey(c); n.has(k) ? n.delete(k) : n.add(k); return n; })} />
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ display: "flex", gap: 8, alignItems: "baseline", flexWrap: "wrap" }}>
                     <span style={{ fontSize: 11.5, color: c.enabled ? "rgba(255,255,255,.85)" : "rgba(255,255,255,.35)" }}>
                       {c.check_name}</span>
-                    <span style={{ ...label, fontSize: 8.5 }}>{catName(c.source)}</span>
+                    <span style={{ ...label, fontSize: 8.5, color: GOLD + ".7)" }}>{c.category || "no category"}</span>
+                    <span style={{ ...label, fontSize: 8, color: "rgba(255,255,255,.3)" }}>runs from {c.source}</span>
                     {c.authored && <span style={{ ...label, fontSize: 8.5, color: GOLD + ".8)" }}>authored</span>}
                     {!c.enabled && <span style={{ ...label, fontSize: 8.5, color: "#d9a441" }}>muted</span>}
                     {c.severity === "advisory" && <span style={{ ...label, fontSize: 8.5 }}>advisory</span>}
@@ -538,10 +629,19 @@ export default function LabCaseAdmin() {
             A test case asks a question and compares the answer to a number. A <strong>query</strong> runs
             SQL on a <strong>read-only</strong> connection — SQLite itself refuses anything that writes.
             A <strong>probe</strong> makes an anonymous request to a path here and compares the status.
-            Authored cases land in the <em>{catName("authored")}</em> category.
+            An authored case is <em>run</em> from the authored board, but it belongs to whichever
+            category you put it in — provenance and subject are different things.
           </div>
           <input value={draft.name || ""} onChange={e => setDraft({ ...draft, name: e.target.value })}
             placeholder="what it asserts — e.g. no share names its own owner" style={input} />
+          <div style={{ display: "flex", gap: 7, alignItems: "center" }}>
+            <span style={{ ...label, fontSize: 9 }}>category</span>
+            <select value={draft.category_id || ""} onChange={e => setDraft({ ...draft, category_id: e.target.value })}
+              style={input}>
+              <option value="" style={{ background: "#151310" }}>— what is it about? —</option>
+              {cats.map(c => <option key={c.id} value={c.id} style={{ background: "#151310" }}>{c.name}</option>)}
+            </select>
+          </div>
           <div style={{ display: "flex", gap: 7, alignItems: "center", flexWrap: "wrap" }}>
             <select value={draft.kind} onChange={e => setDraft({ ...draft, kind: e.target.value })} style={input}>
               <option value="query" style={{ background: "#151310" }}>query</option>

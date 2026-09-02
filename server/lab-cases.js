@@ -180,7 +180,13 @@ export function catalogue() {
   const settings = new Map(
     db.prepare(`SELECT * FROM lab_case_settings`).all().map((s) => [`${s.source}|${s.check_name}`, s]));
 
+  // An authored case that has been DELETED leaves its catalogue row behind on
+  // purpose, so incident history stays readable — but it must not go on
+  // appearing in the catalogue as a live case with no category. Drop the
+  // ghosts here rather than deleting the row and losing the history.
+  const liveAuthored = new Set(db.prepare(`SELECT name FROM lab_test_cases`).all().map((a) => a.name));
   const builtin = db.prepare(`SELECT * FROM lab_known_cases ORDER BY source, check_name`).all()
+    .filter((k) => k.source !== "authored" || liveAuthored.has(k.check_name))
     .map((k) => {
       const s = settings.get(`${k.source}|${k.check_name}`);
       return {
