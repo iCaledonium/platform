@@ -21,6 +21,16 @@
 // or the service was unreachable.
 //   ssh mac-mini-ubuntu 'node ~/platform/server/lab-incidents-cli.mjs report' < finding.json
 //   ssh mac-mini-ubuntu 'node ~/platform/server/lab-incidents-cli.mjs list --status unresolved'
+//   ssh mac-mini-ubuntu 'node ~/platform/server/lab-incidents-cli.mjs status resolved \
+//        --source fault-triage --check "the ThoughtEngine cannot reach the decision model"'
+//
+// `status` exists because a routine could previously file and never close.
+// runSweep is only ever invoked with a CATEGORY key, so its auto-resolve arm
+// (WHERE bench = ?) can never match an incident filed under a routine SOURCE —
+// fault-triage, behavior-watch and conduct-watch findings sat open until a
+// person clicked them in the browser, however long ago the fault was fixed.
+// A routine that has re-run its own check and found it clean says so here,
+// through the same door it filed through and against the same fingerprint.
 //
 // `report` reads one JSON object, or an array of them, on stdin:
 //   { "bench": "suite", "check_name": "...", "detail": "...",
@@ -121,6 +131,38 @@ async function main() {
       process.exit(results.some((r) => r.error) ? 1 : 0);
     }
 
+    // Address a row the way `report` does — by (source, check, world, actor) —
+    // because a routine knows what it FILED, not what row id the store gave it.
+    // --id is there for a person reading the board.
+    case "status": {
+      const allowed = ["open", "acknowledged", "known", "resolved", "wontfix"];
+      const next = argv[1] && !argv[1].startsWith("--") ? argv[1] : flag("to", null);
+      const usage = `usage: status <${allowed.join("|")}> ` +
+        `(--id X | --source X --check "name" [--world W] [--actor A]) [--by X] [--note X]`;
+      if (!allowed.includes(next)) { console.error(usage); process.exit(1); }
+
+      const id = flag("id", null);
+      let row;
+      if (id) {
+        row = db.prepare(`SELECT id, status, fingerprint FROM lab_incidents WHERE id = ?`).get(id);
+        if (!row) { console.error(`no incident with id ${id}`); process.exit(1); }
+      } else {
+        const bench = flag("source", null), check = flag("check", null);
+        if (!bench || !check) { console.error(usage); process.exit(1); }
+        const fp = store.fingerprintOf({ bench, check_name: check,
+          world_id: flag("world", null), actor_id: flag("actor", null) });
+        row = db.prepare(`SELECT id, status, fingerprint FROM lab_incidents WHERE fingerprint = ?`).get(fp);
+        // A miss is nearly always a mistyped check name, and exiting 0 here
+        // would let a routine report that it had closed something it had not.
+        if (!row) { console.error(`no incident with fingerprint ${fp}`); process.exit(1); }
+      }
+
+      const ok = store.setStatus(row.id, next, flag("by", flag("source", "routine:cli")), flag("note", null));
+      console.log(JSON.stringify(
+        { ok, id: row.id, fingerprint: row.fingerprint, from: row.status, to: next }, null, 2));
+      process.exit(ok ? 0 : 2);
+    }
+
     case "list": {
       const rows = store.listIncidents({
         status: flag("status", "unresolved"), bench: flag("bench", "all"),
@@ -135,7 +177,8 @@ async function main() {
       process.exit(0);
 
     default:
-      console.error(`usage: lab-incidents-cli.mjs <sweep|report|list|runs> [--source X] [--status X] [--bench X] [--limit N]`);
+      console.error(`usage: lab-incidents-cli.mjs <sweep|report|status|list|runs> [--source X] [--status X] [--bench X] [--limit N]\n` +
+        `       status <open|acknowledged|known|resolved|wontfix> (--id X | --source X --check "name") [--by X] [--note X]`);
       process.exit(1);
   }
 }

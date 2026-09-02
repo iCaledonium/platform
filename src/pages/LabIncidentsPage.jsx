@@ -224,6 +224,13 @@ export default function LabIncidentsPage() {
             const st = STATUS[inc.status] || STATUS.open;
             // Settled: the severity is history now, not a live verdict.
             const settled = inc.status === "resolved" || inc.status === "wontfix";
+            // A sticky row is never un-stuck by a pass — that is the point of
+            // known. But a red-by-design check that has GONE GREEN must not read
+            // identically to one still failing. Both stamps come off the same
+            // clock in the same ISO-Z format, so the later string is the later
+            // observation, and the last observation is what the row means.
+            const sticky = inc.status === "known" || inc.status === "wontfix";
+            const greenAgain = sticky && inc.last_pass_at && inc.last_pass_at > inc.last_seen_at;
             const isOpen = !!open[inc.id];
             return (
               <div key={inc.id} style={{ padding: "12px 15px", borderRadius: 5,
@@ -243,6 +250,8 @@ export default function LabIncidentsPage() {
                   <div style={{ display: "flex", gap: 8, alignItems: "center", flexShrink: 0 }}>
                     {!settled && <span style={{ ...label, fontSize: 9, color: sev.color }}>{sev.label}</span>}
                     <span style={{ ...label, fontSize: 9, color: st.color }}>{st.label}</span>
+                    {greenAgain && <span style={{ ...label, fontSize: 9, color: "#7fc08a" }}>
+                      passing since {ago(inc.last_pass_at)}</span>}
                   </div>
                 </div>
 
@@ -261,6 +270,9 @@ export default function LabIncidentsPage() {
                     <div>recorded as {sev.label}{settled ? " when it was last seen" : ""}</div>
                     <div>source {inc.source} · first seen {inc.first_seen_at} · last seen {inc.last_seen_at}</div>
                     {inc.resolved_at && <div>resolved {inc.resolved_at} by {inc.resolved_by}</div>}
+                    {inc.last_pass_at && <div>last pass {inc.last_pass_at}
+                      {greenAgain ? " — green at the last look" : " — it has failed since"}</div>}
+                    {inc.note && <div style={{ marginTop: 5, whiteSpace: "pre-wrap" }}>note: {inc.note}</div>}
                     {inc.first_detail && inc.first_detail !== inc.detail &&
                       <div style={{ marginTop: 5, whiteSpace: "pre-wrap" }}>first detail: {inc.first_detail}</div>}
                   </div>
@@ -294,7 +306,9 @@ export default function LabIncidentsPage() {
           A check that merely <em>disappears</em> from its board is left open on purpose — its absence
           is not a fix. A board that could not be read resolves nothing and files
           “{"the bench answered"}” against itself instead, because an empty board and a clean
-          board are the same shape.
+          board are the same shape. A <em>known</em> or <em>won't fix</em> row is sticky — no sweep
+          moves it — but if its check comes back <em>pass</em> the row says so, and a person decides
+          what that means.
           <br />
           Routines file here over ssh:{" "}
           <code style={{ color: "rgba(255,255,255,.45)" }}>
