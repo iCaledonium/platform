@@ -23,6 +23,7 @@
 
 import crypto from "crypto";
 import db from "./db.js";
+import * as cases from "./lab-cases.js";
 
 // The module owns its own tables rather than adding them to db.js's schema
 // block: db.js is a large shared file and every whole-file write to one of
@@ -146,6 +147,14 @@ export const BENCHES = {
     page: "/lab/character/deploy",
     watcher: "Feature - Character Deploy",
     side: "platform", scoped: false, needsActor: false, local: "deployChecks",
+  },
+  // Cases written in the test manager rather than in code. A source like
+  // any other downstream: same fingerprints, same incidents, same sweep.
+  authored: {
+    label: "Authored · Test cases",
+    page: "/lab/home/testmanager",
+    watcher: null,
+    side: "platform", scoped: false, needsActor: false, local: "authoredChecks",
   },
 };
 
@@ -331,8 +340,12 @@ async function fetchSimulatorBoard(bench, target, { SIMULATOR_URL, SERVICE_TOKEN
 
 // One board → incidents. Returns the tally.
 function fileBoard({ bench, target, checks, source }) {
-  const tally = { checks: checks.length, passed: 0, failed: 0, skipped: 0,
+  const tally = { checks: checks.length, passed: 0, failed: 0, skipped: 0, muted: 0,
                   opened: 0, reopened: 0, recurred: 0, resolved: 0 };
+  // The catalogue learns what this source contains by watching it answer —
+  // nothing anywhere holds a hardcoded list of case names.
+  try { cases.recordSeen(bench, checks); } catch { /* never fail a sweep over bookkeeping */ }
+  const muted = cases.mutedSet();
   const scope_label = scopeLabel(bench, target);
   const passedNames = [];
   // Every check this board ran, by name — what the manager shows when a board
@@ -343,8 +356,14 @@ function fileBoard({ bench, target, checks, source }) {
   for (const c of checks) {
     const name = c?.name || "unnamed check";
     const verdict = c?.verdict;
-    roll.push({ name, verdict: verdict || "unknown",
+    const isMuted = muted.has(`${bench}|${name}`);
+    roll.push({ name, verdict: isMuted ? "muted" : (verdict || "unknown"),
+                muted: isMuted, real_verdict: verdict || "unknown",
                 detail: c?.detail == null ? "" : String(c.detail).slice(0, 600) });
+    // A muted case files nothing and fails nothing. It is still COUNTED and
+    // still shown, because a board that reads green only because somebody
+    // turned three cases off is not a green board.
+    if (isMuted) { tally.muted++; continue; }
     if (verdict === "pass") { tally.passed++; passedNames.push(name); continue; }
     if (verdict === "skip") { tally.skipped++; continue; }
 
@@ -352,8 +371,10 @@ function fileBoard({ bench, target, checks, source }) {
     // client already renders unknown verdicts as failing; the store agrees.
     const severity = verdict === "fail" ? "fail" : "unknown";
     tally.failed++;
+    const sev = cases.severityMap().get(`${bench}|${name}`) || "blocking";
     const r = report({
       bench, bench_label: BENCHES[bench]?.label, check_name: name,
+      case_severity: sev,
       world_id: target.world_id, actor_id: target.actor_id, scope_label,
       severity, source,
       detail: verdict === "fail" ? (c?.detail || "") :
@@ -401,24 +422,25 @@ function fileBoard({ bench, target, checks, source }) {
 // `signupChecks` is injected rather than fetched over HTTP: the signup board is
 // this same process, and making it a self-request would mean minting a session
 // for the server to show to itself.
-export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks } = {}) {
+export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks, authoredChecks } = {}) {
   // Platform-local boards are values, not HTTP routes the server would have
   // to authenticate to itself. The CLI cannot supply them — it runs outside
   // the process — so a CLI sweep reports them "not configured" rather than
   // green, which is the same rule as an unreachable simulator board.
-  const localBoards = { signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks };
+  const localBoards = { signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks, authoredChecks };
   const runId = uid();
   const startedAt = now();
   db.prepare(`INSERT INTO lab_sweep_runs (id, source, started_at) VALUES (?,?,?)`)
     .run(runId, source, startedAt);
 
   const totals = { boards_ok: 0, boards_errored: 0, checks_total: 0, passed: 0, failed: 0,
-                   skipped: 0, opened: 0, reopened: 0, recurred: 0, resolved: 0 };
+                   skipped: 0, muted: 0, opened: 0, reopened: 0, recurred: 0, resolved: 0 };
   const boards = [];
 
   const add = (t) => {
     totals.checks_total += t.checks; totals.passed += t.passed; totals.failed += t.failed;
-    totals.skipped += t.skipped; totals.opened += t.opened; totals.reopened += t.reopened;
+    totals.skipped += t.skipped; totals.muted += (t.muted || 0);
+    totals.opened += t.opened; totals.reopened += t.reopened;
     totals.recurred += t.recurred; totals.resolved += t.resolved;
   };
 

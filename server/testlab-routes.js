@@ -10,6 +10,7 @@ import { wizardChecks } from "./wizardlab-routes.js";
 import { avatarChecks } from "./avatarlab-routes.js";
 import { shareChecks } from "./sharelab-routes.js";
 import { deployChecks } from "./deploylab-routes.js";
+import * as cases from "./lab-cases.js";
 
 export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
   // ── Test Lab ─────────────────────────────────────────────────────────────────
@@ -217,6 +218,7 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
     sweepInFlight = labIncidents.runSweep({
       source, SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks,
       shareChecks, deployChecks,
+      authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
     });
     try {
       const out = await sweepInFlight;
@@ -226,5 +228,95 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
     } finally {
       sweepInFlight = null;
     }
+  });
+
+  // ── Test-case administration ─────────────────────────────────────────────
+  //
+  // A TEST CASE is one assertion; a SOURCE is where a built-in one comes from;
+  // a BOARD is a named set you compose. Boards are VIEWS — the same case in
+  // five boards is still one case with one incident, because the fingerprint
+  // is (source, check_name, world, actor) and a board is not part of it.
+
+  const admin = (req, res) => {
+    const u = authUser(req);
+    if (!u) { res.status(401).json({ error: "not authenticated" }); return null; }
+    return u;
+  };
+
+  app.get("/api/test/cases", (req, res) => {
+    if (!admin(req, res)) return;
+    try {
+      res.json({ ok: true, cases: cases.catalogue(), severities: cases.SEVERITIES });
+    } catch (e) { res.status(500).json({ error: String(e.message || e).slice(0, 200) }); }
+  });
+
+  app.post("/api/test/cases/settings", (req, res) => {
+    if (!admin(req, res)) return;
+    const b = req.body || {};
+    if (!b.source || !b.check_name) return res.status(400).json({ error: "source and check_name are required" });
+    try {
+      cases.setCaseSettings(b);
+      res.json({ ok: true, cases: cases.catalogue() });
+    } catch (e) { res.status(400).json({ error: String(e.message || e).slice(0, 200) }); }
+  });
+
+  // Authored cases. The SQL kind is prepared on a READ-ONLY SQLite connection,
+  // so a statement that writes is refused by the engine at save time — not by
+  // this route trying to out-think it with a keyword list.
+  app.get("/api/test/cases/authored", (req, res) => {
+    if (!admin(req, res)) return;
+    res.json({ ok: true, authored: cases.listAuthored() });
+  });
+
+  app.post("/api/test/cases/authored", (req, res) => {
+    if (!admin(req, res)) return;
+    try {
+      const id = cases.saveAuthored(req.body || {});
+      res.json({ ok: true, id, authored: cases.listAuthored() });
+    } catch (e) { res.status(400).json({ error: String(e.message || e).slice(0, 300) }); }
+  });
+
+  app.post("/api/test/cases/authored/:id/delete", (req, res) => {
+    if (!admin(req, res)) return;
+    const ok = cases.deleteAuthored(req.params.id);
+    if (!ok) return res.status(404).json({ error: "no such test case" });
+    res.json({ ok: true, authored: cases.listAuthored() });
+  });
+
+  // Dry-run one authored case without saving it, so the form can say whether
+  // what you just typed actually answers before it joins the sweep.
+  app.post("/api/test/cases/authored/try", async (req, res) => {
+    if (!admin(req, res)) return;
+    try {
+      const result = await cases.tryAuthored(req.body || {}, { PORT: 4002 });
+      res.json({ ok: true, result });
+    } catch (e) { res.status(400).json({ error: String(e.message || e).slice(0, 300) }); }
+  });
+
+  app.get("/api/test/boards", (req, res) => {
+    if (!admin(req, res)) return;
+    res.json({ ok: true, boards: cases.listBoards() });
+  });
+
+  app.post("/api/test/boards", (req, res) => {
+    if (!admin(req, res)) return;
+    try {
+      const id = cases.saveBoard(req.body || {});
+      res.json({ ok: true, id, boards: cases.listBoards() });
+    } catch (e) { res.status(400).json({ error: String(e.message || e).slice(0, 200) }); }
+  });
+
+  app.post("/api/test/boards/:id/delete", (req, res) => {
+    if (!admin(req, res)) return;
+    cases.deleteBoard(req.params.id);
+    res.json({ ok: true, boards: cases.listBoards() });
+  });
+
+  app.post("/api/test/boards/:id/members", (req, res) => {
+    if (!admin(req, res)) return;
+    try {
+      const board = cases.setBoardMembers(req.params.id, (req.body || {}).members);
+      res.json({ ok: true, board, boards: cases.listBoards() });
+    } catch (e) { res.status(400).json({ error: String(e.message || e).slice(0, 200) }); }
   });
 }

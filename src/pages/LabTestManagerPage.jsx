@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
+import LabCaseAdmin from "../components/LabCaseAdmin.jsx";
 
 // ── Test Lab · Test manager ──────────────────────────────────────────────────
 //
@@ -201,6 +202,12 @@ export default function LabTestManagerPage() {
             {error}
           </div>
         )}
+
+        {/* ── Administration ───────────────────────────────────────────── */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <span style={label}>Test cases</span>
+          <LabCaseAdmin onChanged={() => {}} />
+        </div>
 
         {/* ── Run ─────────────────────────────────────────────────────────── */}
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>

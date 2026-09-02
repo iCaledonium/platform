@@ -135,7 +135,7 @@ export default function LabHomePage() {
         display: "flex", flexDirection: "column", gap: 24 }}>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <span style={label}>Boards</span>
+          <span style={label}>Across all test cases</span>
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             {BOARDS.map(b => (
               <div key={b.path} onClick={() => navigate(b.path)}
