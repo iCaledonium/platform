@@ -152,9 +152,18 @@ async function main() {
         const fp = store.fingerprintOf({ bench, check_name: check,
           world_id: flag("world", null), actor_id: flag("actor", null) });
         row = db.prepare(`SELECT id, status, fingerprint FROM lab_incidents WHERE fingerprint = ?`).get(fp);
-        // A miss is nearly always a mistyped check name, and exiting 0 here
-        // would let a routine report that it had closed something it had not.
-        if (!row) { console.error(`no incident with fingerprint ${fp}`); process.exit(1); }
+        // A miss is nearly always a mistyped check name, or `--source routine:x`
+        // copied from the `report` line above while the row's source is `x`
+        // (report's --source is PROVENANCE; here it selects the board). Name the
+        // sources that do carry this check, because exiting 0 would let a
+        // routine report that it had closed something it had not.
+        if (!row) {
+          console.error(`no incident with fingerprint ${fp}`);
+          const near = db.prepare(`SELECT DISTINCT bench FROM lab_incidents WHERE check_name = ?`)
+            .all(check).map((r) => r.bench);
+          if (near.length) console.error(`that check_name is filed under --source ${near.join(", ")}`);
+          process.exit(1);
+        }
       }
 
       const ok = store.setStatus(row.id, next, flag("by", flag("source", "routine:cli")), flag("note", null));
