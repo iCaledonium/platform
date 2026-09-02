@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 // ── Test Lab · Home ──────────────────────────────────────────────────────────
@@ -15,22 +16,24 @@ const BOARDS = [
   {
     path: "/lab/home/testmanager",
     title: "Test manager",
-    blurb: "Runs every bench's scorecard against the pinned targets and files each failing row " +
-      "as an incident. Read-only: nothing here authors a past or wipes a memory, so it is safe " +
-      "on a world somebody is working in, and safe on a schedule.",
+    blurb: "Where test cases are administered and run. Build suites from individual cases or " +
+      "whole categories, give a suite the world it runs against, then run it by hand or on a " +
+      "schedule. Read-only: nothing here authors a past or wipes a memory, so a suite is safe " +
+      "against a world somebody is working in, and safe unattended.",
   },
   {
     path: "/lab/home/incidents",
     title: "Incidents",
-    blurb: "Everything every bench and every routine found, fingerprinted so a check that fails " +
-      "on ninety nightly runs is one incident seen ninety times. Closes itself when the check " +
-      "comes back green.",
+    blurb: "Everything every test case and every routine found, fingerprinted so a case that " +
+      "fails on ninety nightly runs is one incident seen ninety times \u2014 never ninety rows. " +
+      "Closes itself when the case comes back green.",
   },
 ];
 
 const CASES = [
   {
     path: "/lab/actor/apartment/encounter",
+    key: "encounter",
     subject: "Actor",
     place: "Apartment",
     situation: "Encounter",
@@ -40,6 +43,7 @@ const CASES = [
   },
   {
     path: "/lab/user/signup",
+    key: "signup",
     subject: "User",
     place: "Signup",
     situation: "Creation",
@@ -49,6 +53,7 @@ const CASES = [
   },
   {
     path: "/lab/user/avatar",
+    key: "avatar",
     subject: "User",
     place: "Avatar",
     situation: "Body",
@@ -58,6 +63,7 @@ const CASES = [
   },
   {
     path: "/lab/character/share",
+    key: "share",
     subject: "Character",
     place: "Sharing",
     situation: "Link",
@@ -68,6 +74,7 @@ const CASES = [
   },
   {
     path: "/lab/character/deploy",
+    key: "deploy",
     subject: "Character",
     place: "Deploy",
     situation: "World",
@@ -76,6 +83,7 @@ const CASES = [
   },
   {
     path: "/lab/character/wizard",
+    key: "wizard",
     subject: "Character",
     place: "Wizard",
     situation: "Authoring",
@@ -86,6 +94,7 @@ const CASES = [
   },
   {
     path: "/lab/world/behavior",
+    key: "behavior",
     subject: "World",
     place: "—",
     situation: "Behaviour",
@@ -95,6 +104,7 @@ const CASES = [
   },
   {
     path: "/lab/world/transport/actor",
+    key: "transport",
     subject: "Transport",
     place: "—",
     situation: "Actor",
@@ -106,6 +116,21 @@ const CASES = [
 
 export default function LabHomePage() {
   const navigate = useNavigate();
+  // How many test cases each category holds. The catalogue is learned from
+  // sweeps, so this is what the category actually returned rather than a
+  // number anybody maintains. Silent on failure: this page renders signed
+  // out and should carry on doing so.
+  const [counts, setCounts] = useState({});
+  useEffect(() => {
+    fetch("/api/test/cases", { credentials: "include" })
+      .then(r => r.ok ? r.json() : null)
+      .then(j => {
+        if (!j?.cases) return;
+        const n = {};
+        for (const c of j.cases) n[c.source] = (n[c.source] || 0) + 1;
+        setCounts(n);
+      }).catch(() => {});
+  }, []);
 
   const label = { fontSize: 10, letterSpacing: ".16em", textTransform: "uppercase",
     color: "rgba(255,255,255,.4)" };
@@ -150,7 +175,12 @@ export default function LabHomePage() {
         </div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <span style={label}>Test cases</span>
+          <span style={label}>Categories</span>
+          <span style={{ fontSize: 10.5, lineHeight: 1.6, color: "rgba(255,255,255,.35)", marginTop: -4 }}>
+            Each holds many test cases. Build suites from them — or from individual cases — on the
+            <span onClick={() => navigate("/lab/home/testmanager")}
+              style={{ color: GOLD + ".85)", cursor: "pointer" }}> test manager</span>.
+          </span>
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {CASES.map(c => (
               <div key={c.path} onClick={() => c.live && navigate(c.path)} style={card(c.live)}>
@@ -158,9 +188,16 @@ export default function LabHomePage() {
                   <span style={{ fontSize: 13.5, color: c.live ? GOLD + ".95)" : "rgba(255,255,255,.3)" }}>
                     {c.subject} · {c.place} · {c.situation}
                   </span>
-                  <span style={{ ...label, fontSize: 9,
-                    color: c.live ? "rgba(150,210,150,.75)" : "rgba(255,255,255,.25)" }}>
-                    {c.live ? "live" : "planned"}
+                  <span style={{ display: "flex", gap: 10, alignItems: "baseline", flexShrink: 0 }}>
+                    {counts[c.key] != null && (
+                      <span style={{ ...label, fontSize: 9, color: "rgba(255,255,255,.45)" }}>
+                        {counts[c.key]} test case{counts[c.key] === 1 ? "" : "s"}
+                      </span>
+                    )}
+                    <span style={{ ...label, fontSize: 9,
+                      color: c.live ? "rgba(150,210,150,.75)" : "rgba(255,255,255,.25)" }}>
+                      {c.live ? "live" : "planned"}
+                    </span>
                   </span>
                 </div>
                 <span style={{ fontSize: 11, lineHeight: 1.6,

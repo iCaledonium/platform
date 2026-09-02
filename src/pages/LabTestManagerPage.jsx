@@ -4,7 +4,8 @@ import LabCaseAdmin from "../components/LabCaseAdmin.jsx";
 
 // ── Test Lab · Test manager ──────────────────────────────────────────────────
 //
-// Runs every bench's board once and files what they say into /lab/home/incidents.
+// Administers test cases and runs them: categories -> suites -> runner.
+// Findings go to /lab/home/incidents.
 //
 // This sweep is STRICTLY READ-ONLY. Every board it touches is a set of
 // assertions against live state — none of them author anything. The fixture
@@ -33,7 +34,6 @@ export default function LabTestManagerPage() {
   const [error, setError] = useState("");
   const [authed, setAuthed] = useState(true);
 
-  const [bench, setBench] = useState("encounter");
   const [worldId, setWorldId] = useState("");
   const [actorId, setActorId] = useState("");
 
@@ -53,7 +53,6 @@ export default function LabTestManagerPage() {
     fontFamily: "'DM Sans',sans-serif", fontSize: 11, outline: "none",
   };
 
-  const spec = benches.find(b => b.key === bench);
 
   const loadRuns = useCallback(async () => {
     try {
@@ -108,7 +107,6 @@ export default function LabTestManagerPage() {
     finally { setRunning(false); }
   }
 
-  const globals = benches.filter(b => !b.scoped);
 
   return (
     <div style={{ minHeight: "100vh", background: "#0d0c0a", fontFamily: "'DM Sans',system-ui,sans-serif" }}>
@@ -157,7 +155,6 @@ Test cases live in categories. Build SUITES from individual cases or whole
 
         {/* ── Administration ───────────────────────────────────────────── */}
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <span style={label}>Test cases</span>
           <LabCaseAdmin onChanged={() => {}} />
         </div>
 
@@ -175,7 +172,7 @@ Test cases live in categories. Build SUITES from individual cases or whole
                 {!r.finished_at && <span style={{ color: "#d9a441" }}> · did not finish</span>}
               </span>
               <span style={{ color: "rgba(255,255,255,.45)" }}>
-                {r.boards_ok} board(s){r.boards_errored ? ` · ${r.boards_errored} unreadable` : ""} ·{" "}
+                {r.boards_ok} categor{r.boards_ok === 1 ? "y" : "ies"}{r.boards_errored ? ` · ${r.boards_errored} unreadable` : ""} ·{" "}
                 <span style={{ color: r.failed ? "#e0736b" : "#7fc08a" }}>{r.failed} fail</span> ·{" "}
                 {r.passed} pass · {r.skipped} skip · {r.opened} new · {r.resolved} closed
               </span>

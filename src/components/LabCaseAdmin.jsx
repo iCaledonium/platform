@@ -47,6 +47,7 @@ export default function LabCaseAdmin() {
   const [tWorld, setTWorld] = useState("");
   const [tActor, setTActor] = useState("");
   const [uncovered, setUncovered] = useState([]);
+  const [coverage, setCoverage] = useState(null);
   const [draft, setDraft] = useState(null);
   const [tryResult, setTryResult] = useState(null);
 
@@ -73,6 +74,13 @@ export default function LabCaseAdmin() {
       const s = await fetch("/api/test/suites", { credentials: "include" }).then(x => x.json());
       setSuites(s.suites || []);
       setScheduler(s.scheduler || null);
+      const b = await fetch("/api/test/benches", { credentials: "include" }).then(x => x.json()).catch(() => null);
+      setCoverage(b?.coverage || null);
+      // Derived here rather than waiting for a run: a category in no suite is
+      // a gap whether or not anybody has pressed anything today.
+      const covered = new Set((s.suites || []).filter(x => x.enabled)
+        .flatMap(x => (x.members || []).map(m => m.source)));
+      setUncovered((b?.benches || []).map(x => x.key).filter(k => !covered.has(k)));
       setErr("");
     } catch (e) { setCases(null); setErr(String(e.message || e)); }
   }, []);
@@ -207,10 +215,28 @@ export default function LabCaseAdmin() {
               }}>{running === "all" ? "Running…" : "Run every suite"}</button>
           </div>
 
+          {/* Two different gaps, both of which would otherwise be silent. */}
+          {coverage?.unwired?.length > 0 && (
+            <div style={{ fontSize: 11, lineHeight: 1.7, color: "#e0736b" }}>
+              Live scorecard routes with no entry in the catalogue: {coverage.unwired.join(", ")}.
+              Nothing can run these until they are added to BENCHES in server/lab-incidents.js.
+            </div>
+          )}
+          {coverage?.missing?.length > 0 && (
+            <div style={{ fontSize: 11, lineHeight: 1.7, color: "#c96fd0" }}>
+              Catalogued but no longer served: {coverage.missing.join(", ")}. A renamed or removed
+              category would otherwise show up only as one that mysteriously never fails.
+            </div>
+          )}
           {uncovered.length > 0 && (
             <div style={{ fontSize: 11, lineHeight: 1.7, color: "#d9a441" }}>
               In no suite, so nothing runs them: {uncovered.join(", ")}.
               A category no suite covers is not a passing category.
+            </div>
+          )}
+          {coverage && !coverage.unwired?.length && !coverage.missing?.length && !uncovered.length && (
+            <div style={{ fontSize: 10.5, color: "rgba(150,210,150,.65)" }}>
+              Every category on this server is catalogued and covered by a suite ({coverage.detected.length}).
             </div>
           )}
 
