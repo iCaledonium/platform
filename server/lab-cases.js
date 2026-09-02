@@ -758,3 +758,28 @@ export function migrateSuiteCategoryMembers() {
   tx();
   return { moved, dropped };
 }
+
+// ── Read access for the designer assistant ───────────────────────────────────
+//
+// The assistant checks its own SQL through the SAME read-only connection the
+// finished test case will use. That is the point: what it proves in the chat is
+// what the case will do, and it cannot write there any more than the case can.
+export function readQuery(sql, { rows = 20 } = {}) {
+  let stmt;
+  try { stmt = readonlyDb().prepare(sql); }
+  catch (e) { throw new Error(`SQLite rejected this query: ${e.message}`); }
+  if (!stmt.readonly) throw new Error("that statement writes — the assistant may only read");
+  if (!stmt.reader) throw new Error("that statement returns no rows");
+  return stmt.all().slice(0, rows);
+}
+
+// Table names and columns, so the assistant writes against the real schema
+// instead of a plausible-looking invention.
+export function schemaSummary() {
+  const tables = readonlyDb().prepare(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).all();
+  return tables.map((t) => {
+    const cols = readonlyDb().prepare(`PRAGMA table_info(${JSON.stringify(t.name)})`).all();
+    return `${t.name}(${cols.map((c) => c.name).join(", ")})`;
+  });
+}

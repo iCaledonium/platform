@@ -56,6 +56,13 @@ export default function LabCaseAdmin() {
   const [moveTo, setMoveTo] = useState("");
   const [draft, setDraft] = useState(null);
   const [tryResult, setTryResult] = useState(null);
+  // The assistant's thread. Held here and sent back whole each turn, so the
+  // server keeps no session and closing the form ends the conversation.
+  const [chat, setChat] = useState([]);          // {role, text} for display
+  const [thread, setThread] = useState([]);      // the Anthropic-shaped thread
+  const [ask, setAsk] = useState("");
+  const [thinking, setThinking] = useState(false);
+  const [proposal, setProposal] = useState(null);
 
   const label = { fontSize: 10, letterSpacing: ".16em", textTransform: "uppercase",
     color: "rgba(255,255,255,.4)" };
@@ -535,6 +542,7 @@ export default function LabCaseAdmin() {
             <input value={q} onChange={e => setQ(e.target.value)} placeholder="search test cases…" style={{ ...input, width: 220 }} />
             <button style={btn(GOLD + ".8)")} onClick={() => {
               setDraft({ kind: "query", op: "eq", expected: 0, probe_method: "GET" }); setTryResult(null);
+              setChat([]); setThread([]); setProposal(null); setAsk("");
             }}>Write a test case</button>
             <span onClick={() => setCatFilter("all")} style={chip(catFilter === "all")}>all categories</span>
             {categories.map(c => <span key={c} onClick={() => setCatFilter(c)} style={chip(catFilter === c)}>{c} ({countIn(c)})</span>)}
@@ -551,6 +559,71 @@ export default function LabCaseAdmin() {
                 An authored case is <em>run</em> from the authored board, but it belongs to whichever
                 category you put it in — provenance and subject are different things.
               </div>
+          {/* ── The designer assistant ─────────────────────────────────────
+                  It reads the real schema and TRIES the query through the same
+                  read-only connection the finished case will use, so what it shows
+                  you here is what the case will do. It proposes; Try it and the
+                  read-only save still stand between that and a stored case. */}
+              <div style={{ padding: "10px 12px", borderRadius: 4, background: "rgba(255,255,255,.025)",
+                border: "0.5px solid rgba(255,255,255,.09)", display: "flex", flexDirection: "column", gap: 8 }}>
+                <span style={{ ...label, fontSize: 9, color: GOLD + ".75)" }}>designer assistant</span>
+
+                {chat.length === 0 && (
+                  <span style={{ fontSize: 10.5, lineHeight: 1.6, color: "rgba(255,255,255,.4)" }}>
+                    Describe what you want to be true — “no share link should outlive its expiry”. It will
+                    read the schema, try the query against the live database, tell you what it returns
+                    today, and propose the exact fields.
+                  </span>
+                )}
+
+                {chat.map((m, i) => (
+                  <div key={i} style={{ fontSize: 10.5, lineHeight: 1.65, whiteSpace: "pre-wrap",
+                    color: m.role === "me" ? "rgba(255,255,255,.75)" : "rgba(255,255,255,.55)",
+                    paddingLeft: m.role === "me" ? 0 : 10,
+                    borderLeft: m.role === "me" ? "none" : `2px solid ${GOLD}.3)` }}>
+                    {m.role === "me" ? "› " : ""}{m.text}
+                  </div>
+                ))}
+
+                {proposal && (
+                  <div style={{ padding: "9px 11px", borderRadius: 4, background: GOLD + ".08)",
+                    border: `0.5px solid ${GOLD}.35)`, display: "flex", flexDirection: "column", gap: 6 }}>
+                    <span style={{ fontSize: 11, color: GOLD + ".95)" }}>{proposal.name}</span>
+                    <span style={{ fontSize: 10, color: "rgba(255,255,255,.5)", lineHeight: 1.6 }}>{proposal.rationale}</span>
+                    <button style={{ ...btn(GOLD + ".8)", true), alignSelf: "flex-start" }}
+                      onClick={() => {
+                        setDraft({ ...draft, name: proposal.name, kind: proposal.kind,
+                          sql: proposal.sql || "", probe_path: proposal.probe_path || "",
+                          probe_method: proposal.probe_method || "GET",
+                          op: proposal.op, expected: proposal.expected,
+                          category_id: proposal.category_id || draft.category_id });
+                        setProposal(null);
+                      }}>Apply to the form</button>
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: 6 }}>
+                  <input value={ask} onChange={e => setAsk(e.target.value)} disabled={thinking}
+                    onKeyDown={e => { if (e.key === "Enter" && ask.trim()) e.currentTarget.nextSibling.click(); }}
+                    placeholder={thinking ? "thinking…" : "what should be true?"}
+                    style={{ ...input, flex: 1 }} />
+                  <button style={btn()} disabled={thinking || !ask.trim()} onClick={async () => {
+                    const mine = ask.trim(); if (!mine) return;
+                    setAsk(""); setThinking(true);
+                    setChat(c => [...c, { role: "me", text: mine }]);
+                    try {
+                      const next = [...thread, { role: "user", content: mine }];
+                      const j = await post("/api/test/cases/assist", { messages: next });
+                      setThread(j.messages || next);
+                      if (j.reply) setChat(c => [...c, { role: "it", text: j.reply }]);
+                      if (j.draft) setProposal(j.draft);
+                    } catch (e) {
+                      setChat(c => [...c, { role: "it", text: "(the assistant could not answer: " + (e.message || e) + ")" }]);
+                    } finally { setThinking(false); }
+                  }}>{thinking ? "…" : "Ask"}</button>
+                </div>
+              </div>
+
               <input value={draft.name || ""} onChange={e => setDraft({ ...draft, name: e.target.value })}
                 placeholder="what it asserts — e.g. no share names its own owner" style={input} />
               <div style={{ display: "flex", gap: 7, alignItems: "center" }}>

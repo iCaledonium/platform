@@ -12,6 +12,7 @@ import { shareChecks } from "./sharelab-routes.js";
 import { deployChecks } from "./deploylab-routes.js";
 import { signinChecks } from "./signinlab-routes.js";
 import * as cases from "./lab-cases.js";
+import * as assistant from "./lab-assistant.js";
 
 export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
   // ── Test Lab ─────────────────────────────────────────────────────────────────
@@ -308,6 +309,21 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
 
   // Dry-run one authored case without saving it, so the form can say whether
   // what you just typed actually answers before it joins the sweep.
+  // The designer assistant. Conversational, and stateless here: the thread
+  // lives with the person having it and is sent back each turn.
+  app.post("/api/test/cases/assist", async (req, res) => {
+    if (!admin(req, res)) return;
+    const msgs = (req.body || {}).messages;
+    if (!Array.isArray(msgs) || !msgs.length) {
+      return res.status(400).json({ error: "send the conversation so far" });
+    }
+    try {
+      res.json({ ok: true, ...(await assistant.assist({ messages: msgs })) });
+    } catch (e) {
+      res.status(502).json({ error: String(e.message || e).slice(0, 300) });
+    }
+  });
+
   app.post("/api/test/cases/authored/try", async (req, res) => {
     if (!admin(req, res)) return;
     try {
