@@ -62,6 +62,7 @@ db.exec(`
     severity    TEXT NOT NULL DEFAULT 'blocking',
     owner       TEXT,
     note        TEXT,
+    category_id TEXT,
     updated_at  TEXT NOT NULL,
     UNIQUE(source, check_name)
   );
@@ -78,6 +79,7 @@ db.exec(`
     expected     REAL NOT NULL DEFAULT 0,
     probe_path   TEXT,                   -- kind=probe: a loopback path
     probe_method TEXT NOT NULL DEFAULT 'GET',
+    category_id  TEXT,
     pass_detail  TEXT,
     fail_detail  TEXT,
     inserted_at  TEXT NOT NULL,
@@ -88,6 +90,17 @@ db.exec(`
   -- whole CATEGORY — "everything the deploy category asserts" should not have
   -- to be re-picked every time somebody adds a case to it, which is the point
   -- of letting a category be a member in its own right.
+  -- Categories are managed here, not inferred from code. builtin_source is
+  -- set on the ones seeded to mirror a board, so seeding stays idempotent and
+  -- a renamed category is never re-created behind your back.
+  CREATE TABLE IF NOT EXISTS lab_categories (
+    id             TEXT PRIMARY KEY,
+    name           TEXT NOT NULL UNIQUE,
+    description    TEXT,
+    builtin_source TEXT UNIQUE,
+    inserted_at    TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS lab_suites (
     id             TEXT PRIMARY KEY,
     name           TEXT NOT NULL UNIQUE,
@@ -115,11 +128,17 @@ db.exec(`
     id         TEXT PRIMARY KEY,
     suite_id   TEXT NOT NULL REFERENCES lab_suites(id) ON DELETE CASCADE,
     kind       TEXT NOT NULL DEFAULT 'case',          -- 'case' | 'category'
-    source     TEXT NOT NULL,
+    source     TEXT NOT NULL,                         -- kind='case': the board; kind='category': a category id
     check_name TEXT,                                  -- NULL when kind='category'
     UNIQUE(suite_id, kind, source, check_name)
   );
 `);
+
+// Additive migrations for databases created before categories existed.
+for (const stmt of [
+  `ALTER TABLE lab_test_cases ADD COLUMN category_id TEXT`,
+  `ALTER TABLE lab_case_settings ADD COLUMN category_id TEXT`,
+]) { try { db.exec(stmt); } catch { /* already there */ } }
 
 const now = () => new Date().toISOString();
 const uid = () => crypto.randomBytes(9).toString("hex");
@@ -153,6 +172,11 @@ export function recordSeen(source, checks) {
 
 // Every case the lab knows about, built-in and authored, with its settings.
 export function catalogue() {
+  const maps = categoryMaps();
+  const catName = (source, name) => {
+    const id = categoryOf(source, name, maps);
+    return { category_id: id, category: id ? (maps.byId.get(id)?.name || null) : null };
+  };
   const settings = new Map(
     db.prepare(`SELECT * FROM lab_case_settings`).all().map((s) => [`${s.source}|${s.check_name}`, s]));
 
@@ -160,6 +184,7 @@ export function catalogue() {
     .map((k) => {
       const s = settings.get(`${k.source}|${k.check_name}`);
       return {
+        ...catName(k.source, k.check_name),
         source: k.source, check_name: k.check_name, authored: false,
         last_verdict: k.last_verdict, last_detail: k.last_detail, last_seen_at: k.last_seen_at,
         enabled: s ? !!s.enabled : true,
@@ -172,6 +197,7 @@ export function catalogue() {
     const s = settings.get(`authored|${a.name}`);
     const k = db.prepare(`SELECT * FROM lab_known_cases WHERE source='authored' AND check_name=?`).get(a.name);
     return {
+      ...catName("authored", a.name),
       source: "authored", check_name: a.name, authored: true, id: a.id,
       kind: a.kind, sql: a.sql, op: a.op, expected: a.expected,
       probe_path: a.probe_path, probe_method: a.probe_method,
@@ -231,6 +257,12 @@ export function listAuthored() {
 export function validateAuthored(c) {
   const name = String(c.name || "").trim();
   if (!name) throw new Error("a test case needs a name");
+  // Provenance is not subject: a case written here is still ABOUT something,
+  // and must say which category before it can join a sweep.
+  if (!c.category_id) throw new Error("pick the category this test case belongs to");
+  if (!db.prepare(`SELECT id FROM lab_categories WHERE id = ?`).get(c.category_id)) {
+    throw new Error("no such category");
+  }
   if (!["query", "probe"].includes(c.kind)) throw new Error("kind must be query or probe");
   if (!OPS[c.op || "eq"]) throw new Error(`op must be one of ${Object.keys(OPS).join(", ")}`);
   if (!Number.isFinite(Number(c.expected))) throw new Error("expected must be a number");
@@ -268,16 +300,16 @@ export function saveAuthored(c) {
   const existing = c.id ? db.prepare(`SELECT id FROM lab_test_cases WHERE id = ?`).get(c.id) : null;
   if (existing) {
     db.prepare(`UPDATE lab_test_cases SET name=?, kind=?, sql=?, op=?, expected=?, probe_path=?,
-                  probe_method=?, pass_detail=?, fail_detail=?, updated_at=? WHERE id=?`)
+                  probe_method=?, pass_detail=?, fail_detail=?, category_id=?, updated_at=? WHERE id=?`)
       .run(name, c.kind, c.sql || null, c.op || "eq", Number(c.expected || 0), c.probe_path || null,
-        c.probe_method || "GET", c.pass_detail || null, c.fail_detail || null, t, c.id);
+        c.probe_method || "GET", c.pass_detail || null, c.fail_detail || null, c.category_id, t, c.id);
     return c.id;
   }
   const id = uid();
   db.prepare(`INSERT INTO lab_test_cases (id, name, kind, sql, op, expected, probe_path, probe_method,
-                pass_detail, fail_detail, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+                pass_detail, fail_detail, category_id, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .run(id, name, c.kind, c.sql || null, c.op || "eq", Number(c.expected || 0), c.probe_path || null,
-      c.probe_method || "GET", c.pass_detail || null, c.fail_detail || null, t, t);
+      c.probe_method || "GET", c.pass_detail || null, c.fail_detail || null, c.category_id, t, t);
   return id;
 }
 
@@ -467,16 +499,28 @@ export function setSuiteMembers(suite_id, members) {
 // category; a case member pulls the one it belongs to. Running is per-category
 // because a scorecard endpoint is all-or-nothing — it cannot be asked for one
 // case — so the suite is applied as a filter over what comes back.
+// Which BOARDS must run for this suite. A case member names its board
+// directly; a category member resolves to every board that currently holds
+// a case in it, which is what lets a category span boards.
 export function suiteCategories(suite) {
-  return [...new Set((suite.members || []).map((m) => m.source))];
+  const out = new Set();
+  for (const m of suite.members || []) {
+    if (m.kind === "case") { out.add(m.source); continue; }
+    for (const s of sourcesForCategory(m.source)) out.add(s);
+  }
+  return [...out];
 }
 
 // Does this suite include a given case? A category member includes everything
 // in it, INCLUDING cases added to that category later — which is the whole
 // reason a category can be a member.
-export function suiteIncludes(suite, source, check_name) {
+export function suiteIncludes(suite, source, check_name, maps) {
+  const m0 = maps || categoryMaps();
+  const cat = categoryOf(source, check_name, m0);
   for (const m of suite.members || []) {
-    if (m.kind === "category" && m.source === source) return true;
+    // A category member matches on the case's CATEGORY, so a case moved into
+    // that category is picked up wherever it is executed from.
+    if (m.kind === "category" && m.source === cat) return true;
     if (m.kind === "case" && m.source === source && m.check_name === check_name) return true;
   }
   return false;
@@ -561,4 +605,150 @@ export function migrateGlobalTargets(allCategories) {
     if (targets.length) setSuiteTargets(id, targets);
     return { id, targets: targets.length, categories: (allCategories || []).length };
   } catch { return null; }
+}
+
+// ── Categories ───────────────────────────────────────────────────────────────
+
+// Seed one category per board, once. Idempotent via builtin_source, and it
+// never touches a category somebody has renamed or re-described.
+export function seedCategories(benches) {
+  const ins = db.prepare(`INSERT OR IGNORE INTO lab_categories
+    (id, name, description, builtin_source, inserted_at) VALUES (?,?,?,?,?)`);
+  const tx = db.transaction(() => {
+    for (const [key, b] of Object.entries(benches || {})) {
+      // `authored` is a SOURCE, not a category — cases written in the manager
+      // are about whatever their author says they are about.
+      if (key === "authored") continue;
+      ins.run(uid(), b.label || key, null, key, now());
+    }
+  });
+  tx();
+  return listCategories();
+}
+
+export function listCategories() {
+  return db.prepare(`SELECT * FROM lab_categories ORDER BY name`).all();
+}
+
+export function saveCategory({ id, name, description }) {
+  const n = String(name || "").trim();
+  if (!n) throw new Error("a category needs a name");
+  if (id) {
+    db.prepare(`UPDATE lab_categories SET name=?, description=? WHERE id=?`).run(n, description || null, id);
+    return id;
+  }
+  const cid = uid();
+  db.prepare(`INSERT INTO lab_categories (id, name, description, inserted_at) VALUES (?,?,?,?)`)
+    .run(cid, n, description || null, now());
+  return cid;
+}
+
+export function deleteCategory(id) {
+  const row = db.prepare(`SELECT builtin_source FROM lab_categories WHERE id = ?`).get(id);
+  if (!row) return false;
+  // A board's own category may not be deleted: its cases would have nowhere to
+  // land, and it would be re-seeded at the next boot anyway.
+  if (row.builtin_source) throw new Error("this category mirrors a board and cannot be deleted — rename it instead");
+  const used = db.prepare(`SELECT COUNT(*) c FROM lab_case_settings WHERE category_id = ?`).get(id).c
+             + db.prepare(`SELECT COUNT(*) c FROM lab_test_cases WHERE category_id = ?`).get(id).c;
+  if (used > 0) throw new Error(`${used} test case(s) still sit in this category — move them first`);
+  db.prepare(`DELETE FROM lab_categories WHERE id = ?`).run(id);
+  return true;
+}
+
+// Where a case lives: an explicit assignment if one exists, otherwise the
+// category that mirrors the board it comes from.
+export function categoryOf(source, check_name, maps) {
+  const { assigned, bySource } = maps;
+  return assigned.get(`${source}|${check_name}`) || bySource.get(source) || null;
+}
+
+export function categoryMaps() {
+  const cats = listCategories();
+  const byId = new Map(cats.map((c) => [c.id, c]));
+  const bySource = new Map(cats.filter((c) => c.builtin_source).map((c) => [c.builtin_source, c.id]));
+  const assigned = new Map();
+  for (const s of db.prepare(`SELECT source, check_name, category_id FROM lab_case_settings WHERE category_id IS NOT NULL`).all()) {
+    assigned.set(`${s.source}|${s.check_name}`, s.category_id);
+  }
+  for (const a of db.prepare(`SELECT name, category_id FROM lab_test_cases WHERE category_id IS NOT NULL`).all()) {
+    assigned.set(`authored|${a.name}`, a.category_id);
+  }
+  return { byId, bySource, assigned, cats };
+}
+
+// Move test cases into a category. Works for built-in and authored alike —
+// an authored case keeps its own column, a built-in gets a settings override.
+export function assignCategory(cases_, category_id) {
+  if (!db.prepare(`SELECT id FROM lab_categories WHERE id = ?`).get(category_id)) {
+    throw new Error("no such category");
+  }
+  const tx = db.transaction(() => {
+    for (const c of cases_ || []) {
+      if (!c?.source || !c?.check_name) continue;
+      if (c.source === "authored") {
+        db.prepare(`UPDATE lab_test_cases SET category_id = ?, updated_at = ? WHERE name = ?`)
+          .run(category_id, now(), c.check_name);
+      } else {
+        const existing = db.prepare(`SELECT id FROM lab_case_settings WHERE source=? AND check_name=?`)
+          .get(c.source, c.check_name);
+        if (existing) {
+          db.prepare(`UPDATE lab_case_settings SET category_id=?, updated_at=? WHERE id=?`)
+            .run(category_id, now(), existing.id);
+        } else {
+          db.prepare(`INSERT INTO lab_case_settings (id, source, check_name, category_id, updated_at)
+                      VALUES (?,?,?,?,?)`).run(uid(), c.source, c.check_name, category_id, now());
+        }
+      }
+    }
+  });
+  tx();
+  return listCategories();
+}
+
+// Which SOURCES must run to cover a category — a category can draw cases from
+// several boards once you move things around, and running is per-board because
+// a scorecard is all-or-nothing.
+export function sourcesForCategory(category_id) {
+  const maps = categoryMaps();
+  const out = new Set();
+  for (const k of db.prepare(`SELECT source, check_name FROM lab_known_cases`).all()) {
+    if (categoryOf(k.source, k.check_name, maps) === category_id) out.add(k.source);
+  }
+  const cat = maps.byId.get(category_id);
+  if (cat?.builtin_source) out.add(cat.builtin_source);
+  // Authored cases assigned to this category, INCLUDING ones that have never
+  // run. Reading only the observed catalogue would be circular: a new case
+  // would not run until it had already run.
+  const n = db.prepare(`SELECT COUNT(*) c FROM lab_test_cases WHERE category_id = ?`).get(category_id).c;
+  if (n > 0) out.add("authored");
+  return [...out];
+}
+
+// One-time translation of suite category members from board keys to category
+// ids. Without it a suite built before categories existed matches nothing and
+// reports a clean run over an empty selection, which is the worst failure this
+// system can have.
+export function migrateSuiteCategoryMembers() {
+  const maps = categoryMaps();
+  const rows = db.prepare(`SELECT * FROM lab_suite_members WHERE kind = 'category'`).all();
+  let moved = 0, dropped = 0;
+  const tx = db.transaction(() => {
+    for (const r of rows) {
+      if (maps.byId.has(r.source)) continue;              // already a category id
+      const id = maps.bySource.get(r.source);
+      if (id) {
+        db.prepare(`UPDATE lab_suite_members SET source = ? WHERE id = ?`).run(id, r.id);
+        moved++;
+      } else {
+        // `authored` was a member when it was pretending to be a category. It is
+        // a source, so the membership has no meaning any more — its cases are
+        // covered by whatever category their author put them in.
+        db.prepare(`DELETE FROM lab_suite_members WHERE id = ?`).run(r.id);
+        dropped++;
+      }
+    }
+  });
+  tx();
+  return { moved, dropped };
 }

@@ -126,6 +126,16 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
     if (m) console.log(`[lab] migrated global targets into a suite: ${m.categories} categories, ${m.targets} target(s)`);
   } catch { /* never block boot over a migration */ }
 
+  // Categories are managed, not derived: seed one per board so nothing moves on
+  // its own, then translate any suite membership that still names a board.
+  try {
+    cases.seedCategories(labIncidents.BENCHES);
+    const sm = cases.migrateSuiteCategoryMembers();
+    if (sm.moved || sm.dropped) {
+      console.log(`[lab] suite category members: ${sm.moved} translated, ${sm.dropped} dropped`);
+    }
+  } catch (e) { console.log(`[lab] category seeding skipped: ${e.message}`); }
+
   // One timer for the whole process, started here rather than at import so
   // it can close over the dependencies the runs need.
   labIncidents.startScheduler({
@@ -316,6 +326,42 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
   const RUN_DEPS = () => ({
     SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks,
     shareChecks, deployChecks, signinChecks, authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
+  });
+
+  // ── Categories ───────────────────────────────────────────────────────────
+  //
+  // A CATEGORY is what a test case is about; a SOURCE is which board executes
+  // it. They coincide by default and need not stay that way — which is the
+  // whole point of being able to make one and move cases into it.
+
+  app.get("/api/test/categories", (req, res) => {
+    if (!admin(req, res)) return;
+    res.json({ ok: true, categories: cases.listCategories() });
+  });
+
+  app.post("/api/test/categories", (req, res) => {
+    if (!admin(req, res)) return;
+    try {
+      const id = cases.saveCategory(req.body || {});
+      res.json({ ok: true, id, categories: cases.listCategories() });
+    } catch (e) { res.status(400).json({ error: String(e.message || e).slice(0, 250) }); }
+  });
+
+  app.post("/api/test/categories/:id/delete", (req, res) => {
+    if (!admin(req, res)) return;
+    try {
+      cases.deleteCategory(req.params.id);
+      res.json({ ok: true, categories: cases.listCategories() });
+    } catch (e) { res.status(400).json({ error: String(e.message || e).slice(0, 250) }); }
+  });
+
+  // Move existing test cases into a category — built-in or authored alike.
+  app.post("/api/test/categories/:id/assign", (req, res) => {
+    if (!admin(req, res)) return;
+    try {
+      cases.assignCategory((req.body || {}).cases, req.params.id);
+      res.json({ ok: true, cases: cases.catalogue(), categories: cases.listCategories() });
+    } catch (e) { res.status(400).json({ error: String(e.message || e).slice(0, 250) }); }
   });
 
   app.get("/api/test/suites", (req, res) => {
