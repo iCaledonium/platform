@@ -658,7 +658,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     window.addEventListener("keyup", onKeyUp);
     window.addEventListener("blur", onBlur);
 
-    api.current = { scene, camera, renderer, landing, el, clock: new THREE.Clock(), timer: new THREE.Timer(),
+    api.current = { scene, camera, renderer, landing, el, timer: new THREE.Timer(),
                     abort: new AbortController(), ambient, key, rim, fpv, keys, sunTarget,
                     maxHWalk: readSetting(SETTING_KEYS.cap, MAX_H_WALK),
                     maxAspect: readSetting(SETTING_KEYS.aspect, 0) };
@@ -1241,9 +1241,77 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   function advanceTts(audio) {
     if (ttsWatchdog.current) { clearTimeout(ttsWatchdog.current); ttsWatchdog.current = null; }
     try { if (audio) URL.revokeObjectURL(audio.src); } catch {}
+    // Advancing ABANDONED the outgoing source without silencing it. Harmless
+    // on the onended path (it has already finished), fatal on the watchdog
+    // path: the watchdog fires at duration+3s, drops ttsPlaying and lets the
+    // next wav start while the source it gave up on is STILL AUDIBLE. If
+    // onended is late or never comes, every later sentence layers on top of
+    // the last and you hear the whole turn at once. Reported live 2026-09-04
+    // by Magnus on the ORIGINAL bundle, which proves this is pre-existing and
+    // not a regression from the queue-reset work. Silence it, always.
+    try {
+      const a = api.current;
+      if (a && a._ttsSrc) { a._ttsSrc.onended = null; a._ttsSrc.stop(); a._ttsSrc.disconnect(); a._ttsSrc = null; }
+    } catch {}
     delete ttsQueueRef.current[ttsNextIdx.current];
     ttsNextIdx.current++;
     ttsPlaying.current = false;
+  }
+
+  // Session 155 - the turn separator never reached the audio queue.
+  // ttsNextIdx only ever INCREMENTED (advanceTts, above) and nothing reset it
+  // between turns, but the server numbers every turn's sentences from 0. So
+  // after a two-sentence turn the player sat waiting on slot 2 while the next
+  // turn's wav decoded into slot 0. The 3s gap-jumper rescued that ONLY when
+  // nothing was playing at that instant; if a wav was still going it no-opped
+  // with no retry, and on its end the index climbed past the waiting audio for
+  // good. From there the scene was permanently mute while bubbles kept
+  // arriving. Reported live 2026-09-03: "Working on what?" and "Well?" were
+  // both synthesized server-side (chatterbox returned, no error logged) and
+  // neither was ever heard.
+  //
+  // NOT filtered by response_id the way PresenceView does it: the wavs are
+  // stamped with Process.get(:llm_response_id, "unknown") in a process that
+  // never Process.puts that key, so such a filter would discard every sentence
+  // and make the silence total instead of intermittent.
+  function resetTtsQueue() {
+    const a = api.current || {};
+    if (ttsWatchdog.current) { clearTimeout(ttsWatchdog.current); ttsWatchdog.current = null; }
+    // Clearing ttsPlaying while a source is STILL AUDIBLE is how you get every
+    // line at once in your ears. Reported live 2026-09-04, minutes after the
+    // reset landed: encounter_response_id can fire more than once around a
+    // turn (the silence path broadcasts its own, the stream path stores and
+    // rebroadcasts), and each fire dropped the flag while the previous wav was
+    // mid-sentence. The next decode then started a SECOND source over it, and
+    // it compounded turn on turn. So the flag may only be dropped by a stop
+    // that provably happened: disconnect too, and never trust stop() alone.
+    try {
+      if (a._ttsSrc) { a._ttsSrc.onended = null; a._ttsSrc.stop(); a._ttsSrc.disconnect(); }
+    } catch {}
+    a._ttsSrc = null;
+    a._ttsGen = (a._ttsGen || 0) + 1;   // invalidates in-flight gap-jumpers
+
+    // Session 155 - a long-lived AudioContext WEDGES. Measured 2026-09-04 in
+    // the developer's shell: the scene's context reported state "running" and
+    // its currentTime advanced EXACTLY 0.000 over a full second, while a
+    // freshly constructed context in the SAME document advanced 0.859s. Every
+    // wav start()ed into it played to a stopped render thread -- correct code,
+    // real audio, total silence, and no error anywhere to show for it. This
+    // survived an app relaunch as soon as the scene rebuilt one long-lived
+    // context and kept using it, which is why "sound works early in a session
+    // and then never again" was the shape of the bug all day.
+    //
+    // So do not carry one across turns. Close the old one (an unclosed context
+    // is a real resource, and leaking one per turn is its own bug) and let
+    // ttsAudioCtx() build a fresh one on the next sentence. The persistent
+    // gesture listeners read a._ttsCtx at call time, so they keep working
+    // against whatever context is current -- they do NOT need re-arming.
+    try { if (a._ttsCtx && a._ttsCtx.state !== "closed") a._ttsCtx.close(); } catch {}
+    a._ttsCtx = null;
+    ttsQueueRef.current = {};
+    ttsNextIdx.current  = 0;
+    ttsPlaying.current  = false;
+    a._ttsSkipped = new Set();   // indices are per-turn; retirements are too
   }
 
   // One context for all of her speech, resumed on demand.
@@ -1252,6 +1320,26 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     if (!a._ttsCtx || a._ttsCtx.state === "closed") {
       const C = window.AudioContext || window.webkitAudioContext;
       a._ttsCtx = new C();
+    }
+    // Session 155 - arm the healing listeners UNCONDITIONALLY, at creation.
+    // They used to live inside the `state === "suspended"` branch below, i.e.
+    // they were installed only if the context happened to be born suspended.
+    // A context born RUNNING and suspended later -- which Chromium does on
+    // every focus loss -- therefore armed NOTHING, and there was no path back:
+    // the queue held her lines politely and the scene was silent for good.
+    // Measured 2026-09-04 on a live encounter: ctx "suspended", currentTime
+    // 0.01, _ttsResumeHooked undefined, and a TRUSTED click changed nothing,
+    // while an explicit resume() went straight to "running". The listeners
+    // were simply never there.
+    if (!a._ttsResumeHooked) {
+      a._ttsResumeHooked = true;
+      const kick = () => {
+        const ctx = a._ttsCtx;
+        if (!ctx || ctx.state === "running") return;
+        ctx.resume().then(() => playNextTts()).catch(() => {});
+      };
+      document.addEventListener("pointerdown", kick, true);
+      document.addEventListener("keydown", kick, true);
     }
     if (a._ttsCtx.state === "suspended") {
       a._ttsCtx.resume().catch(() => {});
@@ -1278,8 +1366,100 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     return a._ttsCtx;
   }
 
+  // One short-lived context per sentence. Closed by closePlayCtx() on every
+  // exit path, so contexts never accumulate (a leak here is its own bug: the
+  // browser caps how many a document may hold).
+  // Decoding gets its OWN context, created once and NEVER closed.
+  //
+  // Sharing one context between decode and playback is what made the audio
+  // "die" after the first sentence: playback contexts are short-lived by
+  // design (a long-lived one wedges), so onended closes them -- and a wav for
+  // the NEXT sentence that was still inside decodeAudioData had its context
+  // closed underneath it. The decode promise rejects, that buffer never
+  // reaches the queue, and every sentence after the first is lost. Reported
+  // live 2026-09-04 as "the audio dies".
+  //
+  // A decoding context never renders anything, so it cannot wedge and never
+  // needs closing. It exists purely to turn bytes into AudioBuffers, which
+  // then play on whatever short-lived context the sentence opens.
+  function decodeCtx() {
+    const a = api.current || {};
+    if (!a._decCtx || a._decCtx.state === "closed") {
+      const C = window.AudioContext || window.webkitAudioContext;
+      a._decCtx = new C();
+    }
+    return a._decCtx;
+  }
+
+  // REUSE while healthy, REPLACE only when proven wedged.
+  //
+  // Building a context per sentence looked right and failed differently: a
+  // context constructed mid-playback is born SUSPENDED, because there is no
+  // fresh user gesture at that moment. Measured 2026-09-04 across one reply:
+  // 18 of 20 samples suspended, clock stuck at 0.01, only the first sentence
+  // audible -- reported as "the audio dies". (An earlier test where seven new
+  // contexts all started "running" was misleading: it ran immediately after a
+  // trusted click.)
+  //
+  // So keep one context, and tear it down ONLY when the wedge detector below
+  // proves its clock is not advancing while a source plays. Healthy sessions
+  // never churn; a wedged one heals and REPLAYS the sentence it was about to
+  // lose, rather than discarding it.
+  function playCtx() {
+    const a = api.current || {};
+    if (a._ctxWedged) { closePlayCtx(); a._ctxWedged = false; }
+    return ttsAudioCtx();
+  }
+
+  function closePlayCtx() {
+    const a = api.current || {};
+    try {
+      if (a._ttsCtx && a._ttsCtx.state !== "closed") a._ttsCtx.close();
+    } catch {}
+    a._ttsCtx = null;
+  }
+
+  // Build her voice's context on the FIRST REAL GESTURE, not on her first wav.
+  //
+  // In this shell a context's health is decided at BIRTH. Measured 2026-09-04,
+  // three designs deep:
+  //   - constructed right after a trusted click -> healthy, clock advanced
+  //     0.859s over 1.3s, audible;
+  //   - constructed lazily at decode/playback time, when no gesture is active
+  //     -> born "suspended", and even after resume() succeeds and the state
+  //     reads "running", currentTime stays frozen (0.01 -> 0.02 across a whole
+  //     reply). Dead audio that reports perfect health.
+  // Every earlier design created it at decode or playback -- exactly the
+  // moment there is no activation -- which is why the wedge survived being
+  // "fixed" four times, including an app relaunch.
+  //
+  // So create it while the user's click or keystroke is still on the stack,
+  // and let playback reuse that one. The wedge detector in playNextTts stays
+  // as a safety net, but it should now have nothing to catch.
+  useEffect(() => {
+    const make = () => {
+      const c = ttsAudioCtx();
+      if (c && c.state === "suspended") c.resume().catch(() => {});
+    };
+    document.addEventListener("pointerdown", make, true);
+    document.addEventListener("keydown", make, true);
+    return () => {
+      document.removeEventListener("pointerdown", make, true);
+      document.removeEventListener("keydown", make, true);
+    };
+  }, []);
+
   function playNextTts() {
     if (ttsPlaying.current) return;
+    // Walk past indices the server has told us are never coming.
+    {
+      const sk = (api.current || {})._ttsSkipped;
+      if (sk) {
+        while (!ttsQueueRef.current[ttsNextIdx.current] && sk.has(ttsNextIdx.current)) {
+          ttsNextIdx.current++;
+        }
+      }
+    }
     const buf = ttsQueueRef.current[ttsNextIdx.current];
     if (!buf) return;                        // gap — resumes when it arrives
     ttsPlaying.current = true;
@@ -1294,7 +1474,27 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       }, ms);
     };
 
-    const ctx = ttsAudioCtx();
+    // Session 155 - a FRESH context per sentence, closed when it ends.
+    //
+    // A long-lived AudioContext wedges: it reports state "running" while its
+    // currentTime stands still, and every buffer start()ed into it plays to a
+    // stopped render thread. Measured twice on 2026-09-04, before AND after an
+    // app relaunch -- resume() resolves, state reads "running", clock advances
+    // 0.000 over a full second, while a context constructed seconds earlier in
+    // the same document advanced 0.859s. Nothing in the app can hear the
+    // difference, which is why this survived a dozen "fixes": every observable
+    // says the audio played.
+    //
+    // The previous attempt rebuilt the context once per turn, hung off the
+    // encounter_response_id separator. That hook is not reliable -- measured
+    // here with _ttsTurn still null after several spoken turns, so the rebuild
+    // never ran and the context aged into the same wedge. Do not depend on a
+    // message that may not arrive: build one per sentence, at the moment of
+    // playback, and close it in every path that ends the sentence.
+    //
+    // AudioBuffers decoded on the shared context play fine on this one (same
+    // sampleRate), so decoding is left where it is.
+    const ctx = playCtx();
 
     // A suspended context still accepts start() — the buffer plays into
     // nothing, onended fires, the queue advances, and the line is GONE.
@@ -1312,16 +1512,44 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     const src = ctx.createBufferSource();
     src.buffer = buf;
     src.connect(ctx.destination);
+    (api.current || {})._ttsSrc = src;
     const durMs = buf.duration * 1000;
     revealSentence(idx, durMs);
     armWatchdog(durMs + 3000);
     src.onended = () => {
+      if ((api.current || {})._ttsSrc === src) api.current._ttsSrc = null;
       advanceTts(null);
       playNextTts();
       maybeSettle();
     };
     try {
       src.start();
+      // The wedge is invisible to every API: start() returns, onended will
+      // fire, state says "running" -- and the render thread is stopped, so the
+      // sentence is never heard. The only honest witness is the clock. If it
+      // has not moved shortly after a source began, the context is dead:
+      // bin it and replay this same sentence on a fresh one. advanceTts has
+      // NOT run, so the buffer is still in the queue and nothing is lost.
+      const startedCt = ctx.currentTime;
+      const a2 = api.current || {};
+      a2._ctxRetries = a2._ctxRetries || 0;
+      setTimeout(() => {
+        const cur = api.current || {};
+        if (cur._ttsSrc !== src) return;                 // sentence already moved on
+        if (ctx.state === "running" && ctx.currentTime - startedCt < 0.05) {
+          if (cur._ctxRetries >= 2) return;              // do not loop forever
+          cur._ctxRetries++;
+          console.warn("[door] audio context wedged (clock frozen) — rebuilding and replaying sentence", idx);
+          try { src.onended = null; src.stop(); src.disconnect(); } catch {}
+          cur._ttsSrc = null;
+          cur._ctxWedged = true;
+          if (ttsWatchdog.current) { clearTimeout(ttsWatchdog.current); ttsWatchdog.current = null; }
+          ttsPlaying.current = false;
+          playNextTts();
+        } else {
+          cur._ctxRetries = 0;                           // healthy again
+        }
+      }, 700);
     } catch (e) {
       console.warn("[door] tts source start failed on sentence", idx, e && e.name);
       advanceTts(null);
@@ -1357,6 +1585,28 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         } else {
           syncReset();
         }
+        // Once per TURN, not once per announcement of it.
+        if (!api.current) api.current = {};
+        if (api.current._ttsTurn !== data.response_id) {
+          api.current._ttsTurn = data.response_id;
+          resetTtsQueue();   // new turn: her wavs restart at index 0
+        }
+        return;
+      }
+      // The server now names the indices it will never synthesize (narration
+      // -only sentences). Retiring them explicitly is what lets the hole-jumper
+      // stop guessing: a missing index is either announced skipped, or it is
+      // still coming and worth waiting for. Before this, the client inferred it
+      // from a timer and played her sentences out of order.
+      if (data.type === "encounter_tts_skip" && data.encounter_id === encounter_id) {
+        const a = api.current || {};
+        if (!a._ttsSkipped) a._ttsSkipped = new Set();
+        a._ttsSkipped.add(data.index);
+        if (!ttsPlaying.current) playNextTts();
+        return;
+      }
+      if (data.type === "encounter_tts_reset" && data.encounter_id === encounter_id) {
+        if (!ttsPlaying.current) resetTtsQueue();
         return;
       }
       if (data.type === "encounter_token" && data.encounter_id === encounter_id) {
@@ -1373,7 +1623,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
           // oscillator was audible in the same document moments earlier.
           // The element path "works" by every observable and is silent; the
           // context path is the one that provably reaches the speakers.
-          ttsAudioCtx().decodeAudioData(bytes.buffer.slice(0)).then(buf => {
+          decodeCtx().decodeAudioData(bytes.buffer.slice(0)).then(buf => {
             ttsQueueRef.current[data.index] = buf;
             playNextTts();
           }).catch(e => console.warn("[door] tts decode failed", e));
@@ -1381,12 +1631,35 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
           // index, so the wav sequence has holes. A queue waiting politely at
           // a hole waits forever: if nothing occupies the next slot shortly
           // after a later wav arrived, jump to the earliest one that exists.
-          setTimeout(() => {
-            if (!ttsPlaying.current && !ttsQueueRef.current[ttsNextIdx.current]) {
-              const have = Object.keys(ttsQueueRef.current).map(Number);
-              if (have.length) { ttsNextIdx.current = Math.min(...have); playNextTts(); }
-            }
-          }, 3000);
+          // Session 155 - the gap-jumper must not outrun a slow sentence.
+          //
+          // Sentences are synthesized in PARALLEL, so wavs come back in order
+          // of LENGTH, not index. Measured 2026-09-04: the server dispatched
+          // 0 = "You're welcome to come in, but don't expect..." then
+          // 1 = "I've had a long day."; the short one returned several seconds
+          // first, this timer fired at its flat 3s, could not tell a
+          // still-synthesizing index 0 from a permanently skipped one, and
+          // played her SECOND sentence first. Reported live by Magnus, who
+          // heard them in the wrong order.
+          //
+          // So measure patience from the NEWEST arrival rather than from this
+          // wav: every arrival pushes the deadline out, and we only conclude
+          // "index N is never coming" once the stream has gone quiet for a
+          // while. A genuine hole still resolves, just not prematurely.
+          (api.current || {})._ttsLastArrival = Date.now();
+          const gen = (api.current || {})._ttsGen || 0;
+          const QUIET_MS = 6000;
+          const tryJump = () => {
+            const cur = api.current || {};
+            if ((cur._ttsGen || 0) !== gen) return;                  // turn moved on
+            if (ttsPlaying.current) return;                          // audio is flowing
+            if (ttsQueueRef.current[ttsNextIdx.current]) return;     // no hole
+            const quietFor = Date.now() - (cur._ttsLastArrival || 0);
+            if (quietFor < QUIET_MS) { setTimeout(tryJump, QUIET_MS - quietFor); return; }
+            const have = Object.keys(ttsQueueRef.current).map(Number);
+            if (have.length) { ttsNextIdx.current = Math.min(...have); playNextTts(); }
+          };
+          setTimeout(tryJump, QUIET_MS);
         } catch {}
         return;
       }
@@ -2664,6 +2937,23 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   // Drop the triangles that seal the doorway, so the one thing you are meant
   // to walk through is the one thing you can. Everything else — walls, floor,
   // furniture — is untouched.
+  // Session 155 - carve by INTERSECTION, not by centroid.
+  //
+  // The old test dropped a triangle only when its centroid fell inside the
+  // aperture box. That silently fails on exactly the geometry that matters: a
+  // wall panel built from two big triangles spanning the whole wall has its
+  // centroid metres away from the door, so both were KEPT and the doorway
+  // stayed solid in the collider while looking wide open on screen. Measured
+  // 2026-09-04: the player walked to the threshold, stopped dead at z 0.19
+  // (aperture outer face z 0.114) and slid sideways along a wall that is not
+  // drawn; nulling a.collider let him walk straight in. Zero triangles had
+  // centroids in the doorway, which is why a centroid-based search -- mine as
+  // well as this carve -- reported the opening as clear.
+  //
+  // Dropping every INTERSECTING triangle instead would delete the entire wall
+  // along with the door, so straddling triangles are subdivided until the
+  // pieces are small enough to classify honestly. Only triangles that touch
+  // the aperture pay that cost; everything else is copied through untouched.
   function carveAperture(geo, aperture) {
     if (!aperture) return geo;
     const pos = geo.attributes.position;
@@ -2671,14 +2961,41 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     const count = idx ? idx.count : pos.count;
     const keep = [];
     const a1 = new THREE.Vector3(), b1 = new THREE.Vector3(), c1 = new THREE.Vector3();
-    const mid = new THREE.Vector3();
+    const tri = new THREE.Triangle();
     let dropped = 0;
+
+    const MIN_EDGE = 0.06;   // stop splitting near the wall's own thickness
+    const MAX_DEPTH = 5;     // 4^5 pieces worst case, only for straddlers
+
+    const emit = (p1, p2, p3) => {
+      keep.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, p3.x, p3.y, p3.z);
+    };
+
+    const carve = (p1, p2, p3, depth) => {
+      tri.set(p1, p2, p3);
+      if (!aperture.intersectsTriangle(tri)) { emit(p1, p2, p3); return; }
+      const longest = Math.max(p1.distanceTo(p2), p2.distanceTo(p3), p3.distanceTo(p1));
+      if (depth >= MAX_DEPTH || longest < MIN_EDGE) {
+        const cx = (p1.x + p2.x + p3.x) / 3;
+        const cy = (p1.y + p2.y + p3.y) / 3;
+        const cz = (p1.z + p2.z + p3.z) / 3;
+        if (aperture.containsPoint(new THREE.Vector3(cx, cy, cz))) { dropped++; return; }
+        emit(p1, p2, p3);
+        return;
+      }
+      const m12 = p1.clone().add(p2).multiplyScalar(0.5);
+      const m23 = p2.clone().add(p3).multiplyScalar(0.5);
+      const m31 = p3.clone().add(p1).multiplyScalar(0.5);
+      carve(p1, m12, m31, depth + 1);
+      carve(m12, p2, m23, depth + 1);
+      carve(m31, m23, p3, depth + 1);
+      carve(m12, m23, m31, depth + 1);
+    };
+
     for (let i = 0; i < count; i += 3) {
       const ia = idx ? idx.getX(i) : i, ib = idx ? idx.getX(i + 1) : i + 1, ic = idx ? idx.getX(i + 2) : i + 2;
       a1.fromBufferAttribute(pos, ia); b1.fromBufferAttribute(pos, ib); c1.fromBufferAttribute(pos, ic);
-      mid.copy(a1).add(b1).add(c1).multiplyScalar(1 / 3);
-      if (aperture.containsPoint(mid)) { dropped++; continue; }
-      keep.push(a1.x, a1.y, a1.z, b1.x, b1.y, b1.z, c1.x, c1.y, c1.z);
+      carve(a1.clone(), b1.clone(), c1.clone(), 0);
     }
     if (!dropped) return geo;
     const out = new THREE.BufferGeometry();
@@ -2973,7 +3290,14 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // gating here makes the rule one you can SEE rather than one you have to
     // know: if the pointer is visible, you are not walking — the keys belong to
     // the page, where you might be typing to her.
-    if (!a.canWalk || !a.walkMode || a.eyeToEye) return;
+    // Session 155 - "unlock" (Magnus, 2026-09-04). Third person is a GTA-style
+    // rig and GTA does not seize your mouse to let you walk, so cam=third drives
+    // straight from the keyboard. The reason the gate existed is preserved
+    // exactly: isTyping() still holds the feet, so typing "was" to her cannot
+    // walk you into the sofa. First person is untouched and still needs
+    // walk mode, where the hidden cursor is what tells you the keys are yours.
+    if (!a.canWalk || a.eyeToEye) return;
+    if (!a.walkMode && !(a.thirdPerson && !isTyping())) return;
     const keys = a.keys;
     let forward = 0, strafe = 0;
     // You are driving now — the scripted move does not get to argue.
