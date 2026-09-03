@@ -377,11 +377,14 @@ const _steerEuler = new THREE.Euler(0, 0, 0, "YXZ");
 const _eyeMatrix  = new THREE.Matrix4();
 const _eyeQuat    = new THREE.Quaternion();
 
-// ?cam=third turns the over-the-shoulder rig on. Absent, nothing below runs
-// and the scene behaves exactly as it did in first person.
+// GTA-style over-the-shoulder is how this scene is played. It was built
+// behind ?cam=third and nothing in the product ever set that, so the rig ran
+// for nobody: loadMe() returns immediately when it is off, which is why the
+// player had no body at all. Now it is the default and ?cam=first is the way
+// back to the old eyes-only camera.
 const THIRD_PERSON = (() => {
-  try { return new URLSearchParams(window.location.search).get("cam") === "third"; }
-  catch { return false; }
+  try { return new URLSearchParams(window.location.search).get("cam") !== "first"; }
+  catch { return true; }
 })();
 
 export default function DoorScene3D({ world, user, sceneData, actorName, actorId, glbUrl, playerGlbUrl, onLeave }) {
@@ -412,6 +415,12 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   const [encounterGone, setEncounterGone] = useState(false);
   const goneRef      = useRef(0);      // consecutive 404s; one is a blip
   const goneShownRef = useRef(false);  // say it once, not every poll
+  // The knock decision and her greeting generate DURING the asset download,
+  // so the spinner waits for them too rather than revealing an empty room
+  // that then waits again. A deadline keeps a slow model from holding the
+  // scene hostage: past it we show what we have.
+  const greetRef = useRef({ decided: false, greeted: false, deadline: 0 });
+  if (greetRef.current.deadline === 0) greetRef.current.deadline = Date.now() + 30000;
 
   // ── stepping inside, and talking once you are ───────────────────────────
   const [inside,    setInside]    = useState(false);  // pointer lock held
@@ -1087,6 +1096,8 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         }[rehearse] || "");
         setDecision(map[rehearse] || null);
         setPhase("answered");
+        markDecided();
+        if ((map[rehearse] || null) !== "open_door") markGreeted();  // nobody is coming to speak
       }, 2600);
       return () => clearTimeout(t);
     }
@@ -1100,7 +1111,13 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         const d = await r.json();
         if (dead) return;
         if (d.narrative) setNarrative(d.narrative);
-        if (d.decision) { setDecision(d.decision); setPhase("answered"); clearInterval(poll); }
+        if (d.decision) {
+          setDecision(d.decision); setPhase("answered"); clearInterval(poll);
+          markDecided();
+          // A refusal has no opening line to wait for — the narration IS the
+          // answer, so stop holding the scene for a greeting that is not coming.
+          if (d.decision !== "open_door") markGreeted();
+        }
         else if (d.phase === "ended") {
           // Ended with nothing decided is not her being rude — it is the world
           // failing to think. Those are different pictures.
@@ -2004,6 +2021,13 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   // The encounter is gone and is not coming back — a restart takes its
   // GenServer with it and the id in this tab now refers to nothing. Say so
   // plainly and stop pretending a reply is on its way.
+  // The greeting has landed the moment any line that is not mine and not the
+  // scene's own narration reaches the transcript.
+  useEffect(() => {
+    if (greetRef.current.greeted) return;
+    if (messages.some(m => m.from !== "me" && m.from !== "sys")) markGreeted();
+  }, [messages]);
+
   function declareEncounterGone() {
     if (goneShownRef.current) return;
     goneShownRef.current = true;
@@ -2250,8 +2274,18 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     const flatOk = !!a.flatReady;
     const herOk  = !(SHOW_AVATAR && glbUrl) || a.herReady || a.herFailed;
     const meOk   = !a.thirdPerson || a.me != null;
-    if (flatOk && herOk && meOk) setSceneVisible(true);
+    // Her answer at the door, and her first line if she is opening it. Past
+    // the deadline these stop being required — a scene that never appears is
+    // worse than one that appears a beat before she speaks.
+    const g = greetRef.current;
+    const expired = g.deadline > 0 && Date.now() > g.deadline;
+    const talkOk = expired || (g.decided && g.greeted);
+    if (flatOk && herOk && meOk && talkOk) setSceneVisible(true);
   }
+
+  // Called from wherever the decision and the opening line actually land.
+  function markDecided()  { greetRef.current.decided = true;  checkSceneReady(); }
+  function markGreeted()  { greetRef.current.greeted = true;  checkSceneReady(); }
 
   function loadFlat() {
     const a = api.current;
@@ -3034,6 +3068,12 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   function placeThirdPersonCamera(dt = 1 / 60) {
     const a = api.current;
     if (!a || !a.thirdPerson || !a.body) return;
+    // Eye to eye and the door dolly both drive the camera directly, and both
+    // run EARLIER in the same tick — re-placing it from the body here would
+    // undo them every frame, so eye to eye would never survive a single
+    // frame in third person. They own the camera while they are active; the
+    // rig takes it back when they let go (eyeRestore clears itself).
+    if (a.eyeToEye || a.eyeRestore || a.dolly) return;
     const cam = a.camera;
     if (!cam) return;
 
