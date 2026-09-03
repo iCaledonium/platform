@@ -387,6 +387,79 @@ const THIRD_PERSON = (() => {
   catch { return true; }
 })();
 
+// The Sound tab. Kept dumb on purpose: parent owns every value, this renders
+// and reports. The health row polls the voice context's clock once a second
+// while the tab is open -- "LIVE" means currentTime is actually advancing,
+// which no other observable proves.
+function SoundTab({ outs, setOuts, sink, vol, health, setHealth, inside, onSink, onVol, onTone, ctxRef }) {
+  useEffect(() => {
+    let dead = false;
+    const list = () => navigator.mediaDevices?.enumerateDevices?.().then(ds => {
+      if (dead) return;
+      setOuts(ds.filter(d => d.kind === "audiooutput")
+        .map((d, i) => ({ id: d.deviceId, label: d.label || `Output ${i + 1}` })));
+    }).catch(() => {});
+    list();
+    navigator.mediaDevices?.addEventListener?.("devicechange", list);
+    return () => { dead = true; navigator.mediaDevices?.removeEventListener?.("devicechange", list); };
+  }, [setOuts]);
+
+  useEffect(() => {
+    let last = null;
+    const t = setInterval(() => {
+      const c = (ctxRef.current || {})._ttsCtx;
+      if (!c) { setHealth({ state: "no context yet", live: null }); last = null; return; }
+      const ct = c.currentTime;
+      const live = last == null ? null : ct - last > 0.5;
+      last = ct;
+      setHealth({ state: c.state, live });
+    }, 1000);
+    return () => clearInterval(t);
+  }, [ctxRef, setHealth]);
+
+  const row = { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 };
+  const lab = { fontSize: 10, letterSpacing: ".14em", textTransform: "uppercase", color: "rgba(255,255,255,.45)" };
+  const val = { fontSize: 11, color: "rgba(201,151,58,.85)", fontVariantNumeric: "tabular-nums" };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 18, overflowY: "auto", paddingRight: 4 }}>
+      <div style={row}>
+        <span style={lab}>Voice</span>
+        <span style={{ ...val, color: health.live === false ? "rgba(220,90,80,.9)" : val.color }}>
+          {health.live == null ? health.state : health.live ? `${health.state} · LIVE` : `${health.state} · STALLED`}
+        </span>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <span style={lab}>Output</span>
+        <select value={sink} onChange={e => onSink(e.target.value)}
+          style={{ background: "rgba(255,255,255,.06)", color: "rgba(255,255,255,.8)",
+                   border: "1px solid rgba(255,255,255,.14)", borderRadius: 4,
+                   fontSize: 11, padding: "5px 6px", cursor: inside ? "none" : "pointer" }}>
+          <option value="">System default</option>
+          {outs.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
+        </select>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <div style={row}>
+          <span style={lab}>Volume</span>
+          <span style={val}>{Math.round(vol * 100)}%</span>
+        </div>
+        <input type="range" min="0" max="1" step="0.05" value={vol}
+          onChange={e => onVol(Number(e.target.value))}
+          style={{ width: "100%", accentColor: "rgba(201,151,58,.85)" }} />
+      </div>
+      <button onClick={onTone}
+        style={{ alignSelf: "flex-start", background: "rgba(201,151,58,.12)",
+                 border: "1px solid rgba(201,151,58,.4)", borderRadius: 4,
+                 color: "rgba(201,151,58,.9)", fontSize: 10, letterSpacing: ".14em",
+                 textTransform: "uppercase", padding: "6px 12px",
+                 cursor: inside ? "none" : "pointer" }}>
+        Test tone
+      </button>
+    </div>
+  );
+}
+
 export default function DoorScene3D({ world, user, sceneData, actorName, actorId, glbUrl, playerGlbUrl, onLeave }) {
   const routerNavigate = useNavigate();
   const { location, encounter_id, rejoined } = sceneData;
@@ -431,6 +504,17 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   const [chatOpen,  setChatOpen]  = useState(false);
   // Session 153 — the right dock holds two things now, so it has tabs.
   const [tab, setTab] = useState("chat");
+  // Sound tab -- born of one long night (2026-09-04) in which "no sound" had
+  // FIVE distinct causes and none of them were visible from the UI. Volume and
+  // output device are controls; the health row is the part that earns its
+  // place: it reads the voice context's CLOCK, the one witness that cannot lie
+  // (state says "running" through every failure mode this scene has had).
+  const [soundOuts, setSoundOuts]   = useState([]);
+  const [soundSink, setSoundSink]   = useState(() => { try { return localStorage.getItem("anima.soundSink") || ""; } catch { return ""; } });
+  const [soundVol, setSoundVol]     = useState(() => { try { return Number(localStorage.getItem("anima.soundVol") ?? 1); } catch { return 1; } });
+  const [soundHealth, setSoundHealth] = useState({ state: "no context yet", live: null });
+  const soundVolRef = useRef(soundVol);
+  const soundSinkRef = useRef(soundSink);
   const [renderScale, setRenderScale] = useState(() => readSetting(SETTING_KEYS.scale, 1));
   const [fovCap,      setFovCap]      = useState(() => readSetting(SETTING_KEYS.cap, MAX_H_WALK));
   const [maxAspect,   setMaxAspect]   = useState(() => readSetting(SETTING_KEYS.aspect, 0));
@@ -1341,6 +1425,15 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       document.addEventListener("pointerdown", kick, true);
       document.addEventListener("keydown", kick, true);
     }
+    a._keepAlive = null;              // belongs to the previous context
+    keepAudioAlive(a._ttsCtx);
+    // Route to the Sound tab's chosen output. AirPods dropping their idle
+    // Bluetooth link (and switching 48k A2DP <-> 24k call profile) wedged the
+    // whole audio stack repeatedly on 2026-09-04; being able to pin the scene
+    // to wired output is the escape hatch.
+    if (soundSinkRef.current && a._ttsCtx.setSinkId) {
+      a._ttsCtx.setSinkId(soundSinkRef.current).catch(() => {});
+    }
     if (a._ttsCtx.state === "suspended") {
       a._ttsCtx.resume().catch(() => {});
       // resume() without fresh user activation can leave the context suspended
@@ -1382,6 +1475,32 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   // A decoding context never renders anything, so it cannot wedge and never
   // needs closing. It exists purely to turn bytes into AudioBuffers, which
   // then play on whatever short-lived context the sentence opens.
+  // Hold the audio service open with an INAUDIBLE keep-alive.
+  //
+  // Chromium tears the audio utility process down when nothing is playing and
+  // respawns it on demand, orphaning any AudioContext that spanned the gap --
+  // the context reports "running" forever with a frozen clock and never binds
+  // to the new service. Since the trigger is SILENCE, the cure is to never be
+  // entirely silent: a zero-gain source keeps the service resident, so her
+  // context is still valid whenever she next speaks.
+  //
+  // Gain is a true 0, so this is inaudible; it costs an open audio device.
+  // That is the right trade for a character whose whole point is her voice.
+  function keepAudioAlive(ctx) {
+    const a = api.current || {};
+    if (!ctx || a._keepAlive) return;
+    try {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      g.gain.value = 0;                 // inaudible, but the service stays up
+      osc.frequency.value = 30;
+      osc.connect(g);
+      g.connect(ctx.destination);
+      osc.start();
+      a._keepAlive = { osc, g };
+    } catch {}
+  }
+
   function decodeCtx() {
     const a = api.current || {};
     if (!a._decCtx || a._decCtx.state === "closed") {
@@ -1511,7 +1630,10 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
 
     const src = ctx.createBufferSource();
     src.buffer = buf;
-    src.connect(ctx.destination);
+    const vol = ctx.createGain();
+    vol.gain.value = soundVolRef.current;   // Sound tab slider
+    src.connect(vol);
+    vol.connect(ctx.destination);
     (api.current || {})._ttsSrc = src;
     const durMs = buf.duration * 1000;
     revealSentence(idx, durMs);
@@ -1537,15 +1659,37 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         const cur = api.current || {};
         if (cur._ttsSrc !== src) return;                 // sentence already moved on
         if (ctx.state === "running" && ctx.currentTime - startedCt < 0.05) {
-          if (cur._ctxRetries >= 2) return;              // do not loop forever
+          // WHY THIS RETRIES PATIENTLY, and what actually breaks the audio:
+          //
+          // Chromium runs audio in a separate utility process
+          // (--utility-sub-type=audio.mojom.AudioService) and TEARS IT DOWN
+          // WHEN IDLE, respawning on demand. An AudioContext that was live
+          // across that teardown is orphaned: it keeps reporting state
+          // "running" while its clock stands still, and it never rebinds to
+          // the replacement service. Confirmed 2026-09-04 -- the AudioService
+          // process was 79 SECONDS old inside a much older app, with no crash
+          // report anywhere, i.e. a clean idle teardown and respawn.
+          //
+          // So the killer is SILENCE, not age or use: a quiet gap in the
+          // conversation idles the service out, and her next sentence plays
+          // into a context bound to a process that no longer exists. That is
+          // the "works early in a session, then silent forever" report, and no
+          // amount of queue or decode correctness could ever have fixed it.
+          //
+          // Recovery must therefore outlast a respawn: the previous 2 retries
+          // at 700ms both landed before the new service was up and simply
+          // burned the budget (measured _ctxRetries: 2, still silent). Retry
+          // further apart, and long enough to cover the gap.
+          if (cur._ctxRetries >= 5) return;              // do not loop forever
           cur._ctxRetries++;
-          console.warn("[door] audio context wedged (clock frozen) — rebuilding and replaying sentence", idx);
+          console.warn("[door] audio service went away (clock frozen) — rebuilding context, attempt", cur._ctxRetries);
           try { src.onended = null; src.stop(); src.disconnect(); } catch {}
           cur._ttsSrc = null;
           cur._ctxWedged = true;
           if (ttsWatchdog.current) { clearTimeout(ttsWatchdog.current); ttsWatchdog.current = null; }
           ttsPlaying.current = false;
-          playNextTts();
+          // Give the respawned service a moment to exist before binding to it.
+          setTimeout(() => playNextTts(), 900 * cur._ctxRetries);
         } else {
           cur._ctxRetries = 0;                           // healthy again
         }
@@ -3890,7 +4034,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
               {responding && (
                 <span style={{ fontSize: 10, letterSpacing: ".1em", color: "rgba(201,151,58,.65)" }}>…</span>
               )}
-              {[["chat", actorName || "Chat"], ["display", "Display"]].map(([id, label]) => (
+              {[["chat", actorName || "Chat"], ["sound", "Sound"], ["display", "Display"]].map(([id, label]) => (
                 <button key={id} onClick={() => setTab(id)}
                   style={{ background: "none", border: "none", padding: "0 0 3px",
                            cursor: inside ? "none" : "pointer",
@@ -3991,6 +4135,37 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
                                  : "Enter to talk · click the room to walk"}
             </span>
             </>)}
+
+            {tab === "sound" && (
+              <SoundTab
+                outs={soundOuts} setOuts={setSoundOuts}
+                sink={soundSink}
+                vol={soundVol}
+                health={soundHealth} setHealth={setSoundHealth}
+                inside={inside}
+                onSink={(id) => {
+                  setSoundSink(id); soundSinkRef.current = id;
+                  try { localStorage.setItem("anima.soundSink", id); } catch {}
+                  const c = (api.current || {})._ttsCtx;
+                  if (c && c.setSinkId) c.setSinkId(id || "").catch(() => {});
+                }}
+                onVol={(v) => {
+                  setSoundVol(v); soundVolRef.current = v;
+                  try { localStorage.setItem("anima.soundVol", String(v)); } catch {}
+                }}
+                onTone={() => {
+                  const c = ttsAudioCtx();
+                  if (c.state === "suspended") c.resume().catch(() => {});
+                  try {
+                    const o = c.createOscillator(); const g = c.createGain();
+                    g.gain.value = 0.22 * soundVolRef.current;
+                    o.frequency.value = 660; o.connect(g); g.connect(c.destination);
+                    o.start(); setTimeout(() => { try { o.stop(); o.disconnect(); } catch {} }, 450);
+                  } catch {}
+                }}
+                ctxRef={api}
+              />
+            )}
 
             {tab === "display" && (
               <div style={{ display: "flex", flexDirection: "column", gap: 20, overflowY: "auto",
