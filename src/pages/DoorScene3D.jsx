@@ -382,6 +382,16 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   // canvas has painted from the first frame all along; this only gates
   // what covers it.
   const [sceneVisible, setSceneVisible] = useState(false);
+  // An encounter whose process is gone (world restarted under a live
+  // scene) answers 404 to every message and every poll. Both used to be
+  // swallowed silently — the typing dots span forever and the scene was
+  // indistinguishable from a hung model with no voice. Measured live
+  // 2026-09-03: knocked 20:42:53, a peer restart killed the process at
+  // 20:43:41, and three messages 404'd over the next five minutes with
+  // nothing on screen ever saying so.
+  const [encounterGone, setEncounterGone] = useState(false);
+  const goneRef      = useRef(0);      // consecutive 404s; one is a blip
+  const goneShownRef = useRef(false);  // say it once, not every poll
 
   // ── stepping inside, and talking once you are ───────────────────────────
   const [inside,    setInside]    = useState(false);  // pointer lock held
@@ -1475,7 +1485,15 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
           syncRef.current.sentences.length || syncRef.current.pendingFinal) return;
       try {
         const r = await fetch(`/api/worlds/${world.id}/encounter/${encounter_id}`, { credentials: "include" });
-        if (!r.ok || stopped) return;
+        if (stopped) return;
+        if (r.status === 404) {
+          // Two in a row: a restart's own boot window can 404 once before the
+          // service is listening again, and that is not a dead encounter.
+          if (++goneRef.current >= 2) declareEncounterGone();
+          return;
+        }
+        goneRef.current = 0;
+        if (!r.ok) return;
         const d = await r.json();
         const log = d.conversation_log || [];
         for (let i = logCursorRef.current; i < log.length; i++) {
@@ -1963,6 +1981,19 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
 
   useEffect(() => { sendMessageRef.current = sendMessage; });
 
+  // The encounter is gone and is not coming back — a restart takes its
+  // GenServer with it and the id in this tab now refers to nothing. Say so
+  // plainly and stop pretending a reply is on its way.
+  function declareEncounterGone() {
+    if (goneShownRef.current) return;
+    goneShownRef.current = true;
+    setEncounterGone(true);
+    setResponding(false);
+    setSending(false);
+    setMessages(prev => [...prev, { from: "sys", at: Date.now(),
+      text: "This conversation ended \u2014 the world restarted under it. Nothing you say here reaches her. Knock again to start over." }]);
+  }
+
   async function sendMessage() {
     const content = chatInput.trim();
     if (!content || sending || !encounter_id) return;
@@ -1986,7 +2017,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     localMineRef.current.push(canonical(content));
     setMessages(prev => [...prev, { from: "me", text: content, at: Date.now() }]);
     try {
-      await fetch(`/api/worlds/${world.id}/encounter/${encounter_id}/message`, {
+      const r = await fetch(`/api/worlds/${world.id}/encounter/${encounter_id}/message`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
@@ -2001,6 +2032,14 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
             : undefined,
         }),
       });
+      // fetch resolves on 404 as happily as on 200 — the status is the only
+      // place the failure is written down.
+      if (r.status === 404) { declareEncounterGone(); return; }
+      if (!r.ok) {
+        setResponding(false);
+        setMessages(prev => [...prev, { from: "sys", at: Date.now(),
+          text: `That didn't get through (HTTP ${r.status}).` }]);
+      }
     } catch {
       setResponding(false);
       setMessages(prev => [...prev, { from: "sys", text: "That didn't get through.", at: Date.now() }]);
@@ -3534,7 +3573,10 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
                 ref={chatInputRef}
                 className={styles.chatInput}
                 value={chatInput}
-                placeholder={`Say something to ${(actorName || "").split(" ")[0]}…`}
+                placeholder={encounterGone
+                  ? "This conversation has ended \u2014 knock again"
+                  : `Say something to ${(actorName || "").split(" ")[0]}…`}
+                disabled={encounterGone}
                 onFocus={() => setChatOpen(true)}
                 onChange={(e) => { setChatInput(e.target.value); pingTyping(); }}
                 onKeyDown={(e) => {
@@ -3544,7 +3586,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
                 }}
               />
               <button className={styles.sendBtn} onClick={sendMessage}
-                disabled={sending || !chatInput.trim()}>↑</button>
+                disabled={sending || encounterGone || !chatInput.trim()}>↑</button>
             </div>
 
             {/* Session 153 — either of you can call eye contact. */}
