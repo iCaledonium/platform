@@ -2,7 +2,11 @@ import { useState, useEffect } from "react";
 import styles from "./AdminUsersPage.module.css";
 import homeStyles from "./HomePage.module.css";   // shared topbar, same as DeveloperPage
 
-const GENDERS = ["", "female", "male", "other"];
+// The simulator's vocabulary, not this form's: male / female / non-binary /
+// null is what normalise_gender/1 accepts, and what both gender-sync routes
+// enforce. "other" used to sit here and was a value nothing downstream could
+// take — an account born with it could never be pushed to a world.
+const GENDERS = ["", "female", "male", "non-binary"];
 
 function initials(name) {
   return (name || "").split(" ").map(n => n[0]).join("").slice(0, 2).toUpperCase() || "?";

@@ -419,11 +419,21 @@ app.post("/api/admin/users", (req, res) => {
   const name  = String(req.body?.name  || "").trim();
   const email = String(req.body?.email || "").trim().toLowerCase();
   const tier  = String(req.body?.tier || "staff").trim();
-  const gender = req.body?.gender ? String(req.body.gender).trim() : null;
+  // The vocabulary here is the simulator's, not this form's. A gender written
+  // at creation rides the world-creation `members` payload and the add-member
+  // body, and is pushed later by syncGenderToWorlds() — all three normalise
+  // against male / female / non-binary / null. A value born outside that set is
+  // a row that can never sync, so it is refused at the boundary rather than
+  // left to a <select> to prevent. Empty is a real answer: "no gender recorded".
+  const genderRaw = req.body?.gender;
+  const gender = (genderRaw === null || genderRaw === undefined || String(genderRaw).trim() === "")
+    ? null : String(genderRaw).trim().toLowerCase();
 
   if (!name)  return res.status(400).json({ error: "name required" });
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "valid email required" });
   if (!["staff", "personal"].includes(tier)) return res.status(400).json({ error: "tier must be staff or personal" });
+  if (![null, "male", "female", "non-binary"].includes(gender))
+    return res.status(422).json({ error: "gender must be male, female, non-binary, or empty" });
   // Email is unique platform-wide, not per-org: it is the handle a private user
   // signs in with, so it has to resolve to one account without an org to scope it.
   const existing = db.prepare(`SELECT * FROM users WHERE lower(email) = ?`).get(email);
