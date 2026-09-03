@@ -63,6 +63,26 @@ const CAPSULE_TOP    = 1.5;
 // Is the keyboard currently the chat's? Asked of the document every time,
 // because any cached answer to this eventually goes stale in the wrong
 // direction and silently disables walking.
+// Media belongs to whatever host served this page, never to a host baked into
+// the database.
+//
+// actors.glb_url / runtime_glb_url are stored ABSOLUTE, pointing at the public
+// ngrok domain. Loaded from anywhere else — the LAN address, a second tunnel,
+// localhost — that is a cross-origin fetch of an auth-gated file, and it does
+// not fail politely: measured live 2026-09-03 from http://192.168.1.59 the
+// fetch threw `TypeError: Failed to fetch` outright, loadHer set herFailed,
+// openDoor opened onto the gap by design, and Lindsey simply was not in her
+// own flat. The same file requested same-origin answered 200 with all
+// 26,748,152 bytes of her.
+//
+// So keep the PATH and drop the host. /media/* is served by every host that
+// serves this app, which is the whole point of it being a path.
+function sameOriginMedia(u) {
+  if (!u || typeof u !== "string") return u;
+  const i = u.indexOf("/media/");
+  return i > 0 ? u.slice(i) : u;   // i === 0 is already a bare path
+}
+
 function isTyping() {
   const el = document.activeElement;
   return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
@@ -2438,7 +2458,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     a.herAbort = new AbortController();
     setLoadPct(0);
     try {
-      const res = await fetch(glbUrl, { credentials: "include", signal: a.herAbort.signal });
+      const res = await fetch(sameOriginMedia(glbUrl), { credentials: "include", signal: a.herAbort.signal });
       if (!res.ok) throw new Error(`avatar fetch ${res.status}`);
       const total = Number(res.headers.get("content-length")) || 0;
       const reader = res.body.getReader();
@@ -3142,7 +3162,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     }
     a.meLoading = true;
     try {
-      const res = await fetch(playerGlbUrl, { credentials: "include" });
+      const res = await fetch(sameOriginMedia(playerGlbUrl), { credentials: "include" });
       if (!res.ok) throw new Error(`player avatar fetch ${res.status}`);
       const buf = await res.arrayBuffer();
       if (a.abandoned) return;
