@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
@@ -46,6 +46,18 @@ const SHOW_AVATAR = true;
 const EYE_HEIGHT     = 1.65;
 const PLAYER_SPEED   = 1.5;   // m/s
 const CAPSULE_RADIUS = 0.22;  // rough body radius
+
+// Third-person rig (opt-in with ?cam=third). The first-person path is the
+// default and is left exactly as it was: camera.position IS the player there,
+// and a dozen unrelated things read it that way (door-vs-landing at z>-0.05,
+// eye-to-eye, the dolly, distance-to-her). Rather than redefine that for
+// everyone, third-person introduces a separate BODY position and derives the
+// camera from it each frame, so every existing reader keeps meaning what it
+// meant — it just now reads a point that is behind and above the body.
+const CAM_BACK     = 2.45;   // metres behind the body
+const CAM_UP       = 1.62;   // camera height above the floor
+const CAM_SHOULDER = 0.42;   // right-shoulder offset, GTA/TLOU style
+const CAM_MIN_BACK = 0.55;   // hard floor when a wall crowds the camera in
 const CAPSULE_BOTTOM = 0.25;  // above floor — MUST be >= CAPSULE_RADIUS
 const CAPSULE_TOP    = 1.5;
 // Is the keyboard currently the chat's? Asked of the document every time,
@@ -77,6 +89,14 @@ const readLab = () => {
 };
 
 const UP = new THREE.Vector3(0, 1, 0);
+// Scratch ray for the third-person wall clamp — allocated once, like the
+// capsule scratch objects, because this runs every frame.
+const _camRay = new THREE.Ray();
+const _camTarget = new THREE.Vector3();
+// Scratch for the dynamic door-leaf collision — per frame, allocated once.
+const _leafH   = new THREE.Vector3();
+const _leafQ   = new THREE.Quaternion();
+const _leafDir = new THREE.Vector3();
 // The door shot is framed at 50° (a 2.07m door, 2.8m back). Walking around
 // wants a tighter lens: at 50 the flat — genuinely 3.9 x 11m — reads bigger
 // than it is, because a wide lens shrinks whatever is far away. 45 is the
@@ -337,7 +357,14 @@ const _steerEuler = new THREE.Euler(0, 0, 0, "YXZ");
 const _eyeMatrix  = new THREE.Matrix4();
 const _eyeQuat    = new THREE.Quaternion();
 
-export default function DoorScene3D({ world, user, sceneData, actorName, actorId, glbUrl, onLeave }) {
+// ?cam=third turns the over-the-shoulder rig on. Absent, nothing below runs
+// and the scene behaves exactly as it did in first person.
+const THIRD_PERSON = (() => {
+  try { return new URLSearchParams(window.location.search).get("cam") === "third"; }
+  catch { return false; }
+})();
+
+export default function DoorScene3D({ world, user, sceneData, actorName, actorId, glbUrl, playerGlbUrl, onLeave }) {
   const routerNavigate = useNavigate();
   const { location, encounter_id, rejoined } = sceneData;
 
@@ -349,6 +376,12 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   const [narrative, setNarrative] = useState("");
   const [loadPct,   setLoadPct]   = useState(null);
   const [ready,     setReady]    = useState(false);   // everything is on screen
+  // Full-bleed spinner until the flat, her avatar, and (third person
+  // only) the player body have all actually landed — "the scene is
+  // loaded before the user character is positioned and loaded". The
+  // canvas has painted from the first frame all along; this only gates
+  // what covers it.
+  const [sceneVisible, setSceneVisible] = useState(false);
 
   // ── stepping inside, and talking once you are ───────────────────────────
   const [inside,    setInside]    = useState(false);  // pointer lock held
@@ -411,6 +444,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   const ttsQueueRef = useRef({});   // { [index]: HTMLAudioElement }
   const ttsNextIdx  = useRef(0);
   const ttsPlaying  = useRef(false);
+  const ttsWatchdog = useRef(null);
   // Session 154 — her bubbles keep pace with her voice, the way the old chat
   // did. Tokens buffer per SENTENCE; a sentence's text reveals word-by-word
   // across the duration of its own audio clip, starting when the clip starts.
@@ -452,6 +486,15 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // not a person.
     camera.position.set(0.2, 1.62, 2.82);
     camera.lookAt(0, 1.14, 0);
+    // The body starts where the eye is. From here on, in third person, the
+    // body is the thing that walks and the camera is derived from it.
+    const body = camera.position.clone();
+    // ...except on the landing, which is a 3.7m box. First person put the eye
+    // at z=2.82 to knock, leaving 0.9m to the back wall — no room at all for a
+    // camera 2.45m behind. Standing him nearer the door is both what the rig
+    // needs and what a person actually does at a door: close enough to reach
+    // the handle. Only in third person; first person keeps its framing.
+    if (THIRD_PERSON) body.z = 1.15;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
     // Capped at 2 so a Retina panel does not quietly quadruple the fill, then
@@ -576,7 +619,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     window.addEventListener("keyup", onKeyUp);
     window.addEventListener("blur", onBlur);
 
-    api.current = { scene, camera, renderer, landing, el, clock: new THREE.Clock(),
+    api.current = { scene, camera, renderer, landing, el, clock: new THREE.Clock(), timer: new THREE.Timer(),
                     abort: new AbortController(), ambient, key, rim, fpv, keys, sunTarget,
                     maxHWalk: readSetting(SETTING_KEYS.cap, MAX_H_WALK),
                     maxAspect: readSetting(SETTING_KEYS.aspect, 0) };
@@ -822,6 +865,8 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     api.current.stepPlayer = stepPlayer;
     api.current.stepHer = stepHer;
     api.current.steerLook = steerLook;
+    api.current.body = body;             // third person: the thing that walks
+    api.current.thirdPerson = THIRD_PERSON;
     api.current.walkHerTo = walkHerTo;   // drive her from the console: __door.walkHerTo('kitchen')
     api.current.walkHerToMe = walkHerToMe;
     api.current.setEyeToEye = setEyeToEye;   // __door.setEyeToEye(true)
@@ -841,6 +886,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // streamed in) is worse than the bytes a refusal throws away. abandon()
     // cancels this fetch the same as the flat's if she doesn't open.
     loadHer();
+    loadMe();
     loadDisplay({ signal: api.current.abort.signal }).then(d => {
       const a = api.current;
       if (!a.scene) return;
@@ -886,7 +932,8 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       //
       // Raw time still drives the frame counter, because a stall is exactly
       // what a frame counter is supposed to report.
-      const rawDt = api.current.clock.getDelta();
+      api.current.timer.update();
+      const rawDt = api.current.timer.getDelta();
       const dt = Math.min(rawDt, 0.05);
       t += dt;
 
@@ -929,6 +976,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         s.pivot.rotation.y = s.dir * s.now;
       }
       api.current.mixer?.update(dt);
+      api.current.meMixer?.update(dt);
       // Session 153 — the scripted step to the threshold ENDS.
       //
       // Clearing this was wired to the pointer-lock event, so when the browser
@@ -948,6 +996,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       applyEyeToEye(dt, camera);
       steerLook(dt);
       stepPlayer(dt, camera);
+      placeThirdPersonCamera(dt);
 
       // Session 153 — the landing is scenery for the OUTSIDE of the door.
       //
@@ -1133,31 +1182,104 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     settleStream(text, speaker, claimed);
   }
 
+  // Every exit from a sentence goes through here, and a watchdog guarantees
+  // there IS an exit. ttsPlaying used to be cleared in exactly two places —
+  // onended and play()'s catch — so an element that resolved play() and then
+  // stalled (never ending, never erroring) latched the flag true forever.
+  // playNextTts then bailed on its first line for every later wav. Measured
+  // live 2026-08-29 with the audio pipeline otherwise healthy: four wavs
+  // arrived over SSE, four Audio elements were built, play() was called zero
+  // times, and the scene was silent from that point on. The 3s gap-jumper
+  // could not rescue it either — it is guarded by the same flag.
+  function advanceTts(audio) {
+    if (ttsWatchdog.current) { clearTimeout(ttsWatchdog.current); ttsWatchdog.current = null; }
+    try { if (audio) URL.revokeObjectURL(audio.src); } catch {}
+    delete ttsQueueRef.current[ttsNextIdx.current];
+    ttsNextIdx.current++;
+    ttsPlaying.current = false;
+  }
+
+  // One context for all of her speech, resumed on demand.
+  function ttsAudioCtx() {
+    const a = api.current || {};
+    if (!a._ttsCtx || a._ttsCtx.state === "closed") {
+      const C = window.AudioContext || window.webkitAudioContext;
+      a._ttsCtx = new C();
+    }
+    if (a._ttsCtx.state === "suspended") {
+      a._ttsCtx.resume().catch(() => {});
+      // resume() without fresh user activation can leave the context suspended
+      // — measured 2026-09-03: her line decoded, start() ran, state stayed
+      // "suspended", silence. Unlike the old <audio> path this is DETECTABLE,
+      // so heal it: the next real gesture anywhere on the page resumes the
+      // context, and everything queued since simply plays from there.
+      if (!a._ttsResumeHooked) {
+        a._ttsResumeHooked = true;   // armed once, never torn down: the context
+                                     // can be re-suspended any number of times
+        // Any real gesture resumes the context and drains whatever is held.
+        // This listener is NOT removed: focus can be lost and regained many
+        // times in a session, and each loss re-suspends the context.
+        const kick = () => {
+          const ctx = a._ttsCtx;
+          if (!ctx) return;
+          ctx.resume().then(() => playNextTts()).catch(() => {});
+        };
+        document.addEventListener("pointerdown", kick, true);
+        document.addEventListener("keydown", kick, true);
+      }
+    }
+    return a._ttsCtx;
+  }
+
   function playNextTts() {
     if (ttsPlaying.current) return;
-    const audio = ttsQueueRef.current[ttsNextIdx.current];
-    if (!audio) return;                      // gap — resumes when it arrives
+    const buf = ttsQueueRef.current[ttsNextIdx.current];
+    if (!buf) return;                        // gap — resumes when it arrives
     ttsPlaying.current = true;
     const idx = ttsNextIdx.current;
-    audio.onplay = () => {
-      const durMs = (isFinite(audio.duration) && audio.duration > 0) ? audio.duration * 1000 : 0;
-      revealSentence(idx, durMs);
+
+    const armWatchdog = (ms) => {
+      if (ttsWatchdog.current) clearTimeout(ttsWatchdog.current);
+      ttsWatchdog.current = setTimeout(() => {
+        console.warn("[door] tts watchdog fired on sentence", idx, "— unjamming queue");
+        advanceTts(null);
+        playNextTts();
+      }, ms);
     };
-    audio.onended = () => {
-      URL.revokeObjectURL(audio.src);
-      delete ttsQueueRef.current[ttsNextIdx.current];
-      ttsNextIdx.current++;
+
+    const ctx = ttsAudioCtx();
+
+    // A suspended context still accepts start() — the buffer plays into
+    // nothing, onended fires, the queue advances, and the line is GONE.
+    // Chromium suspends whenever the window loses focus, so every wav that
+    // landed while you were elsewhere was destroyed rather than waited on.
+    // Measured 2026-09-03: ctx flipped running -> suspended between two turns
+    // and the audio vanished with it. Hold the queue instead; the persistent
+    // gesture listener below calls back in once the context is live.
+    if (ctx.state !== "running") {
       ttsPlaying.current = false;
+      ctx.resume().then(() => { if (ctx.state === "running") playNextTts(); }).catch(() => {});
+      return;
+    }
+
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    const durMs = buf.duration * 1000;
+    revealSentence(idx, durMs);
+    armWatchdog(durMs + 3000);
+    src.onended = () => {
+      advanceTts(null);
       playNextTts();
       maybeSettle();
     };
-    audio.play().catch(() => {
-      // Autoplay refused (no gesture yet) — drop rather than jam the queue.
-      URL.revokeObjectURL(audio.src);
-      delete ttsQueueRef.current[ttsNextIdx.current];
-      ttsNextIdx.current++;
-      ttsPlaying.current = false;
-    });
+    try {
+      src.start();
+    } catch (e) {
+      console.warn("[door] tts source start failed on sentence", idx, e && e.name);
+      advanceTts(null);
+      playNextTts();
+    }
   }
 
   useEffect(() => {
@@ -1198,9 +1320,16 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         if (!data.wav_b64) return;
         try {
           const bytes = Uint8Array.from(atob(data.wav_b64), c => c.charCodeAt(0));
-          const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
-          ttsQueueRef.current[data.index] = new Audio(url);
-          playNextTts();
+          // WebAudio, not an <audio> element. Measured in this shell on
+          // 2026-09-03: a 5.75s wav in an HTMLAudioElement resolved play(),
+          // fired ended — and produced NO sound, while an AudioContext
+          // oscillator was audible in the same document moments earlier.
+          // The element path "works" by every observable and is silent; the
+          // context path is the one that provably reaches the speakers.
+          ttsAudioCtx().decodeAudioData(bytes.buffer.slice(0)).then(buf => {
+            ttsQueueRef.current[data.index] = buf;
+            playNextTts();
+          }).catch(e => console.warn("[door] tts decode failed", e));
           // The server skips action-only sentences AFTER consuming their
           // index, so the wav sequence has holes. A queue waiting politely at
           // a hole waits forever: if nothing occupies the next slot shortly
@@ -1295,7 +1424,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
           break;
         case "encounter_error":
           setResponding(false);
-          setMessages(prev => [...prev, { from: "sys", text: payload.text || "No answer." }]);
+          setMessages(prev => [...prev, { from: "sys", text: payload.text || "No answer.", at: Date.now() }]);
           break;
         default: break;
       }
@@ -1686,7 +1815,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       setResponding(false);
       setMessages(prev => [
         ...prev.map(m => (m.live ? { ...m, live: false } : m)).filter(m => m.text),
-        { from: "them", speaker, text: shown, live: true },
+        { from: "them", speaker, text: shown, live: true, at: Date.now() },
       ]);
     } else {
       setMessages(prev => prev.map((m, n) =>
@@ -1762,7 +1891,36 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       streamedRef.current.push(canonical(text));
       lastReplyRef.current = text;
     }
-    setMessages(prev => prev.map(m => (m.live ? { from: "them", speaker, text } : m)));
+    // A settle must never be able to LOSE the turn.
+    //
+    // This was a bare map over `live`: if no live bubble existed — the token
+    // stream never opened for this turn, so bufferToken never created one —
+    // the map matched nothing and the text was silently discarded. Measured
+    // 2026-09-03: "It's great to finally have some time together" reached
+    // chatterbox, logged a RAW_RESPONSE, and never appeared in the panel at
+    // all, while the NEXT turn rendered normally above it. Spoken, logged,
+    // and gone. If there is no slot to settle into, make one.
+    setMessages(prev => {
+      if (prev.some(m => m.live)) {
+        return prev.map(m => (m.live ? { ...m, from: "them", speaker, text, live: false } : m));
+      }
+      return [...prev, { from: "them", speaker, text, live: false, at: Date.now() }];
+    });
+  }
+
+  // Wall-clock stamp per bubble. Captured at creation (not at render) so a
+  // paced reveal or a late settle cannot re-date a line that was said
+  // earlier — the two settle paths below rebuild the message object, so they
+  // spread the original rather than replacing it. Date is shown only when the
+  // line falls on a different day from the one before it, which keeps a long
+  // scene readable while still marking the moment it crossed midnight.
+  function stampOf(ms) {
+    if (!ms) return "";
+    try {
+      // Clock only — 24h, no AM/PM, no date. A scene is one evening; a date
+      // separator is noise in a conversation you can read end to end.
+      return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+    } catch { return ""; }
   }
 
   function revealReply(rawText, speaker) {
@@ -1788,13 +1946,13 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // partial bubble can never be left behind.
     setMessages(prev => [
       ...prev.map(m => (m.live ? { ...m, live: false } : m)).filter(m => m.text),
-      { from: "them", speaker, text: "", live: true },
+      { from: "them", speaker, text: "", live: true, at: Date.now() },
     ]);
     replyTimerRef.current = setInterval(() => {
       if (i >= words.length) {
         clearInterval(replyTimerRef.current);
         setMessages(prev => prev.map((m, n) =>
-          n === prev.length - 1 && m.live ? { from: "them", speaker, text: sofar.trim() } : m));
+          n === prev.length - 1 && m.live ? { ...m, from: "them", speaker, text: sofar.trim(), live: false } : m));
         return;
       }
       sofar += (sofar ? " " : "") + words[i++];
@@ -1826,7 +1984,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     }
     streamRef.current = { text: "", live: false };
     localMineRef.current.push(canonical(content));
-    setMessages(prev => [...prev, { from: "me", text: content }]);
+    setMessages(prev => [...prev, { from: "me", text: content, at: Date.now() }]);
     try {
       await fetch(`/api/worlds/${world.id}/encounter/${encounter_id}/message`, {
         method: "POST",
@@ -1845,7 +2003,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       });
     } catch {
       setResponding(false);
-      setMessages(prev => [...prev, { from: "sys", text: "That didn't get through." }]);
+      setMessages(prev => [...prev, { from: "sys", text: "That didn't get through.", at: Date.now() }]);
     }
     setSending(false);
   }
@@ -2025,6 +2183,17 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   // Loaded while she decides. Ten megabytes and a knock takes seconds, so the
   // dead time pays for itself — and it has to be here rather than on open,
   // because the door you are standing in front of is the one out of this file.
+  // Any of the three loaders can finish in any order (or not apply at
+  // all — no avatar configured, not in third person); this only flips once
+  // ALL that apply have.
+  function checkSceneReady() {
+    const a = api.current;
+    const flatOk = !!a.flatReady;
+    const herOk  = !(SHOW_AVATAR && glbUrl) || a.herReady || a.herFailed;
+    const meOk   = !a.thirdPerson || a.me != null;
+    if (flatOk && herOk && meOk) setSceneVisible(true);
+  }
+
   function loadFlat() {
     const a = api.current;
     if (!a.scene || a.flatLoading) return;
@@ -2150,6 +2319,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         a.scene.add(pivot);
         pivot.attach(leaf);
         a.leafPivot = pivot;
+        a.leafWidth = Math.max(0.3, lb.max.x - lb.min.x);
         a.leafDir = left ? -1 : 1;
 
         // Her leaf swings; the hall side of it is ours.
@@ -2200,6 +2370,8 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       warm.visible = false;
       a.scene.add(warm);
       a.warm = warm;
+      a.flatReady = true;
+      checkSceneReady();
     }).catch(e => {
       console.warn("[door] flat failed", e);
       // Still a door to knock on, just nothing behind it.
@@ -2208,6 +2380,8 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       a.leafPivot = a.landing.hinge;
       a.leafDir = -1;
       if (a.pendingOpen) openDoor();
+      a.flatReady = true;
+      checkSceneReady();
     });
 
     void 0;
@@ -2306,6 +2480,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       // her to the kitchen, and nothing else moves her at all.
       a.herRoom = "hall";
       a.herReady = true;
+      checkSceneReady();
       if (readLab()?.stage === "inside" && a.doorOpen) placeHerForLab();
       aimSun();
       if (a.pendingOpen) openDoor();
@@ -2316,6 +2491,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         console.warn("[door] avatar failed", e);
         // The door still opens — onto the gap, honestly — rather than never.
         a.herFailed = true;
+        checkSceneReady();
         if (a.pendingOpen) openDoor();
       }
     }
@@ -2328,14 +2504,44 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   // than imported (see the constants above): the same approach, the same
   // numbers, none of the coupling. Her mesh is skinned and is excluded — you
   // walk around furniture, not through her, and she is handled separately.
+  // Is this object inside any of these subtrees?
+  function isUnderAny(obj, roots) {
+    for (const r of roots) {
+      if (!r) continue;
+      for (let n = obj; n; n = n.parent) if (n === r) return true;
+    }
+    return false;
+  }
+
   function buildCollider(home) {
     const a = api.current;
     const meshes = [];
     const box = new THREE.Box3();
-    home.traverse(o => {
+
+    // The LANDING is solid too.
+    //
+    // This walked only the flat, so everything outside her threshold — the
+    // landing floor, its side walls, the wall behind you, and the door itself —
+    // had no collision at all. In first person you rarely noticed: you stood
+    // still and knocked. In third person you walk around out here, and you walk
+    // straight into the door and through the plaster. Measured 2026-09-03.
+    //
+    // The swinging leaf is deliberately NOT included: a BVH is static, so a
+    // leaf baked at its closed position would wall off a doorway that is
+    // visibly open. It is skipped by name, and by the existing !visible test.
+    const roots = [home];
+    if (a.landing?.group) roots.push(a.landing.group);
+
+    for (const root of roots) root.traverse(o => {
       if (!o.isMesh || !o.geometry?.attributes?.position) return;
       if (o.isSkinnedMesh || o.morphTargetInfluences?.length || o.isInstancedMesh) return;
       if (!o.visible) return;                       // the hidden leaf, the balcony lip
+      // The doors move; they cannot be static collision. There are TWO — her
+      // flat's adopted leaf (a.leafPivot) and the landing's own (landing.hinge)
+      // — and both swing, so a BVH baked while either is closed would wall off
+      // a doorway you can see standing open. Walk the whole ancestor chain:
+      // the leaf is a descendant, not a direct child, of its pivot.
+      if (isUnderAny(o, [a.leafPivot, a.landing?.hinge])) return;
       box.setFromObject(o);
       const size = box.getSize(new THREE.Vector3());
       if (Math.max(size.x, size.z) < 0.15) return;  // too small to walk into
@@ -2386,6 +2592,37 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     out.setAttribute("position", new THREE.BufferAttribute(new Float32Array(keep), 3));
     console.log(`[door] carved ${dropped} triangle(s) out of the doorway aperture`);
     return out;
+  }
+
+  // The doors are deliberately NOT in the static BVH — they swing, and a BVH
+  // baked with a closed leaf walls off an open doorway. The price was that the
+  // leaf itself became intangible: measured 2026-09-03, the player stood
+  // INSIDE the open leaf. So the leaf collides dynamically instead: a segment
+  // from the hinge to the free edge at its CURRENT angle, and the capsule is
+  // pushed out of it — the same treatment her body gets, shaped like a door.
+  function pushOutOfLeaf(pos, pivotObj, width) {
+    if (!pivotObj || !width) return;
+    pivotObj.updateWorldMatrix(true, false);
+    _leafH.setFromMatrixPosition(pivotObj.matrixWorld);
+    pivotObj.getWorldQuaternion(_leafQ);
+    _leafDir.set(1, 0, 0).applyQuaternion(_leafQ);
+    _leafDir.y = 0;
+    if (_leafDir.lengthSq() < 1e-6) return;
+    _leafDir.normalize();
+    const px = pos.x - _leafH.x, pz = pos.z - _leafH.z;
+    let t = px * _leafDir.x + pz * _leafDir.z;
+    t = Math.max(0, Math.min(width, t));
+    const cx = _leafH.x + _leafDir.x * t, cz = _leafH.z + _leafDir.z * t;
+    const dx = pos.x - cx, dz = pos.z - cz;
+    const d = Math.hypot(dx, dz);
+    const MIN = CAPSULE_RADIUS + 0.06;
+    if (d > 1e-4) {
+      if (d < MIN) { pos.x = cx + (dx / d) * MIN; pos.z = cz + (dz / d) * MIN; }
+    } else {
+      // Dead centre of the leaf plane: eject perpendicular to it.
+      pos.x = cx + _leafDir.z * MIN;
+      pos.z = cz - _leafDir.x * MIN;
+    }
   }
 
   function resolveCapsule(position) {
@@ -2652,7 +2889,11 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     if (keys.has("KeyS") || keys.has("ArrowDown"))  forward -= 1;
     if (keys.has("KeyD") || keys.has("ArrowRight")) strafe  += 1;
     if (keys.has("KeyA") || keys.has("ArrowLeft"))  strafe  -= 1;
-    if (!forward && !strafe) return;
+    if (!forward && !strafe) {
+      // Standing still: hand the animator back to idle.
+      if (a.thirdPerson && a.moving) { a.moving = false; setPlayerClip("idle"); }
+      return;
+    }
 
     const look = new THREE.Vector3();
     camera.getWorldDirection(look);
@@ -2663,34 +2904,245 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     const move = look.multiplyScalar(forward).add(right.multiplyScalar(strafe));
     if (move.lengthSq() < 1e-6) return;
 
+    // GTA-style: he turns to face the way he is GOING. The camera keeps its own
+    // aim, so strafing swings him around rather than side-stepping — which is
+    // exactly how both reference games read.
+    if (a.thirdPerson) {
+      a.moveDir = { x: move.x, z: move.z };
+      if (!a.moving) { a.moving = true; setPlayerClip("walk"); }
+    }
     if (!a.movedOnce) {
       a.movedOnce = true;
       console.log("[door] walking — pointer lock held, keys reaching the scene.");
     }
     const running = keys.has("ShiftLeft") || keys.has("ShiftRight");
     move.normalize().multiplyScalar(PLAYER_SPEED * (running ? 2 : 1) * delta);
-    camera.position.add(move);
-    resolveCapsule(camera.position);
+    // In third person the BODY walks; the camera is placed from it afterwards
+    // by placeThirdPersonCamera/1. In first person these are the same object,
+    // so this is a no-op rename.
+    const walker = (THIRD_PERSON && a.body) ? a.body : camera.position;
+    walker.add(move);
+    resolveCapsule(walker);
+    // Only a CLOSED door is a barrier. Pushing the player off an OPEN leaf
+    // walled off the very doorway that had just opened — "I can't walk into
+    // the apartment", 2026-09-03. Collide her door only while it is shut; the
+    // landing's outer door is scenery you already passed to knock, so it is
+    // not collided at all.
+    if (a.leafPivot && !a.doorOpen) pushOutOfLeaf(walker, a.leafPivot, a.leafWidth);
     // And she is solid. Her mesh is skinned, so it is deliberately not in the
     // static BVH — a person who moves is a standing cylinder you cannot walk
     // into, which is both cheaper and correct while she is walking.
     const her = a.her;
     if (her) {
-      const hx = camera.position.x - her.position.x;
-      const hz = camera.position.z - her.position.z;
+      const hx = walker.x - her.position.x;
+      const hz = walker.z - her.position.z;
       const hd = Math.hypot(hx, hz);
       const MIN = CAPSULE_RADIUS + 0.24;
       if (hd > 1e-4 && hd < MIN) {
-        camera.position.x = her.position.x + (hx / hd) * MIN;
-        camera.position.z = her.position.z + (hz / hd) * MIN;
+        walker.x = her.position.x + (hx / hd) * MIN;
+        walker.z = her.position.z + (hz / hd) * MIN;
       }
     }
     const b = a.bounds;
     if (b) {
-      camera.position.x = Math.max(b.minX, Math.min(b.maxX, camera.position.x));
-      camera.position.z = Math.max(b.minZ, Math.min(b.maxZ, camera.position.z));
+      walker.x = Math.max(b.minX, Math.min(b.maxX, walker.x));
+      walker.z = Math.max(b.minZ, Math.min(b.maxZ, walker.z));
     }
-    camera.position.y = (a.floorY ?? 0) + EYE_HEIGHT;
+    walker.y = (a.floorY ?? 0) + EYE_HEIGHT;
+  }
+
+  // idle <-> walk, crossfaded rather than cut. 0.18s is short enough to feel
+  // responsive on a key press and long enough not to pop.
+  function setPlayerClip(name) {
+    const a = api.current;
+    if (!a || !a.meActions || a.meState === name) return;
+    const next = a.meActions[name];
+    const prev = a.meActions[a.meState];
+    if (!next) return;
+    next.reset().setEffectiveWeight(1).fadeIn(0.18).play();
+    if (prev && prev !== next) prev.fadeOut(0.18);
+    a.meState = name;
+  }
+
+  // Over-the-shoulder. Runs after every mover has had its say (walk, dolly,
+  // eye-to-eye), so whatever moved the "player" this frame, the camera lands
+  // in one consistent place relative to the body.
+  //
+  // The camera keeps its own orientation — PointerLockControls rotates it and
+  // that is still what steers — so this only ever writes position. The body is
+  // then yawed to match, which is what makes him turn on the spot when you
+  // look around, the way both reference games do it.
+  function placeThirdPersonCamera(dt = 1 / 60) {
+    const a = api.current;
+    if (!a || !a.thirdPerson || !a.body) return;
+    const cam = a.camera;
+    if (!cam) return;
+
+    const look = new THREE.Vector3();
+    cam.getWorldDirection(look);
+    look.y = 0;
+    if (look.lengthSq() < 1e-6) return;
+    look.normalize();
+
+    const floorY = a.floorY ?? 0;
+    const right  = new THREE.Vector3().crossVectors(look, UP).normalize();
+
+    // How far back we can actually sit. A wall behind you must not put the
+    // camera inside it — pull in instead, which is what every third-person
+    // game does in a corridor, and this flat is mostly corridor.
+    let backTarget = CAM_BACK;
+    const bt = a.collider?.boundsTree;
+    if (bt) {
+      _camRay.origin.set(a.body.x, floorY + CAM_UP, a.body.z);
+      _camRay.direction.copy(look).negate();
+      _camRay.far = CAM_BACK + 0.2;
+      const hit = bt.raycastFirst(_camRay, THREE.DoubleSide);
+      if (hit && hit.distance < backTarget) backTarget = Math.max(CAM_MIN_BACK, hit.distance - 0.18);
+    }
+    // The raycast flickers on/off across wall edges and mouse micro-movement,
+    // snapping `back` between the clamped hit and full range every frame — a
+    // hard position.set on that value is the camera SHAKE reported 2026-09-03.
+    // Ease the distance toward its target instead of jumping to it.
+    const kBack = 1 - Math.exp(-10 * dt);
+    a.camBack = (a.camBack == null) ? backTarget : a.camBack + (backTarget - a.camBack) * kBack;
+    const back = a.camBack;
+
+    // The shoulder offset has to scale with how far back we actually got. A
+    // wall can crush `back` to a fraction of CAM_BACK, and a full-width offset
+    // against a short distance swings the body far off-axis — measured on the
+    // landing: back collapsed to 0.63m, shoulder stayed 0.42m, and he sat ~60°
+    // out of a 45° frame. Visible in the scene graph, invisible on screen.
+    const shoulder = CAM_SHOULDER * Math.min(1, back / CAM_BACK);
+
+    _camTarget.set(
+      a.body.x - look.x * back + right.x * shoulder,
+      floorY + CAM_UP,
+      a.body.z - look.z * back + right.z * shoulder
+    );
+
+    // The landing is a CLOSED BOX, not open air: 3.7m deep with a plaster wall
+    // across the back (Landing.js builds it). You stand at z≈2.82 to knock, so
+    // a camera 2.45m behind you sits at z≈5.2 — through that wall, and the shot
+    // is the grey outside face of it. The collider raycast above cannot catch
+    // this because it tests the FLAT's BVH; the landing was never in it.
+    //
+    // Measured from the group rather than hard-coding 3.7, so this follows
+    // Landing.js if its dimensions ever change.
+    if (a.landing?.group) {
+      if (!a.landingBox) a.landingBox = new THREE.Box3().setFromObject(a.landing.group);
+      const lb = a.landingBox;
+      // Only while the BODY is on the landing side of her threshold. Inside the
+      // flat the collider raycast is the right authority and this must not fight it.
+      if (a.body.z > -0.05 && isFinite(lb.max.z)) {
+        const pad = 0.28;
+        _camTarget.z = Math.min(_camTarget.z, lb.max.z - pad);
+        _camTarget.x = Math.max(lb.min.x + pad, Math.min(lb.max.x - pad, _camTarget.x));
+      }
+    }
+
+    // One smoothed commit. Everything above shaped a TARGET; the camera eases
+    // to it so nothing above can jitter the actual view.
+    cam.position.lerp(_camTarget, 1 - Math.exp(-14 * dt));
+
+    // He faces where the camera is looking. Yaw only — a body that pitches
+    // with the camera looks like a hinge, not a person.
+    if (a.me) {
+      a.me.position.set(a.body.x, floorY, a.body.z);
+      // Facing: where he WALKS while moving, where the camera looks when still.
+      // Turned toward the target rather than snapped — a body that changes
+      // heading in one frame reads as a sprite, not a person.
+      const want = (a.moving && a.moveDir)
+        ? Math.atan2(a.moveDir.x, a.moveDir.z)
+        : Math.atan2(look.x, look.z);
+      let d = want - a.me.rotation.y;
+      while (d >  Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      a.me.rotation.y += d * (1 - Math.exp(-9 * dt));
+    }
+  }
+
+  // The player's own body.
+  //
+  // Deliberately RUNTIME-ONLY. The raw export for this player is 93 MB against
+  // her 26 MB runtime build, and a fetch of it from the page failed outright on
+  // 2026-09-02 while the same file served fine on the box — the tunnel will not
+  // carry it. Loading it per scene would trade a working door for a body. If
+  // there is no runtime model, say so once and run the rig without him rather
+  // than hanging the scene.
+  async function loadMe() {
+    const a = api.current;
+    if (!a || !a.thirdPerson || a.meLoading) return;
+    if (!playerGlbUrl) {
+      // No runtime body yet. A third-person camera with nothing in frame is
+      // impossible to judge — you cannot tell a good shoulder distance from a
+      // bad one against empty air — so stand a plain proxy at the body while
+      // the real model is missing. Deliberately crude: nobody should mistake
+      // this for the avatar, and it costs nothing to load.
+      console.warn("[door] third person: no runtime model for the player — " +
+                   "standing a proxy body. Push a runtime_glb_url through the avatar " +
+                   "pipeline (the raw glb_url is ~93 MB and will not cross the tunnel).");
+      const proxy = new THREE.Group();
+      const mat   = new THREE.MeshStandardMaterial({ color: 0x8a8f98, roughness: .85, metalness: .05 });
+      const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.20, 0.72, 4, 12), mat);
+      torso.position.y = 1.06;
+      const head  = new THREE.Mesh(new THREE.SphereGeometry(0.125, 16, 12), mat);
+      head.position.y = 1.62;
+      // A nose, so which way he faces is readable at a glance — without it a
+      // capsule gives you no way to see that the body yaws with the camera.
+      const nose  = new THREE.Mesh(new THREE.ConeGeometry(0.045, 0.14, 8), mat);
+      nose.rotation.x = Math.PI / 2;
+      nose.position.set(0, 1.62, 0.12);
+      proxy.add(torso, head, nose);
+      proxy.traverse(o => { if (o.isMesh) o.castShadow = true; });
+      proxy.position.set(a.body.x, a.floorY ?? 0, a.body.z);
+      a.scene.add(proxy);
+      a.me = proxy;
+      a.meIsProxy = true;
+      checkSceneReady();
+      return;
+    }
+    a.meLoading = true;
+    try {
+      const res = await fetch(playerGlbUrl, { credentials: "include" });
+      if (!res.ok) throw new Error(`player avatar fetch ${res.status}`);
+      const buf = await res.arrayBuffer();
+      if (a.abandoned) return;
+      const gltf = await new Promise((ok, no) => gltfLoader().parse(buf, "", ok, no));
+      if (a.abandoned) return;
+      const me = gltf.scene;
+      // He is never rendered from his own eyes, so nothing here needs to hide
+      // his head — but he DOES cast into the shot, which is most of the point.
+      me.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = false; } });
+      me.position.set(a.body.x, a.floorY ?? 0, a.body.z);
+      a.scene.add(me);
+      a.me = me;
+      a.meLoading = false;   // cleared on success, not just on failure
+
+      // Same two clips hers carries. Without a mixer he loads in bind pose —
+      // arms straight out — which is what the first third-person shot showed.
+      const clips = gltf.animations || [];
+      const idle  = clips.find(c => c.name === "idle") || clips[0];
+      const walk  = clips.find(c => c.name === "walk");
+      if (idle) {
+        a.meMixer = new THREE.AnimationMixer(me);
+        a.meActions = {
+          idle: a.meMixer.clipAction(idle),
+          walk: walk ? a.meMixer.clipAction(walk) : null,
+        };
+        a.meActions.idle.play();
+        a.meState = "idle";
+      }
+      console.log("[door] player body in the scene —",
+                  clips.map(c => c.name).join(", ") || "no clips");
+      checkSceneReady();
+    } catch (e) {
+      console.warn("[door] player avatar failed", e);
+      // No body loaded and none coming — a stuck spinner over a broken third
+      // person rig would be worse than showing the empty rig, same as the
+      // flat's own failure path above.
+      a.meLoading = false;
+      checkSceneReady();
+    }
   }
 
   // Nobody is coming. Cancel what is in flight and drop what already arrived —
@@ -2849,6 +3301,21 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
                                // vanished. isolate contains it: canvas above this
                                // background, below every overlay.
                                isolation: "isolate" }}>
+        {/* Spinner until the flat, her avatar, and (third person) the
+            player body have all actually landed. Opaque, so nothing behind
+            it can pop or flash into view first; fades rather than snaps once
+            everything is ready. */}
+        {!sceneVisible && (
+          <div style={{ position: "absolute", inset: 0, zIndex: 50,
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        background: "#0d0c0a", transition: "opacity .5s ease" }}>
+            <div style={{ width: 36, height: 36, borderRadius: "50%",
+                          border: "2px solid rgba(255,255,255,.12)",
+                          borderTopColor: "rgba(201,151,58,.85)",
+                          animation: "doorSceneSpin 0.9s linear infinite" }} />
+            <style>{"@keyframes doorSceneSpin { to { transform: rotate(360deg); } }"}</style>
+          </div>
+        )}
         {/* Session 153 — her vitals, top left, as the old presence view had
             them. Never interactive: this is something you read while she is
             talking, not something you click, and in walk mode the pointer is
@@ -3026,16 +3493,26 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
             <div className={styles.messages}
                  style={{ maxHeight: "none", flex: "0 1 auto", overflowY: "auto",
                           justifyContent: "flex-end", gap: 10 }}>
-              {messages.map((m, i) => (
-                <div key={i}
-                  className={`${styles.msg} ${m.from === "me" ? styles.msgMe : styles.msgThem}`}
-                  style={m.from === "sys"
-                    ? { alignSelf: "center", background: "none", border: "none",
-                        color: "rgba(255,255,255,.35)", fontSize: 12, fontStyle: "italic" }
-                    : { maxWidth: "92%" }}>
-                  {m.text}
-                </div>
-              ))}
+              {messages.map((m, i) => {
+                return (
+                <Fragment key={i}>
+                  <div
+                    className={`${styles.msg} ${m.from === "me" ? styles.msgMe : styles.msgThem}`}
+                    style={m.from === "sys"
+                      ? { alignSelf: "center", background: "none", border: "none",
+                          color: "rgba(255,255,255,.35)", fontSize: 12, fontStyle: "italic" }
+                      : { maxWidth: "92%" }}>
+                    {m.text}
+                    {m.at && m.from !== "sys" && (
+                      <span style={{ display: "block", marginTop: 4, fontSize: 10,
+                                     opacity: .38, textAlign: m.from === "me" ? "right" : "left" }}>
+                        {stampOf(m.at)}
+                      </span>
+                    )}
+                  </div>
+                </Fragment>
+                );
+              })}
               {/* Session 153 — she is about to say something. The reply can take
                   seconds, and a panel that shows nothing in the meantime reads
                   as a panel that has stopped working. */}
