@@ -1568,6 +1568,40 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     };
   }, []);
 
+  // Rebuild her voice when the OUTPUT DEVICE changes -- the confirmed killer.
+  //
+  // Caught in the act 2026-09-04, after four wrong theories: the Mac's default
+  // output flipped mid-session (AirPods dropped; macOS fell back to External
+  // Headphones) and every stream the browser had open died at the flip --
+  // context frozen while reporting "running", all wedge retries burned during
+  // the transition, silence from then on. The AudioService process was ALIVE
+  // and stable through it, which is what killed the teardown theory.
+  //
+  // devicechange is the signal made for exactly this. Throw the orphaned
+  // context away, reset the retry budget (the old one was spent against a
+  // device mid-flip), give the new device a beat to settle, and replay from
+  // wherever the queue stands. Sentences already decoded are not lost.
+  useEffect(() => {
+    const md = navigator.mediaDevices;
+    if (!md || !md.addEventListener) return;
+    const onFlip = () => {
+      const a = api.current || {};
+      console.warn("[door] audio output device changed — rebuilding her voice path");
+      try { if (a._ttsSrc) { a._ttsSrc.onended = null; a._ttsSrc.stop(); a._ttsSrc.disconnect(); } } catch {}
+      a._ttsSrc = null;
+      a._keepAlive = null;
+      try { if (a._ttsCtx && a._ttsCtx.state !== "closed") a._ttsCtx.close(); } catch {}
+      a._ttsCtx = null;
+      a._ctxRetries = 0;
+      a._ctxWedged = false;
+      if (ttsWatchdog.current) { clearTimeout(ttsWatchdog.current); ttsWatchdog.current = null; }
+      ttsPlaying.current = false;
+      setTimeout(() => playNextTts(), 1200);   // let the new device settle
+    };
+    md.addEventListener("devicechange", onFlip);
+    return () => md.removeEventListener("devicechange", onFlip);
+  }, []);
+
   function playNextTts() {
     if (ttsPlaying.current) return;
     // Walk past indices the server has told us are never coming.
