@@ -229,8 +229,6 @@ export default function LabIncidentsPage() {
           <span style={{ ...label, color: GOLD + ".65)" }}>incidents</span>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={() => navigate("/lab/home/testmanager")} style={btn(GOLD + ".7)")}>Test manager</button>
-          <button onClick={load} style={btn()}>{busy ? "Loading…" : "Refresh"}</button>
           <button onClick={() => navigate("/lab/home")} style={btn()}>Close</button>
         </div>
       </div>

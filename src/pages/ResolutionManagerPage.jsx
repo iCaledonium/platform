@@ -95,8 +95,6 @@ export default function ResolutionManagerPage() {
           <span style={{ ...label, color: GOLD + ".65)" }}>resolution manager</span>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={() => navigate("/lab/home/incidents")} style={btn(GOLD + ".7)")}>Incidents</button>
-          <button onClick={load} style={btn()}>{busy ? "Loading…" : "Refresh"}</button>
           <button onClick={() => navigate("/lab/home")} style={btn()}>Close</button>
         </div>
       </div>

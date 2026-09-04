@@ -118,7 +118,6 @@ export default function LabTestManagerPage() {
           <span style={{ ...label, color: GOLD + ".65)" }}>test manager</span>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={() => navigate("/lab/home/incidents")} style={btn(GOLD + ".7)")}>Incidents</button>
           <button onClick={() => navigate("/lab/home")} style={btn()}>Close</button>
         </div>
       </div>
