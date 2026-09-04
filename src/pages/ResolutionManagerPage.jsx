@@ -173,34 +173,49 @@ export default function ResolutionManagerPage() {
             </div>
 
             {(status.recent || []).length > 0 && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                 <span style={label}>Recent activity</span>
                 {status.recent.map((r, i) => {
                   const needsAck = r.status === "acknowledged";
                   return (
                     <div key={`${r.fingerprint || r.check_name}:${i}`}
-                      style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
-                        gap: 10, padding: "8px 12px", borderRadius: 4,
-                        background: "rgba(255,255,255,.02)",
+                      style={{ padding: "10px 12px", borderRadius: 4,
+                        background: needsAck ? GOLD + ".04)" : "rgba(255,255,255,.02)",
                         border: `0.5px solid ${needsAck ? GOLD + ".3)" : "rgba(255,255,255,.08)"}` }}>
-                      <div style={{ minWidth: 0 }}>
-                        <div style={{ fontSize: 11.5, color: "rgba(255,255,255,.75)" }}>{r.check_name}</div>
-                        <div style={{ fontSize: 9.5, color: "rgba(255,255,255,.4)", marginTop: 2 }}>
-                          {r.bench} · {r.status === "resolved" ? "resolved" : "needs acknowledgement"} · {ago(r.finished_at)}
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontSize: 11.5, color: "rgba(255,255,255,.75)" }}>{r.check_name}</div>
+                          <div style={{ fontSize: 9.5, color: "rgba(255,255,255,.4)", marginTop: 2 }}>
+                            {r.bench} · {needsAck ? "needs acknowledgement" : "resolved"} · {ago(r.finished_at)}
+                          </div>
                         </div>
+                        {needsAck ? (
+                          <button
+                            onClick={() => navigate(`/lab/home/incidents?status=acknowledged&bench=${encodeURIComponent(r.bench)}`)}
+                            style={{ ...btn(GOLD + ".9)"), background: GOLD + ".14)", flexShrink: 0 }}>
+                            Needs you
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => navigate(`/lab/home/incidents?status=resolved&bench=${encodeURIComponent(r.bench)}`)}
+                            style={{ ...btn(), flexShrink: 0 }}>
+                            View
+                          </button>
+                        )}
                       </div>
-                      {needsAck ? (
-                        <button
-                          onClick={() => navigate(`/lab/home/incidents?status=acknowledged&bench=${encodeURIComponent(r.bench)}`)}
-                          style={{ ...btn(GOLD + ".9)"), background: GOLD + ".14)", flexShrink: 0 }}>
-                          Needs you
-                        </button>
-                      ) : (
-                        <button
-                          onClick={() => navigate(`/lab/home/incidents?status=resolved&bench=${encodeURIComponent(r.bench)}`)}
-                          style={{ ...btn(), flexShrink: 0 }}>
-                          View
-                        </button>
+                      {/* The whole point of this row: WHY it needs a human, right
+                          here — not a click through to Incidents and an expand
+                          toggle to find out. Every flag carries a note (the
+                          worker's own diagnosis, or the daemon's safety-net text
+                          when a turn ended without one); this is the one place
+                          it always shows without another click. */}
+                      {r.note && (
+                        <div style={{ marginTop: 8, fontSize: 11, lineHeight: 1.6,
+                          color: needsAck ? "rgba(255,255,255,.8)" : "rgba(255,255,255,.5)",
+                          borderTop: `0.5px solid ${needsAck ? GOLD + ".18)" : "rgba(255,255,255,.06)"}`,
+                          paddingTop: 7 }}>
+                          {r.note}
+                        </div>
                       )}
                     </div>
                   );
