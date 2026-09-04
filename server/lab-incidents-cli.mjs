@@ -91,7 +91,8 @@ async function main() {
         const body = await r.json().catch(() => null);
         if (!r.ok || !body?.ok) {
           console.error(`the sweep endpoint refused: HTTP ${r.status} ${JSON.stringify(body)}`);
-          process.exit(2);
+          process.exitCode = 2;
+          return;
         }
         console.log(JSON.stringify(body, null, 2));
         // A run that measured NOTHING is not a pass. Exit non-zero so a cron
@@ -101,15 +102,24 @@ async function main() {
         const failed = rs.reduce((a, x) => a + (x.failed || 0), 0);
         if (rs.length && measured === 0) {
           console.error("nothing was measured — every suite was empty or had no target");
-          process.exit(2);
+          process.exitCode = 2;
+          return;
         }
-        process.exit(failed > 0 ? 1 : 0);
+        process.exitCode = failed > 0 ? 1 : 0;
       } catch (e) {
         // A dead platform-api must be loud. Reporting nothing here would look
         // exactly like a clean sweep to whatever reads this output.
         console.error(`platform-api unreachable on 127.0.0.1:${PORT} — nothing was measured: ${e.message}`);
-        process.exit(2);
+        process.exitCode = 2;
       } finally {
+        // process.exitCode (never process.exit()) above so THIS always runs:
+        // process.exit() terminates immediately and skips a pending finally,
+        // which was leaking a 60s auth_tokens row on every sweep call. Same
+        // fix also covers a second, separate bug: a piped (non-TTY) stdout
+        // is non-blocking on Linux, and process.exit() does not wait for a
+        // large write (a full sweep report) to finish draining through the
+        // 64KB OS pipe buffer before terminating — found live 2026-09-04 via
+        // `list` truncating mid-string with 30 real incidents on the board.
         db.prepare(`DELETE FROM auth_tokens WHERE token_hash = ?`).run(hash);
       }
     }
@@ -128,7 +138,8 @@ async function main() {
         results.push(store.report({ ...it, source: it.source || source }));
       }
       console.log(JSON.stringify({ filed: results.length, results }, null, 2));
-      process.exit(results.some((r) => r.error) ? 1 : 0);
+      process.exitCode = results.some((r) => r.error) ? 1 : 0;
+      return;
     }
 
     // Address a row the way `report` does — by (source, check, world, actor) —
@@ -169,7 +180,8 @@ async function main() {
       const ok = store.setStatus(row.id, next, flag("by", flag("source", "routine:cli")), flag("note", null));
       console.log(JSON.stringify(
         { ok, id: row.id, fingerprint: row.fingerprint, from: row.status, to: next }, null, 2));
-      process.exit(ok ? 0 : 2);
+      process.exitCode = ok ? 0 : 2;
+      return;
     }
 
     case "list": {
@@ -177,13 +189,24 @@ async function main() {
         status: flag("status", "unresolved"), bench: flag("bench", "all"),
         limit: Number(flag("limit", "200")),
       });
+      // process.exitCode, not process.exit(): a piped (non-TTY) stdout is
+      // non-blocking on Linux, and process.exit() does not wait for a large
+      // write to finish draining through the OS's 64KB pipe buffer before
+      // terminating. Found live 2026-09-04 by the resolution manager's own
+      // `list` call: truncated mid-string at byte 65536 with 30 real
+      // incidents on the board — small payloads during development never
+      // crossed the boundary. exitCode lets node exit only once the write
+      // has actually flushed.
       console.log(JSON.stringify({ count: rows.length, counts: store.counts(), incidents: rows }, null, 2));
-      process.exit(0);
+      process.exitCode = 0;
+      return;
     }
 
     case "runs":
+      // Same 64KB-pipe-truncation fix as `list` above.
       console.log(JSON.stringify(store.listRuns(Number(flag("limit", "10"))), null, 2));
-      process.exit(0);
+      process.exitCode = 0;
+      return;
 
     default:
       console.error(`usage: lab-incidents-cli.mjs <sweep|report|status|list|runs> [--source X] [--status X] [--bench X] [--limit N]\n` +
