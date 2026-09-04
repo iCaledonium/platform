@@ -45,6 +45,22 @@ const FILTERS = [
   { key: "all",        label: "All" },
 ];
 
+// Three of the row actions open an inline compose box instead of firing
+// immediately. "Hand to watcher" and "Resolve" take an optional note;
+// "Won't fix" requires one — a judgment call with no reason recorded is not
+// useful to whoever reads it back.
+const COMPOSE = {
+  watcher: { label: "Note for the watcher — sent with the incident, not saved on it",
+             placeholder: "anything the watcher should know before it starts",
+             required: false, confirmLabel: "Send to watcher", color: GOLD + ".8)" },
+  resolve: { label: "What fixed this? (optional — saved on the incident)",
+             placeholder: "how you know it's fixed",
+             required: false, confirmLabel: "Resolve", color: "#7fc08a" },
+  wontfix: { label: "Reason (required — saved on the incident)",
+             placeholder: "why this won't be fixed",
+             required: true, confirmLabel: "Won't fix", color: undefined },
+};
+
 const ago = (iso) => {
   if (!iso) return "—";
   const s = Math.max(0, (Date.now() - new Date(iso + (iso.endsWith("Z") ? "" : "Z")).getTime()) / 1000);
@@ -64,6 +80,9 @@ export default function LabIncidentsPage() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState({});
+  // At most one compose box open at a time: { id: incident id, kind: "watcher" | "resolve" | "wontfix" }.
+  const [compose, setCompose] = useState(null);
+  const [drafts, setDrafts] = useState({});
 
   // Every source that either RUNS (a category with a scorecard) or has FILED
   // (a routine). Built from both, because a routine has no category entry and
@@ -106,12 +125,12 @@ export default function LabIncidentsPage() {
       .then(r => r.json()).then(j => setBenches(Array.isArray(j.benches) ? j.benches : [])).catch(() => {});
   }, []);
 
-  async function setStatus(id, status) {
+  async function setStatus(id, status, note) {
     try {
       const r = await fetch(`/api/test/incidents/${id}/status`, {
         method: "POST", credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status }),
+        body: JSON.stringify(note ? { status, note } : { status }),
       });
       const j = await r.json();
       if (!j.ok) throw new Error(j.error || `HTTP ${r.status}`);
@@ -123,7 +142,7 @@ export default function LabIncidentsPage() {
   // surface, so the ask is dispatched after navigating to the bench's own page
   // — dispatching it here would land it in whatever conversation the unbound
   // /lab/home panel happens to be holding.
-  function handToWatcher(inc) {
+  function handToWatcher(inc, note) {
     const page = benches.find(b => b.key === inc.bench)?.page;
     const text =
       `Incident from the Test Lab board — ${inc.bench_label || inc.bench}\n\n` +
@@ -132,8 +151,9 @@ export default function LabIncidentsPage() {
       (inc.world_id ? `\nworld_id: ${inc.world_id}` : "") +
       (inc.actor_id ? `\nactor_id: ${inc.actor_id}` : "") +
       `\nSeverity: ${inc.severity} · seen ${inc.occurrences}× · first ${inc.first_seen_at} · last ${inc.last_seen_at}\n\n` +
-      `Detail: ${inc.detail || "(none)"}\n\n` +
-      `Diagnose this. Read-only first: confirm the finding is real before proposing anything, ` +
+      `Detail: ${inc.detail || "(none)"}` +
+      (note ? `\n\nOperator note: ${note}` : "") +
+      `\n\nDiagnose this. Read-only first: confirm the finding is real before proposing anything, ` +
       `and remember a count or a grep returning 0 indicts the query before the code.`;
     if (page) {
       navigate(page);
@@ -157,6 +177,13 @@ export default function LabIncidentsPage() {
     fontFamily: "'DM Sans',sans-serif", fontSize: 10,
     color: color || "rgba(255,255,255,.55)",
   });
+
+  const composeKey = (id, kind) => `${id}:${kind}`;
+  const draftFor = (id, kind) => drafts[composeKey(id, kind)] || "";
+  const setDraft = (id, kind, text) =>
+    setDrafts(d => ({ ...d, [composeKey(id, kind)]: text }));
+  const toggleCompose = (id, kind) =>
+    setCompose(c => (c && c.id === id && c.kind === kind) ? null : { id, kind });
 
   return (
     <div style={{ minHeight: "100vh", background: "#0d0c0a", fontFamily: "'DM Sans',system-ui,sans-serif" }}>
@@ -279,22 +306,56 @@ export default function LabIncidentsPage() {
                 )}
 
                 <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
-                  <button onClick={() => handToWatcher(inc)} style={btn(GOLD + ".8)")}>Hand to watcher</button>
+                  <button onClick={() => toggleCompose(inc.id, "watcher")} style={btn(GOLD + ".8)")}>Hand to watcher</button>
                   {benches.find(b => b.key === inc.bench)?.page && (
                     <button onClick={() => navigate(benches.find(b => b.key === inc.bench).page)}
                       style={btn()}>Open bench</button>
                   )}
-                  {inc.status !== "acknowledged" && inc.status !== "resolved" &&
-                    <button onClick={() => setStatus(inc.id, "acknowledged")} style={btn()}>Acknowledge</button>}
-                  {inc.status !== "known" &&
-                    <button onClick={() => setStatus(inc.id, "known")} style={btn()}>Red by design</button>}
                   {inc.status !== "resolved" &&
-                    <button onClick={() => setStatus(inc.id, "resolved")} style={btn("#7fc08a")}>Resolve</button>}
+                    <button onClick={() => toggleCompose(inc.id, "resolve")} style={btn("#7fc08a")}>Resolve</button>}
                   {inc.status !== "wontfix" &&
-                    <button onClick={() => setStatus(inc.id, "wontfix")} style={btn()}>Won't fix</button>}
+                    <button onClick={() => toggleCompose(inc.id, "wontfix")} style={btn()}>Won't fix</button>}
                   {inc.status !== "open" &&
                     <button onClick={() => setStatus(inc.id, "open")} style={btn()}>Reopen</button>}
                 </div>
+
+                {compose && compose.id === inc.id && (() => {
+                  const meta = COMPOSE[compose.kind];
+                  const text = draftFor(inc.id, compose.kind);
+                  const blocked = meta.required && !text.trim();
+                  const confirm = () => {
+                    if (blocked) return;
+                    if (compose.kind === "watcher") handToWatcher(inc, text.trim());
+                    else setStatus(inc.id, compose.kind === "resolve" ? "resolved" : "wontfix", text.trim() || undefined);
+                    setDraft(inc.id, compose.kind, "");
+                    setCompose(null);
+                  };
+                  return (
+                    <div style={{ marginTop: 8, padding: "9px 11px", borderRadius: 4,
+                      background: "rgba(255,255,255,.03)", border: "0.5px solid rgba(255,255,255,.1)" }}>
+                      <div style={{ ...label, fontSize: 9, marginBottom: 6 }}>{meta.label}</div>
+                      <textarea
+                        autoFocus
+                        value={text}
+                        onChange={(e) => setDraft(inc.id, compose.kind, e.target.value)}
+                        placeholder={meta.placeholder}
+                        rows={2}
+                        style={{ width: "100%", resize: "vertical", boxSizing: "border-box",
+                          background: "rgba(0,0,0,.3)", border: "0.5px solid rgba(255,255,255,.14)",
+                          borderRadius: 3, padding: "6px 8px", fontFamily: "'DM Sans',sans-serif",
+                          fontSize: 11, color: "rgba(255,255,255,.85)" }}
+                      />
+                      <div style={{ display: "flex", gap: 6, marginTop: 6, alignItems: "center" }}>
+                        <button onClick={confirm} disabled={blocked}
+                          style={{ ...btn(meta.color), opacity: blocked ? 0.4 : 1,
+                            cursor: blocked ? "not-allowed" : "pointer" }}>{meta.confirmLabel}</button>
+                        <button onClick={() => setCompose(null)} style={btn()}>Cancel</button>
+                        {blocked &&
+                          <span style={{ ...label, fontSize: 9, color: sev.color }}>a reason is required</span>}
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
             );
           })}
