@@ -9,9 +9,13 @@
 //
 // `active_workers` (2026-09-04, concurrency raised to 6): a JSON array of
 // {bench, check_name, started_at}, one per incident currently being worked.
+// `recent` (2026-09-04): a JSON array of the last N incidents a worker
+// FINISHED — {bench, check_name, fingerprint, status, finished_at} — so the
+// page can show a row per completed activity rather than only the single
+// most recent as a string, and light a link on the ones that need a human.
 // `state` is still stored rather than derived, but the daemon is the only
-// writer and always sends it consistent with the array's length — empty
-// array means idle, one-or-more means active. The old singular
+// writer and always sends it consistent with active_workers' length —
+// empty means idle, one-or-more means active. The old singular
 // bench/check_name/started_at/note fields stay in the schema (harmless,
 // unused by anything written after concurrency went in) rather than being
 // dropped, since a column drop needs more care than an ADD ever does.
@@ -35,20 +39,24 @@ db.exec(`
 `);
 try { db.exec(`ALTER TABLE resolution_manager ADD COLUMN active_workers TEXT NOT NULL DEFAULT '[]'`); }
 catch { /* already there */ }
+try { db.exec(`ALTER TABLE resolution_manager ADD COLUMN recent TEXT NOT NULL DEFAULT '[]'`); }
+catch { /* already there */ }
 
 const now = () => new Date().toISOString();
 
 const DEFAULTS = {
   id: "singleton", state: "idle", bench: null, check_name: null, note: null,
   started_at: null, updated_at: null, resolved_count: 0, flagged_count: 0,
-  last_result: null, last_run_at: null, active_workers: [],
+  last_result: null, last_run_at: null, active_workers: [], recent: [],
 };
 
 function parseRow(row) {
   if (!row) return null;
   let active_workers = [];
   try { active_workers = JSON.parse(row.active_workers || "[]"); } catch { /* leave [] */ }
-  return { ...row, active_workers };
+  let recent = [];
+  try { recent = JSON.parse(row.recent || "[]"); } catch { /* leave [] */ }
+  return { ...row, active_workers, recent };
 }
 
 export function getStatus() {
@@ -57,26 +65,28 @@ export function getStatus() {
 }
 
 // A patch, not a replace — the daemon only sends the fields that changed.
-// `active_workers`, when sent, is always the daemon's full current list
-// (it is the only process that tracks concurrency, so it is the only
-// source of truth for what "current" means — there is nothing to merge).
+// `active_workers` and `recent`, when sent, are always the daemon's full
+// current arrays (it is the only process that tracks either, so it is the
+// only source of truth for what "current" means — there is nothing here to
+// merge).
 export function setStatus(patch) {
   const cur = getStatus();
   const next = { ...DEFAULTS, ...cur, ...patch, id: "singleton", updated_at: now() };
   const activeWorkersJson = JSON.stringify(next.active_workers || []);
+  const recentJson = JSON.stringify(next.recent || []);
   db.prepare(`
     INSERT INTO resolution_manager
       (id, state, bench, check_name, note, started_at, updated_at,
-       resolved_count, flagged_count, last_result, last_run_at, active_workers)
-    VALUES ('singleton', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       resolved_count, flagged_count, last_result, last_run_at, active_workers, recent)
+    VALUES ('singleton', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       state = excluded.state, bench = excluded.bench, check_name = excluded.check_name,
       note = excluded.note, started_at = excluded.started_at, updated_at = excluded.updated_at,
       resolved_count = excluded.resolved_count, flagged_count = excluded.flagged_count,
       last_result = excluded.last_result, last_run_at = excluded.last_run_at,
-      active_workers = excluded.active_workers
+      active_workers = excluded.active_workers, recent = excluded.recent
   `).run(next.state, next.bench, next.check_name, next.note, next.started_at,
          next.updated_at, next.resolved_count, next.flagged_count,
-         next.last_result, next.last_run_at, activeWorkersJson);
+         next.last_result, next.last_run_at, activeWorkersJson, recentJson);
   return next;
 }

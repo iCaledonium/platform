@@ -172,12 +172,39 @@ export default function ResolutionManagerPage() {
               </div>
             </div>
 
-            {status.last_result && (
-              <div style={{ padding: "12px 15px", borderRadius: 5, background: "rgba(255,255,255,.02)",
-                border: "0.5px solid rgba(255,255,255,.08)", fontSize: 11.5,
-                color: "rgba(255,255,255,.55)", lineHeight: 1.65 }}>
-                <div style={{ ...label, fontSize: 9, marginBottom: 6 }}>Last result</div>
-                {status.last_result}
+            {(status.recent || []).length > 0 && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <span style={label}>Recent activity</span>
+                {status.recent.map((r, i) => {
+                  const needsAck = r.status === "acknowledged";
+                  return (
+                    <div key={`${r.fingerprint || r.check_name}:${i}`}
+                      style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+                        gap: 10, padding: "8px 12px", borderRadius: 4,
+                        background: "rgba(255,255,255,.02)",
+                        border: `0.5px solid ${needsAck ? GOLD + ".3)" : "rgba(255,255,255,.08)"}` }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: 11.5, color: "rgba(255,255,255,.75)" }}>{r.check_name}</div>
+                        <div style={{ fontSize: 9.5, color: "rgba(255,255,255,.4)", marginTop: 2 }}>
+                          {r.bench} · {r.status === "resolved" ? "resolved" : "needs acknowledgement"} · {ago(r.finished_at)}
+                        </div>
+                      </div>
+                      {needsAck ? (
+                        <button
+                          onClick={() => navigate(`/lab/home/incidents?status=acknowledged&bench=${encodeURIComponent(r.bench)}`)}
+                          style={{ ...btn(GOLD + ".9)"), background: GOLD + ".14)", flexShrink: 0 }}>
+                          Needs you
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => navigate(`/lab/home/incidents?status=resolved&bench=${encodeURIComponent(r.bench)}`)}
+                          style={{ ...btn(), flexShrink: 0 }}>
+                          View
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             )}
           </>

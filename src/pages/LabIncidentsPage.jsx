@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 
 // ── Test Lab · Incidents ─────────────────────────────────────────────────────
 //
@@ -90,8 +90,18 @@ const ago = (iso) => {
 
 export default function LabIncidentsPage() {
   const navigate = useNavigate();
-  const [filter, setFilter] = useState("unresolved");
-  const [bench, setBench] = useState("all");
+  // Seeded once from ?status=<key> so another page (Resolution manager's
+  // flagged/resolved tiles) can link straight into a filtered view rather
+  // than landing on Unresolved and making a person click again. Only the
+  // initial value comes from the URL — clicking a chip after that is plain
+  // local state, same as before; this is a landing shortcut, not two-way
+  // URL sync.
+  const [searchParams] = useSearchParams();
+  const initialFilter = searchParams.get("status");
+  const [filter, setFilter] = useState(
+    FILTERS.some(f => f.key === initialFilter) ? initialFilter : "unresolved"
+  );
+  const [bench, setBench] = useState(searchParams.get("bench") || "all");
   const [benches, setBenches] = useState([]);
   const [rows, setRows] = useState(null);
   const [counts, setCounts] = useState({});
