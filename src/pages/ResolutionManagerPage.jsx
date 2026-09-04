@@ -37,17 +37,33 @@ const ago = (iso) => {
 export default function ResolutionManagerPage() {
   const navigate = useNavigate();
   const [status, setStatus] = useState(null);
+  const [incidentCounts, setIncidentCounts] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
+  // The daemon's own resolved_count/flagged_count are lifetime EVENT
+  // counters (every flag, every resolve, incremented forever, never
+  // decremented) — reopen something and resolve it later and it counts
+  // toward both. That drifted from the Incidents board's own tiles, which
+  // are a live snapshot of current status (2026-09-04, Magnus: "the needs
+  // acknowledgement and flagged shall be the same number"). Fixed at the
+  // root rather than resynced once: this page now reads the SAME live
+  // counts query Incidents uses (limit=1 - only `counts` is wanted, the
+  // rows are thrown away), so the two can never disagree again.
   const load = useCallback(async () => {
     setBusy(true);
     try {
-      const r = await fetch("/api/test/resolution-manager/status", { credentials: "include" });
-      if (r.status === 401) throw new Error("not signed in on this origin — the API answered 401");
+      const [r, ri] = await Promise.all([
+        fetch("/api/test/resolution-manager/status", { credentials: "include" }),
+        fetch("/api/test/incidents?status=all&bench=all&limit=1", { credentials: "include" }),
+      ]);
+      if (r.status === 401 || ri.status === 401) throw new Error("not signed in on this origin — the API answered 401");
       const j = await r.json();
+      const ji = await ri.json();
       if (!j.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      if (!ji.ok) throw new Error(ji.error || `HTTP ${ri.status}`);
       setStatus(j.status);
+      setIncidentCounts(ji.counts);
       setError("");
     } catch (e) {
       setError(String(e.message || e));
@@ -155,13 +171,13 @@ export default function ResolutionManagerPage() {
             <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
               <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                 <span style={{ fontSize: 20, color: "#7fc08a",
-                  fontFamily: "'Cormorant Garamond',Georgia,serif" }}>{status.resolved_count ?? 0}</span>
+                  fontFamily: "'Cormorant Garamond',Georgia,serif" }}>{incidentCounts?.resolved ?? 0}</span>
                 <span style={{ ...label, fontSize: 9 }}>resolved</span>
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                 <span style={{ fontSize: 20, color: "#d9a441",
-                  fontFamily: "'Cormorant Garamond',Georgia,serif" }}>{status.flagged_count ?? 0}</span>
-                <span style={{ ...label, fontSize: 9 }}>flagged</span>
+                  fontFamily: "'Cormorant Garamond',Georgia,serif" }}>{incidentCounts?.acknowledged ?? 0}</span>
+                <span style={{ ...label, fontSize: 9 }}>needs acknowledgement</span>
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                 <span style={{ fontSize: 13, color: "rgba(255,255,255,.6)",
