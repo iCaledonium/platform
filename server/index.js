@@ -3403,7 +3403,14 @@ app.post("/api/actors/:id/undeploy", async (req, res) => {
 
   console.log(`[undeploy] simulator erased ${deployment.simulator_actor_id} — ${simBody?.rows_deleted ?? "?"} row(s)`);
 
-  db.prepare(`UPDATE actor_deployments SET undeployed_at = ? WHERE id = ?`).run(now, deployment.id);
+  // Sessions 156 (watcher: Feature - Character Deploy) - deploy_status is a
+  // mirror of undeployed_at, and undeploy only ever moved the clock: the row
+  // went out while the scalar still read 'deployed'. Every live route keys off
+  // undeployed_at (19 read sites) and nothing outside the deploy board reads
+  // deploy_status, so this misled no caller - but a mirror that disagrees with
+  // what it mirrors is a trap primed for the first route that trusts it.
+  // Move both in one statement so they cannot drift again.
+  db.prepare(`UPDATE actor_deployments SET undeployed_at = ?, deploy_status = 'undeployed' WHERE id = ?`).run(now, deployment.id);
 
   // Session 149 — actors.status was left at 'active' forever after
   // undeploy; nothing ever moved it back. An actor still deployed
