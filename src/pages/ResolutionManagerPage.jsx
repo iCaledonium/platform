@@ -9,11 +9,18 @@ import { useNavigate } from "react-router-dom";
 // resolution-manager-cli.mjs into the `resolution_manager` table. There is
 // exactly one of these, so there is exactly one status row.
 //
-// idle    — nothing to do right now, or between runs.
-// active  — working exactly one incident, full fault-triage authority (real
-//           code edits, commits, restarts under the broker protocol).
-// On success it closes the incident itself over the incidents CLI. When it
-// cannot safely finish one alone, it sets that incident to "needs
+// idle    — no incident currently being worked.
+// active  — up to MAX_CONCURRENT (6, 2026-09-04) incidents worked at once,
+//           full fault-triage authority (real code edits, service restarts
+//           under the broker protocol — never a git commit).
+// Six concurrent workers against two real repos means several can land on
+// the same repo at once — a deliberate tradeoff (Magnus, 2026-09-04:
+// throughput over the safer default of one worker per host) — so a
+// clobbered edit or a false compile/restart verification from a
+// same-repo collision is a real possibility here, not a hypothetical.
+//
+// On success a worker closes its incident itself over the incidents CLI.
+// When it cannot safely finish one alone, it sets that incident to "needs
 // acknowledgement" with a note explaining what it needs, and moves on.
 
 const GOLD = "rgba(201,151,58,";
@@ -47,9 +54,10 @@ export default function ResolutionManagerPage() {
     } finally { setBusy(false); }
   }, []);
 
-  // The daemon pushes its status once per state change, not continuously —
-  // a person watching this page wants to see "it just picked something up"
-  // within a few seconds, so poll rather than wait for a manual refresh.
+  // The daemon pushes its status once per worker start/finish, not
+  // continuously — a person watching this page wants to see "it just
+  // picked something up" within a few seconds, so poll rather than wait
+  // for a manual refresh.
   useEffect(() => {
     load();
     const t = setInterval(load, 5000);
@@ -66,9 +74,9 @@ export default function ResolutionManagerPage() {
     color: color || "rgba(255,255,255,.55)",
   });
 
-  const active = status?.state === "active";
+  const workers = status?.active_workers || [];
+  const active = workers.length > 0;
   const stateColor = active ? "#d9a441" : "#7fc08a";
-  const stateLabel = active ? "active" : "idle";
   // Staleness matters more here than on the incidents board: a daemon that
   // crashed leaves its last row saying "active" forever. No update in well
   // over an hour, while claiming active, reads as stuck rather than working.
@@ -111,17 +119,22 @@ export default function ResolutionManagerPage() {
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
                 <span style={{ fontSize: 22, fontFamily: "'Cormorant Garamond',Georgia,serif",
                   color: stale ? "#e0736b" : stateColor, textTransform: "uppercase", letterSpacing: ".08em" }}>
-                  {stale ? "not responding" : stateLabel}
+                  {stale ? "not responding" : active ? `active · ${workers.length}/6` : "idle"}
                 </span>
                 <span style={{ ...label, fontSize: 9 }}>last update {ago(status.updated_at)}</span>
               </div>
 
               {active && !stale && (
-                <div style={{ marginTop: 10, fontSize: 12.5, color: "rgba(255,255,255,.8)" }}>
-                  Working <strong>{status.check_name}</strong>
-                  <div style={{ fontSize: 10, color: "rgba(255,255,255,.4)", marginTop: 3 }}>
-                    {status.bench} · started {ago(status.started_at)}
-                  </div>
+                <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+                  {workers.map((w, i) => (
+                    <div key={`${w.bench}:${w.check_name}:${i}`}
+                      style={{ fontSize: 12.5, color: "rgba(255,255,255,.8)" }}>
+                      Working <strong>{w.check_name}</strong>
+                      <div style={{ fontSize: 10, color: "rgba(255,255,255,.4)", marginTop: 2 }}>
+                        {w.bench} · started {ago(w.started_at)}
+                      </div>
+                    </div>
+                  ))}
                 </div>
               )}
 
@@ -172,10 +185,14 @@ export default function ResolutionManagerPage() {
 
         <div style={{ fontSize: 10.5, lineHeight: 1.8, color: "rgba(255,255,255,.32)",
           borderTop: "0.5px solid rgba(255,255,255,.07)", paddingTop: 14 }}>
-          Same authority and guardrails as the <em>fault-triage</em> routine — real code edits,
-          commits, and service restarts under the restart-flag broker protocol, never past an
-          ANIMA-INVARIANT line, never a fix it did not verify. It picks up one open incident at a
-          time; when it cannot finish one safely alone it sets that incident to{" "}
+          Same authority and guardrails as the <em>fault-triage</em> routine — real code edits and
+          service restarts under the restart-flag broker protocol, never a git commit (both repos
+          carry other sessions' uncommitted work — a person reviews and commits afterwards), never
+          past an ANIMA-INVARIANT line, never a fix it did not verify. Up to <strong>6</strong>{" "}
+          incidents at once (Magnus, 2026-09-04) — with only two real repos behind them, several
+          workers can land on the same one at the same time, so a clobbered edit or a false
+          compile/restart verification from a same-repo collision is a real possibility, not a
+          hypothetical. When a worker cannot finish one safely alone it sets that incident to{" "}
           <em>needs acknowledgement</em> with a note explaining what it needs, and moves on to the
           next one rather than blocking on it. Nothing here decides what counts as "safely" —
           that is still the fault-triage playbook's own judgment, unattended, exactly as it works
