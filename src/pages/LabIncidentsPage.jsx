@@ -152,7 +152,15 @@ export default function LabIncidentsPage() {
     } finally { setBusy(false); }
   }, [filter, bench]);
 
-  useEffect(() => { load(); }, [load]);
+  // Polls rather than waiting for a person to notice it's stale — the
+  // resolution manager and the routines all file/close incidents in the
+  // background, and this page lost its own manual Refresh button (2026-09-04)
+  // when the header was trimmed to just Close.
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
+  }, [load]);
 
   useEffect(() => {
     fetch("/api/test/benches", { credentials: "include" })
