@@ -1188,9 +1188,32 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
 
     if (!encounter_id) return;
     let dead = false;
+    // A poll that can only ever succeed will ask forever.
+    //
+    // This loop returned on ANY non-OK response and tried again 1.4s later,
+    // with no cap and no notion of giving up. Filed from the Test Lab board
+    // 2026-09-03: encounter 629f8093 was evicted when a new encounter took the
+    // pair, and the client then asked for it 333 TIMES over twelve minutes --
+    // every one a 404, still going when the window closed, while the scene sat
+    // behind a spinner telling the player nothing.
+    //
+    // A 404 here is not a hiccup: the encounter id is in the URL, so the
+    // server saying "no such encounter" repeatedly means it is GONE, not slow.
+    // Two are tolerated (a service restart's own boot window can 404 once
+    // before it is listening again -- the same allowance the live poll makes
+    // at goneRef), then the scene says so instead of spinning.
+    let missing = 0;
     const poll = setInterval(async () => {
       try {
         const r = await fetch(`/api/worlds/${world.id}/encounter/${encounter_id}`, { credentials: "include" });
+        if (r.status === 404) {
+          if (++missing >= 3) {
+            clearInterval(poll);
+            if (!dead) setPhase("error");
+          }
+          return;
+        }
+        missing = 0;
         if (!r.ok) return;
         const d = await r.json();
         if (dead) return;
