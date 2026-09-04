@@ -50,6 +50,14 @@ const FILTERS = [
   { key: "all",        label: "All" },
 ];
 
+// Acknowledged and Known dropped from the summary tiles too (2026-09-04,
+// Magnus) - same reasoning as the filter chips and row buttons before them:
+// nothing on this page sets either from here anymore. STATUS itself keeps
+// both entries so a row that somehow carries one (set by the CLI, or from
+// before this page stopped offering them) still gets a correct color and
+// label - this only trims which counts get a tile up top.
+const TILE_KEYS = ["open", "resolved", "wontfix"];
+
 // Two of the row actions open an inline compose box instead of firing
 // immediately. "Hand to watcher" takes an optional note; "Won't fix"
 // requires one — a judgment call with no reason recorded is not useful to
@@ -221,11 +229,11 @@ export default function LabIncidentsPage() {
         display: "flex", flexDirection: "column", gap: 20 }}>
 
         <div style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
-          {Object.entries(STATUS).map(([k, s]) => (
+          {TILE_KEYS.map(k => (
             <div key={k} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-              <span style={{ fontSize: 20, color: s.color,
+              <span style={{ fontSize: 20, color: STATUS[k].color,
                 fontFamily: "'Cormorant Garamond',Georgia,serif" }}>{counts[k] ?? 0}</span>
-              <span style={{ ...label, fontSize: 9 }}>{s.label}</span>
+              <span style={{ ...label, fontSize: 9 }}>{STATUS[k].label}</span>
             </div>
           ))}
         </div>
