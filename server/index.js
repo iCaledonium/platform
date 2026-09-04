@@ -5623,6 +5623,16 @@ app.get("/api/interior-templates", (req, res) => {
 app.get("/api/actors", (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
+  // A user's own 3D profile is an actors row like any other (users.avatar_actor_id
+  // points at it — see [[anima-user-3d-profile]]), which means it also owner_id's
+  // to this same user and, without this exclusion, listed here as if it were a
+  // character: it showed up in the gallery with a Deploy button (deploying your
+  // own body is nonsensical — the avatar push already goes through
+  // deployAvatarToWorlds, not this card's deploy flow), in the wizard's drafts
+  // rail as a resumable draft (it already auto-resumes via GET /api/me/avatar),
+  // and in the Avatar Lab's "adopt as yourself" picker as an option to adopt
+  // yourself. Found live 2026-09-04 — a screenshot showed "Magnus Klack" as a
+  // deployable card next to Benny Jensen and Lindsey Vaughn.
   const actors = db.prepare(`
     SELECT a.id, a.name, a.age, a.gender, a.occupation, a.status, a.updated_at,
            p.attachment_style, b.openness, b.conscientiousness, b.extraversion, b.agreeableness, b.neuroticism,
@@ -5631,8 +5641,9 @@ app.get("/api/actors", (req, res) => {
     LEFT JOIN actor_psychology p ON p.actor_id = a.id
     LEFT JOIN actor_big5 b ON b.actor_id = a.id
     WHERE a.owner_id = ?
+      AND a.id != COALESCE((SELECT avatar_actor_id FROM users WHERE id = ?), '')
     ORDER BY a.name
-  `).all(user.id);
+  `).all(user.id, user.id);
   res.json(actors);
 });
 
