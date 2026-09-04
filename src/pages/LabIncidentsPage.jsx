@@ -29,34 +29,34 @@ const SEVERITY = {
 
 const STATUS = {
   open:         { label: "unresolved",   color: "#e0736b" },
-  acknowledged: { label: "acknowledged", color: "#d9a441" },
+  acknowledged: { label: "needs acknowledgement", color: "#d9a441" },
   known:        { label: "known",        color: "rgba(255,255,255,.45)" },
   resolved:     { label: "resolved",     color: "#7fc08a" },
   wontfix:      { label: "won't fix",    color: "rgba(255,255,255,.35)" },
 };
 
-// Open/Acknowledged/Known dropped 2026-09-04 (Magnus): those three statuses
-// have no row action left that sets them from this page (Acknowledge and
-// Known were removed earlier; Open only ever meant "not yet touched"), so a
-// filter chip for each was a control with nothing on the other end for most
-// of what a person does here. Unresolved already covers open+acknowledged
-// for anyone just asking "what still needs attention" - the two are still
-// real statuses (a routine or the CLI can still set them) and still counted
-// in the tiles above, just not each worth their own chip.
+// Open and Known dropped 2026-09-04 (Magnus): neither has a row action left
+// that sets it from this page (Open only ever meant "not yet touched", and
+// Known's "red by design" button is gone), so a filter chip for either was a
+// control with nothing on the other end. Acknowledged came back the same
+// day, repurposed: it is now what a resolution manager sets when it tried a
+// fix and could not, so it needs its own chip again - "what still needs
+// attention" (Unresolved) and "what a robot got stuck on" (Needs
+// acknowledgement) are different questions once something is setting it.
 const FILTERS = [
-  { key: "unresolved", label: "Unresolved" },
-  { key: "resolved",   label: "Resolved" },
-  { key: "wontfix",    label: "Won't fix" },
-  { key: "all",        label: "All" },
+  { key: "unresolved",   label: "Unresolved" },
+  { key: "acknowledged", label: "Needs acknowledgement" },
+  { key: "resolved",     label: "Resolved" },
+  { key: "wontfix",      label: "Won't fix" },
+  { key: "all",          label: "All" },
 ];
 
-// Acknowledged and Known dropped from the summary tiles too (2026-09-04,
-// Magnus) - same reasoning as the filter chips and row buttons before them:
-// nothing on this page sets either from here anymore. STATUS itself keeps
-// both entries so a row that somehow carries one (set by the CLI, or from
-// before this page stopped offering them) still gets a correct color and
-// label - this only trims which counts get a tile up top.
-const TILE_KEYS = ["open", "resolved", "wontfix"];
+// Known dropped from the summary tiles too (2026-09-04, Magnus) - nothing
+// sets it from this page anymore. STATUS keeps the entry so a row that
+// somehow carries it (set by the CLI) still gets a correct color and label -
+// this only trims which counts get a tile up top. Acknowledged is back in
+// the list, same day, once it had a real setter again (see FILTERS above).
+const TILE_KEYS = ["open", "acknowledged", "resolved", "wontfix"];
 
 // Two of the row actions open an inline compose box instead of firing
 // immediately. "Hand to watcher" takes an optional note; "Won't fix"
