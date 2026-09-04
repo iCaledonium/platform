@@ -45,17 +45,20 @@ const FILTERS = [
   { key: "all",        label: "All" },
 ];
 
-// Three of the row actions open an inline compose box instead of firing
-// immediately. "Hand to watcher" and "Resolve" take an optional note;
-// "Won't fix" requires one — a judgment call with no reason recorded is not
-// useful to whoever reads it back.
+// Two of the row actions open an inline compose box instead of firing
+// immediately. "Hand to watcher" takes an optional note; "Won't fix"
+// requires one — a judgment call with no reason recorded is not useful to
+// whoever reads it back. There is no manual Resolve action (2026-09-04,
+// Magnus): a row only reaches `resolved` two ways now — a sweep sees the
+// check pass, or whoever is fixing it (a watcher session, a routine) closes
+// it themselves over ssh once they have re-verified it, via
+// `lab-incidents-cli.mjs status resolved --source <bench> --check "<name>"`.
+// Both are a claim someone actually re-measured, never a click made from
+// habit.
 const COMPOSE = {
   watcher: { label: "Note for the watcher — sent with the incident, not saved on it",
              placeholder: "anything the watcher should know before it starts",
              required: false, confirmLabel: "Send to watcher", color: GOLD + ".8)" },
-  resolve: { label: "What fixed this? (optional — saved on the incident)",
-             placeholder: "how you know it's fixed",
-             required: false, confirmLabel: "Resolved", color: "#7fc08a" },
   wontfix: { label: "Reason (required — saved on the incident)",
              placeholder: "why this won't be fixed",
              required: true, confirmLabel: "Won't fix", color: undefined },
@@ -311,8 +314,6 @@ export default function LabIncidentsPage() {
                     <button onClick={() => navigate(benches.find(b => b.key === inc.bench).page)}
                       style={btn()}>Open bench</button>
                   )}
-                  {inc.status !== "resolved" &&
-                    <button onClick={() => toggleCompose(inc.id, "resolve")} style={btn("#7fc08a")}>Resolved</button>}
                   {inc.status !== "wontfix" &&
                     <button onClick={() => toggleCompose(inc.id, "wontfix")} style={btn()}>Won't fix</button>}
                   {inc.status !== "open" &&
@@ -370,6 +371,12 @@ export default function LabIncidentsPage() {
           board are the same shape. A <em>known</em> or <em>won't fix</em> row is sticky — no sweep
           moves it — but if its check comes back <em>pass</em> the row says so, and a person decides
           what that means.
+          <br />
+          There is no button for Resolved. A row gets there by a sweep seeing its check pass, or by
+          whoever fixed it closing it themselves, over ssh, once they have re-verified it:{" "}
+          <code style={{ color: "rgba(255,255,255,.45)" }}>
+            node ~/platform/server/lab-incidents-cli.mjs status resolved --source &lt;bench&gt; --check "&lt;name&gt;"
+          </code>
           <br />
           Routines file here over ssh:{" "}
           <code style={{ color: "rgba(255,255,255,.45)" }}>
