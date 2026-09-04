@@ -28,6 +28,14 @@ const BOARDS = [
       "fails on ninety nightly runs is one incident seen ninety times \u2014 never ninety rows. " +
       "Closes itself when the case comes back green.",
   },
+  {
+    path: "/lab/home/resolutionmanager",
+    title: "Resolution manager",
+    blurb: "Always on. Works the unresolved list itself \u2014 diagnoses, fixes, verifies, and " +
+      "closes the incident, same authority and guardrails as the fault-triage routine. Idle " +
+      "when there is nothing to do; flags an incident needs acknowledgement, with its own " +
+      "note, the moment it cannot finish one safely alone.",
+  },
 ];
 
 const CASES = [

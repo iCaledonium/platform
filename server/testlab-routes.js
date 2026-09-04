@@ -13,6 +13,7 @@ import { deployChecks } from "./deploylab-routes.js";
 import { signinChecks } from "./signinlab-routes.js";
 import * as cases from "./lab-cases.js";
 import * as assistant from "./lab-assistant.js";
+import * as resolutionManager from "./resolution-manager-store.js";
 
 export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
   // ── Test Lab ─────────────────────────────────────────────────────────────────
@@ -154,6 +155,17 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
       benches: Object.entries(labIncidents.BENCHES).map(([key, b]) => ({
         key, label: b.label, page: b.page, watcher: b.watcher,
         side: b.side, scoped: !!b.scoped, needs_actor: !!b.needsActor })) });
+  });
+
+  // The always-alive resolution manager (local Mac) pushes its status here
+  // over ssh via resolution-manager-cli.mjs; this just reads it back.
+  app.get("/api/test/resolution-manager/status", (req, res) => {
+    if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
+    try {
+      res.json({ ok: true, status: resolutionManager.getStatus() });
+    } catch (e) {
+      res.status(500).json({ error: "status read failed", detail: String(e.message || e).slice(0, 200) });
+    }
   });
 
   app.get("/api/test/incidents", (req, res) => {
