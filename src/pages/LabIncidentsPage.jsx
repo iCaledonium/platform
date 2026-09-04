@@ -35,11 +35,16 @@ const STATUS = {
   wontfix:      { label: "won't fix",    color: "rgba(255,255,255,.35)" },
 };
 
+// Open/Acknowledged/Known dropped 2026-09-04 (Magnus): those three statuses
+// have no row action left that sets them from this page (Acknowledge and
+// Known were removed earlier; Open only ever meant "not yet touched"), so a
+// filter chip for each was a control with nothing on the other end for most
+// of what a person does here. Unresolved already covers open+acknowledged
+// for anyone just asking "what still needs attention" - the two are still
+// real statuses (a routine or the CLI can still set them) and still counted
+// in the tiles above, just not each worth their own chip.
 const FILTERS = [
   { key: "unresolved", label: "Unresolved" },
-  { key: "open",       label: "Open" },
-  { key: "acknowledged", label: "Acknowledged" },
-  { key: "known",      label: "Known" },
   { key: "resolved",   label: "Resolved" },
   { key: "wontfix",    label: "Won't fix" },
   { key: "all",        label: "All" },
@@ -52,7 +57,9 @@ const FILTERS = [
 // Magnus): a row only reaches `resolved` two ways now — a sweep sees the
 // check pass, or whoever is fixing it (a watcher session, a routine) closes
 // it themselves over ssh once they have re-verified it, via
-// `lab-incidents-cli.mjs status resolved --source <bench> --check "<name>"`.
+// `lab-incidents-cli.mjs status resolved --source "<bench>" --check "<name>"`
+// (quote every placeholder - a bare "<bench>" is shell input redirection, not a
+// placeholder, and errors as "bench: No such file or directory").
 // Both are a claim someone actually re-measured, never a click made from
 // habit.
 const COMPOSE = {
@@ -375,7 +382,7 @@ export default function LabIncidentsPage() {
           There is no button for Resolved. A row gets there by a sweep seeing its check pass, or by
           whoever fixed it closing it themselves, over ssh, once they have re-verified it:{" "}
           <code style={{ color: "rgba(255,255,255,.45)" }}>
-            node ~/platform/server/lab-incidents-cli.mjs status resolved --source &lt;bench&gt; --check "&lt;name&gt;"
+            node ~/platform/server/lab-incidents-cli.mjs status resolved --source "&lt;bench&gt;" --check "&lt;name&gt;"
           </code>
           <br />
           Routines file here over ssh:{" "}
