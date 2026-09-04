@@ -64,12 +64,14 @@ function LabWatcherOverlay() {
   // Magnus's rule (2026-08-29): the watcher lives in LAB TERRITORY ONLY —
   // /lab pages and runs explicitly stamped ?lab=. And each surface BINDS its
   // own conversation: the encounter lab must never host the transport watcher.
-  // The resolution manager has no conversation to bind to and nothing on
-  // the page needs one - it is a status window onto an unattended daemon,
-  // not a bench under test. Magnus, 2026-09-04: hide it here specifically
-  // rather than widen the "unbound is dangerous" comment below to cover it.
+  // The resolution manager and restart broker have no conversation to bind
+  // to and nothing on either page needs one - both are status windows onto
+  // an unattended daemon, not a bench under test. Magnus, 2026-09-04/2026-09-05:
+  // hide it here specifically rather than widen the "unbound is dangerous"
+  // comment below to cover them.
   const show = (location.pathname.startsWith("/lab") &&
-    !location.pathname.startsWith("/lab/home/resolutionmanager")) || qs.has("lab");
+    !location.pathname.startsWith("/lab/home/resolutionmanager") &&
+    !location.pathname.startsWith("/lab/home/restartbroker")) || qs.has("lab");
   if (!show) return null;
   let bound = null;
   if (location.pathname.startsWith("/lab/actor/apartment/encounter")) bound = "Feature - Actor Apartment Encounter";
