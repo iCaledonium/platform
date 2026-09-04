@@ -55,7 +55,7 @@ const COMPOSE = {
              required: false, confirmLabel: "Send to watcher", color: GOLD + ".8)" },
   resolve: { label: "What fixed this? (optional — saved on the incident)",
              placeholder: "how you know it's fixed",
-             required: false, confirmLabel: "Resolve", color: "#7fc08a" },
+             required: false, confirmLabel: "Resolved", color: "#7fc08a" },
   wontfix: { label: "Reason (required — saved on the incident)",
              placeholder: "why this won't be fixed",
              required: true, confirmLabel: "Won't fix", color: undefined },
@@ -312,11 +312,11 @@ export default function LabIncidentsPage() {
                       style={btn()}>Open bench</button>
                   )}
                   {inc.status !== "resolved" &&
-                    <button onClick={() => toggleCompose(inc.id, "resolve")} style={btn("#7fc08a")}>Resolve</button>}
+                    <button onClick={() => toggleCompose(inc.id, "resolve")} style={btn("#7fc08a")}>Resolved</button>}
                   {inc.status !== "wontfix" &&
                     <button onClick={() => toggleCompose(inc.id, "wontfix")} style={btn()}>Won't fix</button>}
                   {inc.status !== "open" &&
-                    <button onClick={() => setStatus(inc.id, "open")} style={btn()}>Reopen</button>}
+                    <button onClick={() => setStatus(inc.id, "open")} style={btn()}>Unresolved</button>}
                 </div>
 
                 {compose && compose.id === inc.id && (() => {
