@@ -98,10 +98,16 @@ export default function LabIncidentsPage() {
   // (a routine). Built from both, because a routine has no category entry and
   // would otherwise be filterable by nothing at all; and it keeps its own
   // bench_label, so a routine names itself rather than showing a bare key.
+  //
+  // "authored" is excluded on purpose (2026-09-04, Magnus). This only drops
+  // the chip; the category itself, its scorecard on the test manager, and
+  // any incident it ever files under bench="authored" are untouched and
+  // still show up under "All sources".
   const sources = (() => {
     const byKey = new Map();
-    for (const b of benches) byKey.set(b.key, { key: b.key, label: b.label });
+    for (const b of benches) if (b.key !== "authored") byKey.set(b.key, { key: b.key, label: b.label });
     for (const i of rows || []) {
+      if (i.bench === "authored") continue;
       if (!byKey.has(i.bench)) byKey.set(i.bench, { key: i.bench, label: i.bench_label || i.bench });
     }
     return [...byKey.values()].sort((a, b) => a.label.localeCompare(b.label));
