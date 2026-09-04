@@ -28,7 +28,7 @@ const SEVERITY = {
 };
 
 const STATUS = {
-  open:         { label: "open",         color: "#e0736b" },
+  open:         { label: "unresolved",   color: "#e0736b" },
   acknowledged: { label: "acknowledged", color: "#d9a441" },
   known:        { label: "known",        color: "rgba(255,255,255,.45)" },
   resolved:     { label: "resolved",     color: "#7fc08a" },
