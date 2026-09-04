@@ -16,6 +16,7 @@ import { educationFromCv } from "./cv_edu.mjs";
 import { mount as mountTestLabRoutes } from "./testlab-routes.js";
 import { mount as mountSignupLabRoutes } from "./signuplab-routes.js";
 import { mount as mountAvatarLabRoutes } from "./avatarlab-routes.js";
+import { mount as mountSignInLabRoutes } from "./signinlab-routes.js";
 import { mount as mountWizardLabRoutes } from "./wizardlab-routes.js";
 import { mount as mountShareLinkRoutes } from "./sharelinks-routes.js";
 import { mount as mountShareLabRoutes } from "./sharelab-routes.js";
@@ -886,11 +887,25 @@ app.post("/api/auth/handoff/ticket", (req, res) => {
               VALUES (?, ?, ?, datetime('now'))`).run(hash, user.id, expires);
 
   // Housekeeping: a ticket is worthless after a minute, so do not keep them.
-  db.prepare(`DELETE FROM auth_handoff_tickets WHERE expires_at < datetime('now', '-1 hour')`).run();
+  db.prepare(`DELETE FROM auth_handoff_tickets WHERE julianday(expires_at) < julianday('now', '-1 hour')`).run();
 
   res.json({ ticket: raw, expires_in: HANDOFF_TTL_SECONDS,
              url: `anima://auth?ticket=${raw}` });
 });
+
+// Session 156: expired tickets used to linger because the only sweep rode along
+// with minting a new one - if nobody minted, nothing swept. Timer, tickets only:
+// auth_tokens is deliberately NOT reaped here (the lab CLI holds short-lived
+// shell sessions and a broad reaper would kill them mid-call).
+function sweepHandoffTickets() {
+  try {
+    const r = db.prepare(`DELETE FROM auth_handoff_tickets
+                           WHERE julianday(expires_at) < julianday('now', '-1 hour')`).run();
+    if (r.changes) console.log(`[handoff sweep] removed ${r.changes} expired ticket(s)`);
+  } catch (e) { console.error("[handoff sweep]", e.message); }
+}
+sweepHandoffTickets();
+setInterval(sweepHandoffTickets, 10 * 60 * 1000).unref();
 
 app.get("/api/auth/handoff/redeem", (req, res) => {
   const ticket = String(req.query.ticket || "");
@@ -928,7 +943,7 @@ app.get("/api/auth/check", (req, res) => {
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (!match) return res.status(401).end();
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
-  const row = db.prepare(`SELECT id FROM auth_tokens WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > datetime('now')`).get(hash);
+  const row = db.prepare(`SELECT id FROM auth_tokens WHERE token_hash = ? AND revoked_at IS NULL AND julianday(expires_at) > julianday('now')`).get(hash);
   if (!row) return res.status(401).end();
   res.status(200).end();
 });
@@ -1183,7 +1198,7 @@ app.get("/api/me", async (req, res) => {
     FROM auth_tokens t
     JOIN users u ON u.id = t.user_id
     LEFT JOIN orgs o ON o.id = u.org_id
-    WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')
+    WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')
   `).get(hash);
   if (!row) return res.status(401).json({ error: "not authenticated" });
   const worlds = db.prepare(`SELECT world_id, actor_id, role FROM world_memberships WHERE user_id = ?`).all(row.id);
@@ -1257,7 +1272,7 @@ app.patch("/api/me", async (req, res) => {
   const me = db.prepare(`
     SELECT u.id, u.name, u.email, u.gender FROM auth_tokens t
     JOIN users u ON u.id = t.user_id
-    WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')
+    WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')
       AND u.status != 'removed'
   `).get(hash);
   if (!me) return res.status(401).json({ error: "not authenticated" });
@@ -1545,7 +1560,7 @@ app.get("/api/worlds", async (req, res) => {
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
   const user = db.prepare(`
     SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id
-    WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')
+    WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')
   `).get(hash);
   if (!user) return res.status(401).json({ error: "not authenticated" });
 
@@ -2379,7 +2394,7 @@ app.get("/api/keys", (req, res) => {
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (!match) return res.status(401).json({ error: "not authenticated" });
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
-  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')`).get(hash);
   if (!user) return res.status(401).json({ error: "not authenticated" });
   const keys = db.prepare(`SELECT id, name, world_id, key_prefix, scopes, last_used_at, inserted_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY inserted_at DESC`).all(user.id);
   res.json(keys.map(k => ({ ...k, scopes: JSON.parse(k.scopes) })));
@@ -2391,7 +2406,7 @@ app.post("/api/keys", (req, res) => {
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (!match) return res.status(401).json({ error: "not authenticated" });
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
-  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')`).get(hash);
   if (!user) return res.status(401).json({ error: "not authenticated" });
   const { name, world_id, scopes } = req.body;
   if (!name || !world_id || !scopes?.length) return res.status(400).json({ error: "name, world_id, scopes required" });
@@ -2408,7 +2423,7 @@ app.delete("/api/keys/:id", (req, res) => {
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (!match) return res.status(401).json({ error: "not authenticated" });
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
-  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')`).get(hash);
   if (!user) return res.status(401).json({ error: "not authenticated" });
   db.prepare(`UPDATE api_keys SET revoked_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND user_id = ?`).run(req.params.id, user.id);
   res.json({ ok: true });
@@ -2420,7 +2435,7 @@ app.get("/api/apps", (req, res) => {
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (!match) return res.status(401).json({ error: "not authenticated" });
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
-  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')`).get(hash);
   if (!user) return res.status(401).json({ error: "not authenticated" });
   const apps = db.prepare(`
     SELECT r.id, r.name, r.tool_type, r.world_id, r.actor_id, r.api_key_id, r.inserted_at,
@@ -2439,7 +2454,7 @@ app.post("/api/apps", (req, res) => {
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (!match) return res.status(401).json({ error: "not authenticated" });
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
-  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')`).get(hash);
   if (!user) return res.status(401).json({ error: "not authenticated" });
   const { name, tool_type, world_id, actor_id, api_key_id, url, built_by, contact_ids } = req.body;
   if (!name || !tool_type || !world_id || !actor_id || !api_key_id) return res.status(400).json({ error: "all fields required" });
@@ -2463,7 +2478,7 @@ app.patch("/api/apps/:id", (req, res) => {
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (!match) return res.status(401).json({ error: "not authenticated" });
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
-  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')`).get(hash);
   if (!user) return res.status(401).json({ error: "not authenticated" });
   const { contact_ids } = req.body;
   if (!contact_ids) return res.status(400).json({ error: "contact_ids required" });
@@ -2478,7 +2493,7 @@ app.delete("/api/apps/:id", (req, res) => {
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (!match) return res.status(401).json({ error: "not authenticated" });
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
-  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')`).get(hash);
   if (!user) return res.status(401).json({ error: "not authenticated" });
   db.prepare(`DELETE FROM registered_tools WHERE id = ? AND user_id = ?`).run(req.params.id, user.id);
   res.json({ ok: true });
@@ -2558,7 +2573,7 @@ app.get("/api/worlds/:world_id/actors/:actor_id/context/:contact_id", async (req
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (!match) return res.status(401).json({ error: "unauthorized" });
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
-  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')`).get(hash);
   if (!user) return res.status(401).json({ error: "unauthorized" });
   try {
     const data = await simFetch(`/internal/worlds/${req.params.world_id}/actors/${req.params.actor_id}/context/${req.params.contact_id}`);
@@ -2600,7 +2615,7 @@ app.get("/api/viewer-token", (req, res) => {
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
   const user = db.prepare(`
     SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id
-    WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')
+    WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')
   `).get(hash);
   if (!user) return res.status(401).json({ error: "not authenticated" });
 
@@ -2628,7 +2643,7 @@ function getAuthUser(req) {
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (!match) return null;
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
-  return db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash) || null;
+  return db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')`).get(hash) || null;
 }
 
 // ── GET /api/notifications ────────────────────────────────────────────────────
@@ -2696,7 +2711,7 @@ app.get("/api/pending-messages", async (req, res) => {
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (!match) return res.status(401).json({ count: 0 });
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
-  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')`).get(hash);
   if (!user) return res.status(401).json({ count: 0 });
   const membership = db.prepare(`SELECT actor_id, world_id FROM world_memberships WHERE user_id = ? LIMIT 1`).get(user.id);
   if (!membership) return res.json({ count: 0 });
@@ -2712,7 +2727,7 @@ app.get("/api/stream", async (req, res) => {
   const match = cookieHeader.match(/anima_token=([a-f0-9]+)/);
   if (!match) return res.status(401).end();
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
-  const user = db.prepare(`SELECT u.id, u.name FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now')`).get(hash);
+  const user = db.prepare(`SELECT u.id, u.name FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')`).get(hash);
   if (!user) return res.status(401).end();
 
   const requestedWorldId = req.query.world_id;
@@ -6039,7 +6054,7 @@ function authUser(req) {
     // status must be checked here too: revoking an erased person's tokens stops
     // the sessions that exist, but nothing else would stop a token minted before
     // the erase from being honoured if one were somehow still live.
-    const row = db.prepare(`SELECT u.id, u.name, u.org_id, u.user_type, u.org_role FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND t.expires_at > datetime('now') AND u.status != 'removed'`).get(hash);
+    const row = db.prepare(`SELECT u.id, u.name, u.org_id, u.user_type, u.org_role FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now') AND u.status != 'removed'`).get(hash);
     if (row) return row;
   }
   // 2. API key auth (installed apps)
@@ -6497,6 +6512,7 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/message", async (req, re
 mountTestLabRoutes(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser });
 mountSignupLabRoutes(app, { db, authUser, PORT });
 mountAvatarLabRoutes(app, { db, authUser, SERVICE_TOKEN, SIMULATOR_URL });
+mountSignInLabRoutes(app, { db, authUser, PORT });
 mountWizardLabRoutes(app, { db, authUser, PORT });
 mountShareLabRoutes(app, { db, authUser, PORT });
 mountDeployLabRoutes(app, { db, authUser, PORT });
@@ -6645,7 +6661,7 @@ app.post("/api/generate/profile", async (req, res) => {
 app.post("/api/generate/appearance", async (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
-  const { images, name, gender, age } = req.body;
+  const { images, name, gender, age, heightCm } = req.body;
   if (!images?.length) return res.status(400).json({ error: "no images" });
   const key = process.env.CLAUDE_API_KEY;
   if (!key) return res.status(500).json({ error: "no API key" });
@@ -6663,7 +6679,7 @@ app.post("/api/generate/appearance", async (req, res) => {
       : "";
     const lastMsg = `You are a creative writing assistant for a fiction platform. A creator has uploaded a visual reference image to inspire the look of a fictional character they are designing — do not attempt to identify who is in the image. Use it only as a style and aesthetic reference.
 
-Fictional character details: Name: ${name||"character"}, Age: ${age||"unknown"}, Gender: ${gender||"unknown"}.
+Fictional character details: Name: ${name||"character"}, Age: ${age||"unknown"}, Gender: ${gender||"unknown"}${heightCm ? `, Height: ${heightCm}cm (this is the character's real height - the "height" you return must agree with it, not with your impression of the photo)` : ""}.
 
 Based on the visual reference, describe the fictional character's appearance. Return ONLY valid JSON with short descriptive values:
 {"gender":"${gender||"unknown"}","height":"tall|above average|average|petite|short","build":"slim|lean|athletic|curvy|full-figured|stocky|muscular","body_shape":"hourglass|pear|apple|rectangle|inverted triangle","hair":"[colour, length, texture, style]","eyes":"[colour and notable quality]","face":"[shape, skin tone, jaw, cheekbones, notable features]","style":"[inferred clothing style]","notable":"[any distinctive features or none]","presence":"commanding|warm|understated|magnetic|reserved","body_confidence":"high|moderate|low","grooming":"meticulous|natural|minimal|casual","tension_markers":"none|[visible physical tension signals]"${genderSpecific}}`;

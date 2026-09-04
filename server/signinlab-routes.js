@@ -194,7 +194,7 @@ export function mount(app, { db, authUser, PORT }) {
     try {
       const rows = db.prepare(
         `SELECT user_id, COUNT(*) c FROM auth_tokens
-          WHERE revoked_at IS NULL AND expires_at > datetime('now')
+          WHERE revoked_at IS NULL AND julianday(expires_at) > julianday('now')
           GROUP BY user_id ORDER BY c DESC`).all();
       const worst = rows[0];
       checks.push(!worst || worst.c <= 10
@@ -208,7 +208,7 @@ export function mount(app, { db, authUser, PORT }) {
     try {
       const stale = db.prepare(
         `SELECT COUNT(*) c FROM auth_handoff_tickets
-          WHERE used_at IS NULL AND expires_at <= datetime('now')`).get().c;
+          WHERE used_at IS NULL AND julianday(expires_at) <= julianday('now')`).get().c;
       checks.push(stale === 0
         ? pass("no handoff ticket is left lying around", "every minted ticket was burned or has been cleaned up")
         : fail("no handoff ticket is left lying around",
