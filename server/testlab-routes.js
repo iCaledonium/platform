@@ -14,6 +14,7 @@ import { signinChecks } from "./signinlab-routes.js";
 import * as cases from "./lab-cases.js";
 import * as assistant from "./lab-assistant.js";
 import * as resolutionManager from "./resolution-manager-store.js";
+import * as restartBroker from "./restart-broker-store.js";
 
 export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
   // ── Test Lab ─────────────────────────────────────────────────────────────────
@@ -163,6 +164,20 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
     if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
     try {
       res.json({ ok: true, status: resolutionManager.getStatus() });
+    } catch (e) {
+      res.status(500).json({ error: "status read failed", detail: String(e.message || e).slice(0, 200) });
+    }
+  });
+
+  // The restart-broker daemon (~/bin/anima-restart-daemon on the local Mac,
+  // launchd-managed, outside any Claude session) pushes lease/queue/heartbeat
+  // here over ssh via restart-broker-cli.mjs; this just reads it back.
+  // Read-only board - no pause/resume, since the daemon administrates
+  // mechanically and nothing here should intervene in what a session deploys.
+  app.get("/api/test/restart-broker/status", (req, res) => {
+    if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
+    try {
+      res.json({ ok: true, status: restartBroker.getStatus() });
     } catch (e) {
       res.status(500).json({ error: "status read failed", detail: String(e.message || e).slice(0, 200) });
     }

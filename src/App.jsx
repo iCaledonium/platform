@@ -6,6 +6,7 @@ import LabHomePage         from "./pages/LabHomePage.jsx";
 import LabIncidentsPage    from "./pages/LabIncidentsPage.jsx";
 import LabTestManagerPage  from "./pages/LabTestManagerPage.jsx";
 import ResolutionManagerPage from "./pages/ResolutionManagerPage.jsx";
+import RestartBrokerPage from "./pages/RestartBrokerPage.jsx";
 import { ShareLabPage, DeployLabPage } from "./pages/GlobalBoardPage.jsx";
 import SignupLabPage       from "./pages/SignupLabPage.jsx";
 import BehaviorLabPage     from "./pages/BehaviorLabPage.jsx";
@@ -414,6 +415,7 @@ export default function App() {
         <Route path="/lab/home/incidents"   element={<LabIncidentsPage />} />
         <Route path="/lab/home/testmanager" element={<LabTestManagerPage />} />
         <Route path="/lab/home/resolutionmanager" element={<ResolutionManagerPage />} />
+        <Route path="/lab/home/restartbroker" element={<RestartBrokerPage />} />
         <Route path="/lab/actor/apartment/encounter" element={<LabPage />} />
         <Route path="/lab/world/transport/actor" element={<TransportLabPage />} />
         <Route path="/lab/transport/actor" element={<Navigate to="/lab/world/transport/actor" replace />} />

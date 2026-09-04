@@ -36,6 +36,16 @@ const BOARDS = [
       "when there is nothing to do; flags an incident needs acknowledgement, with its own " +
       "note, the moment it cannot finish one safely alone.",
   },
+  {
+    path: "/lab/home/restartbroker",
+    title: "Restart broker",
+    blurb: "Every restart of the simulator or the platform goes through one lease at a time \u2014 " +
+      "a hook denies the call outright to anyone not holding it. A session declares how long it " +
+      "needs when it asks; a standalone daemon, outside any Claude session, grants the queue " +
+      "head, reclaims the instant that window is up, and reclaims early on evidence a holder " +
+      "never actually restarted. Read-only here \u2014 current lease, the queue, and the daemon's " +
+      "own heartbeat.",
+  },
 ];
 
 const CASES = [
