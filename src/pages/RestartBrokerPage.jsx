@@ -7,10 +7,22 @@ import { useNavigate } from "react-router-dom";
 // (~/bin/anima-restart-daemon, launchd-managed — outside any Claude session,
 // so it does not die with one) — this page does not run anything itself, it
 // only polls what the daemon last pushed over ssh via restart-broker-cli.mjs
-// into the `restart_broker` table. There is exactly one restart flag shared
-// by deliver-worlds and platform-api, so there is exactly one lease at a time.
+// into the `restart_broker` table.
 //
-// Read-only board, deliberately: the daemon administrates the queue
+// 2026-09-05 (Magnus): "you need two kinds of flags, one anima-platform-
+// restart-flag and one anima-simulator-restart-flag... if they need both
+// flags that is a third lease." One shared lease across two unrelated hosts
+// was the actual bottleneck (resolution-manager runs up to 6 concurrent
+// workers, all funneling into one FIFO - queue depth regularly hit 4-11 and
+// workers burned their entire turn budget just waiting, several proving
+// live that they never restarted anything at all). Now three independent
+// leases: platform and simulator can be held at the same time by two
+// different holders, and `both` is granted only the instant NEITHER
+// individual lease is held (atomic all-or-nothing - never one-then-the-
+// other, which is exactly how two locks deadlock) - it is for the rare fix
+// that genuinely needs both services bounced together as one step.
+//
+// Read-only board, deliberately: the daemon administrates all three queues
 // mechanically (grant the head, reclaim on TTL expiry or on evidence a
 // stalled holder never actually restarted) and never reviews what a session
 // is deploying — this page keeps the same posture. No pause/resume here.
@@ -53,12 +65,85 @@ const shortId = (id) => (id ? id.slice(0, 8) : "—");
 // hyphenated slug in the reason ("behavior-watch: ...", "signup-lab world:
 // control..." - note not every one uses a colon), so prefer that human-
 // readable label when it's there and fall back to the short session id
-// otherwise, same as before.
+// otherwise.
 const BENCH_PREFIX = /^([a-z][a-z]*(?:-[a-z]+)+)\b:?/;
 const requesterLabel = (entry) => {
   const m = entry?.reason ? BENCH_PREFIX.exec(entry.reason) : null;
   return m ? m[1] : shortId(entry?.session_id);
 };
+
+const label = { fontSize: 10, letterSpacing: ".16em", textTransform: "uppercase",
+  color: "rgba(255,255,255,.4)" };
+
+// One lease+queue panel - platform, simulator, or both each render one of
+// these against their own {lease, queue} pair.
+function LeasePanel({ title, pair }) {
+  const lease = pair?.lease || null;
+  const queue = pair?.queue || [];
+  const nowEpoch = Date.now() / 1000;
+  const remaining = lease ? lease.expires_at_epoch - nowEpoch : null;
+  const leaseColor = remaining != null && remaining <= 0 ? "#e0736b" : "#d9a441";
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <span style={{ ...label, color: GOLD + ".55)" }}>{title}</span>
+
+      <div style={{ padding: "16px 18px", borderRadius: 6,
+        background: "rgba(255,255,255,.022)", border: "0.5px solid rgba(255,255,255,.09)",
+        borderLeft: `2px solid ${lease ? leaseColor : "rgba(255,255,255,.2)"}` }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+          <span style={{ fontSize: 18, fontFamily: "'Cormorant Garamond',Georgia,serif",
+            color: lease ? leaseColor : "rgba(255,255,255,.5)",
+            textTransform: "uppercase", letterSpacing: ".08em" }}>
+            {lease ? lease.service : "no lease held"}
+          </span>
+          {lease && <span style={{ ...label, fontSize: 9 }}>{inWord(remaining)} remaining</span>}
+        </div>
+
+        {lease ? (
+          <>
+            <div style={{ marginTop: 8, fontSize: 12, color: "rgba(255,255,255,.75)" }}>
+              {lease.reason}
+            </div>
+            <div style={{ marginTop: 8, display: "flex", gap: 14, flexWrap: "wrap",
+              fontSize: 10, color: "rgba(255,255,255,.4)" }}>
+              <span>held by {requesterLabel(lease)}</span>
+              <span>granted {ago(lease.granted_at)}</span>
+              <span>declared need {lease.need_seconds}s</span>
+            </div>
+          </>
+        ) : (
+          <div style={{ marginTop: 8, fontSize: 11, color: "rgba(255,255,255,.45)" }}>
+            Nothing held — the daemon grants the queue head the moment one appears.
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <span style={{ ...label, fontSize: 9 }}>Queue{queue.length ? ` · ${queue.length}` : ""}</span>
+        {queue.length === 0 && (
+          <div style={{ fontSize: 11, color: "rgba(255,255,255,.35)" }}>Empty.</div>
+        )}
+        {queue.map((q, i) => (
+          <div key={`${q.session_id}:${i}`}
+            style={{ padding: "9px 11px", borderRadius: 4,
+              background: "rgba(255,255,255,.02)", border: "0.5px solid rgba(255,255,255,.08)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
+              <span style={{ fontSize: 11, color: "rgba(255,255,255,.75)" }}>
+                #{i + 1} · {requesterLabel(q)}
+              </span>
+              <span style={{ ...label, fontSize: 9 }}>needs {q.need_seconds}s</span>
+            </div>
+            <div style={{ marginTop: 4, fontSize: 10.5, color: "rgba(255,255,255,.5)" }}>{q.reason}</div>
+            <div style={{ marginTop: 4, fontSize: 9, color: "rgba(255,255,255,.35)" }}>
+              queued {ago(q.ts)}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export default function RestartBrokerPage() {
   const navigate = useNavigate();
@@ -86,9 +171,6 @@ export default function RestartBrokerPage() {
     return () => clearInterval(t);
   }, [load]);
 
-  const label = { fontSize: 10, letterSpacing: ".16em", textTransform: "uppercase",
-    color: "rgba(255,255,255,.4)" };
-
   const btn = (color) => ({
     padding: "4px 9px", borderRadius: 3, cursor: "pointer", background: "transparent",
     border: `0.5px solid ${color || "rgba(255,255,255,.16)"}`,
@@ -96,19 +178,16 @@ export default function RestartBrokerPage() {
     color: color || "rgba(255,255,255,.55)",
   });
 
-  const lease = status?.lease || null;
-  const queue = status?.queue || [];
   const nowEpoch = Date.now() / 1000;
-  const remaining = lease ? lease.expires_at_epoch - nowEpoch : null;
-  const leaseColor = remaining != null && remaining <= 0 ? "#e0736b" : "#d9a441";
-
   // The daemon writes its own heartbeat every loop tick (8s) - not the
-  // status push cadence, which only happens on a lease change. A gap over
-  // ~90s (more than 10 missed ticks) means the launchd-managed process
-  // itself has stopped, independent of whether the last pushed status looks
-  // fine.
+  // status push cadence, which only happens on a lease change or every
+  // ~20s. A gap over ~90s (more than 10 missed ticks) means the launchd-
+  // managed process itself has stopped, independent of whether the last
+  // pushed status looks fine.
   const daemonAgeS = status?.daemon_heartbeat_epoch ? nowEpoch - status.daemon_heartbeat_epoch : null;
   const daemonStale = daemonAgeS == null || daemonAgeS > 90;
+
+  const EMPTY_PAIR = { lease: null, queue: [] };
 
   return (
     <div style={{ minHeight: "100vh", background: "#0d0c0a", fontFamily: "'DM Sans',system-ui,sans-serif" }}>
@@ -122,7 +201,7 @@ export default function RestartBrokerPage() {
         <button onClick={() => navigate("/lab/home")} style={btn()}>Close</button>
       </div>
 
-      <div style={{ maxWidth: 720, margin: "0 auto", padding: "24px 24px 80px",
+      <div style={{ maxWidth: 1080, margin: "0 auto", padding: "24px 24px 80px",
         display: "flex", flexDirection: "column", gap: 20 }}>
 
         {error && (
@@ -146,63 +225,15 @@ export default function RestartBrokerPage() {
               </span>
             </div>
 
-            <div style={{ padding: "18px 20px", borderRadius: 6,
-              background: "rgba(255,255,255,.022)", border: "0.5px solid rgba(255,255,255,.09)",
-              borderLeft: `2px solid ${lease ? leaseColor : "rgba(255,255,255,.2)"}` }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-                <span style={{ fontSize: 22, fontFamily: "'Cormorant Garamond',Georgia,serif",
-                  color: lease ? leaseColor : "rgba(255,255,255,.5)",
-                  textTransform: "uppercase", letterSpacing: ".08em" }}>
-                  {lease ? lease.service : "no lease held"}
-                </span>
-                {lease && <span style={{ ...label, fontSize: 9 }}>{inWord(remaining)} remaining</span>}
-              </div>
-
-              {lease ? (
-                <>
-                  <div style={{ marginTop: 10, fontSize: 12.5, color: "rgba(255,255,255,.75)" }}>
-                    {lease.reason}
-                  </div>
-                  <div style={{ marginTop: 8, display: "flex", gap: 16, flexWrap: "wrap",
-                    fontSize: 10.5, color: "rgba(255,255,255,.4)" }}>
-                    <span>held by {requesterLabel(lease)}</span>
-                    <span>granted {ago(lease.granted_at)}</span>
-                    <span>declared need {lease.need_seconds}s</span>
-                  </div>
-                </>
-              ) : (
-                <div style={{ marginTop: 10, fontSize: 11.5, color: "rgba(255,255,255,.45)" }}>
-                  Nothing held right now — the daemon grants the queue head the moment one appears.
-                </div>
-              )}
-            </div>
-
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              <span style={label}>Queue{queue.length ? ` · ${queue.length}` : ""}</span>
-              {queue.length === 0 && (
-                <div style={{ fontSize: 11.5, color: "rgba(255,255,255,.35)" }}>Empty.</div>
-              )}
-              {queue.map((q, i) => (
-                <div key={`${q.session_id}:${i}`}
-                  style={{ padding: "10px 12px", borderRadius: 4,
-                    background: "rgba(255,255,255,.02)", border: "0.5px solid rgba(255,255,255,.08)" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
-                    <span style={{ fontSize: 11.5, color: "rgba(255,255,255,.75)" }}>
-                      #{i + 1} · {q.service} · {requesterLabel(q)}
-                    </span>
-                    <span style={{ ...label, fontSize: 9 }}>needs {q.need_seconds}s</span>
-                  </div>
-                  <div style={{ marginTop: 4, fontSize: 11, color: "rgba(255,255,255,.5)" }}>{q.reason}</div>
-                  <div style={{ marginTop: 4, fontSize: 9.5, color: "rgba(255,255,255,.35)" }}>
-                    queued {ago(q.ts)}
-                  </div>
-                </div>
-              ))}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 20 }}>
+              <LeasePanel title="Platform-api" pair={status.platform || EMPTY_PAIR} />
+              <LeasePanel title="Deliver-worlds (simulator)" pair={status.simulator || EMPTY_PAIR} />
+              <LeasePanel title="Both (combined)" pair={status.both || EMPTY_PAIR} />
             </div>
 
             {(status.recent || []).length > 0 && (
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                <span style={label}>Recent activity</span>
+                <span style={label}>Recent activity (all three)</span>
                 {status.recent.map((line, i) => (
                   <div key={i} style={{ fontSize: 10.5, color: "rgba(255,255,255,.45)",
                     fontFamily: "ui-monospace,monospace", lineHeight: 1.6 }}>
@@ -216,14 +247,17 @@ export default function RestartBrokerPage() {
 
         <div style={{ fontSize: 10.5, lineHeight: 1.8, color: "rgba(255,255,255,.32)",
           borderTop: "0.5px solid rgba(255,255,255,.07)", paddingTop: 14 }}>
-          Every restart of <em>deliver-worlds</em> or <em>platform-api</em> goes through this flag —
-          a hook denies the systemctl call outright unless the caller holds the lease. A session
-          declares how long it needs (min 30s, max 1800s) when it asks; the daemon reclaims the
-          instant that window is up, whether or not the holder finished, and also reclaims early on
-          evidence the holder never actually restarted (the service's own boot timestamp still
-          predates the grant past a grace period) rather than waiting out the full window. This
-          board only reports what the daemon already decided — nothing here can grant, reclaim, or
-          reorder the queue.
+          Every restart of <em>deliver-worlds</em> or <em>platform-api</em> goes through one of
+          three independent leases — a hook denies the systemctl call outright unless the caller
+          holds the relevant one. Platform and simulator can be held at the same time by two
+          different sessions; <em>both</em> exists for a fix that genuinely needs both services
+          bounced together, and is granted only the instant neither individual lease is held
+          (atomic, all-or-nothing — never one-then-the-other, which is how two locks deadlock). A
+          session declares how long it needs (min 30s, max 1800s) when it asks; the daemon
+          reclaims the instant that window is up, whether or not the holder finished, and also
+          reclaims early on evidence the holder never actually restarted rather than waiting out
+          the full window. This board only reports what the daemon already decided — nothing here
+          can grant, reclaim, or reorder any queue.
         </div>
       </div>
     </div>
