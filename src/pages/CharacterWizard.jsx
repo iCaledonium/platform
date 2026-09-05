@@ -1677,6 +1677,11 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
       // to actually be on the server before generate-3d runs, not just
       // sitting as a local File in the Photos field.
       if (!photos.profile) throw new Error("Upload a reference photo first");
+      // Matches the server-side gate in generate3d.js: a likeness is not built
+      // from photographs whose subject nobody has stated. Raised here too so
+      // the wizard says it in words next to the field instead of surfacing a
+      // bare 400 from the pipeline.
+      if (!depicts) throw new Error("Say who is in these photographs before generating — the record has to be able to name whose likeness this is.");
       setCharacter3DStatus("uploading_photo");
       const fd = new FormData();
       fd.append("photo", photos.profile);
@@ -2351,7 +2356,22 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
             </Field>
 
             <Field label="Who is in these photographs?" hint="Recorded exactly as you answer it and never guessed. These photographs become a face and a body, so the record has to be able to say whose likeness that is.">
-              <select style={S.select} value={depicts} onChange={e=>setDepicts(e.target.value)}>
+              <select style={S.select} value={depicts} onChange={e=>{
+                const v = e.target.value;
+                setDepicts(v);
+                // The photographs are normally already on the server by the
+                // time this is answered — handleSlotFile uploads on pick — so
+                // the answer has to be able to reach rows that already exist.
+                // Without this the declaration was only ever carried by the
+                // NEXT upload, and in the common ordering by none at all.
+                if (v && actorId) {
+                  fetch(`/api/actors/${actorId}/media/depicts`, {
+                    method: "PATCH", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ depicts: v }),
+                  }).then(r=>r.json()).then(d=>console.log("[CharacterWizard] depicts declared:", d))
+                    .catch(err=>console.error("[CharacterWizard] depicts declaration FAILED:", err));
+                }
+              }}>
                 <option value="">— Not stated —</option>
                 <option value="self">Me</option>
                 <option value="other">Someone else</option>

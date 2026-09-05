@@ -386,6 +386,24 @@ if (!db.prepare(`PRAGMA table_info(users)`).all().some(c => c.name === "avatar_a
   db.prepare(`ALTER TABLE users ADD COLUMN avatar_actor_id TEXT REFERENCES actors(id)`).run();
 }
 
+// -- who a reference photograph depicts --------------------------------------
+//
+// Every actor_media row already said which actor a photograph belongs to, and
+// actors.owner_id said who uploaded it, but nothing anywhere said whose
+// likeness the photograph actually carries. That made one specific question
+// unanswerable from the data: is this uploader building a body out of
+// photographs of somebody who is not them. It is the reference photos and the
+// body_front/side/back set that make it matter -- those are what the 3D
+// pipeline turns into a face and a shape.
+//
+// Nullable and never inferred. NULL means "the uploader was not asked, or did
+// not say", which is deliberately a different state from a declaration; the
+// API refuses to invent one, because a guessed 'self' would read later as
+// evidence somebody gave that answer. Written values: 'self' or 'other'.
+if (!db.prepare(`PRAGMA table_info(actor_media)`).all().some(c => c.name === "depicts")) {
+  db.prepare(`ALTER TABLE actor_media ADD COLUMN depicts TEXT`).run();
+}
+
 // ── Seed Anima employees if not present ─────────────────────────────────────
 
 const employees = [

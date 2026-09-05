@@ -109,9 +109,14 @@ export function mount(app, { db, authUser, SERVICE_TOKEN, SIMULATOR_URL }) {
     db.transaction(() => {
       db.prepare(`DELETE FROM actor_media WHERE actor_id = ? AND state_slug = 'profile' AND world_id IS NULL`)
         .run(actorId);
-      db.prepare(`INSERT INTO actor_media (id, actor_id, media_type, filename, url, state_slug, inserted_at, updated_at, file_size)
-                  VALUES (?,?,?,?,?,?,?,?,?)`)
-        .run(randomUUID(), actorId, "photo", filename, url, "profile", now, now, bytes);
+      // depicts = "self" is not a guess here, it is what this route does: the
+      // source row is users.photo_url of the AUTHENTICATED CALLER, copied onto
+      // an actor that same caller owns. The declaration is true by
+      // construction, and recording it keeps the lab's own seeded reference
+      // photograph from being the one unanswered row on the system.
+      db.prepare(`INSERT INTO actor_media (id, actor_id, media_type, filename, url, state_slug, inserted_at, updated_at, file_size, depicts)
+                  VALUES (?,?,?,?,?,?,?,?,?,?)`)
+        .run(randomUUID(), actorId, "photo", filename, url, "profile", now, now, bytes, "self");
     })();
 
     res.json({ ok: true, actor_id: actorId, url, bytes, source: rel });

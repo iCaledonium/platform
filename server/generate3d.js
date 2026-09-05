@@ -2211,9 +2211,21 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser }) {
     if (!actor) return res.status(404).json({ error: "not found" });
 
     const photo = db.prepare(
-      `SELECT url FROM actor_media WHERE actor_id = ? AND state_slug = 'profile' AND media_type = 'photo' AND world_id IS NULL`
+      `SELECT url, depicts FROM actor_media WHERE actor_id = ? AND state_slug = 'profile' AND media_type = 'photo' AND world_id IS NULL`
     ).get(actorId);
     if (!photo) return res.status(400).json({ error: "No reference photo uploaded for this character yet." });
+    // An undeclared reference photograph does not get solved into a likeness.
+    // This is the point where the question stops being paperwork: everything
+    // before it is a file on disk, and everything after it is a face and a
+    // body built from a real person. If the record cannot say whose likeness
+    // is being built, the build does not start. Unset is not treated as
+    // "self" — a blank must never read as a declaration nobody made.
+    if (!photo.depicts) {
+      return res.status(400).json({
+        error: "Say who is in the reference photographs before building a likeness from them.",
+        needs: "depicts",
+      });
+    }
     const localPhotoPath = path.join(__dirname, "../public", photo.url);
 
     const { gender, torsoLength, armsLength, legsLength, bodyHeightCm } = req.body;
