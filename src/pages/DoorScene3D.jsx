@@ -494,6 +494,12 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   // scene hostage: past it we show what we have.
   const greetRef = useRef({ decided: false, greeted: false, deadline: 0 });
   if (greetRef.current.deadline === 0) greetRef.current.deadline = Date.now() + 30000;
+  useEffect(() => {
+    const ms = Math.max(50, greetRef.current.deadline - Date.now() + 50);
+    const t = setTimeout(() => checkSceneReady(), ms);   // the deadline is a reason to look again
+    return () => clearTimeout(t);
+    // eslint-disable-next-line
+  }, []);
 
   // ── stepping inside, and talking once you are ───────────────────────────
   const [inside,    setInside]    = useState(false);  // pointer lock held
@@ -513,6 +519,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   const [soundSink, setSoundSink]   = useState(() => { try { return localStorage.getItem("anima.soundSink") || ""; } catch { return ""; } });
   const [soundVol, setSoundVol]     = useState(() => { try { return Number(localStorage.getItem("anima.soundVol") ?? 1); } catch { return 1; } });
   const [soundHealth, setSoundHealth] = useState({ state: "no context yet", live: null });
+  const [audioDead, setAudioDead]     = useState(false);   // the OS output is not rendering
   const soundVolRef = useRef(soundVol);
   const soundSinkRef = useRef(soundSink);
   const [renderScale, setRenderScale] = useState(() => readSetting(SETTING_KEYS.scale, 1));
@@ -1413,8 +1420,11 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // ttsAudioCtx() build a fresh one on the next sentence. The persistent
     // gesture listeners read a._ttsCtx at call time, so they keep working
     // against whatever context is current -- they do NOT need re-arming.
-    try { if (a._ttsCtx && a._ttsCtx.state !== "closed") a._ttsCtx.close(); } catch {}
-    a._ttsCtx = null;
+    // The context OUTLIVES the turn now (see the 2026-09-06 note below the
+    // keep-alive): closing it here made every turn re-pay the ~5s stream
+    // start this Mac's CoreAudio charges, and the turn's first sentence went
+    // into that gap. devicechange and the wedge detector replace it; a turn
+    // boundary does not.
     ttsQueueRef.current = {};
     ttsNextIdx.current  = 0;
     ttsPlaying.current  = false;
@@ -1625,6 +1635,40 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     return () => md.removeEventListener("devicechange", onFlip);
   }, []);
 
+  // Start nothing on a clock that is not moving.
+  //
+  // Measured 2026-09-06 in the developer's shell, output device healthy: her
+  // wavs arrived and decoded, start() ran on a context reporting "running",
+  // and two of three sentences ended with the clock advanced 0.01s — played
+  // into a stream that had not opened yet. This Mac's CoreAudio takes ~5s to
+  // open an output stream (`say -a` to any device: 5-6s for one word);
+  // Chromium suspends a context whose stream has not started within about a
+  // second, and a source started on it "ends" silently. Every design before
+  // this one started the source first and judged afterwards — by which time
+  // the sentence was already gone.
+  //
+  // The keep-alive oscillator means a live context's clock advances
+  // continuously, so "is the stream open" is one cheap question: did
+  // currentTime move since a moment ago. Ask it before start(), resume a
+  // context Chromium parked while the stream was opening, and only give up
+  // after a wait that comfortably covers the slow open. With the context now
+  // outliving the turn, this wait is paid once per session, not per sentence.
+  function whenClockLive(ctx, onLive, onDead, maxMs = 8000) {
+    let last = ctx.currentTime, waited = 0;
+    const tick = () => {
+      if (ctx.state === "closed") return onDead("closed");
+      if (ctx.state !== "running") ctx.resume().catch(() => {});
+      const now = ctx.currentTime;
+      if (now - last >= 0.08) return onLive();         // it moved — the stream is open
+      last = now; waited += 250;
+      if (waited >= maxMs) return onDead("frozen");
+      setTimeout(tick, 250);
+    };
+    // First reading is free: a clock that already moved since the last
+    // sentence needs no wait at all.
+    setTimeout(tick, 120);
+  }
+
   function playNextTts() {
     if (ttsPlaying.current) return;
     // Walk past indices the server has told us are never coming.
@@ -1685,6 +1729,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       return;
     }
 
+    whenClockLive(ctx, () => {
     const src = ctx.createBufferSource();
     src.buffer = buf;
     const vol = ctx.createGain();
@@ -1712,9 +1757,16 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       const startedCt = ctx.currentTime;
       const a2 = api.current || {};
       a2._ctxRetries = a2._ctxRetries || 0;
-      setTimeout(() => {
+      // 2026-09-06: give the stream time to OPEN. Measured 700ms was well
+      // inside CoreAudio's ~5s start on this Mac, so a healthy context was
+      // declared wedged and rebuilt into another frozen one, five times.
+      let waited = 0;
+      const judge = () => {
         const cur = api.current || {};
         if (cur._ttsSrc !== src) return;                 // sentence already moved on
+        if (ctx.state === "running" && ctx.currentTime - startedCt < 0.05 && waited < 6000) {
+          waited += 500; setTimeout(judge, 500); return;  // still opening — keep waiting
+        }
         if (ctx.state === "running" && ctx.currentTime - startedCt < 0.05) {
           // WHY THIS RETRIES PATIENTLY, and what actually breaks the audio:
           //
@@ -1750,12 +1802,25 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         } else {
           cur._ctxRetries = 0;                           // healthy again
         }
-      }, 700);
+      };
+      setTimeout(judge, 700);
     } catch (e) {
       console.warn("[door] tts source start failed on sentence", idx, e && e.name);
       advanceTts(null);
       playNextTts();
     }
+    }, (why) => {
+      // The clock never moved: this context is not going to render. Bin it
+      // and let the next attempt build a fresh one; the buffer is still in
+      // the queue, so nothing is lost but time. Bounded by the same retry
+      // budget as the wedge detector.
+      const cur = api.current || {};
+      cur._ctxRetries = (cur._ctxRetries || 0) + 1;
+      console.warn("[door] audio clock", why, "before sentence", idx, "— rebuilding context, attempt", cur._ctxRetries);
+      cur._ctxWedged = true;
+      ttsPlaying.current = false;
+      if (cur._ctxRetries <= 5) setTimeout(() => playNextTts(), 900);
+    });
   }
 
   useEffect(() => {
@@ -2502,10 +2567,43 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     if (messages.some(m => m.from !== "me" && m.from !== "sys")) markGreeted();
   }, [messages]);
 
+  // The only honest witness of the audio stack is the clock. The keep-alive
+  // oscillator means her context is never idle, so a context that reports
+  // "running" while its currentTime does not move for three consecutive
+  // seconds is a render thread that is not rendering. Measured 2026-09-06 on
+  // the developer's Mac, with the app doing everything right: her wav arrived,
+  // decoded, start() ran on a "running" context, and currentTime stayed at
+  // 0.005 through six replays -- while Apple's own afplay failed
+  // AudioQueueStart ('what') and `say` took 5-6s per word. The output device
+  // was dead UNDER the app, and the app answered with silence and retries.
+  // JavaScript cannot fix that. It can say so, and point at the Sound tab.
+  //
+  // "suspended" is deliberately NOT counted: that is Chromium parking the
+  // context on focus loss, and the gesture listeners bring it back.
+  useEffect(() => {
+    let last = null, stalls = 0;
+    const t = setInterval(() => {
+      const c = (api.current || {})._ttsCtx;
+      const focused = document.visibilityState === "visible" && document.hasFocus();
+      if (!c || c.state === "closed" || !focused) { last = null; stalls = 0; setAudioDead(false); return; }
+      const ct = c.currentTime;
+      const moved = last != null && ct - last >= 0.3;
+      if (last != null) stalls = moved ? 0 : stalls + 1;
+      last = ct;
+      setAudioDead(stalls >= 3);
+      if (moved && (api.current || {})._ctxRetries > 0) {
+        api.current._ctxRetries = 0;   // the device is back; forgive the past
+        if (!ttsPlaying.current) playNextTts();   // and play what was held
+      }
+    }, 1000);
+    return () => clearInterval(t);
+  }, []);
+
   function declareEncounterGone() {
     if (goneShownRef.current) return;
     goneShownRef.current = true;
     setEncounterGone(true);
+    setSceneVisible(true);   // nothing more is coming; show what there is
     setResponding(false);
     setSending(false);
     setMessages(prev => [...prev, { from: "sys", at: Date.now(),
@@ -3938,6 +4036,20 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
                           borderTopColor: "rgba(201,151,58,.85)",
                           animation: "doorSceneSpin 0.9s linear infinite" }} />
             <style>{"@keyframes doorSceneSpin { to { transform: rotate(360deg); } }"}</style>
+          </div>
+        )}
+        {audioDead && (
+          <div style={{ position: "absolute", top: 14, left: "50%", transform: "translateX(-50%)",
+                        zIndex: 40, maxWidth: 420, padding: "10px 14px", borderRadius: 6,
+                        background: "rgba(40,12,10,.9)", border: "0.5px solid rgba(226,120,110,.5)",
+                        fontSize: 11, lineHeight: 1.55, color: "rgba(255,255,255,.85)",
+                        pointerEvents: "none" }}>
+            <div style={{ fontSize: 9.5, letterSpacing: ".14em", textTransform: "uppercase",
+                          color: "rgba(226,120,110,.95)", marginBottom: 4 }}>
+              Her voice is not reaching the speakers
+            </div>
+            This Mac's audio output is not rendering, so her lines are playing into a stopped
+            device. Open <b>Sound</b> and pick another output, or unplug and replug the headphone jack.
           </div>
         )}
         {/* Session 153 — her vitals, top left, as the old presence view had
