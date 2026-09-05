@@ -21,6 +21,7 @@ import { mount as mountWizardLabRoutes } from "./wizardlab-routes.js";
 import { mount as mountShareLinkRoutes } from "./sharelinks-routes.js";
 import { mount as mountShareLabRoutes } from "./sharelab-routes.js";
 import { mount as mountDeployLabRoutes } from "./deploylab-routes.js";
+import { mount as mountRoutineLabRoutes } from "./routinelab-routes.js";
 
 // Session 102 — drafts carry their wizard adjustment state (all morph
 // slider values, the named body sliders, pose values, reference URLs,
@@ -3175,6 +3176,33 @@ app.post("/api/actors/:id/media", upload.fields([{name:"photo",maxCount:1},{name
   res.json({ id, url, state_slug, media_type, filename, depicts });
 });
 
+// ── PATCH /api/actors/:id/media/depicts ─ declare whose likeness these are ──
+// Session 168 gave the wizard the ability to ASK who is in the reference
+// photographs but only the ability to answer it ON an upload. handleSlotFile
+// POSTs a photograph the instant the file is picked, and the question is
+// normally answered afterwards, so in the ordinary ordering the answer landed
+// nowhere at all — which is why actor_media.depicts was NULL on every row on
+// the system despite both the column and the select existing. The declaration
+// is about the person in the photographs, not about one file, so it applies to
+// the actor's whole non-world reference set.
+app.patch("/api/actors/:id/media/depicts", (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
+  if (!actor) return res.status(404).json({ error: "not found" });
+  // Same whitelist as the upload path and for the same reason: only a value
+  // somebody actually stated may be stored. Nothing here can write NULL —
+  // clearing a declaration is deliberately not offered, because a silent clear
+  // would read later as "never asked" rather than as "withdrawn".
+  const depicts = ["self", "other"].includes(req.body?.depicts) ? req.body.depicts : null;
+  if (!depicts) return res.status(400).json({ error: "depicts must be 'self' or 'other'" });
+  const now = new Date().toISOString();
+  const r = db.prepare(`UPDATE actor_media SET depicts = ?, updated_at = ? WHERE actor_id = ? AND media_type = 'photo' AND world_id IS NULL`)
+    .run(depicts, now, req.params.id);
+  console.log(`[media depicts] actor: ${req.params.id} user: ${user.id} -> ${depicts} (${r.changes} row(s))`);
+  res.json({ ok: true, depicts, updated: r.changes });
+});
+
 // ── PATCH /api/actors/:id/media/:mediaId/rename ──────────────────────────────
 app.patch("/api/actors/:id/media/:mediaId/rename", (req, res) => {
   const user = authUser(req);
@@ -5876,11 +5904,47 @@ app.post("/api/actors/:id/draft-state", (req, res) => {
 // normal fetch()/DELETE inside a beforeunload handler is not guaranteed to
 // complete. Only ever deletes if status is still "draft" — never touches
 // a finished, active character just because its tab happened to close.
+// -- recordActorDeletion -- append-only attribution for an actor delete -------
+// conduct-watch signal 7 filed this: a delete removed an actor, its
+// actor_media rows and its media folder, and left nothing that named the
+// character, its owner, or the account that issued the delete. Every path that
+// removes an `actors` row must call this, and must call it INSIDE the same
+// transaction as the DELETE -- an audit row that can be missing for a
+// committed delete is not an audit.
+//
+// Never updated, never deleted. The table (server/db.js) has no foreign keys
+// on purpose, so the record survives the actor and both accounts.
+function recordActorDeletion({ actor, user, via, mediaCount }) {
+  // authUser() does not carry email, so resolve it here: an account id alone
+  // stops being readable the moment the account is renamed or removed, and the
+  // whole point of this row is that it is still legible long afterwards.
+  const actingEmail = user?.id
+    ? (db.prepare(`SELECT email FROM users WHERE id = ?`).get(user.id)?.email ?? null)
+    : null;
+  db.prepare(`INSERT INTO actor_deletions
+      (id, actor_id, actor_name, owner_id, acting_user_id, acting_email, via,
+       actor_status, media_folder, media_count, deleted_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    randomUUID(),
+    actor.id,
+    actor.name ?? null,
+    actor.owner_id ?? null,
+    user?.id ?? null,
+    actingEmail,
+    via,
+    actor.status ?? null,
+    actor.media_folder ?? null,
+    mediaCount ?? null,
+    new Date().toISOString(),
+  );
+  console.log(`[actor-delete] ${actor.id} (${actor.name ?? "?"}) owner=${actor.owner_id ?? "?"} by=${user?.id ?? "?"} via=${via}`);
+}
+
 app.post("/api/actors/:id/abandon-draft", (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).end();
 
-  const actor = db.prepare(`SELECT id, media_folder FROM actors WHERE id = ? AND owner_id = ? AND status = 'draft'`).get(req.params.id, user.id);
+  const actor = db.prepare(`SELECT id, name, owner_id, status, media_folder FROM actors WHERE id = ? AND owner_id = ? AND status = 'draft'`).get(req.params.id, user.id);
   if (!actor) return res.status(204).end(); // not a draft (already finished, or gone) — nothing to do
 
   // Read the urls before the transaction (it deletes the rows); unlink after it.
@@ -5913,7 +5977,9 @@ app.post("/api/actors/:id/abandon-draft", (req, res) => {
     // row whose files were already destroyed, still being worn. Clearing the
     // pointer here puts it inside the same transaction: all of it, or none.
     db.prepare(`UPDATE users SET avatar_actor_id = NULL, updated_at = datetime('now') WHERE avatar_actor_id = ?`).run(req.params.id);
-    db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
+    const deleted = db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
+    // Attribution, in the same transaction as the delete (conduct-watch signal 7).
+    if (deleted.changes > 0) recordActorDeletion({ actor, user, via: "POST /api/actors/:id/abandon-draft", mediaCount: mediaFiles.length });
   })();
   // Disk only AFTER the commit. A transaction that raises must not leave a live
   // row pointing at media that no longer exists.
@@ -5929,7 +5995,7 @@ app.delete("/api/actors/:id", (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
 
-  const actor = db.prepare(`SELECT id, media_folder FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
+  const actor = db.prepare(`SELECT id, name, owner_id, status, media_folder FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
   if (!actor) return res.status(404).json({ error: "not found" });
 
   const deployment = db.prepare(`SELECT id FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL`).get(req.params.id);
@@ -5970,7 +6036,9 @@ app.delete("/api/actors/:id", (req, res) => {
     // row whose files were already destroyed, still being worn. Clearing the
     // pointer here puts it inside the same transaction: all of it, or none.
     db.prepare(`UPDATE users SET avatar_actor_id = NULL, updated_at = datetime('now') WHERE avatar_actor_id = ?`).run(req.params.id);
-    db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
+    const deleted = db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
+    // Attribution, in the same transaction as the delete (conduct-watch signal 7).
+    if (deleted.changes > 0) recordActorDeletion({ actor, user, via: "DELETE /api/actors/:id", mediaCount: mediaFiles.length });
   })();
   // Disk only AFTER the commit. A transaction that raises must not leave a live
   // row pointing at media that no longer exists.
@@ -6151,9 +6219,14 @@ app.put("/api/actors/:id", (req, res) => {
 
   // Upsert canonical profile photo into actor_media if provided
   if (photoUrl) {
-    const existing = db.prepare("SELECT id FROM actor_media WHERE actor_id = ? AND state_slug = 'profile' AND media_type = 'photo' AND world_id IS NULL").get(id);
+    const existing = db.prepare("SELECT id, url FROM actor_media WHERE actor_id = ? AND state_slug = 'profile' AND media_type = 'photo' AND world_id IS NULL").get(id);
     if (existing) {
-      db.prepare("UPDATE actor_media SET url = ?, updated_at = ? WHERE id = ?").run(photoUrl, now, existing.id);
+      // A different photograph is a different question. Carrying the previous
+      // `depicts` across a swapped url would let a statement made about one
+      // photograph stand as a statement about another — the one thing this
+      // column must never do — so a swap drops it back to "not declared".
+      const swapped = existing.url !== photoUrl;
+      db.prepare(`UPDATE actor_media SET url = ?, updated_at = ?${swapped ? ", depicts = NULL" : ""} WHERE id = ?`).run(photoUrl, now, existing.id);
     } else {
       db.prepare("INSERT INTO actor_media (id, actor_id, media_type, state_slug, url, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?)")
         .run(randomUUID(), id, "photo", "profile", photoUrl, now, now);
@@ -6635,6 +6708,7 @@ mountSignInLabRoutes(app, { db, authUser, PORT });
 mountWizardLabRoutes(app, { db, authUser, PORT });
 mountShareLabRoutes(app, { db, authUser, PORT });
 mountDeployLabRoutes(app, { db, authUser, PORT });
+mountRoutineLabRoutes(app, { authUser });
 
 // Session 158 - cross-org character sharing by link. Its own file for the same
 // reason the lab routes are: a whole-file write to this 340KB index.js cannot

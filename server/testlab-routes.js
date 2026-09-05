@@ -5,6 +5,7 @@
 // ESM only in here — server/package.json is "type": "module" and a require()
 // at module scope is a runtime ReferenceError that node --check will pass.
 import * as labIncidents from "./lab-incidents.js";
+import { routineChecks } from "./routinelab-routes.js";
 import { signupChecks } from "./signuplab-routes.js";
 import { wizardChecks } from "./wizardlab-routes.js";
 import { avatarChecks } from "./avatarlab-routes.js";
@@ -144,6 +145,14 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
   labIncidents.startScheduler({
     SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks,
     shareChecks, deployChecks, signinChecks, authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
+    // The routine benches measure liveness, computed in-process — no HTTP hop
+    // to ourselves, same shape as the other platform-local boards. Supplied at
+    // EVERY deps site: the scheduler, the manual sweep and RUN_DEPS each build
+    // their own object, and a bench missing from one of them fails only on that
+    // path, which is the kind of gap boardCoverage exists to stop.
+    faultTriageChecks: () => routineChecks("fault-triage"),
+    conductWatchChecks: () => routineChecks("conduct-watch"),
+    behaviorWatchChecks: () => routineChecks("behavior-watch"),
   });
 
   app.get("/api/test/benches", (req, res) => {
@@ -166,6 +175,32 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
       res.json({ ok: true, status: resolutionManager.getStatus() });
     } catch (e) {
       res.status(500).json({ error: "status read failed", detail: String(e.message || e).slice(0, 200) });
+    }
+  });
+
+  // Pause/resume — the only write this page itself performs. `paused` is
+  // just another field on the same status row the daemon owns; the daemon
+  // polls it every loop tick and is the one that actually stops, aborting
+  // whatever it has in flight rather than letting it finish (2026-09-04,
+  // Magnus: "if paused the current activities shall go back to unresolved").
+  // This route only sets the flag - it does not and cannot abort anything
+  // itself, since the daemon runs on a different machine.
+  app.post("/api/test/resolution-manager/pause", (req, res) => {
+    const user = authUser(req);
+    if (!user) return res.status(401).json({ error: "not authenticated" });
+    try {
+      res.json({ ok: true, status: resolutionManager.setStatus({ paused: true, paused_by: user.name || user.id }) });
+    } catch (e) {
+      res.status(500).json({ error: "pause failed", detail: String(e.message || e).slice(0, 200) });
+    }
+  });
+
+  app.post("/api/test/resolution-manager/resume", (req, res) => {
+    if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
+    try {
+      res.json({ ok: true, status: resolutionManager.setStatus({ paused: false, paused_by: null }) });
+    } catch (e) {
+      res.status(500).json({ error: "resume failed", detail: String(e.message || e).slice(0, 200) });
     }
   });
 
@@ -270,6 +305,14 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
       source, SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks,
       shareChecks, deployChecks, signinChecks,
       authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
+      // The routine benches measure liveness, computed in-process — no HTTP hop
+      // to ourselves, same shape as the other platform-local boards. Supplied at
+      // EVERY deps site: the scheduler, the manual sweep and RUN_DEPS each build
+      // their own object, and a bench missing from one of them fails only on that
+      // path, which is the kind of gap boardCoverage exists to stop.
+      faultTriageChecks: () => routineChecks("fault-triage"),
+      conductWatchChecks: () => routineChecks("conduct-watch"),
+      behaviorWatchChecks: () => routineChecks("behavior-watch"),
     });
     try {
       const out = await sweepInFlight;
@@ -369,6 +412,14 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
   const RUN_DEPS = () => ({
     SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks,
     shareChecks, deployChecks, signinChecks, authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
+    // The routine benches measure liveness, computed in-process — no HTTP hop
+    // to ourselves, same shape as the other platform-local boards. Supplied at
+    // EVERY deps site: the scheduler, the manual sweep and RUN_DEPS each build
+    // their own object, and a bench missing from one of them fails only on that
+    // path, which is the kind of gap boardCoverage exists to stop.
+    faultTriageChecks: () => routineChecks("fault-triage"),
+    conductWatchChecks: () => routineChecks("conduct-watch"),
+    behaviorWatchChecks: () => routineChecks("behavior-watch"),
   });
 
   // ── Categories ───────────────────────────────────────────────────────────

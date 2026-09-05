@@ -108,6 +108,32 @@ const uid = () => crypto.randomBytes(9).toString("hex");
 // so it runs once per configured target. `signup` is platform-local and global,
 // so it runs exactly once per sweep with no target.
 export const BENCHES = {
+  // The three Mac-side routines. They filed 30 of the board's 48 incidents
+  // while not being benches at all -- no label, no page to hand a fault to, no
+  // coverage entry, and no check, so runSweep could never re-run them and
+  // their rows could neither auto-resolve nor auto-reopen. Their checks are
+  // liveness (routinelab-routes.js): whether the routine ran recently enough,
+  // and whether it reports EVERY run rather than only the eventful ones. What
+  // a routine found is its own output and belongs in the rows it files.
+  "fault-triage": {
+    label: "Routine · Fault triage",
+    page: "/lab/home/incidents?bench=fault-triage",
+    watcher: "Routine - Fault triage",
+    side: "platform", scoped: false, needsActor: false, local: "faultTriageChecks",
+  },
+  "conduct-watch": {
+    label: "Routine · Conduct watch",
+    page: "/lab/home/incidents?bench=conduct-watch",
+    watcher: "Routine - Conduct watch",
+    side: "platform", scoped: false, needsActor: false, local: "conductWatchChecks",
+  },
+  "behavior-watch": {
+    label: "Routine · Behaviour watch",
+    page: "/lab/home/incidents?bench=behavior-watch",
+    watcher: "Routine - Behaviour watch",
+    side: "platform", scoped: false, needsActor: false, local: "behaviorWatchChecks",
+  },
+
   encounter: {
     label: "Actor · Apartment · Encounter",
     page: "/lab/actor/apartment/encounter",
@@ -648,6 +674,12 @@ let schedulerBusy = false;
 export function startScheduler(deps = {}, everyMs = 60_000) {
   if (schedulerTimer) return schedulerTimer;
   schedulerTimer = setInterval(async () => {
+    // Silence is a finding. A routine that stopped firing writes nothing, so
+    // something that is still up has to go looking for the gap. Kept ahead of the
+    // suite work and inside its own try, so a bug in liveness can never stop a
+    // scheduled suite from running.
+    try { maybeCheckRoutineLiveness(); }
+    catch (e) { console.log(`[lab] routine liveness check failed: ${e.message}`); }
     if (schedulerBusy) return;
     let due = [];
     try { due = cases.dueSuites(); } catch { return; }
@@ -678,4 +710,197 @@ export function schedulerStatus() {
                      value: s.schedule_value, last_run_at: s.last_run_at,
                      next_run_at: s.next_run_at })),
   };
+}
+
+// ── Routine liveness ─────────────────────────────────────────────────────────
+//
+// Filed 2026-09-03: the behaviour watch missed eight consecutive firings across
+// 24h56m and NOTHING noticed, because a routine that never runs writes nothing
+// and an empty log is indistinguishable from a clean one. The ten-hour world
+// outage that day was found by a person opening the Test Lab, not by the watch
+// whose whole job is to find it. Absence of evidence was being filed as absence
+// of problems.
+//
+// A routine cannot report its own silence: the run that would have said "I did
+// not run" is the run that did not happen. So the detector has to live somewhere
+// that stays up when the Mac's scheduler does not, and this process is the only
+// such place that already owns the board a person actually reads.
+//
+// Liveness is the NEWER of two signals:
+//   - a ping, written by lab-incidents-cli.mjs when a routine runs one of its
+//     OWN work commands (report/sweep — see PROOF_OF_LIFE_CMDS there; `status`
+//     deliberately does not count, because that is what somebody tidying up
+//     after a dead routine runs). As of 2026-09-05 none of the three routine
+//     SKILL.md files calls `ping` and lab_routine_pings holds 0 rows, so in
+//     practice this signal is not yet wired up and a clean run that files
+//     nothing leaves no trace at all here, and
+//   - the newest last_seen_at of anything that source ever filed. last_seen_at
+//     is written only by report(), never by setStatus, so it is real evidence of
+//     a run and it gives this detector history from before its first ping.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS lab_routine_pings (
+    source       TEXT PRIMARY KEY,
+    last_ping_at TEXT NOT NULL,
+    last_cmd     TEXT,
+    pings        INTEGER NOT NULL DEFAULT 1
+  );
+`);
+
+// Grace is deliberately several missed firings, not one: a routine that starts
+// late, or takes an hour, must not open a red row. Three misses for the
+// behaviour watch is nine hours of nobody watching, which is worth waking to.
+export const ROUTINES = {
+  "behavior-watch": { label: "Routine · Behaviour watch", everyHours: 3, graceHours: 9 },
+  "conduct-watch":  { label: "Routine · Conduct watch",   everyHours: 1, graceHours: 4 },
+  "fault-triage":   { label: "Routine · Fault triage",    everyHours: 1, graceHours: 4 },
+};
+
+export const LIVENESS_CHECK = "the routine stopped running and nothing noticed";
+
+// ONLY the `routine:<name>` provenance form counts as proof of life. The bare
+// bench name (`--source behavior-watch`) is also what the resolution manager
+// passes when it closes a row that routine filed, and treating that as a run
+// would let a dead routine look alive because somebody else tidied up after
+// it — precisely the false negative this detector exists to prevent. An
+// explicit `ping` normalises to the prefixed form before calling in.
+export function routineKey(source) {
+  const s = String(source || "").trim();
+  if (!s.startsWith("routine:")) return null;
+  const k = s.slice("routine:".length);
+  return Object.prototype.hasOwnProperty.call(ROUTINES, k) ? k : null;
+}
+
+export function recordRoutinePing(source, cmd) {
+  const key = routineKey(source);
+  if (!key) return null;
+  const t = now();
+  db.prepare(`
+    INSERT INTO lab_routine_pings (source, last_ping_at, last_cmd, pings)
+    VALUES (?,?,?,1)
+    ON CONFLICT(source) DO UPDATE SET
+      last_ping_at = excluded.last_ping_at, last_cmd = excluded.last_cmd, pings = pings + 1
+  `).run(key, t, cmd ? String(cmd).slice(0, 80) : null);
+  return { source: key, at: t };
+}
+
+export function routineLiveness() {
+  return Object.entries(ROUTINES).map(([key, r]) => {
+    const ping = db.prepare(`SELECT last_ping_at, pings FROM lab_routine_pings WHERE source = ?`).get(key);
+    const filed = db.prepare(`SELECT MAX(last_seen_at) AS t FROM lab_incidents WHERE source IN (?, ?)`)
+      .get(key, `routine:${key}`);
+    const stamps = [ping?.last_ping_at, filed?.t].filter(Boolean).sort();
+    const last = stamps.length ? stamps[stamps.length - 1] : null;
+    const ageMs = last ? Date.now() - Date.parse(last) : null;
+    return {
+      source: key, label: r.label, every_hours: r.everyHours, grace_hours: r.graceHours,
+      last_heard_at: last, pings: ping?.pings || 0,
+      age_hours: ageMs == null ? null : Number((ageMs / 3600000).toFixed(2)),
+      // Never heard from AT ALL is not the same finding as stopped: it is a
+      // routine this store has no history for, and a detector that opens a red
+      // row about something it has never seen is one nobody reads.
+      stale: ageMs != null && ageMs > r.graceHours * 3600000,
+    };
+  });
+}
+
+export function checkRoutineLiveness() {
+  const acted = [];
+  for (const r of routineLiveness()) {
+    const fp = fingerprintOf({ bench: r.source, check_name: LIVENESS_CHECK });
+    const row = db.prepare(`SELECT * FROM lab_incidents WHERE fingerprint = ?`).get(fp);
+
+    // A liveness row set `wontfix`/`known` says "this routine is switched off on
+    // purpose, so its silence is not a fault" — a statement about a routine that
+    // was not running at the time, NOT a standing decision to stop watching it.
+    // The premise expires the moment the routine speaks again. Until 2026-09-05
+    // it never did: report()'s sticky branch returns `suppressed` and leaves the
+    // status alone, and the recovery arm below only looked at open/acknowledged,
+    // so ONE wontfix on this fingerprint permanently blinded the detector for
+    // that routine — it could never go red again and could never auto-close
+    // either. The detector promises the opposite in its own detail text ("This
+    // row closes itself as soon as the routine speaks again").
+    //
+    // Deliberately narrow. Sticky stays sticky everywhere else — the encounter
+    // board's by-design reds, and anima-watch's `ignored`. This un-sticks ONLY
+    // the liveness fingerprint, and ONLY when the routine has been heard from
+    // AFTER the decision was recorded. `updated_at` is the "as of" for the
+    // decision: report() bumps it only while the row is stale (i.e. always
+    // strictly after last_heard_at at that moment), so it can only fall before
+    // last_heard_at once the routine has genuinely spoken since.
+    const stickyExpired = !!(row && (row.status === "wontfix" || row.status === "known") &&
+      r.last_heard_at && String(row.updated_at) < String(r.last_heard_at));
+    // Carried ONLY on the un-stick, so a person's won't-fix reasoning is not
+    // silently overwritten by the detector. Not carried on ordinary auto-close,
+    // which would grow the note without bound over repeated stop/start cycles.
+    const carried = stickyExpired && row.note
+      ? `\n\n--- carried over from the ${row.status} note set at ${row.updated_at} ---\n${row.note}`
+      : "";
+
+    if (r.stale) {
+      const missed = Math.max(1, Math.floor(r.age_hours / r.every_hours));
+      if (stickyExpired) {
+        setStatus(row.id, "open", "routine-liveness",
+          `Re-armed automatically: this row was set ${row.status} at ${row.updated_at}, but ` +
+          `${r.label} has been heard from since (${r.last_heard_at}) and has now gone silent ` +
+          `again. A "it is switched off" decision does not outlive the routine being switched ` +
+          `back on.` + carried);
+        acted.push({ source: r.source, action: `re-armed (was ${row.status})` });
+      }
+      // Only claim the evidence we actually have. With pings > 0 the age below
+      // really is the newer of two independent signals. With pings = 0 the ONLY
+      // input is last_seen_at, which report() moves and a clean run never
+      // touches — so the age measures "nothing has been FILED for this long",
+      // not a missed heartbeat, and a clean run is indistinguishable from a dead
+      // one. Saying otherwise tells a reader a clean run would have been visible
+      // when it would not.
+      //
+      // Deliberately NOT gating the row on pings > 0: with last_seen_at alone
+      // this detector still produces true positives (2026-09-05: fault-triage
+      // genuinely silent ~30h), and suppressing the row would delete a correct
+      // alarm and recreate the outage nobody noticed. Only the wording was wrong.
+      const evidence = r.pings > 0
+        ? `Liveness is the newer of its last ping to this board and the last thing it filed; both are ` +
+          `that old, so this is silence, not a clean run.`
+        : `This routine has never pinged this board (0 pings recorded), so this row is inferred purely ` +
+          `from the last thing it FILED. A clean run that files nothing writes nothing here, so read the ` +
+          `age as "nothing filed for that long" — a clean run and a dead one are currently ` +
+          `indistinguishable to this detector.`;
+      report({
+        bench: r.source, bench_label: r.label, check_name: LIVENESS_CHECK,
+        severity: "error", source: "routine-liveness", scope_label: "global",
+        detail: `${r.label} is scheduled every ${r.every_hours}h and has not been heard from since ` +
+          `${r.last_heard_at} — ${r.age_hours}h ago, roughly ${missed} missed firings. ${evidence} ` +
+          `Look for a previous run of this routine still stalled mid-flight ` +
+          `and blocking its own next firing. This row closes itself as soon as the routine speaks again.`,
+      });
+      acted.push({ source: r.source, action: "reported", age_hours: r.age_hours });
+    } else if (row && (row.status === "open" || row.status === "acknowledged" || stickyExpired)) {
+      setStatus(row.id, "resolved", "routine-liveness",
+        `Running again: heard from at ${r.last_heard_at}, ${r.age_hours}h ago, inside its ` +
+        `${r.grace_hours}h grace. Closed automatically by the liveness detector.` +
+        (stickyExpired
+          ? ` This row had been set ${row.status} at ${row.updated_at} while the routine was off; ` +
+            `the routine has spoken since, so that decision has expired rather than muting this ` +
+            `routine's alarm for good.`
+          : "") + carried);
+      acted.push({ source: r.source, action: stickyExpired ? `resolved (was ${row.status})` : "resolved" });
+    }
+  }
+  return acted;
+}
+
+// Ridden on the scheduler's existing one-minute timer rather than a second
+// interval, but evaluated at most every ten minutes: the question "has anything
+// been silent for hours" does not get a better answer by being asked sixty
+// times an hour.
+let lastLivenessAt = 0;
+export function maybeCheckRoutineLiveness(everyMs = 600000) {
+  if (Date.now() - lastLivenessAt < everyMs) return [];
+  lastLivenessAt = Date.now();
+  const acted = checkRoutineLiveness();
+  for (const a of acted) {
+    console.log(`[lab] routine liveness: ${a.source} ${a.action}` +
+      (a.age_hours == null ? "" : ` (${a.age_hours}h silent)`));
+  }
+  return acted;
 }
