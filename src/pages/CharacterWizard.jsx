@@ -15,6 +15,7 @@ import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import { NATIONALITIES, flagEmoji } from "./nationalities.js"; // Session 149 — moved out of this file so ActorsEditorPage.jsx can share it; see nationalities.js for Session 148 rationale.
 import { attachKtx2 } from "../lib/gltfKtx2.js";
 import { APP_SELECTS, FEMALE_FRAME, MALE_FRAME, emptyAppearanceFields, composeAppearance } from "../lib/appearance.js";
+import { labReturnPath } from "../labReturn.js";
 
 // Session 106 — self-generating home thumbnails. A static .jpg beside
 // the GLB (/media/homes/<name>.jpg) wins when present; otherwise the
@@ -235,6 +236,109 @@ export default function CharacterWizard({ user, worlds, mode = "character" }) {
   // to the character gallery on the way out would strand you somewhere you
   // never asked to be.
   const exitTo = isAvatar ? "/home" : "/actors";
+
+  // We already know who you are — asking you to type your own name and gender
+  // into a form is asking a question we have the answer to. These three come
+  // from the account and stay read-only here: gender in particular has its own
+  // sync path (PUT /api/users/:id/gender pushes it to every world), so a second
+  // place to set it would only create drift.
+  //
+  // The gender vocabularies differ: this wizard says "neutral", users.gender
+  // says "non-binary". Mapping both ways rather than assuming they match.
+  const GENDER_FROM_ACCOUNT = { male: "male", female: "female", "non-binary": "neutral" };
+  // Session 162 - and the way back. Gender used to be READ-ONLY in avatar mode,
+  // on the reasoning that it has its own sync path and a second place to set it
+  // would only create drift. Correct about drift, wrong about the consequence:
+  // the value is set by whoever INVITED you (POST /api/admin/users), you are
+  // never asked for it at enrolment, and the one screen where you are building
+  // your own body was the one screen that refused to let you correct it.
+  //
+  // No second source of truth is introduced here. The wizard writes through
+  // PATCH /api/me - the same endpoint ProfilePage uses - which validates
+  // against [null, male, female, non-binary] and then runs syncGenderToWorlds,
+  // so the value still reaches every world by exactly one route.
+  //
+  // NOT the staff endpoint (PUT /api/users/:id/gender): that one is staff-only
+  // and would 403 for a personal account editing its own body.
+  const GENDER_TO_ACCOUNT = { male: "male", female: "female", neutral: "non-binary" };
+  async function saveGenderToAccount(wizardGender) {
+    const g = GENDER_TO_ACCOUNT[wizardGender] ?? null;
+    try {
+      const r = await fetch("/api/me", {
+        method: "PATCH", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ gender: g }),
+      });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `HTTP ${r.status}`);
+    } catch (e) {
+      // Visible, not swallowed: this value rides out to the player actor in
+      // every world, so a silent failure here is drift by another name.
+      console.error("[CharacterWizard] could not save gender to your account:", e);
+      setError(`Gender set for this body, but not saved to your account: ${e.message}`);
+    }
+  }
+  async function claimAsAvatarProfile(id) {
+    try {
+      const r = await fetch("/api/me/avatar", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ actor_id: id }),
+      });
+      if (!r.ok) console.error("[CharacterWizard] could not claim draft as 3D profile:", await r.text().catch(() => ""));
+    } catch (e) {
+      // Non-fatal: the draft still exists and the final save claims it again.
+      console.error("[CharacterWizard] claim as 3D profile failed:", e);
+    }
+  }
+
+  const [prefillFromAccount, setPrefillFromAccount] = useState(null);
+  useEffect(() => {
+    if (!isAvatar) return;
+    fetch("/api/me")
+      .then(r => r.ok ? r.json() : null)
+      .then(me => {
+        if (!me) return;
+        const parts = (me.name || "").trim().split(/\s+/);
+        const first = parts[0] || "";
+        const last  = parts.slice(1).join(" ");
+        setPrefillFromAccount({ first, last, gender: GENDER_FROM_ACCOUNT[me.gender] || "" });
+        setIdentity(prev => ({
+          ...prev,
+          first_name: prev.first_name || first,
+          last_name:  prev.last_name  || last,
+          gender:     prev.gender     || (GENDER_FROM_ACCOUNT[me.gender] || ""),
+        }));
+      })
+      .catch(() => {});
+
+    // You have exactly one 3D profile, so there is nothing to choose between:
+    // if a draft of it is already in progress, pick it back up. loadDraft has
+    // its own guard for a draft with no model yet and simply logs and returns,
+    // which is the right outcome — there is nothing to restore visually, and
+    // identity is prefilled from the account anyway.
+    fetch("/api/me/avatar")
+      .then(r => r.ok ? r.json() : null)
+      .then(av => {
+        if (!av?.actor_id) return;
+        return fetch(`/api/actors/${av.actor_id}`)
+          .then(r => r.ok ? r.json() : null)
+          .then(d => {
+            // Session 162 - was: status === "draft" && glb_url. That resumed a
+            // half-finished avatar but NOT a finished one, so the moment you
+            // completed yours (status flips to ready_to_deploy on save) this
+            // screen went back to offering a blank wizard - with your name
+            // prefilled from the account and no body, which reads exactly like
+            // the save was lost. Confirmed live: avatar 3d57f95f with a model
+            // AND a runtime model, GET /api/me/avatar answering ready:true,
+            // and /me/avatar showing an empty Step 1.
+            //
+            // You have exactly ONE 3D profile, so there is nothing to choose
+            // between: if it has a body, load it, whatever status it carries.
+            // loadDraft keeps its own guard for a row with no model yet.
+            if (d?.actor?.glb_url) loadDraft(av.actor_id);
+          });
+      })
+      .catch(() => {});
+  }, [isAvatar]);
   const navigate = useNavigate();
   const [step, setStep]       = useState(1);
   // Session 97: real accessories state — selected value per region/slot,
@@ -357,6 +461,14 @@ export default function CharacterWizard({ user, worlds, mode = "character" }) {
   const [showBodyPhotos, setShowBodyPhotos] = useState(false);
   const [bodyHeightCm, setBodyHeightCm] = useState(170);
   const [photos, setPhotos] = useState({}); // { slug: File }
+  // Session 168 -- who the reference photographs actually depict.
+  //
+  // actor_media.depicts exists to answer one question: is this uploader
+  // building a likeness out of photographs of somebody who is not them.
+  // It can only ever answer it if somebody is asked, so this asks. "" is
+  // "unanswered" and sends nothing at all, leaving the column NULL --
+  // a blank must never read later as a declaration that was made.
+  const [depicts, setDepicts] = useState("");
   // Session 103 — the XTTS voice sample: { url } (server) or { file, url:objectURL } (just picked).
   const [voiceSample, setVoiceSample] = useState(null);
   // Session 103 — the profile photo shown in the viewer's loading
@@ -467,10 +579,35 @@ export default function CharacterWizard({ user, worlds, mode = "character" }) {
   // underneath them while the UI shows stale values. Only depends on
   // bodyHeight, not the other three, so adjusting Torso/Arms/Legs
   // individually afterward still works normally without fighting this.
+  //
+  // Session 157 — Height is NOT a uniform scale, and driving all three dials to
+  // the same number (what this did) is what made the proportions wrong for
+  // everybody who was not the body they were last adjusted against.
+  //
+  // Stature varies mostly in the legs: leg length accounts for roughly twice as
+  // much of the difference between two people's heights as sitting height does,
+  // and the upper limb tracks the torso rather than the legs. Two live cases,
+  // from opposite ends, both consistent with that:
+  //   - Benny (Height 50) had to have arms hand-corrected back to -3, a fix
+  //     that existed only inside his own draft and helped nobody else.
+  //   - A 170cm avatar (Height -33) came out with legs at 71% of total height,
+  //     anatomically impossible, and clothing fitted to it sat visibly wrong.
+  //
+  // The weights below come from published segment proportions (leg ~0.53 of
+  // stature, upper limb ~0.44), NOT from a per-morph measurement of this rig.
+  // That distinction is deliberate and this comment is the honest version of
+  // it: this file's history is full of constants reverse-tuned to whichever
+  // single body was on screen at the time — the 52-57% garment window, the hip
+  // bone, the 184cm calibration — each of which then failed on the next
+  // character. So these are named, in one place, and explicitly a starting
+  // point to be corrected by a real measurement pass (dial to a known value,
+  // read the viewer's own cm readout, derive cm-per-unit per morph), not
+  // another number tuned until one figure looked right.
+  const HEIGHT_SEGMENT_WEIGHTS = { legs: 1.0, torso: 0.55, arms: 0.35 };
   useEffect(() => {
-    setBodyTorsoLength(bodyHeight);
-    setBodyArmsLength(bodyHeight);
-    setBodyLegsLength(bodyHeight);
+    setBodyTorsoLength(Math.round(bodyHeight * HEIGHT_SEGMENT_WEIGHTS.torso));
+    setBodyArmsLength(Math.round(bodyHeight * HEIGHT_SEGMENT_WEIGHTS.arms));
+    setBodyLegsLength(Math.round(bodyHeight * HEIGHT_SEGMENT_WEIGHTS.legs));
   }, [bodyHeight]);
   // Real feature (Session 101+) — the newly-baked 93 real morphs (see
   // generate3d.js's bakeAllMorphsAtDefault()) are applied generically
@@ -930,15 +1067,22 @@ export default function CharacterWizard({ user, worlds, mode = "character" }) {
     const data = await res.json().catch(() => null);
     if (!data?.actor) { console.error("[CharacterWizard] loadDraft: fetch failed for", draftId); return; }
     const a = data.actor;
-    if (!a.glb_url) { console.error("[CharacterWizard] loadDraft: draft has no glb_url — cannot load", a); return; }
+    // Session 163 — was: a hard `return` when the row had no glb_url, which
+    // made a bodyless draft render clickable in the rail and then do NOTHING,
+    // the reason going only to the console (incident 1b3574d1, seen 5x). A
+    // draft with no model is a NORMAL state — the wizard creates the actors
+    // row before generation — and it can still carry appearanceFields,
+    // psychology and step in draft_state, all of which restore fine without a
+    // body. Only the VIEWER needs a model, so only the viewer is conditional.
+    if (!a.glb_url) console.warn("[CharacterWizard] loadDraft: draft has no model yet — restoring state without a viewer", a.id);
     let st = {};
     try { st = a.draft_state ? JSON.parse(a.draft_state) : {}; } catch (e) { console.error("[CharacterWizard] loadDraft: draft_state parse failed:", e); }
     loadedPristineStateRef.current = st; // what "Discard changes" restores — required since auto-persist writes continuously
     lastSyncedNameRef.current = null; // rename baseline re-captures from the loaded identity on next effect run
     setActorId(a.id);
     setLoadedFromDraft(true);
-    setGlbUrl(a.glb_url);
-    setCharacter3DStatus("ready"); // the viewer mounts on character3DStatus==="ready" && glbUrl — generation's status poll sets it, so a draft load must too (found live: healthy loadDraft, glbUrl in state, viewer never mounted)
+    setGlbUrl(a.glb_url || null);
+    if (a.glb_url) setCharacter3DStatus("ready"); // the viewer mounts on character3DStatus==="ready" && glbUrl — generation's status poll sets it, so a draft load must too (found live: healthy loadDraft, glbUrl in state, viewer never mounted)
     // Identity fills from the ROW first (it exists for every draft,
     // draft_state does not — found live: a resurrected draft loaded
     // with every form field at placeholder), then draft_state.identity
@@ -1086,6 +1230,10 @@ export default function CharacterWizard({ user, worlds, mode = "character" }) {
     // indistinguishable from fresh uploads (thumbnails, ✕, Regenerate
     // all unchanged).
     const mediaBySlug = Object.fromEntries((data.mediaPhotos || []).map(m => [m.state_slug, m.url]));
+    // Restore the declaration the same way the photos themselves restore --
+    // reopening a draft must not present an answered question as unanswered.
+    const declaredRow = (data.mediaPhotos || []).find(m => m.depicts);
+    if (declaredRow) setDepicts(declaredRow.depicts);
     const voiceRow = (data.mediaPhotos || []).find(m => m.state_slug === "voice_sample" || m.media_type === "audio");
     setVoiceSample(voiceRow ? { url: voiceRow.url } : null);
     for (const [suffix, slug] of [["_front.jpeg", "body_front"], ["_side.jpeg", "body_side"], ["_back.jpeg", "body_back"]]) {
@@ -1422,7 +1570,12 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
       for (const f of files) images.push(await fileToBase64(await resizeForUpload(f)));
       const res = await fetch("/api/generate/appearance", {
         method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ images, name:(identity.first_name+" "+identity.last_name).trim(), gender:identity.gender, age:identity.age }),
+        // Session 162 - heightCm added. Age was already sent and used; height
+        // never was, so Haiku GUESSED the descriptive "height" it returns from
+        // the photo alone while the mesh was built from bodyHeightCm - two
+        // heights produced independently, free to disagree ("petite" prose on a
+        // 190cm body). Sending the real number makes the word describe the body.
+        body: JSON.stringify({ images, name:(identity.first_name+" "+identity.last_name).trim(), gender:identity.gender, age:identity.age, heightCm: bodyHeightCm }),
       });
       const d = await res.json().catch(() => ({}));
       if (!res.ok || d.error) throw new Error(d.error || `server ${res.status}`);
@@ -1456,6 +1609,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
         fd.append("photo", file);
         fd.append("state_slug", slug);
         fd.append("media_type", "photo");
+        if (depicts) fd.append("depicts", depicts);
         fetch(`/api/actors/${actorId}/media`, { method: "POST", body: fd })
           .then(r => r.json()).then(d => console.log(`[CharacterWizard] photo slot '${slug}' uploaded to actor_media:`, d))
           .catch(err => console.error(`[CharacterWizard] photo slot '${slug}' upload FAILED:`, err));
@@ -1509,6 +1663,14 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
         if (!res.ok || data.error) throw new Error(data.error || "Could not create draft character");
         id = data.id;
         setActorId(id);
+        // Claim it immediately. avatarStateOf() then reports state="building"
+        // (a row with no model yet), which /home already renders as "finish
+        // it" and which the mount effect below uses to resume this exact
+        // draft. Claiming at CREATE rather than at save is what makes "save
+        // as a draft to continue later" a true statement in avatar mode.
+        if (isAvatar) {
+          await claimAsAvatarProfile(id);
+        }
       }
 
       // The backend looks up the reference photo from actor_media — it has
@@ -1521,6 +1683,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
       fd.append("state_slug", "profile");
       fd.append("media_type", "photo");
       fd.append("filename", photos.profile.name);
+      if (depicts) fd.append("depicts", depicts);
       const uploadRes = await fetch(`/api/actors/${id}/media`, { method: "POST", body: fd });
       if (!uploadRes.ok) throw new Error("Photo upload failed");
 
@@ -1549,6 +1712,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
           bfd.append("state_slug", slot.slug);
           bfd.append("media_type", "photo");
           bfd.append("filename", `${id}_${shortName}.${ext}`);
+          if (depicts) bfd.append("depicts", depicts);
           const bRes = await fetch(`/api/actors/${id}/media`, { method: "POST", body: bfd });
           if (!bRes.ok) throw new Error(`${slot.label} body photo upload failed`);
         }
@@ -1561,7 +1725,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
           // Only meaningful (and only sent) alongside the three body
           // photos above — the backend's interpret_body.py call needs
           // it for --height-cm, same value the Advanced slider sets.
-          ...(showBodyPhotos ? { bodyHeightCm } : {}),
+          bodyHeightCm,   // Session 162 — always sent; was gated on showBodyPhotos, so the ordinary path silently built everyone at the 170cm default
         }),
       });
       const startData = await startRes.json();
@@ -1670,6 +1834,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
         fd.append("state_slug", slug);
         fd.append("media_type", "photo");
         fd.append("filename", resized.name);
+        if (depicts) fd.append("depicts", depicts);
         await fetch(`/api/actors/${savedActorId}/media`, {method:"POST",body:fd}).catch(()=>{});
       }
 
@@ -1683,6 +1848,54 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
         }
       }
 
+      // 4. Session 162 - BOTH model artefacts, at save time.
+      //
+      // Only the EDITABLE model was ever automatic: leaving steps 1 and 2
+      // exports the live scene to save-morphed-glb (see that call above). The
+      // RUNTIME model - the one a world actually loads - had no automatic
+      // writer anywhere. Its only caller was the button in ActorModelPanel
+      // (:1033), so a character could reach ready_to_deploy having never had
+      // one, and the deploy push then refuses with 409 "runtime_missing"
+      // (server/index.js:3641). Confirmed live on two avatars in a row: model
+      // on disk, avatarStateOf reporting ready, nothing for a world to load.
+      //
+      // Both come from the SAME live scene with deliberately different options.
+      // The editable export SUSPENDS skin culling - bodyLayers.js is explicit
+      // that saving a working body with holes would be permanent data loss -
+      // while the runtime bake KEEPS it. One file cannot serve both purposes.
+      if (!exportGlbRef.current) {
+        setError("Saved, but no 3D model could be exported - the viewer had not finished loading this character. Open its 3D tab and build the models there before deploying.");
+        setSaving(false);
+        return;
+      }
+      try {
+        const editableBlob = await exportGlbRef.current({ includeAccessories: true });
+        await fetch(`/api/actors/${savedActorId}/save-morphed-glb`, {
+          method: "POST", credentials: "include",
+          headers: { "Content-Type": "model/gltf-binary" }, body: editableBlob,
+        });
+        const runtimeBlob = await exportGlbRef.current({ includeAccessories: true, runtime: true });
+        const rtRes = await fetch(`/api/actors/${savedActorId}/runtime-glb`, {
+          method: "POST", credentials: "include",
+          headers: { "Content-Type": "model/gltf-binary" }, body: runtimeBlob,
+        });
+        if (!rtRes.ok) {
+          const d = await rtRes.json().catch(() => ({}));
+          throw new Error(d.error || `runtime model rejected (HTTP ${rtRes.status})`);
+        }
+      } catch (e) {
+        // Deliberately LOUD, unlike the fire-and-forget editable persist on
+        // step navigation. Without a runtime model this character cannot enter
+        // a world, and a silent failure is indistinguishable from success right
+        // up until deploy refuses it - which is exactly how this stayed hidden.
+        // Stopping here rather than navigating means the message is actually
+        // read; the character itself is saved either way.
+        console.error("[CharacterWizard] model build at save failed:", e);
+        setError(`Saved, but the runtime model could not be built: ${e.message}${isAvatar ? " It is also not set as your 3D profile yet." : ""} Open the 3D tab and build it, or press Save again.`);
+        setSaving(false);
+        return;
+      }
+
       // Adopting it as your body is the last step and it is separate from
       // saving: POST /api/actors made a character, this is what makes that
       // character you. If it fails the character still exists and is still
@@ -1694,7 +1907,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
             body: JSON.stringify({ actor_id: savedActorId }),
           });
           if (!r.ok) throw new Error((await r.json().catch(()=>({}))).error || "Could not set it as your profile.");
-          navigate("/home");
+          navigate(labReturnPath() || "/home");
           return;
         } catch (e) {
           setError(`Saved, but not set as your 3D profile: ${e.message} You can pick it in your character gallery.`);
@@ -1703,7 +1916,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
         }
       }
 
-      navigate("/actors");
+      navigate(labReturnPath() || "/actors");
     } catch(e) {
       // Only roll back an actor freshly created in THIS save attempt.
       // A pre-existing draft (already has a generated 3D character on it)
@@ -1840,7 +2053,9 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [glbReady, step, glbUrl]);
-  const step1Complete = glbReady && !!identity.age && !!identity.orientation && !!identity.occupation;
+  const step1Complete = isAvatar
+    ? glbReady && !!identity.age
+    : glbReady && !!identity.age && !!identity.orientation && !!identity.occupation;
   // Psychology: every field in psychFields has to actually have text —
   // reuses the same array the step renders from, so a field added there
   // is covered here automatically, no second list to keep in sync.
@@ -1871,10 +2086,12 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
         {closePrompt && (
           <div style={{position:"fixed", inset:0, zIndex:60, background:"rgba(0,0,0,0.35)", display:"flex", alignItems:"center", justifyContent:"center"}}>
             <div style={{background:"#f6f4f1", borderRadius:14, padding:"26px 30px", width:380, boxShadow:"0 12px 40px rgba(0,0,0,0.25)"}}>
-              <div style={{fontFamily:"'DM Mono',monospace", fontSize:13, fontWeight:600, marginBottom:8}}>Close character wizard?</div>
+              <div style={{fontFamily:"'DM Mono',monospace", fontSize:13, fontWeight:600, marginBottom:8}}>{isAvatar ? "Close your 3D profile?" : "Close character wizard?"}</div>
               <div style={{fontSize:12, color:"#6b6760", marginBottom:18, lineHeight:1.5}}>
                 {loadedFromDraft
                   ? "Save your changes to this draft, or discard them — the draft itself stays as it was last saved."
+                  : isAvatar
+                  ? "Keep it unfinished and pick it up again from your home page, or discard it — discarding permanently deletes the generated files."
                   : "Save this character as a draft to continue later, or discard it — discarding permanently deletes the generated files."}
               </div>
               <div style={{display:"flex", gap:8}}>
@@ -1913,7 +2130,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
         {/* Header */}
         <div style={S.head}>
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
-            <div style={{...S.serif,fontSize:26,fontWeight:400,color:"#1a1814"}}>{step<7?"New Character":(identity.first_name+" "+identity.last_name).trim()||"Review"}</div>
+            <div style={{...S.serif,fontSize:26,fontWeight:400,color:"#1a1814"}}>{step<7?(isAvatar?"Your 3D profile":"New Character"):(identity.first_name+" "+identity.last_name).trim()||"Review"}</div>
             <button onClick={handleCloseWizard} style={{background:"none",border:"1px solid rgba(0,0,0,0.08)",borderRadius:8,padding:"6px 12px",cursor:"pointer",fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:12,color:"#a8a5a0"}}>✕</button>
           </div>
           <div style={{display:"flex",gap:0}}>
@@ -2001,14 +2218,14 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
             />
             </div>
           )}
-          {step===1 && !draftsRailOpen && (
+          {!isAvatar && step===1 && !draftsRailOpen && (
             <button onClick={()=>setDraftsRailOpen(true)} title="Show drafts"
               style={{position:"fixed", left:0, top:120, zIndex:40, writingMode:"vertical-rl", textOrientation:"mixed",
                 padding:"12px 6px", borderRadius:"0 8px 8px 0", border:"1px solid rgba(0,0,0,0.10)", borderLeft:"none",
                 background:"#f6f4f1", color:"#6b6760", fontFamily:"'DM Mono',monospace", fontSize:10, letterSpacing:"0.1em", cursor:"pointer"}}>
               DRAFTS{draftsList.length ? ` (${draftsList.length})` : ""}</button>
           )}
-          {step===1 && draftsRailOpen && (
+          {!isAvatar && step===1 && draftsRailOpen && (
             <div style={{position:"fixed", left:0, top:0, bottom:0, width:264, zIndex:40, background:"#f0eeea",
               borderRight:"1px solid rgba(0,0,0,0.10)", boxShadow:"6px 0 24px rgba(0,0,0,0.08)",
               display:"flex", flexDirection:"column"}}>
@@ -2049,12 +2266,12 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
               calc, and the 3D preview fits the screen with no main scrollbar. */}
           <div style={{maxHeight:"calc(100vh - 260px)", overflowY:"auto", overflowX:"hidden", paddingRight:4}}>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:18}}>
-              <Field label="First Name" required><input style={S.input} value={identity.first_name} onChange={e=>updI("first_name",e.target.value)} placeholder="Emma…" /></Field>
-              <Field label="Last Name" required><input style={S.input} value={identity.last_name} onChange={e=>updI("last_name",e.target.value)} placeholder="Lindqvist…" /></Field>
+              <Field label="First Name" required hint={isAvatar?"From your account":undefined}><input style={{...S.input,...(isAvatar?{opacity:.65,cursor:"default"}:{})}} value={identity.first_name} onChange={e=>updI("first_name",e.target.value)} placeholder="Emma…" readOnly={isAvatar} /></Field>
+              <Field label="Last Name" required hint={isAvatar?"From your account":undefined}><input style={{...S.input,...(isAvatar?{opacity:.65,cursor:"default"}:{})}} value={identity.last_name} onChange={e=>updI("last_name",e.target.value)} placeholder="Lindqvist…" readOnly={isAvatar} /></Field>
             </div>
 
             <Field label="Gender" required>
-              <select style={S.select} value={identity.gender} onChange={e=>updI("gender",e.target.value)}>
+              <select style={S.select} value={identity.gender} onChange={e=>{ updI("gender", e.target.value); if (isAvatar) saveGenderToAccount(e.target.value); }}>
                 <option value="">— Select Gender —</option>
                 <option value="female">Female — she/her</option>
                 <option value="male">Male — he/him</option>
@@ -2084,8 +2301,8 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
                 these fields is kept as documented at its declaration —
                 position changed, behavior didn't. */}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-              <Field label="Age" required><input style={S.input} type="number" min={18} max={99} value={identity.age} onChange={e=>updI("age",e.target.value)} placeholder="28" disabled={!glbReady} /></Field>
-              <Field label="Sexual Orientation" required>
+              <Field label="Age" required><input style={S.input} type="number" min={18} max={99} value={identity.age} onChange={e=>updI("age",e.target.value)} placeholder="28" disabled={!isAvatar && !glbReady} /></Field>
+              {!isAvatar && <Field label="Sexual Orientation" required>
                 <select style={S.select} value={identity.orientation} onChange={e=>updI("orientation",e.target.value)} disabled={!glbReady}>
                   <option value="">— Select Sexual —</option>
                   <option value="straight">Straight</option>
@@ -2094,11 +2311,11 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
                   <option value="pansexual">Pansexual</option>
                   <option value="asexual">Asexual</option>
                 </select>
-              </Field>
+              </Field>}
             </div>
-            <Field label="Occupation" required hint="Shapes schedule, income and daily behaviour.">
+            {!isAvatar && <Field label="Occupation" required hint="Shapes schedule, income and daily behaviour.">
               <input style={S.input} value={identity.occupation} onChange={e=>updI("occupation",e.target.value)} placeholder="Photographer, nurse, architect…" disabled={!glbReady} />
-            </Field>
+            </Field>}
 
 
             <Field label="Reference Photo" hint="Face forward, neutral background, good even lighting — like a passport photo. This drives both the appearance description and the 3D face generation, so composition matters here.">
@@ -2131,6 +2348,14 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
                 ))}
               </div>
               <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}} onChange={e=>{if(activeSlotRef.current)handleSlotFile(activeSlotRef.current,e);}} />
+            </Field>
+
+            <Field label="Who is in these photographs?" hint="Recorded exactly as you answer it and never guessed. These photographs become a face and a body, so the record has to be able to say whose likeness that is.">
+              <select style={S.select} value={depicts} onChange={e=>setDepicts(e.target.value)}>
+                <option value="">— Not stated —</option>
+                <option value="self">Me</option>
+                <option value="other">Someone else</option>
+              </select>
             </Field>
 
             {/* Advanced, collapsed by default — default flow (one
@@ -2205,36 +2430,43 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
                     </div>
                   ))}
                 </div>
-                <label style={{display:"block",fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:9,letterSpacing:"0.1em",textTransform:"uppercase",color:"#a8a5a0",marginBottom:6}}>
-                  Real height — required to scale the photos correctly
-                </label>
-                <div style={{...S.sliderRow, maxWidth:270}}>
-                  <span style={S.sliderLbl}>Height</span>
-                  <input
-                    type="range"
-                    min={140}
-                    max={200}
-                    step={1}
-                    value={bodyHeightCm}
-                    onChange={e=>setBodyHeightCm(Number(e.target.value))}
-                    style={{flex:1,accentColor:"#b05c08",height:4,cursor:"pointer"}}
-                  />
-                  <span style={{...S.sliderVal,width:48}}>{bodyHeightCm} cm</span>
-                </div>
               </Field>
             )}
 
-            <button
-              onClick={handleGenerateFace}
-              disabled={IN_PROGRESS_STAGES.includes(character3DStatus) || character3DStatus==="creating_actor"}
-              style={{...S.btnAmberFull, marginBottom:18, opacity:(IN_PROGRESS_STAGES.includes(character3DStatus) || character3DStatus==="creating_actor")?0.6:1}}>
-              {character3DStatus==="ready" ? "◈ Regenerate 3D Character" : (IN_PROGRESS_STAGES.includes(character3DStatus) || character3DStatus==="creating_actor") ? "◈ Working…" : "◈ Create 3D Character"}
-            </button>
+            {/* Session 162 — height moved OUT of the Advanced block, and it is
+                asked ALWAYS, right after the photo. It used to live inside
+                {showBodyPhotos && …} and was only sent to generate-3d when
+                Advanced was on (see the same session's change at the POST
+                below). So the ordinary path — one reference photo, no body
+                photos — never asked how tall the person is and never told the
+                pipeline, and every body was built at the 170cm default no
+                matter who it was of. Confirmed live: an avatar came out
+                162.6cm without anyone having chosen a height.
+                Height is a property of the PERSON, not of the Advanced
+                photo-measurement feature that happened to need it first. */}
+            <Field label="Height" required>
+              <label style={{display:"block",fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:9,letterSpacing:"0.1em",textTransform:"uppercase",color:"#a8a5a0",marginBottom:6}}>
+                Real height — the body is built to this
+              </label>
+              <div style={{...S.sliderRow, maxWidth:270}}>
+                <span style={S.sliderLbl}>Height</span>
+                <input
+                  type="range"
+                  min={140}
+                  max={200}
+                  step={1}
+                  value={bodyHeightCm}
+                  onChange={e=>setBodyHeightCm(Number(e.target.value))}
+                  style={{flex:1,accentColor:"#b05c08",height:4,cursor:"pointer"}}
+                />
+                <span style={{...S.sliderVal,width:48}}>{bodyHeightCm} cm</span>
+              </div>
+            </Field>
 
             {/* Session 103 — the XTTS voice sample slot: upload straight
                 to actor_media (audio branch already live server-side),
                 playback as the receipt. */}
-            <div style={{marginBottom:18}}>
+            {!isAvatar && <div style={{marginBottom:18}}>
               <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:10,letterSpacing:"0.18em",textTransform:"uppercase",color:"#a8a5a0",marginBottom:8}}>Voice Sample (XTTS)</div>
               {voiceSample?.url && (
                 <audio controls src={voiceSample.url} style={{width:"100%",height:36,marginBottom:8}} />
@@ -2277,7 +2509,13 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
 
               <FoldableSection title="Appearance Fields" expanded={expandedSections.appearance} onToggle={()=>toggleSection("appearance")}>
                 <div style={S.row2}>
-                  {appSelect("Height","height")}
+                  {/* Session 162 - the descriptive Height dropdown (tall/average/
+                      petite) is gone. It predates the real height in cm, which
+                      is now asked once, after the photo, and actually reaches
+                      generate-3d. Two heights on one form invite disagreement,
+                      and only one of them builds the body. Haiku may still fill
+                      the `height` key and composeAppearance still reads it for
+                      prose; it just isn't a control any more. */}
                   {appSelect("Build","build")}
                   {appSelect("Body shape","body_shape")}
                   {identity.gender==="female" && FEMALE_FRAME.map(k => appSelect(APP_LABELS[k], k))}
@@ -2295,11 +2533,34 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
                 {appText("Notable features","notable")}
                 {appText("Dress style","style")}
                 {appText("Tension markers","tension_markers")}
-                {appText("Voice","voice")}
-                {appText("Sexual presence","sexual_presence")}
-                {appText("Endowment","endowment")}
+                {/* Session 162 - Voice, Sexual presence and Endowment removed.
+                    These are the three fields appearance.js calls "manual only -
+                    never in the generate/appearance contract": POST
+                    /api/generate/appearance is never asked for them, so nothing
+                    ever populates them and they sat empty on every character.
+                    Confirmed in the data - appearance_fields is NULL on all four
+                    actors, so not one has ever been filled by hand either.
+                    The keys stay in emptyAppearanceFields() and composeAppearance()
+                    so any value that already exists still reads out; what is gone
+                    is asking a person to type into a box nothing consumes. */}
               </FoldableSection>
             </div>
+
+            {/* Session 162 - "Create 3D Character" moved BELOW the appearance
+                block. The description and the fields that compose it are one
+                thing and now sit together, and the build button comes after
+                what feeds it: the prose reaches the character, and reading it
+                from the photo is worth doing BEFORE generating, not after.
+                Previously the button sat above all of it, so the natural
+                reading order invited you to generate first and describe
+                afterwards. */}
+            <button
+              onClick={handleGenerateFace}
+              disabled={IN_PROGRESS_STAGES.includes(character3DStatus) || character3DStatus==="creating_actor"}
+              style={{...S.btnAmberFull, marginBottom:18, opacity:(IN_PROGRESS_STAGES.includes(character3DStatus) || character3DStatus==="creating_actor")?0.6:1}}>
+              {character3DStatus==="ready" ? "◈ Regenerate 3D Character" : (IN_PROGRESS_STAGES.includes(character3DStatus) || character3DStatus==="creating_actor") ? "◈ Working…" : "◈ Create 3D Character"}
+            </button>
+
 
 
           </div>
