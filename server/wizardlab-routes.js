@@ -130,15 +130,43 @@ export function mount(app, { db, authUser, PORT }) {
           "no drafts exist — nothing is being offered for resume"));
         return;
       }
+      // Session 163 — the predicate was "a model AND a readable snapshot".
+      // Both halves were wrong, and the check was failing honest rows.
+      //
+      // The MODEL half: loadDraft used to hard-return without a glb_url, so a
+      // bodyless draft really was unopenable — but that was the defect, and it
+      // is fixed (commit 4f03439). A draft with a snapshot and no body now
+      // restores identity/appearanceFields/psychology/step fine; only the 3D
+      // viewer needs a model. Asserting a model is asserting the old bug.
+      //
+      // The SNAPSHOT half: a null/absent draft_state is documented as a
+      // normal, common state (server/index.js:3886) — the wizard creates the
+      // actors row BEFORE generation, and auto-persist may never have fired.
+      // A draft with a body and no snapshot opens with its body and default
+      // controls, which is correct when nothing was ever adjusted.
+      //
+      // So: resumable = a model OR a readable snapshot. A row with NEITHER is
+      // an abandoned shell the rail offers and cannot restore anything from —
+      // still a real finding, and the one this check should be making.
+      //
+      // UNPARSEABLE draft_state stays a failure whether or not there is a
+      // model: that is corruption, not absence, and deploy already refuses it
+      // outright (server/index.js:3897).
+      //
+      // This was widened after the product fix, NOT to make the board green —
+      // it does not go green: aab5fda6 still fails, correctly.
       const broken = [];
       for (const d of drafts) {
         const st = parseState(d.draft_state);
-        if (!d.glb_url) broken.push(`${short(d.id)} ${d.name}: no model — loadDraft returns early and the click does nothing`);
-        else if (!st.ok) broken.push(`${short(d.id)} ${d.name}: draft_state ${st.reason} — opens with every control back at its default beside the body it built`);
+        if (!st.ok && st.reason !== "absent") {
+          broken.push(`${short(d.id)} ${d.name}: draft_state ${st.reason} — corrupt snapshot; loadDraft restores nothing and deploy refuses the actor outright`);
+        } else if (!d.glb_url && !st.ok) {
+          broken.push(`${short(d.id)} ${d.name}: no model and no snapshot — an abandoned shell with nothing to restore, still offered in the rail; it wants deleting, not resuming`);
+        }
       }
       checks.push(broken.length === 0
         ? pass("a draft the rail offers can actually be resumed",
-            `${drafts.length} draft(s), each with a model and a readable snapshot`)
+            `${drafts.length} draft(s), each resumable — a model, a snapshot, or both`)
         : fail("a draft the rail offers can actually be resumed", broken.join("; ")));
     });
 
