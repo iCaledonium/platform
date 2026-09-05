@@ -108,6 +108,23 @@ export default function LabIncidentsPage() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState({});
+  // Transition history per incident, fetched on expand rather than joined
+  // into every list response. The row itself only carries the LATEST of
+  // everything - updated_at is overwritten by the next write and
+  // resolved_at is cleared the moment a row leaves resolved - so this is
+  // the only place "when was it flagged" or "has this bounced" is answerable.
+  const [events, setEvents] = useState({});
+
+  const loadEvents = useCallback(async (inc) => {
+    if (events[inc.id]) return;
+    try {
+      const r = await fetch(
+        `/api/test/incidents/${inc.id}/events?fingerprint=${encodeURIComponent(inc.fingerprint)}`,
+        { credentials: "include" });
+      const j = await r.json();
+      if (j.ok) setEvents((e) => ({ ...e, [inc.id]: j.events || [] }));
+    } catch { /* the history is a nicety; never break the row over it */ }
+  }, [events]);
   // At most one compose box open at a time: { id: incident id, kind: "watcher" | "resolve" | "wontfix" }.
   const [compose, setCompose] = useState(null);
   const [drafts, setDrafts] = useState({});
@@ -322,7 +339,7 @@ export default function LabIncidentsPage() {
                   </div>
                 </div>
 
-                <div onClick={() => setOpen(o => ({ ...o, [inc.id]: !isOpen }))}
+                <div onClick={() => { if (!isOpen) loadEvents(inc); setOpen(o => ({ ...o, [inc.id]: !isOpen })); }}
                   style={{ marginTop: 7, fontSize: 11, lineHeight: 1.65, cursor: "pointer",
                     color: "rgba(255,255,255,.5)",
                     display: "-webkit-box", WebkitLineClamp: isOpen ? "unset" : 2,
@@ -342,6 +359,17 @@ export default function LabIncidentsPage() {
                     {inc.note && <div style={{ marginTop: 5, whiteSpace: "pre-wrap" }}>note: {inc.note}</div>}
                     {inc.first_detail && inc.first_detail !== inc.detail &&
                       <div style={{ marginTop: 5, whiteSpace: "pre-wrap" }}>first detail: {inc.first_detail}</div>}
+                    {(events[inc.id] || []).length > 0 && (
+                      <div style={{ marginTop: 7 }}>
+                        <div>history ({events[inc.id].length} transition{events[inc.id].length === 1 ? "" : "s"}):</div>
+                        {events[inc.id].map((ev) => (
+                          <div key={ev.id} style={{ paddingLeft: 10 }}>
+                            {ev.at} · {ev.from_status || "(new)"} &rarr; {ev.to_status}
+                            {ev.by ? ` · ${ev.by}` : ""} · via {ev.via}
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
 

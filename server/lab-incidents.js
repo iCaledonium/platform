@@ -95,6 +95,61 @@ db.exec(`
 // Nothing else about the row changes: only a person un-sticks it.
 try { db.exec(`ALTER TABLE lab_incidents ADD COLUMN last_pass_at TEXT`); } catch { /* already there */ }
 
+// Append-only transition log (2026-09-05). The row itself carries only the
+// LATEST of everything: `updated_at` is overwritten by the next write, and
+// `resolved_at` is actively cleared the moment a row leaves `resolved`
+// (setStatus's CASE, and report()'s reopen branch). Nothing recorded when a
+// row entered `acknowledged`, `wontfix` or `known` at all. So a row resolved
+// once cleanly and one that bounced resolved -> reopened -> resolved four
+// times were indistinguishable, and "how long did this take" had no answer.
+// That matters now that the resolution manager churns these states
+// unattended. Keyed by fingerprint as well as id so the history survives the
+// row being deleted and re-filed under the same check.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS lab_incident_events (
+    id           TEXT PRIMARY KEY,
+    incident_id  TEXT NOT NULL,
+    fingerprint  TEXT NOT NULL,
+    from_status  TEXT,
+    to_status    TEXT NOT NULL,
+    at           TEXT NOT NULL,
+    by           TEXT,
+    via          TEXT NOT NULL,
+    note         TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_lab_incident_events_incident
+    ON lab_incident_events(incident_id, at);
+  CREATE INDEX IF NOT EXISTS idx_lab_incident_events_fp
+    ON lab_incident_events(fingerprint, at);
+`);
+
+// Only genuine changes are recorded. A no-op (open -> open, e.g. a bulk
+// reopen sweeping rows that were already open, or the resolution manager's
+// pause revert) is not a transition and would only dilute the log.
+function recordEvent({ incident_id, fingerprint, from_status, to_status, at, by, via, note }) {
+  if (from_status === to_status) return;
+  try {
+    db.prepare(`
+      INSERT INTO lab_incident_events
+        (id, incident_id, fingerprint, from_status, to_status, at, by, via, note)
+      VALUES (?,?,?,?,?,?,?,?,?)
+    `).run(uid(), incident_id, fingerprint, from_status ?? null, to_status, at,
+           by ?? null, via, note == null ? null : String(note).slice(0, 500));
+  } catch (e) {
+    // The log is evidence, not a gate: never let a bookkeeping failure stop
+    // an incident from actually changing state.
+    console.error("[lab-incidents] event log write failed:", e.message);
+  }
+}
+
+export function eventsFor(incidentId, fingerprint) {
+  return db.prepare(`
+    SELECT * FROM lab_incident_events
+     WHERE incident_id = ? OR fingerprint = ?
+     ORDER BY at ASC, rowid ASC
+  `).all(incidentId, fingerprint || "");
+}
+
 const now = () => new Date().toISOString();
 const uid = () => crypto.randomBytes(9).toString("hex");
 
@@ -278,6 +333,9 @@ export function report(inc) {
     `).run(uid(), fp, bench, inc.bench_label || BENCHES[bench]?.label || bench, check_name,
       world_id, actor_id, inc.scope_label || "global", severity,
       inc.source || "sweep", detail, detail, t, t, t);
+    const openedId = db.prepare(`SELECT id FROM lab_incidents WHERE fingerprint = ?`).get(fp)?.id;
+    recordEvent({ incident_id: openedId, fingerprint: fp, from_status: null, to_status: "open",
+      at: t, by: inc.source || "sweep", via: "report", note: detail });
     return { outcome: "opened", fingerprint: fp };
   }
 
@@ -286,6 +344,8 @@ export function report(inc) {
       UPDATE lab_incidents SET status='open', severity=?, detail=?, occurrences=occurrences+1,
         last_seen_at=?, resolved_at=NULL, resolved_by=NULL, source=?, updated_at=? WHERE id=?
     `).run(severity, detail, t, inc.source || "sweep", t, existing.id);
+    recordEvent({ incident_id: existing.id, fingerprint: fp, from_status: "resolved",
+      to_status: "open", at: t, by: inc.source || "sweep", via: "report", note: detail });
     return { outcome: "reopened", fingerprint: fp };
   }
 
@@ -304,6 +364,11 @@ export function setStatus(id, status, by, note) {
   const allowed = ["open", "acknowledged", "known", "resolved", "wontfix"];
   if (!allowed.includes(status)) throw new Error(`unknown status ${status}`);
   const t = now();
+  // Read the prior status first — it is the only way the transition log can
+  // record what this changed FROM, and the UPDATE below is about to
+  // overwrite it (along with resolved_at, which is cleared for every status
+  // that is not `resolved`).
+  const prior = db.prepare(`SELECT status, fingerprint FROM lab_incidents WHERE id = ?`).get(id);
   const r = db.prepare(`
     UPDATE lab_incidents
        SET status = ?, note = COALESCE(?, note), updated_at = ?,
@@ -311,6 +376,10 @@ export function setStatus(id, status, by, note) {
            resolved_by = CASE WHEN ? = 'resolved' THEN ? ELSE NULL END
      WHERE id = ?
   `).run(status, note ?? null, t, status, t, status, by || null, id);
+  if (r.changes > 0 && prior) {
+    recordEvent({ incident_id: id, fingerprint: prior.fingerprint, from_status: prior.status,
+      to_status: status, at: t, by, via: "status", note });
+  }
   return r.changes > 0;
 }
 

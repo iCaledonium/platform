@@ -252,6 +252,18 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
     }
   });
 
+  // The row carries only the latest of everything; this is the history it
+  // cannot hold. Fetched on demand when a row is expanded rather than joined
+  // into every list response.
+  app.get("/api/test/incidents/:id/events", (req, res) => {
+    if (!authUser(req)) return res.status(401).json({ error: "not authenticated" });
+    try {
+      res.json({ ok: true, events: labIncidents.eventsFor(req.params.id, req.query.fingerprint) });
+    } catch (e) {
+      res.status(500).json({ error: "event read failed", detail: String(e.message || e).slice(0, 200) });
+    }
+  });
+
   app.post("/api/test/incidents/:id/status", (req, res) => {
     const user = authUser(req);
     if (!user) return res.status(401).json({ error: "not authenticated" });
