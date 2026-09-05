@@ -208,6 +208,42 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── Per-request attribution ──────────────────────────────────────────────────
+// Conduct watch, 2026-09-03/05: the platform app logged no request paths at
+// all, so the only request record was nginx's access.log -- and ngrok delivers
+// every external request as loopback, so 3847 of 3851 requests presented as
+// 127.0.0.1 with no account, session or key beside them. Conduct signals could
+// count actions and prove existence, but could never say WHO acted.
+//
+// One line per dynamic request, with the account resolved through the same
+// authUser() the routes use, so the log cannot disagree with the authorisation.
+// Resolved on 'finish' so the status and duration are real. Static asset paths
+// are excluded: they carry no actor and would bury the signal.
+const ATTRIB_SKIP = /^\/(assets|js|media|favicon|static|phoenix|live)\b/;
+app.use((req, res, next) => {
+  if (ATTRIB_SKIP.test(req.path)) return next();
+  const started = Date.now();
+  res.on("finish", () => {
+    let account = "anon";
+    let how = "none";
+    try {
+      const u = authUser(req);
+      if (u) {
+        account = u.id;
+        how = /anima_token=/.test(req.headers["cookie"] || "") ? "session" : "api_key";
+      }
+    } catch (_e) {
+      account = "unresolved";
+    }
+    const fwd = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+    console.log(
+      `[req] ${req.method} ${req.originalUrl.split("?")[0]} ${res.statusCode} ` +
+      `${Date.now() - started}ms account=${account} auth=${how} ip=${fwd || req.ip || "-"}`
+    );
+  });
+  next();
+});
+
 // ── Signup: admin invite → self-enrolment ────────────────────────────────────
 //
 // Accounts are created by someone who already has one, never by the public. The
@@ -789,15 +825,64 @@ app.post("/api/enroll/confirm", (req, res) => {
   res.json({ ok: true });
 });
 
+// ── Live session cap ─────────────────────────────────────────────────────────
+//
+// Every sign-in minted a 30-day token and nothing ever pruned them. Sign-out
+// revokes only the cookie in the hand doing the signing out, so every other
+// browser, phone and desktop handoff ever used stayed valid for a month —
+// one account had 31 live tokens at once. A cookie lifted off a laptop last
+// touched three weeks ago was still a working session.
+//
+// A sign-in now retires that account's oldest sessions past the cap instead
+// of stacking on top of them. Rows are revoked, never deleted, so the trail
+// survives exactly as sign-out leaves it, and the newest are the ones kept —
+// the session just minted plus the devices actually in use. The cap sits
+// under the 10 the sign-in board tolerates, leaving headroom for the
+// short-lived rows the lab harnesses insert straight into the table.
+//
+// Deliberately not a timer: auth_tokens is still unreaped on a schedule (see
+// the handoff sweep below, which says why). This runs only when a session is
+// minted, and only ever touches that one user's oldest rows.
+const MAX_LIVE_SESSIONS = 8;
+
+function capLiveSessions(userId) {
+  try {
+    const r = db.prepare(`
+      UPDATE auth_tokens SET revoked_at = datetime('now')
+       WHERE user_id = ?
+         AND revoked_at IS NULL
+         AND julianday(expires_at) > julianday('now')
+         AND id NOT IN (
+           SELECT id FROM auth_tokens
+            WHERE user_id = ?
+              AND revoked_at IS NULL
+              AND julianday(expires_at) > julianday('now')
+            ORDER BY inserted_at DESC, rowid DESC
+            LIMIT ?)`).run(userId, userId, MAX_LIVE_SESSIONS);
+    if (r.changes) console.log(`[session cap] ${userId}: retired ${r.changes} session(s) past ${MAX_LIVE_SESSIONS}`);
+  } catch (e) { console.error("[session cap]", e.message); }
+}
+
+// The hoard predates the cap, so apply it once at boot too — otherwise an
+// account that already stacked up 31 stays that way until its next sign-in,
+// which is the whole window the cap exists to close.
+try {
+  for (const u of db.prepare(`SELECT DISTINCT user_id FROM auth_tokens
+                               WHERE revoked_at IS NULL
+                                 AND julianday(expires_at) > julianday('now')`).all())
+    capLiveSessions(u.user_id);
+} catch (e) { console.error("[session cap] boot", e.message); }
+
 // Two ways in, because there are two kinds of tenant:
 //
 //   { user_id, code }  an organization's member, picked off that org's list
 //   { email, code }    a private person, who is not on any list to be picked
 //
-// The email path answers 401 identically for an address that has no account, an
+// BOTH paths answer 401 identically for a subject that has no account, an
 // account that never enrolled, and a wrong code. A private account's existence
-// is exactly what must not be discoverable here — the org path can afford to be
-// more talkative only because its member list is public by design.
+// is exactly what must not be discoverable here, and the user_id path is no
+// safer than the email one: it accepts any id, not only ids drawn off a public
+// member list, and ids are initials — short enough to enumerate.
 app.post("/api/auth/verify", (req, res) => {
   const { user_id, code } = req.body;
   const email = req.body?.email ? String(req.body.email).trim().toLowerCase() : null;
@@ -812,8 +897,16 @@ app.post("/api/auth/verify", (req, res) => {
 
   const row = db.prepare("SELECT * FROM user_totp_secrets WHERE user_id = ? AND enrolled_at IS NOT NULL").get(userId);
   if (!row) {
+    // Both paths answer here exactly as they answer a wrong code. The user_id
+    // path used to say 403 "not enrolled", on the premise that its subjects are
+    // all on a public member list anyway - but it accepts ANY id, including a
+    // private person who is on no list at all, and ids are initials (2 chars,
+    // enumerable). 403-vs-401 therefore mapped the whole id space into "is an
+    // enrolled account" / "is not". Nothing consumed the 403: the sign-in page
+    // never reaches it, because it refuses an un-enrolled member up front from
+    // the `enrolled` flag on /api/orgs/:org/members.
     if (email) return res.status(401).json({ error: "invalid email or code" });
-    return res.status(403).json({ error: "not enrolled" });
+    return res.status(401).json({ error: "invalid code" });
   }
   const totp = new OTPAuth.TOTP({ issuer: "Anima", algorithm: "SHA1", digits: 6, period: 30, secret: OTPAuth.Secret.fromBase32(row.secret) });
   const delta = totp.validate({ token: code, window: 1 });
@@ -822,6 +915,7 @@ app.post("/api/auth/verify", (req, res) => {
   const hash = crypto.createHash("sha256").update(raw).digest("hex");
   const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
   db.prepare(`INSERT INTO auth_tokens (id, user_id, token_hash, expires_at, inserted_at) VALUES (?, ?, ?, ?, datetime('now'))`).run(randomUUID(), userId, hash, expires);
+  capLiveSessions(userId);
   res.setHeader("Set-Cookie", `anima_token=${raw}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=2592000`);
 
   // Session 153 — the handoff ticket rides back with the login itself.
@@ -933,6 +1027,7 @@ app.get("/api/auth/handoff/redeem", (req, res) => {
   const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
   db.prepare(`INSERT INTO auth_tokens (id, user_id, token_hash, expires_at, inserted_at)
               VALUES (?, ?, ?, ?, datetime('now'))`).run(randomUUID(), row.user_id, tokenHash, expires);
+  capLiveSessions(row.user_id);
 
   res.setHeader("Set-Cookie", `anima_token=${raw}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=2592000`);
   res.redirect(302, next);
@@ -2400,6 +2495,11 @@ app.get("/api/keys", (req, res) => {
   res.json(keys.map(k => ({ ...k, scopes: JSON.parse(k.scopes) })));
 });
 
+// Session 164: API keys used to be minted permanent - expires_at was written
+// by no code path and enforced by none, so a key was a password that never
+// aged out. Default TTL, overridable per key and by env.
+const API_KEY_TTL_DAYS = Number(process.env.API_KEY_TTL_DAYS || 90);
+
 // ── POST /api/keys  { name, world_id, scopes[] } ──────────────────────────────
 app.post("/api/keys", (req, res) => {
   const cookieHeader = req.headers["cookie"] || "";
@@ -2408,12 +2508,14 @@ app.post("/api/keys", (req, res) => {
   const hash = crypto.createHash("sha256").update(match[1]).digest("hex");
   const user = db.prepare(`SELECT u.id FROM auth_tokens t JOIN users u ON u.id = t.user_id WHERE t.token_hash = ? AND t.revoked_at IS NULL AND julianday(t.expires_at) > julianday('now')`).get(hash);
   if (!user) return res.status(401).json({ error: "not authenticated" });
-  const { name, world_id, scopes } = req.body;
+  const { name, world_id, scopes, expires_in_days } = req.body;
+  const ttlDays = Number(expires_in_days) > 0 ? Number(expires_in_days) : API_KEY_TTL_DAYS;
+  const ttlModifier = `+${ttlDays} days`;
   if (!name || !world_id || !scopes?.length) return res.status(400).json({ error: "name, world_id, scopes required" });
   const raw = `sk-an-${crypto.randomBytes(32).toString("hex")}`;
   const keyHash = crypto.createHash("sha256").update(raw).digest("hex");
   const prefix = raw.slice(0, 12) + "••••••••" + raw.slice(-4);
-  db.prepare(`INSERT INTO api_keys (id, user_id, world_id, name, key_hash, key_prefix, scopes, inserted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`).run(randomUUID(), user.id, world_id, name, keyHash, prefix, JSON.stringify(scopes));
+  db.prepare(`INSERT INTO api_keys (id, user_id, world_id, name, key_hash, key_prefix, scopes, expires_at, inserted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', ?), datetime('now'), datetime('now'))`).run(randomUUID(), user.id, world_id, name, keyHash, prefix, JSON.stringify(scopes), ttlModifier);
   res.json({ key: raw, prefix });
 });
 
@@ -2523,11 +2625,12 @@ app.post("/api/worlds/:world_id/issue-key", (req, res) => {
   const prefix   = raw.slice(0, 12) + "••••••••" + raw.slice(-4);
   const newKeyId = randomUUID();
 
-  db.prepare(`INSERT INTO api_keys (id, user_id, world_id, name, key_hash, key_prefix, scopes, inserted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`).run(
+  db.prepare(`INSERT INTO api_keys (id, user_id, world_id, name, key_hash, key_prefix, scopes, expires_at, inserted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', ?), datetime('now'), datetime('now'))`).run(
     newKeyId, user.id, worldId,
     `World key — ${worldId.slice(0, 8)}`,
     keyHash, prefix,
-    JSON.stringify(["messages:read", "messages:write", "contacts:read", "calendar:read"])
+    JSON.stringify(["messages:read", "messages:write", "contacts:read", "calendar:read"]),
+    `+${API_KEY_TTL_DAYS} days`
   );
 
   // Wire all apps in this world to the new key
@@ -3024,6 +3127,11 @@ app.post("/api/actors/:id/media", upload.fields([{name:"photo",maxCount:1},{name
   const world_id   = req.body.world_id || null;
   const isVideo = req_file.mimetype.startsWith("video/") || filename.endsWith(".mp4");
 
+  // The uploader's own statement of whose likeness this photograph carries.
+  // Whitelisted and never defaulted: anything absent or unrecognised stores
+  // NULL, which reads as "not declared" instead of as an answer nobody gave.
+  const depicts = ["self", "other"].includes(req.body.depicts) ? req.body.depicts : null;
+
   // Photos/audio: stored under /media/actors/{slug}/worlds/{world_id}/ when world-specific
   // This avoids the nginx proxy rule which intercepts /media/worlds/ and sends to simulator
   // Videos: stored at /media/worlds/{world_id}/actors/{slug}/ (nginx proxies missing ones to simulator)
@@ -3061,10 +3169,10 @@ app.post("/api/actors/:id/media", upload.fields([{name:"photo",maxCount:1},{name
 
   db.prepare(`DELETE FROM actor_media WHERE actor_id = ? AND state_slug = ? AND media_type = ? AND (world_id = ? OR (world_id IS NULL AND ? IS NULL))`)
     .run(req.params.id, state_slug, media_type, world_id, world_id);
-  db.prepare(`INSERT INTO actor_media (id, actor_id, world_id, media_type, filename, url, state_slug, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)`)
-    .run(id, req.params.id, world_id, media_type, filename, url, state_slug, now, now);
+  db.prepare(`INSERT INTO actor_media (id, actor_id, world_id, media_type, filename, url, state_slug, depicts, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, req.params.id, world_id, media_type, filename, url, state_slug, depicts, now, now);
 
-  res.json({ id, url, state_slug, media_type, filename });
+  res.json({ id, url, state_slug, media_type, filename, depicts });
 });
 
 // ── PATCH /api/actors/:id/media/:mediaId/rename ──────────────────────────────
@@ -5920,7 +6028,7 @@ app.get("/api/actors/:id", (req, res) => {
   // body_*), so draft loading restores photo slots from actor_media
   // instead of guessing file conventions (the pipeline's pulled
   // copies live elsewhere and may predate the pull fix).
-  const mediaPhotos = db.prepare(`SELECT state_slug, url FROM actor_media WHERE actor_id = ? AND media_type = 'photo' AND world_id IS NULL`).all(req.params.id);
+  const mediaPhotos = db.prepare(`SELECT state_slug, url, depicts FROM actor_media WHERE actor_id = ? AND media_type = 'photo' AND world_id IS NULL`).all(req.params.id);
   // Session 150 — say plainly whether this caller owns the character.
   //
   // owner_id and permission were both already in the payload and the profile
@@ -6072,7 +6180,7 @@ function authUser(req) {
   const apiKey = req.headers["x-api-key"] || "";
   if (apiKey.startsWith("sk-an-")) {
     const keyHash = crypto.createHash("sha256").update(apiKey).digest("hex");
-    const keyRow = db.prepare(`SELECT user_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL`).get(keyHash);
+    const keyRow = db.prepare(`SELECT user_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL AND expires_at IS NOT NULL AND julianday(expires_at) > julianday('now')`).get(keyHash);
     if (keyRow) {
       db.prepare(`UPDATE api_keys SET last_used_at = datetime('now') WHERE key_hash = ?`).run(keyHash);
       return db.prepare(`SELECT id, name, org_id, user_type, org_role FROM users WHERE id = ? AND status != 'removed'`).get(keyRow.user_id);
