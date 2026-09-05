@@ -159,6 +159,62 @@ export default function LabHomePage() {
       }).catch(() => {});
   }, []);
 
+  // The category list comes from the SERVER, not from CASES above. CASES was
+  // the whole list, maintained by hand, and it went stale the moment three
+  // routine categories were registered on 2026-09-05: they existed in
+  // lab_categories and showed as chips on the incidents page, but this page
+  // could not know about them. That is the same trap boardCoverage was written
+  // to catch one layer down ("BENCHES is a hardcoded list of other people's
+  // work, and on 2026-08-30 it went stale twice in one evening") — except
+  // nothing was checking this copy at all.
+  //
+  // CASES is now a DETAIL map, not the list: it supplies the blurb, the page
+  // path and the live flag for the categories it happens to know, keyed by the
+  // name those fields already spell. A category the server reports and CASES
+  // has never heard of still renders, which is the whole point.
+  const [cats, setCats] = useState(null);
+  const [benchPages, setBenchPages] = useState({});
+  useEffect(() => {
+    // Both are auth-gated and this page deliberately renders signed out, so a
+    // failure here is silent and falls back to CASES rather than blanking the
+    // section.
+    fetch("/api/test/categories", { credentials: "include" })
+      .then(r => r.ok ? r.json() : null)
+      .then(j => { if (Array.isArray(j?.categories)) setCats(j.categories); })
+      .catch(() => {});
+    fetch("/api/test/benches", { credentials: "include" })
+      .then(r => r.ok ? r.json() : null)
+      .then(j => {
+        if (!Array.isArray(j?.benches)) return;
+        const m = {};
+        for (const b of j.benches) if (b.label) m[b.label] = { path: b.page, key: b.key };
+        setBenchPages(m);
+      }).catch(() => {});
+  }, []);
+
+  // A CASES entry's own subject/place/situation already join to exactly the
+  // category name the server stores ("World · Behaviour", "Transport · Actor"),
+  // so no second spelling is introduced here.
+  const nameOf = (c) => [c.subject, c.place, c.situation].filter(x => x && x !== "\u2014").join(" \u00b7 ");
+  const detailByName = Object.fromEntries(CASES.map(c => [nameOf(c), c]));
+
+  const categoryCards = (cats || []).length
+    ? cats.map(cat => {
+        const d = detailByName[cat.name] || {};
+        const b = benchPages[cat.name] || {};
+        return {
+          name: cat.name,
+          path: d.path || b.path || null,
+          key: d.key || b.key,
+          blurb: d.blurb || cat.description || null,
+          // Only a category we can actually navigate to is clickable. A
+          // server-side category with no page is still listed — its absence
+          // would be the bug — it just does not pretend to be a link.
+          live: d.live !== undefined ? d.live && !!(d.path || b.path) : !!(d.path || b.path),
+        };
+      })
+    : CASES.map(c => ({ name: nameOf(c), path: c.path, key: c.key, blurb: c.blurb, live: c.live }));
+
   const label = { fontSize: 10, letterSpacing: ".16em", textTransform: "uppercase",
     color: "rgba(255,255,255,.4)" };
 
@@ -209,12 +265,11 @@ export default function LabHomePage() {
               style={{ color: GOLD + ".85)", cursor: "pointer" }}> test manager</span>.
           </span>
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {CASES.map(c => (
-              <div key={c.path} onClick={() => c.live && navigate(c.path)} style={card(c.live)}>
+            {categoryCards.map(c => (
+              <div key={c.name} onClick={() => c.live && c.path && navigate(c.path)} style={card(c.live)}>
                 <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12 }}>
                   <span style={{ fontSize: 13.5, color: c.live ? GOLD + ".95)" : "rgba(255,255,255,.3)" }}>
-                    {[c.subject, c.place, c.situation]
-                      .filter(x => x && x !== "\u2014").join(" \u00b7 ")}
+                    {c.name}
                   </span>
                   <span style={{ display: "flex", gap: 10, alignItems: "baseline", flexShrink: 0 }}>
                     {counts[c.key] != null && (
@@ -231,7 +286,8 @@ export default function LabHomePage() {
                 <span style={{ fontSize: 11, lineHeight: 1.6,
                   color: c.live ? "rgba(255,255,255,.45)" : "rgba(255,255,255,.22)" }}>{c.blurb}</span>
                 <span style={{ fontSize: 9.5, fontFamily: "ui-monospace,monospace",
-                  color: c.live ? "rgba(255,255,255,.3)" : "rgba(255,255,255,.15)" }}>{c.path}</span>
+                  color: c.live ? "rgba(255,255,255,.3)" : "rgba(255,255,255,.15)" }}>
+                  {c.path || "no page \u2014 its incidents are on the incidents board"}</span>
               </div>
             ))}
           </div>
