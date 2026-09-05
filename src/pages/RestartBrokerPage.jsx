@@ -17,9 +17,20 @@ import { useNavigate } from "react-router-dom";
 
 const GOLD = "rgba(201,151,58,";
 
+// granted_at comes from the Mac shell script's own `%Y-%m-%dT%H:%M:%S%z`
+// (e.g. "2026-09-05T21:54:53+0100") - it already carries an explicit
+// offset, unlike the resolution-manager's timestamps (bare
+// toISOString() with no offset, where appending "Z" is correct). Blindly
+// appending "Z" here turned "...+0100" into "...+0100Z", an invalid
+// string that parsed to Invalid Date and printed "NaNd ago". Only append
+// Z when the string carries no zone information at all.
+const HAS_ZONE = /(Z|[+-]\d{2}:?\d{2})$/;
 const ago = (iso) => {
   if (!iso) return "—";
-  const s = Math.max(0, (Date.now() - new Date(iso + (iso.endsWith("Z") ? "" : "Z")).getTime()) / 1000);
+  const withZone = HAS_ZONE.test(iso) ? iso : iso + "Z";
+  const ms = Date.now() - new Date(withZone).getTime();
+  if (!Number.isFinite(ms)) return "—";
+  const s = Math.max(0, ms / 1000);
   if (s < 90) return `${Math.round(s)}s ago`;
   if (s < 5400) return `${Math.round(s / 60)}m ago`;
   if (s < 172800) return `${Math.round(s / 3600)}h ago`;
@@ -35,6 +46,19 @@ const inWord = (secs) => {
 };
 
 const shortId = (id) => (id ? id.slice(0, 8) : "—");
+
+// There is no requester "name" anywhere in this data - only a Claude session
+// id and a free-text reason. Most autonomous benches (behavior-watch,
+// conduct-watch, signup-lab, ...) write their own name as a leading
+// hyphenated slug in the reason ("behavior-watch: ...", "signup-lab world:
+// control..." - note not every one uses a colon), so prefer that human-
+// readable label when it's there and fall back to the short session id
+// otherwise, same as before.
+const BENCH_PREFIX = /^([a-z][a-z]*(?:-[a-z]+)+)\b:?/;
+const requesterLabel = (entry) => {
+  const m = entry?.reason ? BENCH_PREFIX.exec(entry.reason) : null;
+  return m ? m[1] : shortId(entry?.session_id);
+};
 
 export default function RestartBrokerPage() {
   const navigate = useNavigate();
@@ -141,7 +165,7 @@ export default function RestartBrokerPage() {
                   </div>
                   <div style={{ marginTop: 8, display: "flex", gap: 16, flexWrap: "wrap",
                     fontSize: 10.5, color: "rgba(255,255,255,.4)" }}>
-                    <span>held by {shortId(lease.session_id)}</span>
+                    <span>held by {requesterLabel(lease)}</span>
                     <span>granted {ago(lease.granted_at)}</span>
                     <span>declared need {lease.need_seconds}s</span>
                   </div>
@@ -164,7 +188,7 @@ export default function RestartBrokerPage() {
                     background: "rgba(255,255,255,.02)", border: "0.5px solid rgba(255,255,255,.08)" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
                     <span style={{ fontSize: 11.5, color: "rgba(255,255,255,.75)" }}>
-                      #{i + 1} · {q.service} · {shortId(q.session_id)}
+                      #{i + 1} · {q.service} · {requesterLabel(q)}
                     </span>
                     <span style={{ ...label, fontSize: 9 }}>needs {q.need_seconds}s</span>
                   </div>
