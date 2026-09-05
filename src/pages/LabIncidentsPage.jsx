@@ -44,7 +44,14 @@ const STATUS = {
 // attention" (Unresolved) and "what a robot got stuck on" (Needs
 // acknowledgement) are different questions once something is setting it.
 const FILTERS = [
-  { key: "unresolved",   label: "Unresolved" },
+  // `open`, NOT the store's "unresolved" bucket. The store maps
+  // status=unresolved to open+acknowledged, which was right when
+  // "unresolved" was the umbrella word for anything unsettled. It stopped
+  // being right on 2026-09-04 when `open`'s own label became "unresolved"
+  // and `acknowledged` got its own chip and tile: the same word then meant
+  // two different sets on one page, so clicking Unresolved listed 8 rows
+  // beside a tile reading 2. The chip and the tile now count the same thing.
+  { key: "open",         label: "Unresolved" },
   { key: "acknowledged", label: "Needs acknowledgement" },
   { key: "resolved",     label: "Resolved" },
   { key: "wontfix",      label: "Won't fix" },
@@ -99,7 +106,7 @@ export default function LabIncidentsPage() {
   const [searchParams] = useSearchParams();
   const initialFilter = searchParams.get("status");
   const [filter, setFilter] = useState(
-    FILTERS.some(f => f.key === initialFilter) ? initialFilter : "unresolved"
+    FILTERS.some(f => f.key === initialFilter) ? initialFilter : "open"
   );
   const [bench, setBench] = useState(searchParams.get("bench") || "all");
   const [benches, setBenches] = useState([]);
@@ -295,7 +302,7 @@ export default function LabIncidentsPage() {
           <div style={{ padding: "20px 18px", borderRadius: 5, background: "rgba(255,255,255,.02)",
             border: "0.5px solid rgba(255,255,255,.08)", fontSize: 12, color: "rgba(255,255,255,.45)", lineHeight: 1.7 }}>
             Nothing filed under this filter.
-            {filter === "unresolved" && <> That is only evidence if a sweep has actually run — an empty
+            {filter === "open" && <> That is only evidence if a sweep has actually run — an empty
               board and an unrun board look identical here. Check the last run on the{" "}
               <span onClick={() => navigate("/lab/home/testmanager")}
                 style={{ color: GOLD + ".9)", cursor: "pointer" }}>test manager</span>.</>}
