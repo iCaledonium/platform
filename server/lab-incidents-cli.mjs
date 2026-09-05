@@ -56,6 +56,24 @@ function readStdin() {
 }
 
 async function main() {
+  // A routine talking to this board is proof that the routine ran. Only the
+  // `routine:<name>` provenance form counts (see routineKey): the bare bench
+  // name is what OTHER callers pass when they close that routine's rows.
+  //
+  // ...and only the commands by which a routine does its own work count. The
+  // hole this closes is `status`: to MOVE a row you must name that row's own
+  // source, and every row a routine filed carries `routine:<name>` (the skills
+  // file with `report --source routine:<name>`). So anyone tidying up after a
+  // routine -- the resolution manager, a person at a terminal -- was writing
+  // proof that the routine itself had just run. That is not a theory: at
+  // 2026-09-05T01:51-01:52Z all three liveness rows auto-closed with "Running
+  // again: heard from at ..." while all three routines were still enabled=false
+  // in the Mac scheduler and had not run since 2026-09-03. `report` and `sweep`
+  // are work only the routine does; the explicit `ping` command records itself
+  // further down and does not need this line.
+  const PROOF_OF_LIFE_CMDS = new Set(["report", "sweep"]);
+  try { if (PROOF_OF_LIFE_CMDS.has(cmd)) store.recordRoutinePing(flag("source", null), cmd); }
+  catch { /* liveness bookkeeping must never fail a routine's real work */ }
   switch (cmd) {
     case "sweep": {
       // Delegate to the RUNNING platform-api rather than sweeping in here.
@@ -149,7 +167,7 @@ async function main() {
       const allowed = ["open", "acknowledged", "known", "resolved", "wontfix"];
       const next = argv[1] && !argv[1].startsWith("--") ? argv[1] : flag("to", null);
       const usage = `usage: status <${allowed.join("|")}> ` +
-        `(--id X | --source X --check "name" [--world W] [--actor A]) [--by X] [--note X]`;
+        `(--id X | --source X --check "name" [--world W] [--actor A]) [--by X] [--note X | --note-stdin]`;
       if (!allowed.includes(next)) { console.error(usage); process.exit(1); }
 
       const id = flag("id", null);
@@ -177,10 +195,35 @@ async function main() {
         }
       }
 
-      const ok = store.setStatus(row.id, next, flag("by", flag("source", "routine:cli")), flag("note", null));
+      // --note-stdin reads the note from stdin instead of argv, so a note
+      // containing backticks, $(...), or quotes cannot be re-parsed by the
+      // remote shell on its way here. Confirmed live 2026-09-04: a backtick
+      // quoting an Elixir atom inside --note killed real resolve/flag
+      // commands with an unexpected-EOF error, leaving those incidents
+      // silently stuck open. Callers pass the note through a quoted heredoc
+      // instead; argv --note still works unchanged.
+      const note = argv.includes("--note-stdin") ? (readStdin().trim() || null) : flag("note", null);
+      const ok = store.setStatus(row.id, next, flag("by", flag("source", "routine:cli")), note);
       console.log(JSON.stringify(
         { ok, id: row.id, fingerprint: row.fingerprint, from: row.status, to: next }, null, 2));
       process.exitCode = ok ? 0 : 2;
+      return;
+    }
+
+    // Check in without filing anything. A run that finds nothing still ran, and
+    // that is the run this board could never see: it wrote no incident, so the
+    // only trace it left was an empty log entry on the Mac indistinguishable
+    // from no run at all. Takes the bare routine name or the prefixed form.
+    case "ping": {
+      const raw = flag("source", null);
+      if (!raw) { console.error("usage: ping --source <behavior-watch|conduct-watch|fault-triage>"); process.exit(1); }
+      const r = store.recordRoutinePing(raw.startsWith("routine:") ? raw : `routine:${raw}`, "ping");
+      if (!r) {
+        console.error(`not a known routine: ${raw} (known: ${Object.keys(store.ROUTINES).join(", ")})`);
+        process.exit(1);
+      }
+      console.log(JSON.stringify({ ok: true, ...r }, null, 2));
+      process.exitCode = 0;
       return;
     }
 
@@ -209,8 +252,8 @@ async function main() {
       return;
 
     default:
-      console.error(`usage: lab-incidents-cli.mjs <sweep|report|status|list|runs> [--source X] [--status X] [--bench X] [--limit N]\n` +
-        `       status <open|acknowledged|known|resolved|wontfix> (--id X | --source X --check "name") [--by X] [--note X]`);
+      console.error(`usage: lab-incidents-cli.mjs <sweep|report|status|ping|list|runs> [--source X] [--status X] [--bench X] [--limit N]\n` +
+        `       status <open|acknowledged|known|resolved|wontfix> (--id X | --source X --check "name") [--by X] [--note X | --note-stdin]`);
       process.exit(1);
   }
 }

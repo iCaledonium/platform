@@ -25,6 +25,11 @@ import { useNavigate } from "react-router-dom";
 
 const GOLD = "rgba(201,151,58,";
 
+const quietFor = (iso) => {
+  if (!iso) return Infinity;
+  return Math.max(0, (Date.now() - new Date(iso + (iso.endsWith("Z") ? "" : "Z")).getTime()) / 1000);
+};
+
 const ago = (iso) => {
   if (!iso) return "—";
   const s = Math.max(0, (Date.now() - new Date(iso + (iso.endsWith("Z") ? "" : "Z")).getTime()) / 1000);
@@ -80,6 +85,30 @@ export default function ResolutionManagerPage() {
     return () => clearInterval(t);
   }, [load]);
 
+  // Pause/resume (2026-09-04, Magnus). This route only sets a flag on the
+  // status row - the daemon on the local Mac is the one that actually
+  // stops, polling this same flag itself and aborting whatever it has in
+  // flight rather than letting it finish. "Current activities shall go
+  // back to unresolved": nothing here marks anything resolved or flagged,
+  // the incidents just return to open, same as if nothing had picked them
+  // up yet.
+  const [toggling, setToggling] = useState(false);
+  const togglePause = useCallback(async () => {
+    setToggling(true);
+    try {
+      const path = status?.paused ? "resume" : "pause";
+      const r = await fetch(`/api/test/resolution-manager/${path}`, {
+        method: "POST", credentials: "include",
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      setStatus(j.status);
+      setError("");
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally { setToggling(false); }
+  }, [status?.paused]);
+
   const label = { fontSize: 10, letterSpacing: ".16em", textTransform: "uppercase",
     color: "rgba(255,255,255,.4)" };
 
@@ -111,6 +140,10 @@ export default function ResolutionManagerPage() {
           <span style={{ ...label, color: GOLD + ".65)" }}>resolution manager</span>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={togglePause} disabled={toggling}
+            style={btn(status?.paused ? "#7fc08a" : GOLD + ".7)")}>
+            {toggling ? "…" : status?.paused ? "Resume" : "Pause"}
+          </button>
           <button onClick={() => navigate("/lab/home")} style={btn()}>Close</button>
         </div>
       </div>
@@ -132,13 +165,21 @@ export default function ResolutionManagerPage() {
               borderLeft: `2px solid ${stale ? "#e0736b" : stateColor}` }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
                 <span style={{ fontSize: 22, fontFamily: "'Cormorant Garamond',Georgia,serif",
-                  color: stale ? "#e0736b" : stateColor, textTransform: "uppercase", letterSpacing: ".08em" }}>
-                  {stale ? "not responding" : active ? `active · ${workers.length}/6` : "idle"}
+                  color: status.paused ? "rgba(255,255,255,.5)" : stale ? "#e0736b" : stateColor,
+                  textTransform: "uppercase", letterSpacing: ".08em" }}>
+                  {status.paused ? "paused" : stale ? "not responding" : active ? `active · ${workers.length}/6` : "idle"}
                 </span>
                 <span style={{ ...label, fontSize: 9 }}>last update {ago(status.updated_at)}</span>
               </div>
 
-              {active && !stale && (
+              {status.paused && (
+                <div style={{ marginTop: 10, fontSize: 11.5, color: "rgba(255,255,255,.5)" }}>
+                  Paused{status.paused_by ? ` by ${status.paused_by}` : ""} — picking up nothing new, and
+                  whatever it had in flight was returned to unresolved rather than left half-finished.
+                </div>
+              )}
+
+              {active && !stale && !status.paused && (
                 <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
                   {workers.map((w, i) => (
                     <div key={`${w.bench}:${w.check_name}:${i}`}
@@ -146,13 +187,24 @@ export default function ResolutionManagerPage() {
                       Working <strong>{w.check_name}</strong>
                       <div style={{ fontSize: 10, color: "rgba(255,255,255,.4)", marginTop: 2 }}>
                         {w.bench} · started {ago(w.started_at)}
+                        {typeof w.steps === "number" && <> · {w.steps} step{w.steps === 1 ? "" : "s"}</>}
+                        {w.last_activity_at && <> · active {ago(w.last_activity_at)}</>}
                       </div>
+                      {w.last_action && (
+                        <div style={{
+                          fontSize: 10, marginTop: 3, fontFamily: "ui-monospace,SFMono-Regular,Menlo,monospace",
+                          color: quietFor(w.last_activity_at) > 180 ? "rgba(224,115,107,.75)" : "rgba(127,192,138,.75)",
+                          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "100%",
+                        }} title={w.last_action}>
+                          {quietFor(w.last_activity_at) > 180 ? "\u23f8 " : "\u25b8 "}{w.last_action}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
               )}
 
-              {!active && !stale && (
+              {!active && !stale && !status.paused && (
                 <div style={{ marginTop: 10, fontSize: 11.5, color: "rgba(255,255,255,.45)" }}>
                   Nothing to do right now — watching the incidents board for the next open one.
                 </div>
@@ -173,6 +225,11 @@ export default function ResolutionManagerPage() {
                 <span style={{ fontSize: 20, color: "#7fc08a",
                   fontFamily: "'Cormorant Garamond',Georgia,serif" }}>{incidentCounts?.resolved ?? 0}</span>
                 <span style={{ ...label, fontSize: 9 }}>resolved</span>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                <span style={{ fontSize: 20, color: "#e0736b",
+                  fontFamily: "'Cormorant Garamond',Georgia,serif" }}>{(incidentCounts?.open ?? 0) + (incidentCounts?.acknowledged ?? 0)}</span>
+                <span style={{ ...label, fontSize: 9 }}>unresolved</span>
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                 <span style={{ fontSize: 20, color: "#d9a441",
