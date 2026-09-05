@@ -61,13 +61,40 @@ export default function WatcherPanel({ bound = null }) {
   // change = re-attach). "default" = inherit the bridge's CLI default.
   const MODELS = ["default", "fable", "opus", "sonnet", "haiku"];
   const EFFORTS = ["default", "low", "medium", "high", "xhigh", "max"];
+  // Offer only what this model has. Haiku, for instance, reports none at all.
+  const effortsForModel = (m) => {
+    if (!modelCaps) return [...EFFORTS, "ultracode"];
+    const hit = modelCaps.find((c) => (c.name || "").toLowerCase().startsWith((m || "default").toLowerCase()));
+    if (!hit) return [...EFFORTS, "ultracode"];
+    if (!hit.efforts || !hit.efforts.length) return ["default"];
+    // "ultracode" is not a member of the SDK's EffortLevel union — it is an
+    // ALIAS the CLI resolves (N={ultracode:"xhigh"}) which ALSO turns on
+    // standing dynamic-workflow orchestration for the session. The SDK does no
+    // runtime validation on effort (sdk.mjs passes --effort through verbatim),
+    // so it reaches the CLI intact. Offer it wherever xhigh exists, since that
+    // is what it resolves to. Verified empirically 2026-09-03.
+    const base = ["default", ...hit.efforts];
+    return hit.efforts.includes("xhigh") ? [...base, "ultracode"] : base;
+  };
   const [model, setModel] = useState(() => { try { return localStorage.getItem("watcherModel") || "default"; } catch { return "default"; } });
-  const [effort, setEffort] = useState(() => { try { return localStorage.getItem("watcherEffort") || "default"; } catch { return "default"; } });
+  // Ordinary watching does not need the slowest setting: measured 2026-09-03,
+  // every watcher was pinned to effort=high, which is the floor cost on every
+  // turn including "what does your dossier say". Default to medium and let
+  // high be a deliberate choice for a real diagnosis.
+  const [effort, setEffort] = useState(() => { try { return localStorage.getItem("watcherEffort") || "medium"; } catch { return "medium"; } });
   const modelRef = useRef(model); modelRef.current = model;
   const effortRef = useRef(effort); effortRef.current = effort;
   const [applied, setApplied] = useState(null); // what the bridge actually spawned with
   const [menu, setMenu] = useState(null); // "model" | "effort" | null — composer-footer popover
   const [minimized, setMinimized] = useState(false);
+  // The watcher's own notebook, fetched on demand. Readable BY YOU is the main
+  // point: the only way to catch a specialist believing something wrong is to
+  // be able to see what it believes.
+  const [dossier, setDossier] = useState(null);
+  // What each model ACTUALLY supports, straight from the SDK via the bridge.
+  // Effort is per-model and an unsupported level is silently downgraded, so a
+  // fixed list would show "max" while the run quietly used something else.
+  const [modelCaps, setModelCaps] = useState(null);
   const [watchers, setWatchers] = useState([]);
   const [watcherName, setWatcherName] = useState("");
   const [newName, setNewName] = useState("");
@@ -80,6 +107,49 @@ export default function WatcherPanel({ bound = null }) {
     try { return JSON.parse(localStorage.getItem(POS_KEY)) || null; } catch { return null; }
   });
   const dragRef = useRef(null);
+
+  // Size, remembered like position. A long finding scrolls badly in a narrow
+  // column, and a run you are only glancing at should be able to shrink out
+  // of the way — so the panel is the developer's to shape, not a fixed slab.
+  const SIZE_KEY = "watcherPanelSize";
+  const MIN_W = 300, MIN_H = 220;
+  const [size, setSize] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(SIZE_KEY)) || null; } catch { return null; }
+  });
+  const resizeRef = useRef(null);
+
+  // `axis`: "x" | "y" | "xy" — the corner grip takes both, the edges take one.
+  const startResize = (axis) => (e) => {
+    e.preventDefault();
+    e.stopPropagation();                      // never let the header's drag see this
+    const el = e.currentTarget.closest("[data-watcher-root]");
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const start = { x: e.clientX, y: e.clientY, w: r.width, h: r.height };
+    resizeRef.current = start;
+    const onMove = (ev) => {
+      const next = {
+        w: axis.includes("x")
+          ? Math.max(MIN_W, Math.min(start.w + (ev.clientX - start.x), window.innerWidth - 40))
+          : start.w,
+        h: axis.includes("y")
+          ? Math.max(MIN_H, Math.min(start.h + (ev.clientY - start.y), window.innerHeight - 40))
+          : start.h,
+      };
+      setSize(next);
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      resizeRef.current = null;
+      setSize((cur) => {
+        try { localStorage.setItem(SIZE_KEY, JSON.stringify(cur)); } catch {}
+        return cur;
+      });
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
 
   const dragged = pos
     ? { left: Math.max(0, Math.min(pos.x, window.innerWidth - 60)),
@@ -242,11 +312,20 @@ export default function WatcherPanel({ bound = null }) {
     setPhase("connecting");
     const ws = new WebSocket(BRIDGE_URL);
     wsRef.current = ws;
-    ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token }));
+    ws.onopen = () => { if (wsRef.current === ws) ws.send(JSON.stringify({ type: "auth", token })); };
     ws.onmessage = (evt) => {
+      // A switch (killSession then startSession) replaces wsRef.current with a
+      // NEW socket while the OLD one is still closing — the server can keep
+      // streaming to it for a moment. Without this guard the dying socket's
+      // events fire on this closure's setters and stomp the new session's
+      // state right after it's set (2026-09-04: a Character Wizard tool-call
+      // delta landed after a User Avatar attach failed, leaving the header
+      // reading "Character Wizard / WORKING" over the avatar page's error).
+      if (wsRef.current !== ws) return;
       let msg;
       try { msg = JSON.parse(evt.data); } catch { return; }
       if (msg.type === "ready") {
+        if (msg.models) setModelCaps(msg.models);
         setWatchers(msg.watchers || []);
         const auto = autoAttachName.current;
         autoAttachName.current = null;
@@ -266,6 +345,7 @@ export default function WatcherPanel({ bound = null }) {
         settleBubble("");
         push({ kind: "tool", text: `${msg.name} ${msg.input}` });
       } else if (msg.type === "uploaded") { /* path already travelling to the watcher */ }
+      else if (msg.type === "dossier") setDossier(msg.text || "(nothing written yet)");
       else if (msg.type === "turn_done") { settleBubble(""); setBusy(false); }
       else if (msg.type === "error") {
         if (/already attached elsewhere/.test(msg.message || "")) { setPhase("pick"); setWatcherName(""); }
@@ -413,7 +493,7 @@ export default function WatcherPanel({ bound = null }) {
     : phase === "dead" ? "rgba(200,90,80,.9)" : "rgba(255,255,255,.35)";
 
   const brainSelects = [["model", model, setModel, MODELS, "watcherModel"],
-    ["effort", effort, setEffort, EFFORTS, "watcherEffort"]].map(([cap, val, set, opts, key]) => (
+    ["effort", effort, setEffort, effortsForModel(model), "watcherEffort"]].map(([cap, val, set, opts, key]) => (
     <label key={cap} style={{ display: "flex", flexDirection: "column", gap: 4, flex: 1 }}>
       <span style={label}>{cap}</span>
       <select value={val}
@@ -450,7 +530,9 @@ export default function WatcherPanel({ bound = null }) {
       onDragOver={(e) => { e.preventDefault(); }}
       onDrop={(e) => { e.preventDefault(); if (e.dataTransfer?.files?.length) stageFiles([...e.dataTransfer.files]); }}
       style={{ position: "fixed", ...panelPosStyle, zIndex: 100000,
-      width: 400, height: "min(880px, calc(100vh - 130px))", overflow: "hidden",
+      width: size ? Math.min(size.w, window.innerWidth - 40) : 400,
+      height: size ? Math.min(size.h, window.innerHeight - 40) : "min(880px, calc(100vh - 130px))",
+      overflow: "hidden",
       display: "flex", flexDirection: "column",
       background: "#0f0e0b", border: "0.5px solid rgba(255,255,255,.12)",
       borderRadius: 12, boxShadow: "0 18px 50px rgba(0,0,0,.6)",
@@ -467,21 +549,6 @@ export default function WatcherPanel({ bound = null }) {
             : phase === "dead" ? "session ended" : ""}
         </span>
         <div style={{ flex: 1 }} />
-        {phase === "live" && !busy && (
-          <button title="Restart the whole scenario — the watcher snapshots, rebuilds the fixture from the first stage, and posts the new scene link"
-            onClick={() => {
-              const text = "Restart the WHOLE scenario from the beginning: take a labelled snapshot first, " +
-                "then rebuild the fixture for the current pair at the scenario's first stage with the same " +
-                "configuration, and reply with the new scene path (/world/...) so I can click straight into it.";
-              push({ kind: "me", text: "⟳ restart the scenario" });
-              wsRef.current?.send(JSON.stringify({ type: "user", text }));
-              setBusy(true);
-            }}
-            style={{ background: "none", border: "none", cursor: "pointer",
-              color: GOLD + ".8)", fontSize: 13, lineHeight: 1 }}>
-            ⟳
-          </button>
-        )}
         {phase === "live" && busy && (
           <button onClick={() => wsRef.current?.send(JSON.stringify({ type: "interrupt" }))}
             style={{ background: "none", border: "none", cursor: "pointer",
@@ -496,13 +563,36 @@ export default function WatcherPanel({ bound = null }) {
             new watcher
           </button>
         )}
-        {(phase === "live" || phase === "dead") && (
-          <button onClick={() => setShowBrain((s) => !s)}
-            title="Model & effort for this watcher — change and re-attach"
-            style={{ background: "none", border: `0.5px solid ${GOLD}.35)`, borderRadius: 5,
-              cursor: "pointer", color: GOLD + ".8)", fontSize: 8.5,
-              letterSpacing: ".08em", padding: "3px 6px" }}>
-            {applied ? [applied.model || "default", applied.effort || "default"].join(" · ") : "brain"}
+        {phase === "live" && (
+          <button title="This watcher's dossier — what it has established on this test case"
+            onClick={() => {
+              if (dossier !== null) { setDossier(null); return; }
+              wsRef.current?.send(JSON.stringify({ type: "dossier" }));
+            }}
+            style={{ background: "none", border: "none", cursor: "pointer",
+              color: dossier !== null ? GOLD + ".9)" : "rgba(255,255,255,.45)",
+              fontSize: 10, letterSpacing: ".1em" }}>
+            dossier
+          </button>
+        )}
+        {phase === "live" && (
+          <button disabled={busy}
+            title={busy
+              ? "Restart the whole scenario — available once the watcher finishes this turn"
+              : "Restart the whole scenario — the watcher snapshots, rebuilds the fixture from the first stage, and posts the new scene link"}
+            onClick={() => {
+              const text = "Restart the WHOLE scenario from the beginning: take a labelled snapshot first, " +
+                "then rebuild the fixture for the current pair at the scenario's first stage with the same " +
+                "configuration, and reply with the new scene path (/world/...) so I can click straight into it.";
+              push({ kind: "me", text: "⟳ restart the scenario" });
+              wsRef.current?.send(JSON.stringify({ type: "user", text }));
+              setBusy(true);
+            }}
+            style={{ background: "none", border: "none",
+              cursor: busy ? "default" : "pointer",
+              color: busy ? "rgba(255,255,255,.25)" : GOLD + ".8)",
+              fontSize: 13, lineHeight: 1 }}>
+            ⟳
           </button>
         )}
         <button onClick={() => setMinimized(true)} title="Minimize — the watcher keeps running"
@@ -548,6 +638,9 @@ export default function WatcherPanel({ bound = null }) {
             onKeyDown={(e) => {
               if (e.key === "Enter" && e.target.value.trim()) {
                 try { localStorage.setItem(TOKEN_KEY, e.target.value.trim()); } catch {}
+                // A fresh token should land you in the page's own watcher,
+                // not the picker — same binding as every other entry path.
+                if (boundRef.current) autoAttachName.current = boundRef.current;
                 startSession(e.target.value.trim());
               }
             }}
@@ -558,7 +651,15 @@ export default function WatcherPanel({ bound = null }) {
         </div>
       ) : (
         <>
-          <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", overflowX: "hidden",
+          {dossier !== null && (
+            <div style={{ flex: 1, overflowY: "auto", overflowX: "hidden", padding: "12px 14px",
+              whiteSpace: "pre-wrap", fontSize: 11, lineHeight: 1.6,
+              color: "rgba(255,255,255,.72)", fontFamily: "ui-monospace,monospace",
+              borderBottom: "0.5px solid rgba(255,255,255,.08)" }}>
+              {dossier}
+            </div>
+          )}
+          <div ref={scrollRef} style={{ flex: dossier !== null ? "none" : 1, maxHeight: dossier !== null ? 170 : "none", overflowY: "auto", overflowX: "hidden",
             scrollbarWidth: "thin", padding: "12px 14px",
             display: "flex", flexDirection: "column", gap: 8 }}>
             {messages.map((m, i) =>
@@ -657,7 +758,7 @@ export default function WatcherPanel({ bound = null }) {
                 background: "#12100d", border: "0.5px solid rgba(255,255,255,.18)",
                 borderRadius: 8, padding: 4, boxShadow: "0 10px 30px rgba(0,0,0,.55)",
                 display: "flex", flexDirection: "column", minWidth: 92 }}>
-                {(menu === "model" ? MODELS : EFFORTS).map((o) => (
+                {(menu === "model" ? MODELS : effortsForModel(model)).map((o) => (
                   <div key={o} onClick={() => pickBrain(menu, o)}
                     style={{ padding: "6px 10px", borderRadius: 5, cursor: "pointer", fontSize: 11,
                       color: o === (menu === "model" ? model : effort) ? GOLD + ".95)" : "rgba(255,255,255,.75)",
@@ -679,6 +780,19 @@ export default function WatcherPanel({ bound = null }) {
           </div>
         </>
       )}
+
+      {/* Resize grips. Pointer-events only on the strips themselves, so they
+          never steal a click from the chat or the header's move-drag. */}
+      <div onPointerDown={startResize("x")} title="Drag to resize width"
+        style={{ position: "absolute", top: 0, right: 0, width: 6, height: "100%",
+          cursor: "ew-resize", touchAction: "none" }} />
+      <div onPointerDown={startResize("y")} title="Drag to resize height"
+        style={{ position: "absolute", left: 0, bottom: 0, width: "100%", height: 6,
+          cursor: "ns-resize", touchAction: "none" }} />
+      <div onPointerDown={startResize("xy")} title="Drag to resize"
+        style={{ position: "absolute", right: 0, bottom: 0, width: 16, height: 16,
+          cursor: "nwse-resize", touchAction: "none",
+          background: "linear-gradient(135deg, transparent 55%, rgba(255,255,255,.22) 55%, rgba(255,255,255,.22) 70%, transparent 70%, transparent 80%, rgba(255,255,255,.22) 80%)" }} />
     </div>
   );
 }
