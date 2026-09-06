@@ -64,8 +64,8 @@ try {
   cookie = raw;
 
   apiKey = "sk-an-" + crypto.randomBytes(20).toString("hex");
-  db.prepare(`INSERT INTO api_keys (id, user_id, world_id, name, key_hash, key_prefix, scopes, inserted_at, updated_at)
-              VALUES (?,?,?,?,?,?,'[]',?,?)`)
+  db.prepare(`INSERT INTO api_keys (id, user_id, world_id, name, key_hash, key_prefix, scopes, expires_at, inserted_at, updated_at)
+              VALUES (?,?,?,?,?,?,'[]',datetime('now','+1 day'),?,?)`)
     .run("tprof-key", USER, "none", "profile e2e", sha(apiKey), apiKey.slice(0, 12), now(), now());
 
   // ── the gate ────────────────────────────────────────────────────────────────
