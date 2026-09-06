@@ -532,6 +532,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   // sentence land. energy/mood/desire/sobriety are what the engine sends.
   const [eyeToEye, setEyeToEyeUI] = useState(false);
   const [vitals, setVitals] = useState(null);
+  const [hudLeft, setHudLeft] = useState(0);   // canvas left edge, for HUD anchoring
   const [changedVitals, setChangedVitals] = useState({});
   const [vitalToasts, setVitalToasts] = useState([]);
   const prevVitalsRef = useRef(null);
@@ -980,8 +981,12 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // Right-click leaves walk mode and gives the cursor back — the game
     // gesture, and it works whether or not pointer lock was ever granted.
     const onContext = (e) => {
-      if (!api.current.walkMode) return;
+      // Always suppress the menu on the canvas. The right button is the
+      // camera now (hold to look, GTA-style), and without this the browser
+      // menu opens on top of the scene the instant you try to turn. A 3D view
+      // has no use for a context menu anyway; this costs nothing.
       e.preventDefault();
+      if (!api.current.walkMode) return;
       exitWalk();
     };
     renderer.domElement.addEventListener("contextmenu", onContext);
@@ -1044,8 +1049,19 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       applyEyeAperture();
       renderer.setSize(cw, ch);
     };
-    api.current.resize = onResize;
-    window.addEventListener("resize", onResize);
+    // Keep the HUD glued to the picture: every resize (including the aspect
+    // cap changing the render width) republishes the canvas's left edge.
+    const publishHudLeft = () => {
+      const cv = renderer.domElement;
+      const host = cv?.parentElement;
+      if (!cv || !host) return;
+      const l = cv.getBoundingClientRect().left - host.getBoundingClientRect().left;
+      setHudLeft(Math.max(0, Math.round(l)));
+    };
+    const onResizeAndHud = () => { onResize(); publishHudLeft(); };
+    api.current.resize = onResizeAndHud;
+    publishHudLeft();
+    window.addEventListener("resize", onResizeAndHud);
 
     let raf, t = 0;
     const tick = () => {
@@ -1147,7 +1163,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
 
     return () => {
       cancelAnimationFrame(raf);
-      window.removeEventListener("resize", onResize);
+      window.removeEventListener("resize", onResizeAndHud);
       renderer.dispose();
       scene.traverse(o => {
         if (o.geometry) o.geometry.dispose();
@@ -1224,6 +1240,11 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         if (!r.ok) return;
         const d = await r.json();
         if (dead) return;
+        // The poll now carries her vitals too, so a client that missed the
+        // one-shot encounter_first_words broadcast (joined late, reloaded
+        // mid-scene) heals on the next tick instead of showing an empty HUD
+        // for the rest of the encounter.
+        if (d.vitals) updateVitals(d.vitals);
         if (d.narrative) setNarrative(d.narrative);
         if (d.decision) {
           setDecision(d.decision); setPhase("answered"); clearInterval(poll);
@@ -2173,10 +2194,25 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       const b = new THREE.Box3().setFromObject(her);
       a.herEyeY = b.max.y - 0.11;          // crown to eye line on a Genesis head
     }
+    // THE SHOT. This was 0.62m from her face with the lens on her eye line —
+    // close enough that she filled the frame from chin to brow and nothing of
+    // her was in it. Reported 2026-09-05 as "too close".
+    //
+    // Standing distance now, with the lens centred below the eye line so the
+    // frame carries her head, shoulders and upper body rather than a face.
+    // The eye contact the mode exists for is untouched: she still looks down
+    // the lens, and the lens is still on her axis — only further back and
+    // aimed a little lower.
+    //
+    // Three constants, all in metres: DIST out for a wider shot, DROP down to
+    // take in more of her, RISE for camera height relative to her eye line.
+    const DIST = 1.05;
+    const DROP = 0.26;              // lens centre below her eye line
+    const RISE = 0.06;                       // camera sits just under her eye line
     const fx = Math.sin(her.rotation.y), fz = Math.cos(her.rotation.y);
     return {
-      pos:  new THREE.Vector3(her.position.x + fx * 0.62, a.herEyeY, her.position.z + fz * 0.62),
-      look: new THREE.Vector3(her.position.x, a.herEyeY, her.position.z),
+      pos:  new THREE.Vector3(her.position.x + fx * DIST, a.herEyeY - RISE, her.position.z + fz * DIST),
+      look: new THREE.Vector3(her.position.x, a.herEyeY - DROP, her.position.z),
     };
   }
 
@@ -2210,6 +2246,12 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       a.eyeRestore = null;
       a.eyeReturn = { pos: a.camera.position.clone(), quat: a.camera.quaternion.clone() };
       a.eyeToEye = true;
+      // Your own body is between the lens and her in third person, so it
+      // walked into frame the moment the camera pulled back to a
+      // conversational distance. Reported 2026-09-05: "the user is visible".
+      // Hide it for the duration -- this mode is her looking at you, and in it
+      // the camera IS you, so there is nothing of yours that belongs in shot.
+      if (a.me) { a._meWasVisible = a.me.visible; a.me.visible = false; }
       applyEyeAperture();
       a.exitWalk?.();                       // the feet are not yours in here
       // She looks at you. That is the entire content of the mode.
@@ -2219,9 +2261,14 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         a.herFacing = Math.atan2(fx, fz);
         a.idleTurn  = a.herFacing;
       }
+
+      // Framing lives in eyeToEyeFraming(), which applyEyeToEye lerps toward
+      // every frame -- setting the camera here as well was redundant and was
+      // simply lerped over on the next tick.
     } else {
       if (!a.eyeToEye) return;
       a.eyeToEye = false;
+      if (a.me) a.me.visible = a._meWasVisible !== false;   // back in the world
       if (a.camera?.view?.enabled) a.camera.clearViewOffset();
       a.eyeRestore = a.eyeReturn || null;
     }
@@ -3418,8 +3465,110 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   //
   // None of this runs when pointer lock is held — there the pointer is
   // infinite and deltas are all you need.
+  // GTA-style mouse look, on a held right button.
+  //
+  // GTA V orbits the camera continuously with the mouse and never asks you to
+  // click for it. This scene cannot take the mouse outright: you also have to
+  // TYPE to her, and pointer lock steals the cursor from the chat input. The
+  // "unlock" change earlier tonight fixed walking without a click, but it also
+  // gated steerLook off (it requires walkMode), leaving GTA-style movement
+  // with no camera control at all -- the worst of both.
+  //
+  // So: hold the right button and the camera is yours, with real mouse look
+  // and no edge-steering approximation; release and the cursor is yours again
+  // for the chat. Holding IS the mode indicator, so nothing has to be
+  // remembered or displayed. Movement stays camera-relative, which is what
+  // makes W walk where you are looking, as it does in GTA.
+  useEffect(() => {
+    const a = api.current;
+    // Bound to the DOCUMENT, not to renderer.domElement.
+    //
+    // The first version read a.renderer?.domElement at mount and bailed when it
+    // was undefined -- which it always is, because the renderer is built by a
+    // later effect. The listeners were therefore never attached and the right
+    // button did nothing. Measured before shipping: _mouseLook false and no
+    // pointer lock after a synthetic right-button press. Same shape as the
+    // audio-arming bug earlier tonight: work gated on a thing that is not
+    // ready yet, silently skipped, with nothing to show for it.
+    //
+    // Document-level listeners have no ordering problem, and the canvas is
+    // looked up at EVENT time, by which point it certainly exists.
+    const canvas = () => api.current?.renderer?.domElement || null;
+
+    // EITHER button holds the camera.
+    //
+    // Right-button-only assumed a gaming mouse. On a Magic Mouse or trackpad a
+    // sustained button:2 is awkward at best -- a two-finger press-and-hold does
+    // not deliver one -- so "hold right to look" was unusable on the hardware
+    // this actually runs on. Measured 2026-09-05 from the event trace: every
+    // press Magnus made arrived as button:0 while the handler waited for
+    // button:2, so nothing happened and it read as "hold is not working".
+    //
+    // Left-drag is also the natural look gesture on a trackpad, so accept
+    // both. The scene has nothing else bound to a left DRAG (a left CLICK on
+    // the doorway still enters first-person walk mode, which is untouched --
+    // see the guard in onUp).
+    const onDown = (e) => {
+      if (e.button !== 0 && e.button !== 2) return;
+      const el = canvas();
+      if (!el) return;
+      if (e.target && e.target.closest && e.target.closest("input,textarea,button,select,a")) return;
+      e.preventDefault();
+      if (isTyping()) document.activeElement.blur();
+      a._mouseLook = true;
+      el.requestPointerLock?.();
+    };
+    const onUp = (e) => {
+      if (e.button !== 0 && e.button !== 2) return;
+      a._mouseLook = false;
+      // Unconditional: if the lock has not arrived yet, onLockChange above
+      // will drop it as soon as it does.
+      document.exitPointerLock?.();
+    };
+    // Losing the lock any other way (Esc, focus loss) must clear the flag too,
+    // or the next frame keeps applying deltas that are no longer arriving.
+    // requestPointerLock() is ASYNCHRONOUS, and that made hold behave like a
+    // toggle. On a quick press-release the lock engages AFTER mouseup, so onUp
+    // ran while there was still nothing to exit -- exitPointerLock() was a
+    // no-op -- and the lock then arrived and stayed. Reported live 2026-09-05:
+    // "It is not hold it is click now."
+    //
+    // So the authority is the FLAG, not the ordering: whenever the lock state
+    // changes, if the button is no longer held, drop the lock immediately.
+    // A release that beats the lock is now corrected the moment it lands.
+    const onLockChange = () => {
+      const el = canvas();
+      if (document.pointerLockElement !== el) { a._mouseLook = false; return; }
+      if (!a._mouseLook) document.exitPointerLock?.();   // released before it engaged
+    };
+    const onMove = (e) => {
+      if (!a._mouseLook || document.pointerLockElement !== canvas()) return;
+      if (a.eyeToEye) return;                  // she has the frame; leave it alone
+      const SENS = 0.0022;                     // rad per pixel, tuned to steerLook's feel
+      const eu = _steerEuler;
+      eu.setFromQuaternion(a.camera.quaternion);
+      eu.y -= e.movementX * SENS;
+      eu.x -= e.movementY * SENS;
+      const lim = Math.PI / 2 - 0.02;
+      eu.x = Math.max(-lim, Math.min(lim, eu.x));
+      a.camera.quaternion.setFromEuler(eu);
+    };
+
+    document.addEventListener("mousedown", onDown, true);
+    window.addEventListener("mouseup", onUp);
+    window.addEventListener("mousemove", onMove);
+    document.addEventListener("pointerlockchange", onLockChange);
+    return () => {
+      document.removeEventListener("mousedown", onDown, true);
+      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("mousemove", onMove);
+      document.removeEventListener("pointerlockchange", onLockChange);
+    };
+  }, []);
+
   function steerLook(delta) {
     const a = api.current;
+    if (a._mouseLook) return;   // the held right button owns the camera
     if (!a.walkMode || a.eyeToEye || a.fpv?.isLocked || document.pointerLockElement) return;
     const p = a.pointer;
     // Left the window, or the window lost focus: freeze. Without this the last
@@ -3734,6 +3883,15 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // against a short distance swings the body far off-axis — measured on the
     // landing: back collapsed to 0.63m, shoulder stayed 0.42m, and he sat ~60°
     // out of a 45° frame. Visible in the scene graph, invisible on screen.
+    // Close in, the offset must NOT scale down with the shortened boom -- that
+    // collapse is the whole bug. Blend toward a wide, fixed offset instead.
+    // REVERTED 2026-09-06. Widening the shoulder when close pushed the camera
+    // SIDEWAYS THROUGH THE WALL: the boom is raycast-tested, the lateral offset
+    // is not, so a wider offset in a corridor puts the camera inside geometry
+    // and the frame becomes flat plaster. Measured -- camBack collapsed to the
+    // 0.55 minimum and the shot was a beige wall with neither person in it.
+    // Any future attempt at over-the-shoulder framing must raycast the LATERAL
+    // offset too, not just the boom.
     const shoulder = CAM_SHOULDER * Math.min(1, back / CAM_BACK);
 
     _camTarget.set(
@@ -4057,7 +4215,13 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
             talking, not something you click, and in walk mode the pointer is
             gone anyway. */}
         {vitals && decision === "open_door" && (
-          <div style={{ position: "absolute", top: 14, left: 16, zIndex: 12,
+          // Anchored to the CANVAS, not the container. The aspect cap narrows
+          // the render (onResize shrinks cw when cw/ch exceeds maxAspect) and
+          // letterboxes it, but this HUD was pinned to the container's own
+          // left edge -- so raising the cap slid her vitals off the picture and
+          // out into the black bar beside it. Reported live 2026-09-05 after an
+          // aspect change. hudLeft tracks the canvas's actual left edge.
+          <div style={{ position: "absolute", top: 14, left: hudLeft + 16, zIndex: 12,
                         pointerEvents: "none", display: "flex", flexDirection: "column",
                         gap: 7, width: 170 }}>
             {Object.entries(VITAL_LABELS).map(([k, label]) => {
