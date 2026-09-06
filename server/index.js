@@ -6236,7 +6236,64 @@ app.put("/api/actors/:id", (req, res) => {
   res.json({ ok: true });
 });
 
-// ── Helper: auth from cookie ──────────────────────────────────────────────────
+// -- API key authorisation: scopes and world binding --------------------------
+//
+// A key is minted per world (POST /api/worlds/:id/issue-key) and carries a
+// scope list. Until 2026-09-05 neither was read at authorisation time. The rule
+// this implements, deliberately narrow so it matches what keys are FOR:
+//
+//   * account surface -- a key is an installed-app credential, not a session.
+//     Only the endpoints the apps genuinely call without a world in the path
+//     are reachable with one. Key minting, org admin, the character library,
+//     enrolment, erasure -- all of that needs a browser session now.
+//   * world binding -- /api/worlds/<id>/... must be the world the key was
+//     minted for. A key bound to a world that no longer exists is inert, which
+//     is why the three dead world_ids need no separate revocation.
+//   * scopes -- taken from the family of the path, with the verb splitting read
+//     from write. An unrecognised world route falls back to world:read for safe
+//     methods and world:control for mutating ones, so a route added later is
+//     closed to under-scoped keys by default rather than open by default.
+//
+// Denial returns null from authUser(), i.e. the caller sees the route's own 401.
+const API_KEY_ACCOUNT_ALLOW = new Set(["/api/me", "/api/apps", "/api/tts"]);
+
+function apiKeyRequiredScope(method, tail) {
+  const safe = method === "GET" || method === "HEAD";
+  if (/\/voicemail(\/|$)/.test(tail))          return safe ? "messages:read" : "messages:write";
+  if (/\/messages(\/|$)/.test(tail))           return safe ? "messages:read" : "messages:write";
+  if (/\/media(\/|$)/.test(tail))              return safe ? "messages:read" : "messages:write";
+  if (/\/meetings(\/|$)/.test(tail))           return safe ? "messages:read" : "messages:write";
+  if (/\/(contacts|context)(\/|$)/.test(tail)) return "contacts:read";
+  if (/\/calendar(\/|$)/.test(tail))           return "calendar:read";
+  if (/\/feed(\/|$)/.test(tail))               return "feed:read";
+  return safe ? "world:read" : "world:control";
+}
+
+// Returns null when the key may serve this request, or a short human reason.
+function apiKeyDenial(req, keyRow) {
+  const path = req.path || "";
+  if (!path.startsWith("/api/")) return null; // static and proxy surface carries no scope
+
+  let scopes = [];
+  try { scopes = JSON.parse(keyRow.scopes || "[]"); } catch (_e) { scopes = []; }
+  if (!Array.isArray(scopes)) scopes = [];
+
+  const world = path.match(/^\/api\/worlds\/([^/]+)/);
+  if (!world) {
+    return API_KEY_ACCOUNT_ALLOW.has(path)
+      ? null
+      : `${path} is account surface, and an api key is world-scoped`;
+  }
+  if (keyRow.world_id && world[1] !== keyRow.world_id) {
+    return `key is bound to world ${keyRow.world_id}, request is for ${world[1]}`;
+  }
+  const tail = path.slice(world[0].length);
+  if (/^\/issue-key(\/|$)/.test(tail)) return "a key may not mint another key";
+  const need = apiKeyRequiredScope(req.method, tail);
+  return scopes.includes(need) ? null : `key lacks scope ${need}`;
+}
+
+// -- Helper: auth from cookie ──────────────────────────────────────────────────
 function authUser(req) {
   // 1. Cookie auth (platform UI)
   const cookieHeader = req.headers["cookie"] || "";
@@ -6250,12 +6307,30 @@ function authUser(req) {
     if (row) return row;
   }
   // 2. API key auth (installed apps)
+  //
+  // Conduct watch, 2026-09-05: this branch used to return the full user row for
+  // any live key -- the same object the cookie branch returns -- so a key's
+  // `scopes` list and the world it was minted for were decorative, and a bearer
+  // of any live key was the whole account, everywhere on the platform API, for
+  // as long as the key lived. Both columns are consulted now, here, at the one
+  // point where a key becomes a principal. See apiKeyDenial() above.
   const apiKey = req.headers["x-api-key"] || "";
   if (apiKey.startsWith("sk-an-")) {
     const keyHash = crypto.createHash("sha256").update(apiKey).digest("hex");
-    const keyRow = db.prepare(`SELECT user_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL AND expires_at IS NOT NULL AND julianday(expires_at) > julianday('now')`).get(keyHash);
+    const keyRow = db.prepare(`SELECT user_id, world_id, scopes FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL AND expires_at IS NOT NULL AND julianday(expires_at) > julianday('now')`).get(keyHash);
     if (keyRow) {
       db.prepare(`UPDATE api_keys SET last_used_at = datetime('now') WHERE key_hash = ?`).run(keyHash);
+      const denial = apiKeyDenial(req, keyRow);
+      if (denial) {
+        // Recorded, not swallowed: a refused key is more interesting than an
+        // honoured one, and the [req] attribution line for this request will
+        // resolve to anon, so this is the only place the refusal is written.
+        if (!req._apiKeyDenialLogged) {
+          req._apiKeyDenialLogged = true;
+          console.warn(`[apikey-denied] ${req.method} ${req.path} key=${keyHash.slice(0, 8)} user=${keyRow.user_id} :: ${denial}`);
+        }
+        return null;
+      }
       return db.prepare(`SELECT id, name, org_id, user_type, org_role FROM users WHERE id = ? AND status != 'removed'`).get(keyRow.user_id);
     }
   }
