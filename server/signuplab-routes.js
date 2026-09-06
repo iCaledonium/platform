@@ -124,15 +124,43 @@ export function mount(app, { db, authUser, PORT }) {
         : fail("every organization has an admin", `${n} organization(s) have no active admin — invites and erasure are impossible there`));
     });
 
-    // api_keys.scopes is enforced nowhere, so an unrevoked key claiming
-    // world:control is a standing grant nothing checks. Red until revoked.
-    guarded("no unrevoked key carries the unenforced world:control scope", () => {
+    // Re-aimed 2026-09-06. It used to read "api_keys.scopes is enforced
+    // nowhere, so an unrevoked key claiming world:control is a standing grant
+    // nothing checks". That premise died with 40c88e8: apiKeyDenial() binds a
+    // key to the world it names and requires the scope the path needs, so
+    // world:control is a real bounded grant, not a phantom. The live question
+    // is no longer "does anyone hold it" but "is the binding still good" — a
+    // key whose owner has lost their membership is a credential outliving the
+    // grant it was issued under.
+    //
+    // Liveness here mirrors authUser() exactly (unrevoked, expiry present and
+    // future) so the check and the code it audits agree on what a usable key
+    // is. Anything refused here is refused at request time too — requireWorld
+    // 404s a non-member — so a hit is hygiene to revoke, not an open door.
+    //
+    // VACUOUS TODAY, deliberately: no live key carries world:control (the only
+    // two that ever did are revoked), so this cannot go red until someone mints
+    // one. It guards the keys that will exist, not the ones that do — and being
+    // unable to fire is exactly how its predecessor rotted into asserting
+    // something untrue, so that is stated here rather than discovered later.
+    //
+    // Only the membership half of "still a real world" is asserted: platform_dev.db
+    // has no worlds table, world existence lives on the simulator.
+    guarded("every world:control key is bound to a world its owner still belongs to", () => {
       const rows = db.prepare(
-        `SELECT name FROM api_keys WHERE revoked_at IS NULL AND scopes LIKE '%world:control%'`).all();
+        `SELECT k.name, k.world_id
+           FROM api_keys k
+           LEFT JOIN world_memberships m
+             ON m.user_id = k.user_id AND m.world_id = k.world_id
+          WHERE k.revoked_at IS NULL
+            AND k.expires_at IS NOT NULL
+            AND julianday(k.expires_at) > julianday('now')
+            AND k.scopes LIKE '%world:control%'
+            AND m.user_id IS NULL`).all();
       checks.push(rows.length === 0
-        ? pass("no unrevoked key carries the unenforced world:control scope", "nothing holds a control scope that no code checks")
-        : fail("no unrevoked key carries the unenforced world:control scope",
-            `${rows.length} unrevoked key(s) claim world:control (${rows.map(r => r.name).join(", ")}) — the scope is enforced nowhere, so these are standing grants`));
+        ? pass("every world:control key is bound to a world its owner still belongs to", "no live control key outlives the membership it was issued under")
+        : fail("every world:control key is bound to a world its owner still belongs to",
+            `${rows.length} live world:control key(s) name a world their owner no longer belongs to (${rows.map(r => r.name).join(", ")}) — apiKeyDenial and requireWorld already refuse them, so revoke them as stale credentials rather than treat them as an open door`));
     });
 
     // A personal org IS one person; two memberships in one is a tenancy breach,
