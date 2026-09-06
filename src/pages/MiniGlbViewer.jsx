@@ -1727,7 +1727,7 @@ function settleLayers(loadedRoot, store, accessories) {
   applySkinLayers(loadedRoot, store);
 }
 
-function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loadedRoot, dracoLoader, isMounted, manualScale, manualOffset, manualRotation, manualParts, accessoryMeshesStore, statureHeightM = null, manualTint = null) {
+function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loadedRoot, dracoLoader, isMounted, manualScale, manualOffset, manualRotation, manualParts, accessoryMeshesStore, statureHeightM = null, manualTint = null, manualHidden = false) {
   // Returns a Promise that always resolves (never rejects) once this
   // accessory's load has either succeeded, failed, or been skipped for
   // any reason — lets the caller wait for every accessory to genuinely
@@ -2326,8 +2326,11 @@ function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loade
         accessoryMesh.userData.accessoryUrl = accessoryUrl;
         accessoryMesh.userData.accessoryMatName = storeEntry.matName;
         // Initial visibility — honors a part already hidden in the
-        // wizard when the model reloads (step change, GLB swap).
-        accessoryMesh.visible = manualParts?.[storeEntry.matName]?.visible !== false;
+        // wizard when the model reloads (step change, GLB swap), AND
+        // (Session 163) a garment already occluded when it first loads —
+        // without this an occluded garment could flash visible for one
+        // frame before the live-update effect corrects it.
+        accessoryMesh.visible = manualHidden ? false : (manualParts?.[storeEntry.matName]?.visible !== false);
         // Apply whatever scale the wizard's sliders already show at
         // the moment this accessory is first loaded — in practice this
         // is {1,1,1} on a fresh selection, but handled properly either
@@ -3337,8 +3340,8 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
     const dl = new DRACOLoader();
     dl.setDecoderPath("https://www.gstatic.com/draco/versioned/decoders/1.5.6/");
     console.log(`[MiniGlbViewer] Accessory manager: adding ${missing.length} prop(s) to the live scene`);
-    Promise.allSettled(missing.map(({ url, scale, offset, rotation, parts, tint }) =>
-      loadAndBindAccessory(url, mainSkinnedMesh, mainSkinnedMesh.skeleton, loadedRoot, dl, () => !cancelled, scale, offset, rotation, parts, store, heightMRef.current, tint)
+    Promise.allSettled(missing.map(({ url, scale, offset, rotation, parts, tint, hidden }) =>
+      loadAndBindAccessory(url, mainSkinnedMesh, mainSkinnedMesh.skeleton, loadedRoot, dl, () => !cancelled, scale, offset, rotation, parts, store, heightMRef.current, tint, hidden)
         .then(() => { finishedUrls.add(url); })
         // Session 142 — allSettled exists so one broken garment can't
         // sink the others, but it also SWALLOWED every rejection: a
@@ -3624,7 +3627,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
   // to live inside the load effect's own dependencies above, so every
   // tick re-triggered a full reload; now it's fully separate.
   useEffect(() => {
-    for (const { url, scale, offset, rotation, parts, tint } of accessories) {
+    for (const { url, scale, offset, rotation, parts, tint, hidden } of accessories) {
       // One entry PER PRIMITIVE — a multi-material accessory (e.g. the
       // shorts: Trim + Pants + Waistband, or the bra: Bra_Heart /
       // Bra_Main / Bra_Upper_Border / Bra_Straps / Bra_Underbust). Each
@@ -3633,12 +3636,14 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
       const entries = accessoryMeshesRef.current[url];
       if (entries) {
         for (const entry of entries) {
-          // Per-part visibility: hidden unless explicitly set false —
-          // lets the wizard toggle individual parts (e.g. hide the
-          // bra's heart ornament, or isolate the band while fitting
-          // it). Lives inside the same parts object, so the dependency
-          // key below already covers it.
-          entry.mesh.visible = parts?.[entry.matName]?.visible !== false;
+          // GARMENT-level visibility first (Session 163 — an occluded
+          // garment, e.g. underwear under a top, stays loaded so it
+          // exports, but must not render live), THEN per-part visibility:
+          // hidden unless explicitly set false — lets the wizard toggle
+          // individual parts (e.g. hide the bra's heart ornament, or
+          // isolate the band while fitting it). Lives inside the same
+          // parts object, so the dependency key below already covers it.
+          entry.mesh.visible = hidden ? false : (parts?.[entry.matName]?.visible !== false);
           const t = effectiveTransform(scale, offset, rotation, parts, entry.matName);
           applyAccessoryScale(entry.mesh, entry.originalPositions, entry.center, t.scale, t.offset, t.rotation);
           // Session 141 — live tint, same whole/part rule (see
@@ -3660,7 +3665,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
     // Dependency key covers scale, offset, per-part adjustments AND
     // tint — all re-apply live on every drag/pick, with no model reload.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [JSON.stringify(accessories.map(a => [a.scale, a.offset, a.rotation, a.parts, a.tint]))]);
+  }, [JSON.stringify(accessories.map(a => [a.scale, a.offset, a.rotation, a.parts, a.tint, a.hidden]))]);
 
   // Switches the playing clip when activeAnimation changes — separate
   // from the load effect above, since the caller can switch clips

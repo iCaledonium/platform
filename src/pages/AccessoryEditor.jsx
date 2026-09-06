@@ -153,15 +153,31 @@ export function buildViewerAccessories({
   const editingOuters = new Set(
     Object.entries(OCCLUDES).filter(([, inner]) => inner === activeKey).map(([outer]) => outer)
   );
+  // Session 163 — occluded no longer means OMITTED. An inner garment whose
+  // outer is worn used to be dropped from this array entirely, which meant
+  // its mesh was never even loaded into MiniGlbViewer's accessory store —
+  // and exportMorphedGlbBlob only ever serializes what's in that store. A
+  // character saved wearing a top therefore had NO bra geometry anywhere in
+  // her exported GLB, editable or runtime, no matter what her accessory data
+  // recorded underneath (found live on Lindsey Vaughn: Basic Bra + Basic
+  // Panties both selected in draft_state, neither mesh present in either
+  // exported file). Kept in the array now, flagged `hidden: true` — loaded,
+  // invisible, and therefore present when exported, since the dressed export
+  // path already forces every stored mesh visible=true during serialization
+  // regardless of its live visibility. Every consumer of this array's
+  // `hidden` field must apply it to mesh.visible itself; see
+  // MiniGlbViewer.jsx's accessory-transform effect and ActorModelPanel.jsx's
+  // applyExploreWardrobe.
   const occluded = new Set(
     Object.entries(OCCLUDES)
       .filter(([outer]) => selectedAccessoryGlbUrls[outer] && !editingOuters.has(outer))
       .map(([, inner]) => inner)
   );
   return Object.entries(selectedAccessoryGlbUrls)
-    .filter(([key, url]) => url && !occluded.has(key) && !editingOuters.has(key))
+    .filter(([key, url]) => url && !editingOuters.has(key))
     .map(([key, url]) => ({
       url: freshUrl(dynamicAccessoryOptions, stripV(url)),
+      hidden: occluded.has(key),
       scale: accessoryScales[key] || { x: 1, y: 1, z: 1 },
       offset: accessoryOffsets[key] || { x: 0, y: 0, z: 0 },
       rotation: accessoryRotations[key] || { x: 0, y: 0, z: 0 },

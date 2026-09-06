@@ -1252,7 +1252,11 @@ export default function ActorModelPanel({ actorId }) {
       const entries = index[key];
       if (!entries) { allCovered = false; continue; }
       for (const entry of entries) {
-        entry.mesh.visible = cfg.parts?.[entry.matName]?.visible !== false;
+        // Same garment-then-part visibility rule as MiniGlbViewer's live
+        // effect (Session 163) — an occluded garment stays in the index so
+        // Explore's mirror does not drift from what actually exported, but
+        // must not render while occluded.
+        entry.mesh.visible = cfg.hidden ? false : (cfg.parts?.[entry.matName]?.visible !== false);
         const t = effectiveTransform(cfg.scale, cfg.offset, cfg.rotation, cfg.parts, entry.matName);
         applyAccessoryScale(entry.mesh, entry.originalPositions, entry.center, t.scale, t.offset, t.rotation);
         applyAccessoryTint(entry.mesh, cfg.parts?.[entry.matName]?.tint || cfg.tint);
