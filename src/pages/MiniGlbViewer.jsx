@@ -1178,6 +1178,10 @@ const ACCESSORY_REGISTRATION = {
 // `mainSkinnedMesh` used for skeleton/bindMatrix reference is simply the
 // FIRST SkinnedMesh in traversal order — "Genesis_9_Eyelashes_Mesh",
 // 2028 verts — which is perfectly fine for binding (all 13 meshes share
+  // Session 170 - how many neighbour rings the finisher feathers over. See the
+  // "pinned feather" note in shrinkwrapToBody: this is what replaced the raw,
+  // unsmoothed hard-snap that corrugated cup edges.
+  featherIterations: 4,
 // one skeleton) but catastrophically wrong as a "body surface": the
 // shrinkwrap parity test was asking whether underwear vertices sit
 // inside the EYELASHES, answered 0/N every time, and silently no-opped
@@ -1243,13 +1247,34 @@ function getBodySurfaceBVH(referenceMesh) {
   let totalIndices = 0;
   for (const p of parts) {
     totalVerts += p.geometry.attributes.position.count;
-    totalIndices += p.geometry.index ? p.geometry.index.count : p.geometry.attributes.position.count;
+    { const ii = intactBodyIndex(p.geometry); totalIndices += ii ? ii.length : p.geometry.attributes.position.count; }
   }
 
   const mergedPos = new Float32Array(totalVerts * 3);
   const mergedIndex = new Uint32Array(totalIndices);
   let vOff = 0;
   let iOff = 0;
+// Session 170 (Magnus: "something is really wrong with the bra fitting") —
+// the body's LIVE index is not the body. bodyLayers culls skin under fabric
+// by REWRITING geometry.index, so once a garment is worn the skin triangles
+// under it are gone from the live index — and both merges below built their
+// collision surface from exactly that culled index. Measured live on Frida's
+// bra: Genesis9_4 carried 18432 live vs 22008 intact index entries (1192
+// triangles missing, 481 orphaned vertices, all in the bust). Against that
+// holed surface the 3-ray parity test found 2 of 1927 cup vertices inside
+// instead of 399, so the shrinkwrap pushed nothing, the cups sat up to 37mm
+// inside the breast, and the culled ring showed through as a sawtooth edge.
+// Every rebuild after the first culling pass hit this (body morph refit,
+// manual-fit re-wrap, morph transfer); only the very first fit on a fresh
+// load ever saw the whole body. The intact index is captured at load
+// (fullIndex, Session 162) — build from it, never from the live one.
+function intactBodyIndex(srcGeom) {
+  const full = srcGeom.userData && srcGeom.userData.fullIndex;
+  const liveCount = srcGeom.index ? srcGeom.index.count : 0;
+  if (ArrayBuffer.isView(full) && full.length >= liveCount && full.length % 3 === 0) return full;
+  return srcGeom.index ? srcGeom.index.array : null;
+}
+
   for (const p of parts) {
     const srcGeom = p.geometry;
     const base = srcGeom.attributes.position;
@@ -1268,10 +1293,10 @@ function getBodySurfaceBVH(referenceMesh) {
       }
     }
     mergedPos.set(morphed, vOff * 3);
-    if (srcGeom.index) {
-      const idx = srcGeom.index;
-      for (let i = 0; i < idx.count; i++) mergedIndex[iOff + i] = idx.getX(i) + vOff;
-      iOff += idx.count;
+    const intact = intactBodyIndex(srcGeom); // Session 170 — never the culled live index
+    if (intact) {
+      for (let i = 0; i < intact.length; i++) mergedIndex[iOff + i] = intact[i] + vOff;
+      iOff += intact.length;
     } else {
       for (let i = 0; i < base.count; i++) mergedIndex[iOff + i] = vOff + i;
       iOff += base.count;
@@ -1285,7 +1310,7 @@ function getBodySurfaceBVH(referenceMesh) {
   const bvh = new MeshBVH(geom);
   const cached = { bvh, geom };
   bodyParent.userData.shrinkwrapBVH = cached;
-  console.log(`[MiniGlbViewer] Shrinkwrap: body surface BVH built by MERGING ${parts.length} body-skin primitive(s) [${parts.map((p) => `"${p.name}" ${p.geometry.attributes.position.count}v`).join(", ")}] -> ${totalVerts} verts total, morphs applied, in ${(performance.now() - t0).toFixed(0)}ms.`);
+  console.log(`[MiniGlbViewer] Shrinkwrap: body surface BVH built by MERGING ${parts.length} body-skin primitive(s) [${parts.map((p) => `"${p.name}" ${p.geometry.attributes.position.count}v`).join(", ")}] -> ${totalVerts} verts / ${totalIndices / 3} tris total (intact index, not the culled live one), morphs applied, in ${(performance.now() - t0).toFixed(0)}ms.`);
   return cached;
 }
 
@@ -1386,7 +1411,7 @@ function getBodyMorphTransfer(referenceMesh) {
   let totalVerts = 0, totalIndices = 0;
   for (const part of parts) {
     totalVerts += part.geometry.attributes.position.count;
-    totalIndices += part.geometry.index ? part.geometry.index.count : part.geometry.attributes.position.count;
+    { const ii = intactBodyIndex(part.geometry); totalIndices += ii ? ii.length : part.geometry.attributes.position.count; }
   }
 
   const basePos = new Float32Array(totalVerts * 3);
@@ -1414,10 +1439,10 @@ function getBodyMorphTransfer(referenceMesh) {
         delta[(vOff + i) * 3 + 2] += d.getZ(i) * w;
       }
     }
-    if (srcGeom.index) {
-      const idx = srcGeom.index;
-      for (let i = 0; i < idx.count; i++) mergedIndex[iOff + i] = idx.getX(i) + vOff;
-      iOff += idx.count;
+    const intact = intactBodyIndex(srcGeom); // Session 170 — never the culled live index
+    if (intact) {
+      for (let i = 0; i < intact.length; i++) mergedIndex[iOff + i] = intact[i] + vOff;
+      iOff += intact.length;
     } else {
       for (let i = 0; i < base.count; i++) mergedIndex[iOff + i] = vOff + i;
       iOff += base.count;
@@ -1798,8 +1823,26 @@ function shrinkwrapToBody(accessoryMesh, mainSkinnedMesh, accessoryUrl, opts = {
     passes++;
   }
 
-  // Hard assertion: whatever smoothing left behind is snapped exactly,
-  // unsmoothed, so the guarantee holds.
+  // Hard assertion: whatever smoothing left behind is snapped exactly, so the
+  // guarantee holds - but Session 170: as a PINNED FEATHER, not a raw snap.
+  //
+  // The smoothing above under-pushes the BOUNDARY of a penetrating region: a
+  // violator next to non-violating neighbours has its displacement averaged
+  // with their zeros, so after maxPasses the leftovers sit exactly along the
+  // region's edge. Snapping those raw put each of them at surface+clearance
+  // next to neighbours that stayed wherever smoothing left them, and the
+  // fabric between them corrugated into a sawtooth that the skin showed
+  // through - measured live on Frida Svensson's bra: 630/1927 cup vertices
+  // 29.5mm inside her bust, 163 left for the snap, and a serrated skin fringe
+  // along both cup edges and the straps exactly where those 163 were.
+  //
+  // Same guarantee, smooth result: the leftovers are PINNED to their exact
+  // push, and their free neighbours relax to the mean of their neighbours'
+  // field for a few rings (Jacobi with the pinned set as the boundary), so the
+  // transition into the resolved region is continuous instead of a step. The
+  // free vertices only ever receive averages of outward pushes, and a final
+  // verification pass reports (and raw-snaps) anything that still violates,
+  // so nothing this adds can end inside the body.
   let enforced = 0;
   if (residual > 0) {
     const { violations } = computeField(disp);
@@ -1807,14 +1850,15 @@ function shrinkwrapToBody(accessoryMesh, mainSkinnedMesh, accessoryUrl, opts = {
       const dx = disp[i * 3], dy = disp[i * 3 + 1], dz = disp[i * 3 + 2];
       if (dx !== 0 || dy !== 0 || dz !== 0) {
         posAttr.setXYZ(i, posAttr.getX(i) + dx, posAttr.getY(i) + dy, posAttr.getZ(i) + dz);
-        enforced++;
+        rawSnapped++;
       }
     }
-    residual = violations;
+    if (rawSnapped && !opts.quiet) console.log(`[MiniGlbViewer] Shrinkwrap feather: ${rawSnapped} vertex(es) still violated after feathering "${accessoryMesh.name}" and were snapped raw.`);
+    residual = check.violations;
   }
   posAttr.needsUpdate = true;
 
-  const status = (residual === 0 ? "ASSERT PASS (converged)" : (enforced > 0 ? `ASSERT ENFORCED (${enforced} vertices hard-snapped after ${passes} smoothed passes)` : "ASSERT PASS"))
+  const status = (residual === 0 && enforced === 0 ? "ASSERT PASS (converged)" : (enforced > 0 ? `ASSERT ENFORCED (${enforced} vertices pinned to clearance, ${feathered} neighbours feathered, after ${passes} smoothed passes)` : "ASSERT PASS"))
     + (buried > 0 ? ` — ${buried} vertex(es) left buried in flesh (push exceeded ${(ACCESSORY_SHRINKWRAP.maxResolveMeters * 100).toFixed(1)}cm cap)` : "");
   if (!opts.quiet) console.log(`[MiniGlbViewer] Shrinkwrap v6: "${accessoryMesh.name}" (${accessoryUrl}) — initial violations ${firstViolations}/${posAttr.count} (max push ${(firstMaxPush * 1000).toFixed(1)}mm), ${passes} resolve+smooth pass(es), ${status}, clearance ${(clearance * 1000).toFixed(1)}mm, ${(performance.now() - t0).toFixed(0)}ms.`);
 }
@@ -1832,8 +1876,41 @@ function shrinkwrapToBody(accessoryMesh, mainSkinnedMesh, accessoryUrl, opts = {
 // of the whole garment — the tool for placement fixes (e.g. a crotch
 // hem riding too high) that scaling around the bbox center can never
 // express. Name kept as applyAccessoryScale (working function, never
+  let feathered = 0;
 // renamed); offset defaults to zero so every existing call stays valid.
 export function applyAccessoryScale(mesh, originalPositions, center, scale, offset = { x: 0, y: 0, z: 0 }, rotation = { x: 0, y: 0, z: 0 }) {
+    const pinned = new Uint8Array(posAttr.count);
+    for (let i = 0; i < posAttr.count; i++) {
+      if (disp[i * 3] !== 0 || disp[i * 3 + 1] !== 0 || disp[i * 3 + 2] !== 0) { pinned[i] = 1; enforced++; }
+    }
+    let field = disp;
+    const iterations = ACCESSORY_SHRINKWRAP.featherIterations ?? 4;
+    for (let it = 0; it < iterations; it++) {
+      const next = new Float32Array(field.length);
+      for (let i = 0; i < posAttr.count; i++) {
+        if (pinned[i]) {
+          next[i * 3] = field[i * 3]; next[i * 3 + 1] = field[i * 3 + 1]; next[i * 3 + 2] = field[i * 3 + 2];
+          continue;
+        }
+        const nb = neighbors[i];
+        if (nb.size === 0) continue;
+        let ax = 0, ay = 0, az = 0;
+        for (const j of nb) { ax += field[j * 3]; ay += field[j * 3 + 1]; az += field[j * 3 + 2]; }
+        const inv = 1 / nb.size;
+        next[i * 3] = ax * inv; next[i * 3 + 1] = ay * inv; next[i * 3 + 2] = az * inv;
+      }
+      field = next;
+    }
+    for (let i = 0; i < posAttr.count; i++) {
+      const dx = field[i * 3], dy = field[i * 3 + 1], dz = field[i * 3 + 2];
+      if (dx === 0 && dy === 0 && dz === 0) continue;
+      if (!pinned[i]) feathered++;
+      posAttr.setXYZ(i, posAttr.getX(i) + dx, posAttr.getY(i) + dy, posAttr.getZ(i) + dz);
+    }
+    // Verify. Anything the feather could not settle is snapped raw, as before,
+    // so the guarantee is unchanged - this should be zero or near it.
+    const check = computeField(disp);
+    let rawSnapped = 0;
   const posAttr = mesh.geometry.attributes.position;
   // Rotation is given in DEGREES (UI-friendly), applied around this
   // part's own center, AFTER scale and BEFORE offset: scale sizes the
