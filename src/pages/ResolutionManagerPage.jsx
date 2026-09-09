@@ -228,7 +228,7 @@ export default function ResolutionManagerPage() {
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                 <span style={{ fontSize: 20, color: "#e0736b",
-                  fontFamily: "'Cormorant Garamond',Georgia,serif" }}>{(incidentCounts?.open ?? 0) + (incidentCounts?.acknowledged ?? 0)}</span>
+                  fontFamily: "'Cormorant Garamond',Georgia,serif" }}>{incidentCounts?.open ?? 0}</span>
                 <span style={{ ...label, fontSize: 9 }}>unresolved</span>
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
