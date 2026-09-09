@@ -228,10 +228,28 @@ async function main() {
     }
 
     case "list": {
-      const rows = store.listIncidents({
+      // 2026-09-09: `list` reads status/bench/limit and NOTHING else. `--source`
+      // is accepted by the arg parser and silently discarded here, while the
+      // same flag means the routine name on `ping`, provenance on `report` and
+      // the BENCH on `status`. A caller that learned "--source is the bench"
+      // from `status` therefore gets EVERY bench back from `list` and has no
+      // way to tell: `list --source conduct-watch` and `list --nonsense zzz`
+      // returned byte-identical output. That cross-filed a behaviour-watch
+      // check_name onto conduct-watch (dba2e22bf4ff7ecb0c, withdrawn in the
+      // same run) because the fingerprint is bench|check_name|world|actor, so
+      // the bench is what forks a row.
+      //
+      // The fix is disclosure rather than validation: the payload now states
+      // the filter that was ACTUALLY applied, so a wrong scope is visible in
+      // the caller's own output instead of being inferred from the flags it
+      // passed. Deliberately the SAME object that is handed to listIncidents,
+      // not a second copy of the same expressions — an echo that can drift
+      // from the query it describes would be worse than no echo.
+      const applied = {
         status: flag("status", "unresolved"), bench: flag("bench", "all"),
         limit: Number(flag("limit", "200")),
-      });
+      };
+      const rows = store.listIncidents(applied);
       // process.exitCode, not process.exit(): a piped (non-TTY) stdout is
       // non-blocking on Linux, and process.exit() does not wait for a large
       // write to finish draining through the OS's 64KB pipe buffer before
@@ -240,7 +258,7 @@ async function main() {
       // incidents on the board — small payloads during development never
       // crossed the boundary. exitCode lets node exit only once the write
       // has actually flushed.
-      console.log(JSON.stringify({ count: rows.length, counts: store.counts(), incidents: rows }, null, 2));
+      console.log(JSON.stringify({ count: rows.length, applied, counts: store.counts(), incidents: rows }, null, 2));
       process.exitCode = 0;
       return;
     }
