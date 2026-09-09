@@ -1173,7 +1173,17 @@ export default function CharacterWizard({ user, worlds, mode = "character" }) {
     // into the profile slot as a File, indistinguishable from a fresh
     // upload (Regenerate re-submits it).
     if (a.photo_url) {
-      fetch(a.photo_url).then(r => (r.ok && (r.headers.get("content-type") || "").startsWith("image")) ? r.blob() : null).then(blob => {
+      // Session 169 -- cache-bust. profile.jpg is a FIXED filename per actor
+      // (see POST /api/actors/:id/media), so the URL alone never proves the
+      // bytes behind it are current: nginx serves it with no Cache-Control,
+      // and a bare fetch() can be answered entirely from the browser's own
+      // HTTP cache. Stamped with the actor_media row's own updated_at, same
+      // convention as every accessory URL in this file (freshUrl / ?v=).
+      const profileRow = (data.mediaPhotos || []).find(m => m.state_slug === "profile");
+      const stampedPhotoUrl = profileRow?.updated_at
+        ? `${a.photo_url}${a.photo_url.includes("?") ? "&" : "?"}v=${encodeURIComponent(profileRow.updated_at)}`
+        : a.photo_url;
+      fetch(stampedPhotoUrl).then(r => (r.ok && (r.headers.get("content-type") || "").startsWith("image")) ? r.blob() : null).then(blob => {
         if (!blob) return;
         setPhotos(prev => ({ ...prev, profile: new File([blob], `${a.id}_profile`, { type: blob.type || "image/jpeg" }) }));
       }).catch(() => {});

@@ -6096,7 +6096,12 @@ app.get("/api/actors/:id", (req, res) => {
   // body_*), so draft loading restores photo slots from actor_media
   // instead of guessing file conventions (the pipeline's pulled
   // copies live elsewhere and may predate the pull fix).
-  const mediaPhotos = db.prepare(`SELECT state_slug, url, depicts FROM actor_media WHERE actor_id = ? AND media_type = 'photo' AND world_id IS NULL`).all(req.params.id);
+  // updated_at exposed so the client can cache-bust: the photo is written to a
+  // FIXED filename per slot (state_slug + ext), so its URL never changes when
+  // the photo is replaced -- without a ?v= stamp taken from this column, a
+  // browser can legitimately keep serving whatever bytes it fetched from that
+  // URL last time.
+  const mediaPhotos = db.prepare(`SELECT state_slug, url, depicts, updated_at FROM actor_media WHERE actor_id = ? AND media_type = 'photo' AND world_id IS NULL`).all(req.params.id);
   // Session 150 — say plainly whether this caller owns the character.
   //
   // owner_id and permission were both already in the payload and the profile
