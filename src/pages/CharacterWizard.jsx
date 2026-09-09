@@ -2312,13 +2312,16 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
 
             {/* Session 148 — Age / Sexual Orientation / Occupation moved
                 above Reference Photo (ruled by Magnus): identity facts
-                cluster first, visual inputs after. The glbReady gate on
-                these fields is kept as documented at its declaration —
-                position changed, behavior didn't. */}
+                cluster first, visual inputs after. Session 170 (Magnus) —
+                the glbReady gate on these three is REMOVED: they are
+                identity facts the author already knows before any 3D
+                generation happens, not properties of the generated body,
+                so there is no real reason to wait on a model before
+                letting them be typed. */}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-              <Field label="Age" required><input style={S.input} type="number" min={18} max={99} value={identity.age} onChange={e=>updI("age",e.target.value)} placeholder="28" disabled={!isAvatar && !glbReady} /></Field>
+              <Field label="Age" required><input style={S.input} type="number" min={18} max={99} value={identity.age} onChange={e=>updI("age",e.target.value)} placeholder="28" /></Field>
               {!isAvatar && <Field label="Sexual Orientation" required>
-                <select style={S.select} value={identity.orientation} onChange={e=>updI("orientation",e.target.value)} disabled={!glbReady}>
+                <select style={S.select} value={identity.orientation} onChange={e=>updI("orientation",e.target.value)}>
                   <option value="">— Select Sexual —</option>
                   <option value="straight">Straight</option>
                   <option value="bisexual">Bisexual</option>
@@ -2329,7 +2332,7 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
               </Field>}
             </div>
             {!isAvatar && <Field label="Occupation" required hint="Shapes schedule, income and daily behaviour.">
-              <input style={S.input} value={identity.occupation} onChange={e=>updI("occupation",e.target.value)} placeholder="Photographer, nurse, architect…" disabled={!glbReady} />
+              <input style={S.input} value={identity.occupation} onChange={e=>updI("occupation",e.target.value)} placeholder="Photographer, nurse, architect…" />
             </Field>}
 
 
