@@ -1332,7 +1332,218 @@ export function applyAccessoryTint(mesh, hex) {
   for (const m of mats) { if (m && m.color) m.color.set(hex); }
 }
 
-function shrinkwrapToBody(accessoryMesh, mainSkinnedMesh, accessoryUrl) {
+// ---------------------------------------------------------------------
+// Session 162 - garments follow the body's PROPORTION MORPHS.
+//
+// Root cause of two separate garment failures, same disease. Verified in the
+// assets: underwear_shorts_basic_shorts.glb and underwear_shirt_basic_shirt.glb
+// both report targets=0 on every primitive. Clothing has NO morph targets, so
+// it follows the SKELETON only, while the body's proportion morphs move the
+// skin independently of the bones. Dial Height/Legs/Torso and the skin walks
+// out from under a garment that stayed where the bones put it.
+//
+// Shrinkwrap was then the only bridge between the two, and it is a PENETRATION
+// resolver sized for millimetres, not a fitter sized for centimetres:
+//   - tight garment (shorts): some hip vertices still find surface inside
+//     maxSearchMeters and are pulled to it, their neighbours find nothing and
+//     stay put, and the primitive rips between them.
+//   - loose garment (shirt): the same pass tears shoulders open, which is why
+//     it was excluded - and excluding it drops the garment INSIDE the body,
+//     because nothing else was holding it out. Confirmed live, both directions.
+// No per-garment allowlist can satisfy both: one needs the resolver off, the
+// other needs it on. The fix is to stop asking the resolver to do fitting.
+//
+// Each garment vertex is bound to the closest point on the body's UNMORPHED
+// surface and carries that point's morph displacement (barycentric across the
+// triangle, so neighbouring vertices move together and the mesh cannot tear).
+// Shrinkwrap still runs afterwards on exactly the garments it ran on before,
+// but now only resolves the residual millimetres it was built for.
+//
+// Deliberately a no-op when no morph is active: at neutral body this function
+// returns 0 without touching a vertex, so it cannot regress the neutral case.
+const MORPH_TRANSFER_MAX_BIND_METERS = 0.15;
+
+function getBodyMorphTransfer(referenceMesh) {
+  const largest = findBodySkinMesh(referenceMesh);
+  const bodyParent = largest.parent || largest;
+  // VALIDATE, never truthiness-check - same law as the shrinkwrap cache above
+  // (a JSON-flattened userData can resurrect a hollow entry).
+  const c = bodyParent.userData.morphTransfer;
+  if (c && c.bvh && c.geom?.isBufferGeometry && c.delta) return c;
+  if (c) delete bodyParent.userData.morphTransfer;
+
+  const parts = (bodyParent.children || []).filter((x) => x.isSkinnedMesh);
+  if (parts.length === 0) parts.push(largest);
+
+  let anyMorph = false;
+  for (const part of parts) {
+    const infl = part.morphTargetInfluences || [];
+    for (let i = 0; i < infl.length; i++) if (infl[i] !== 0) { anyMorph = true; break; }
+    if (anyMorph) break;
+  }
+  if (!anyMorph) return null;
+
+  let totalVerts = 0, totalIndices = 0;
+  for (const part of parts) {
+    totalVerts += part.geometry.attributes.position.count;
+    totalIndices += part.geometry.index ? part.geometry.index.count : part.geometry.attributes.position.count;
+  }
+
+  const basePos = new Float32Array(totalVerts * 3);
+  const delta = new Float32Array(totalVerts * 3);
+  const mergedIndex = new Uint32Array(totalIndices);
+  let vOff = 0, iOff = 0;
+  const t0 = performance.now();
+  for (const part of parts) {
+    const srcGeom = part.geometry;
+    const base = srcGeom.attributes.position;
+    for (let i = 0; i < base.count; i++) {
+      basePos[(vOff + i) * 3]     = base.getX(i);
+      basePos[(vOff + i) * 3 + 1] = base.getY(i);
+      basePos[(vOff + i) * 3 + 2] = base.getZ(i);
+    }
+    const morphAttrs = (srcGeom.morphAttributes && srcGeom.morphAttributes.position) || [];
+    const influences = part.morphTargetInfluences || [];
+    for (let m = 0; m < morphAttrs.length; m++) {
+      const w = influences[m] || 0;
+      if (w === 0) continue;
+      const d = morphAttrs[m];
+      for (let i = 0; i < base.count; i++) {
+        delta[(vOff + i) * 3]     += d.getX(i) * w;
+        delta[(vOff + i) * 3 + 1] += d.getY(i) * w;
+        delta[(vOff + i) * 3 + 2] += d.getZ(i) * w;
+      }
+    }
+    if (srcGeom.index) {
+      const idx = srcGeom.index;
+      for (let i = 0; i < idx.count; i++) mergedIndex[iOff + i] = idx.getX(i) + vOff;
+      iOff += idx.count;
+    } else {
+      for (let i = 0; i < base.count; i++) mergedIndex[iOff + i] = vOff + i;
+      iOff += base.count;
+    }
+    vOff += base.count;
+  }
+
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.BufferAttribute(basePos, 3));
+  geom.setIndex(new THREE.BufferAttribute(mergedIndex, 1));
+  const bvh = new MeshBVH(geom);
+  const cached = { bvh, geom, delta };
+  bodyParent.userData.morphTransfer = cached;
+  console.log(`[MiniGlbViewer] Morph transfer: UNMORPHED body surface BVH built from ${parts.length} primitive(s), ${totalVerts} verts, in ${(performance.now() - t0).toFixed(0)}ms.`);
+  return cached;
+}
+
+const _mtP = new THREE.Vector3();
+const _mtTarget = { point: new THREE.Vector3() };
+const _mtA = new THREE.Vector3(), _mtB = new THREE.Vector3(), _mtC = new THREE.Vector3();
+const _mtV0 = new THREE.Vector3(), _mtV1 = new THREE.Vector3(), _mtV2 = new THREE.Vector3();
+
+// Applies the body's morph displacement to one accessory primitive, in place.
+// Returns how many vertices moved (0 = neutral body, or nothing in reach).
+function transferBodyMorphToGarment(accessoryMesh, mainSkinnedMesh, accessoryUrl) {
+  const t = getBodyMorphTransfer(mainSkinnedMesh);
+  if (!t) return 0;
+  const { bvh, geom, delta } = t;
+  const bodyIndex = geom.index;
+  const bodyPos = geom.attributes.position;
+  const attr = accessoryMesh.geometry.attributes.position;
+  let moved = 0;
+  for (let i = 0; i < attr.count; i++) {
+    _mtP.set(attr.getX(i), attr.getY(i), attr.getZ(i));
+    const hit = bvh.closestPointToPoint(_mtP, _mtTarget, 0, MORPH_TRANSFER_MAX_BIND_METERS);
+    if (!hit) continue;
+    const f = _mtTarget.faceIndex * 3;
+    const ia = bodyIndex.getX(f), ib = bodyIndex.getX(f + 1), ic = bodyIndex.getX(f + 2);
+    _mtA.fromBufferAttribute(bodyPos, ia);
+    _mtB.fromBufferAttribute(bodyPos, ib);
+    _mtC.fromBufferAttribute(bodyPos, ic);
+    // Barycentric weights of the bound point (Ericson). Interpolating across
+    // the triangle is what keeps adjacent garment vertices moving together.
+    _mtV0.subVectors(_mtB, _mtA);
+    _mtV1.subVectors(_mtC, _mtA);
+    _mtV2.subVectors(_mtTarget.point, _mtA);
+    const d00 = _mtV0.dot(_mtV0), d01 = _mtV0.dot(_mtV1), d11 = _mtV1.dot(_mtV1);
+    const d20 = _mtV2.dot(_mtV0), d21 = _mtV2.dot(_mtV1);
+    const denom = d00 * d11 - d01 * d01;
+    let wa = 1, wb = 0, wc = 0;
+    if (denom !== 0) {
+      wb = (d11 * d20 - d01 * d21) / denom;
+      wc = (d00 * d21 - d01 * d20) / denom;
+      wa = 1 - wb - wc;
+    }
+    const dx = delta[ia * 3] * wa + delta[ib * 3] * wb + delta[ic * 3] * wc;
+    const dy = delta[ia * 3 + 1] * wa + delta[ib * 3 + 1] * wb + delta[ic * 3 + 1] * wc;
+    const dz = delta[ia * 3 + 2] * wa + delta[ib * 3 + 2] * wb + delta[ic * 3 + 2] * wc;
+    attr.setXYZ(i, _mtP.x + dx, _mtP.y + dy, _mtP.z + dz);
+    moved++;
+  }
+  attr.needsUpdate = true;
+  return moved;
+}
+
+// ---------------------------------------------------------------------
+// Session 162 - seam weld. Garment seams in this catalogue ship UNWELDED:
+// measured on underwear_shirt_basic_shirt, 912 of its 1162 boundary vertices
+// sit within 2mm of a twin (489 within 0.2mm), and its 8 boundary loops include
+// two that run the full height of the torso and across BOTH shoulders - panel
+// edges that were never merged. In bind pose the twins are coincident and the
+// seam is invisible. The moment anything moves vertices per-vertex - skinning,
+// shrinkwrap, the morph transfer above - the two halves are free to move
+// INDEPENDENTLY, the hairline opens, and skin shows through a gap that has no
+// cloth in it. That is why it traces seams exactly, why it survived every mask
+// change, and why forcing the mask to hide it only ate real skin at the hems.
+//
+// The real fix is a weld on the asset (merge-by-distance, re-export). This is
+// the defence for assets we do not control: group vertices that were coincident
+// in the garment's OWN pre-fit geometry, and after fitting, snap each group back
+// to its average. Grouping uses the pre-fit positions deliberately - by the time
+// shrinkwrap has run the twins have already drifted apart, so grouping on
+// current positions would be grouping the symptom.
+//
+// Cache is a WeakMap, NOT geometry.userData: GLTFExporter serialises userData
+// into the GLB, and a per-vertex index map would ride into every export.
+const _seamGroupsCache = new WeakMap();
+const SEAM_WELD_CELL = 20000; // 0.05mm buckets
+
+function seamGroups(geometry, basePositions) {
+  let groups = _seamGroupsCache.get(geometry);
+  if (groups) return groups;
+  const n = Math.floor(basePositions.length / 3);
+  const buckets = new Map();
+  for (let i = 0; i < n; i++) {
+    const k = Math.round(basePositions[i * 3] * SEAM_WELD_CELL) + "_" +
+              Math.round(basePositions[i * 3 + 1] * SEAM_WELD_CELL) + "_" +
+              Math.round(basePositions[i * 3 + 2] * SEAM_WELD_CELL);
+    let a = buckets.get(k);
+    if (!a) { a = []; buckets.set(k, a); }
+    a.push(i);
+  }
+  groups = [];
+  for (const a of buckets.values()) if (a.length > 1) groups.push(a);
+  _seamGroupsCache.set(geometry, groups);
+  return groups;
+}
+
+// Snaps each coincident group back together, in place. Returns groups welded.
+function weldGarmentSeams(accessoryMesh, basePositions, accessoryUrl) {
+  if (!basePositions) return 0;
+  const groups = seamGroups(accessoryMesh.geometry, basePositions);
+  if (!groups.length) return 0;
+  const attr = accessoryMesh.geometry.attributes.position;
+  for (const grp of groups) {
+    let x = 0, y = 0, z = 0;
+    for (const i of grp) { x += attr.getX(i); y += attr.getY(i); z += attr.getZ(i); }
+    const inv = 1 / grp.length;
+    x *= inv; y *= inv; z *= inv;
+    for (const i of grp) attr.setXYZ(i, x, y, z);
+  }
+  attr.needsUpdate = true;
+  return groups.length;
+}
+
+function shrinkwrapToBody(accessoryMesh, mainSkinnedMesh, accessoryUrl, opts = {}) {
   const { bvh, geom } = getBodySurfaceBVH(mainSkinnedMesh);
   const bodyPos = geom.attributes.position;
   const bodyIndex = geom.index;
@@ -1605,7 +1816,7 @@ function shrinkwrapToBody(accessoryMesh, mainSkinnedMesh, accessoryUrl) {
 
   const status = (residual === 0 ? "ASSERT PASS (converged)" : (enforced > 0 ? `ASSERT ENFORCED (${enforced} vertices hard-snapped after ${passes} smoothed passes)` : "ASSERT PASS"))
     + (buried > 0 ? ` — ${buried} vertex(es) left buried in flesh (push exceeded ${(ACCESSORY_SHRINKWRAP.maxResolveMeters * 100).toFixed(1)}cm cap)` : "");
-  console.log(`[MiniGlbViewer] Shrinkwrap v6: "${accessoryMesh.name}" (${accessoryUrl}) — initial violations ${firstViolations}/${posAttr.count} (max push ${(firstMaxPush * 1000).toFixed(1)}mm), ${passes} resolve+smooth pass(es), ${status}, clearance ${(clearance * 1000).toFixed(1)}mm, ${(performance.now() - t0).toFixed(0)}ms.`);
+  if (!opts.quiet) console.log(`[MiniGlbViewer] Shrinkwrap v6: "${accessoryMesh.name}" (${accessoryUrl}) — initial violations ${firstViolations}/${posAttr.count} (max push ${(firstMaxPush * 1000).toFixed(1)}mm), ${passes} resolve+smooth pass(es), ${status}, clearance ${(clearance * 1000).toFixed(1)}mm, ${(performance.now() - t0).toFixed(0)}ms.`);
 }
 
 // Applies a scale AND a translation offset to an accessory mesh's
@@ -1679,6 +1890,26 @@ export function effectiveTransform(garmentScale, garmentOffset, garmentRotation,
     // shared pivot — for whole-garment tilts keep values small.
     rotation: { x: gr.x + pr.x, y: gr.y + pr.y, z: gr.z + pr.z },
   };
+}
+
+// The manual fit is applied AFTER the shrinkwrap, from the wrapped baseline —
+// and until now nothing wrapped it again. Scale a bra to 0.88x and the wrapped
+// cups shrink straight into the breast; offset it 1.5cm sideways and one cup
+// slides onto the fuller flesh. Found live on Lindsey: "skin tight" meant skin
+// islands across both cups and the band, and the only slider answer was to
+// scale UP past the leak, which is the opposite of what tight means.
+//
+// So the transform is followed by a second wrap on the transformed shape, then
+// the seam weld the wrap can split. Idempotent, because applyAccessoryScale
+// always starts from originalPositions. Quiet, because it runs on every slider
+// tick, one primitive at a time. The wrap only ever pushes OUT to surface +
+// clearance, so a garment scaled down now lands exactly on the skin instead of
+// inside it, and one scaled up is untouched.
+function applyManualFit(entry, t, bodyMesh) {
+  applyAccessoryScale(entry.mesh, entry.originalPositions, entry.center, t.scale, t.offset, t.rotation);
+  if (!bodyMesh || !entry.shrinkwrapEligible) return;
+  shrinkwrapToBody(entry.mesh, bodyMesh, entry.url, { quiet: true });
+  weldGarmentSeams(entry.mesh, entry.prefitPositions, entry.url);
 }
 
 // Session 152 — everything that must be true once the wardrobe settles, in
@@ -2337,7 +2568,7 @@ function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loade
         // way rather than assumed.
         {
           const t = effectiveTransform(manualScale, manualOffset, manualRotation, manualParts, storeEntry.matName);
-          applyAccessoryScale(accessoryMesh, storeEntry.originalPositions, bboxCenter, t.scale, t.offset, t.rotation);
+          applyManualFit(storeEntry, t, mainSkinnedMesh);
         }
         // Session 141 — load-completion tint, per-part override wins
         // over garment-level (same whole/part rule as the fit sliders).
@@ -3583,16 +3814,18 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
           if (!entry.prefitPositions) continue;
           restorePositions(entry.mesh.geometry.attributes.position, entry.prefitPositions);
           entry.mesh.geometry.attributes.position.needsUpdate = true;
+          transferBodyMorphToGarment(entry.mesh, mainMesh, url);
           if (entry.shrinkwrapEligible) {
             shrinkwrapToBody(entry.mesh, mainMesh, url);
           }
+          weldGarmentSeams(entry.mesh, entry.prefitPositions, url);
           // Recapture the manual-slider baseline from the refitted
           // shape, then re-apply the current manual transform on top.
           entry.originalPositions = capturePositions(entry.mesh.geometry.attributes.position);
           entry.mesh.geometry.computeBoundingBox();
           entry.mesh.geometry.boundingBox.getCenter(entry.center);
           const t = effectiveTransform(acc?.scale, acc?.offset, acc?.rotation, acc?.parts, entry.matName);
-          applyAccessoryScale(entry.mesh, entry.originalPositions, entry.center, t.scale, t.offset, t.rotation);
+          applyManualFit(entry, t, mainMesh);
           refitted++;
         }
       }
@@ -3645,7 +3878,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
           // parts object, so the dependency key below already covers it.
           entry.mesh.visible = hidden ? false : (parts?.[entry.matName]?.visible !== false);
           const t = effectiveTransform(scale, offset, rotation, parts, entry.matName);
-          applyAccessoryScale(entry.mesh, entry.originalPositions, entry.center, t.scale, t.offset, t.rotation);
+          applyManualFit(entry, t, mainMeshRef.current);
           // Session 141 — live tint, same whole/part rule (see
           // applyAccessoryTint for why this was never live before).
           applyAccessoryTint(entry.mesh, parts?.[entry.matName]?.tint || tint);
@@ -4095,7 +4328,7 @@ function rebindGarmentsForExport(root, bodySkinMesh) {
           if (runtime) continue;   // never moved — nothing to put back
           const cfg = accessories.find((a) => a.url === entry.url);
           const t = effectiveTransform(cfg?.scale, cfg?.offset, cfg?.rotation, cfg?.parts, entry.matName);
-          applyAccessoryScale(entry.mesh, entry.originalPositions, entry.center, t.scale, t.offset, t.rotation);
+          applyManualFit(entry, t, mainMeshRef.current);
         }
       };
       exporter.parse(
