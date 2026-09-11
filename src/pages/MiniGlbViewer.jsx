@@ -1553,7 +1553,7 @@ function transferSurfaceSkinToHair(hairEntries, store, mainSkinnedMesh) {
   if (skullY === null) return null;
   const tri = []; const srcMesh = []; const srcVert = [];
   for (const [url, entries] of Object.entries(store || {})) {
-    if (!(url.includes("/torso/") || url.includes("/legs/"))) continue;
+    if (!(url.includes("/torso/") || url.includes("/legs/") || url.includes("/underwear/"))) continue;   // Session 174 - visible underwear is fabric too
     for (const e of entries || []) {
       const m = e.mesh; if (!m || m.visible === false) continue;
       const g = m.geometry, pos = g.attributes.position;
@@ -2215,11 +2215,24 @@ function verifyHairUnderIdle(loadedRoot, store, mixer) {
     for (const e of entries || []) {
       const m = e.mesh; if (!m || !m.isSkinnedMesh) continue;
       if (url.includes("/head/hair/")) { hair.push(m); rideOf.set(m, e.ride || null); }
-      else if ((url.includes("/torso/") || url.includes("/legs/")) && m.visible !== false) cloth.push(m);
+      else if ((url.includes("/torso/") || url.includes("/legs/") || url.includes("/underwear/")) && m.visible !== false) cloth.push(m);
     }
   }
-  if (!hair.length || !cloth.length) return;
+  if (!hair.length) return;
   const skeleton = hair[0].skeleton;
+  // Session 174 - the skin is checked too (bare shoulders, no top, no bra):
+  // the intact morphed body surface, skinned per pose from its primitives
+  let body = null;
+  try { const mm = findBodySkinMesh(loadedRoot); body = mm ? getBodySurfaceBVH(mm) : null; } catch (e) { body = null; }
+  const bodyOk = !!(body && body.geom?.index && Array.isArray(body.parts));
+  let bPart = null, bLocal = null, bZone = null;
+  if (bodyOk) {
+    const total = body.geom.attributes.position.count;
+    bPart = new Int32Array(total); bLocal = new Uint32Array(total); bZone = new Array(total);
+    let off = 0;
+    body.parts.forEach((p, pi) => { const z = p.geometry.userData.bodyZones; const n = p.geometry.attributes.position.count; for (let i = 0; i < n; i++) { bPart[off + i] = pi; bLocal[off + i] = i; bZone[off + i] = Array.isArray(z) ? z[i] : "other"; } off += n; });
+  }
+  if (!cloth.length && !bodyOk) return;
   const clip = action.getClip(); const dur = clip.duration || 0; const t0 = action.time;
   if (!(dur > 0)) return;
   const mat = new THREE.Matrix4(), acc = new THREE.Vector3(), q = new THREE.Vector3(), t = new THREE.Vector3();
@@ -2237,7 +2250,8 @@ function verifyHairUnderIdle(loadedRoot, store, mixer) {
   };
   const ray = new THREE.Ray(new THREE.Vector3(), new THREE.Vector3());
   const v = new THREE.Vector3(), h = new THREE.Vector3();
-  let worst = 0, worstMm = 0, worstAt = 0, total = 0, worstAnchored = 0;
+  let worst = 0, worstMm = 0, worstAt = 0, total = 0, worstAnchored = 0, worstSkin = 0, worstSkinMm = 0;
+  const bdirs = [new THREE.Vector3(0.093, 0.031, 0.995).normalize(), new THREE.Vector3(0.719, 0.024, -0.694).normalize(), new THREE.Vector3(-0.757, 0.041, -0.652).normalize()];
   const t1 = performance.now();
   try {
     for (let k = 0; k < HAIR_IDLE_SAMPLES; k++) {
@@ -2252,30 +2266,57 @@ function verifyHairUnderIdle(loadedRoot, store, mixer) {
         const push = (i) => tri.push(s[i * 3], s[i * 3 + 1], s[i * 3 + 2]);
         if (g.index) for (let i = 0; i < g.index.count; i++) push(g.index.getX(i)); else for (let i = 0; i < g.attributes.position.count; i++) push(i);
       }
-      const cg = new THREE.BufferGeometry(); cg.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3));
-      const cbvh = new MeshBVH(cg);
-      let beneath = 0, deepest = 0, anchoredHere = 0; total = 0;
+      const cbvh = tri.length ? new MeshBVH((() => { const cg = new THREE.BufferGeometry(); cg.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3)); return cg; })()) : null;
+      // posed skin surface for this pose: merged morphed bind positions, skinned by their primitives
+      let bbvh = null, bgeom = null;
+      if (bodyOk) {
+        const bp = body.geom.attributes.position, n = bp.count, out = new Float32Array(n * 3);
+        const q2 = new THREE.Vector3(), a2 = new THREE.Vector3(), t2 = new THREE.Vector3(), m2 = new THREE.Matrix4();
+        for (let i = 0; i < n; i++) {
+          const pm = body.parts[bPart[i]], li = bLocal[i], SI = pm.geometry.attributes.skinIndex, SW = pm.geometry.attributes.skinWeight, bm = pm.skeleton.boneMatrices;
+          q2.set(bp.getX(i), bp.getY(i), bp.getZ(i)).applyMatrix4(pm.bindMatrix); a2.set(0, 0, 0);
+          const idx = [SI.getX(li), SI.getY(li), SI.getZ(li), SI.getW(li)], w = [SW.getX(li), SW.getY(li), SW.getZ(li), SW.getW(li)];
+          for (let k = 0; k < 4; k++) { if (!w[k]) continue; m2.fromArray(bm, idx[k] * 16); t2.copy(q2).applyMatrix4(m2); a2.addScaledVector(t2, w[k]); }
+          a2.applyMatrix4(pm.bindMatrixInverse); out[i * 3] = a2.x; out[i * 3 + 1] = a2.y; out[i * 3 + 2] = a2.z;
+        }
+        bgeom = new THREE.BufferGeometry(); bgeom.setAttribute("position", new THREE.BufferAttribute(out, 3)); bgeom.setIndex(new THREE.BufferAttribute(body.geom.index.array.slice(), 1));
+        bbvh = new MeshBVH(bgeom);
+      }
+      const bt = { point: new THREE.Vector3(), distance: 0, faceIndex: 0 };
+      let beneath = 0, deepest = 0, anchoredHere = 0, inSkin = 0, inSkinMm = 0; total = 0;
       for (const m of hair) {
         const s = skinned(m); const n = m.geometry.attributes.position.count; total += n;
         const ride = rideOf.get(m);
         for (let i = 0; i < n; i++) {
           v.set(s[i * 3], s[i * 3 + 1], s[i * 3 + 2]); h.set(v.x, 0, v.z);
           if (h.lengthSq() <= 1e-8) continue;
-          ray.origin.copy(v); ray.direction.copy(h.normalize());
-          const hits = cbvh.raycast(ray, THREE.DoubleSide);
-          let crossings = 0, far = 0;
-          for (const x of hits) { if (x.distance <= 1e-6) continue; crossings++; if (x.distance > far) far = x.distance; }
-          if ((crossings & 1) === 1) { beneath++; if (far > deepest) deepest = far; if (ride && ride.corner[i * 3] >= 0) anchoredHere++; }
+          if (cbvh) {
+            ray.origin.copy(v); ray.direction.copy(h.normalize());
+            const hits = cbvh.raycast(ray, THREE.DoubleSide);
+            let crossings = 0, far = 0;
+            for (const x of hits) { if (x.distance <= 1e-6) continue; crossings++; if (x.distance > far) far = x.distance; }
+            if ((crossings & 1) === 1) { beneath++; if (far > deepest) deepest = far; if (ride && ride.corner[i * 3] >= 0) anchoredHere++; }
+          }
+          if (bbvh && bbvh.closestPointToPoint(v, bt, 0, 0.05)) {
+            // inside the posed skin, nearest skin not the head (roots are allowed in the scalp)
+            const zone = bZone[bgeom.index.getX(bt.faceIndex * 3)];
+            if (zone !== "head") {
+              let votes = 0;
+              for (const d of bdirs) { ray.origin.copy(v); ray.direction.copy(d); const hs = bbvh.raycast(ray, THREE.DoubleSide); let c = 0; for (const x of hs) if (x.distance > 1e-6) c++; if ((c & 1) === 1) votes++; }
+              if (votes >= 2) { inSkin++; if (bt.distance > inSkinMm) inSkinMm = bt.distance; }
+            }
+          }
         }
       }
-      if (beneath > worst) { worst = beneath; worstMm = deepest; worstAt = action.time; worstAnchored = anchoredHere; }
+      if (beneath + inSkin > worst + worstSkin) { worst = beneath; worstMm = deepest; worstAt = action.time; worstAnchored = anchoredHere; worstSkin = inSkin; worstSkinMm = inSkinMm; }
     }
   } finally {
     action.time = t0; mixer.update(0); loadedRoot.updateMatrixWorld(true); skeleton.update();
     try { rideHairOnCloth(store); } catch (e) { /* the render loop re-applies next frame */ }
   }
-  const line = `[MiniGlbViewer] Hair under idle: worst ${worst} of ${total} hair vertex(es) beneath the cloth (${(worstMm * 1000).toFixed(1)}mm, at ${worstAt.toFixed(2)}s of "${clip.name}") across ${HAIR_IDLE_SAMPLES} poses - ASSERT ${worst === 0 ? "PASS" : "RESIDUAL"}${worst ? ` (${worstAnchored} of them ride-anchored, ${worst - worstAnchored} not)` : ""} (${(performance.now() - t1).toFixed(0)}ms).`;
-  if (worst === 0) console.log(line); else console.warn(line);
+  const bad = worst + worstSkin;
+  const line = `[MiniGlbViewer] Hair under idle: worst ${worst} of ${total} hair vertex(es) beneath the cloth (${(worstMm * 1000).toFixed(1)}mm) and ${worstSkin} inside the skin (${(worstSkinMm * 1000).toFixed(1)}mm, scalp exempt), at ${worstAt.toFixed(2)}s of "${clip.name}", across ${HAIR_IDLE_SAMPLES} poses - ASSERT ${bad === 0 ? "PASS" : "RESIDUAL"}${worst ? ` (${worstAnchored} of the cloth ones ride-anchored, ${worst - worstAnchored} not)` : ""} (${(performance.now() - t1).toFixed(0)}ms).`;
+  if (bad === 0) console.log(line); else console.warn(line);
 }
 
 function settleLayers(loadedRoot, store, accessories, mixer = null) {
@@ -2344,8 +2385,8 @@ function settleLayers(loadedRoot, store, accessories, mixer = null) {
   //     prepareHairRide / rideHairOnCloth): what is left after the rig
   //     transfer is corrected in the posed space, every frame.
   try {
-    const r = prepareHairRide(store);
-    if (r) console.log(`[MiniGlbViewer] Hair ride: ${r.anchored} of ${r.total} hair vertex(es) anchored to the nearest fabric (${r.second} also to the fabric beneath them), ${r.clothVertices} fabric vertex(es) posed per frame; corrected per frame from here on.`);
+    const r = prepareHairRide(store, bodySurface);
+    if (r) console.log(`[MiniGlbViewer] Hair ride: ${r.anchored} of ${r.total} hair vertex(es) anchored to fabric, ${r.skin} to skin; ${r.clothVertices} fabric + ${r.skinVertices} skin vertex(es) posed per frame; corrected per frame from here on.`);
   } catch (e) { console.warn("[MiniGlbViewer] Hair ride anchors failed, hair keeps its settled shape only:", e); }
 
   applySkinLayers(loadedRoot, store);
@@ -3104,6 +3145,10 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
   const heightMRef = useRef(null); // measured body height, for the accessory manager's stature scale (Session 103 split)
   const bodyPropsRef = useRef({ bodyTorsoLength, bodyArmsLength, bodyLegsLength, bodyHeight, extraMorphValues, poseValues });
   bodyPropsRef.current = { bodyTorsoLength, bodyArmsLength, bodyLegsLength, bodyHeight, extraMorphValues, poseValues };
+  // Session 174 - the render loop's self-heal settle needs the CURRENT
+  // wardrobe config, not the one captured when the loop was created.
+  const accessoriesLatestRef = useRef(accessories);
+  accessoriesLatestRef.current = accessories;
   // Real feature (Session 101+) — camera framing per body region,
   // clicked from the new region nav in CharacterWizard's Adjustments
   // panel. Matches the small, fixed set of zoom presets researched
@@ -3700,6 +3745,8 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
     let frameId;
     let mixerErrorLogged = false;
     let hairRideErrorLogged = false;
+    let hairRideLastState = null;
+    let hairRideOffSince = 0, hairRideLastHeal = 0;
     let zeroSizeAtRenderLogged = false;
     const animate = () => {
       frameId = requestAnimationFrame(animate);
@@ -3807,11 +3854,38 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
       // final here: mixer, scales and dials have all written). Needs the
       // world matrices the renderer would otherwise compute later.
       if (loadedRootRef.current && accessoryMeshesRef.current) {
+        let rideNow = "running";
         try {
           loadedRootRef.current.updateMatrixWorld(true);
-          rideHairOnCloth(accessoryMeshesRef.current);
+          if (!rideHairOnCloth(accessoryMeshesRef.current)) rideNow = (window.__skinDebug && window.__skinDebug.hairRideStatus && window.__skinDebug.hairRideStatus.state) || "off";
         } catch (err) {
-          if (!hairRideErrorLogged) { hairRideErrorLogged = true; console.error("[MiniGlbViewer] hair ride failed this frame (disabled for the session):", err); }
+          rideNow = "error";
+          if (!hairRideErrorLogged) { hairRideErrorLogged = true; console.error("[MiniGlbViewer] hair ride threw this frame (it will keep trying every frame):", err); }
+        }
+        // Session 174 watchdog - say it once, every time the ride stops correcting
+        if (rideNow !== hairRideLastState) {
+          if (rideNow !== "running") console.warn(`[MiniGlbViewer] hair ride is NOT correcting: ${rideNow} (was ${hairRideLastState}).`);
+          else if (hairRideLastState !== null) console.log(`[MiniGlbViewer] hair ride correcting again (was ${hairRideLastState}).`);
+          hairRideLastState = rideNow;
+          hairRideOffSince = rideNow === "running" ? 0 : performance.now();
+        }
+        // Session 174 self-heal - Magnus: "suddenly the hair started to melt
+        // again". Anchors are only built by settleLayers; whatever path loses
+        // them without a settle following (a manual fit, an interrupted
+        // export, a load order), the hair goes uncorrected until the next
+        // interaction. So: hair in the scene, ride not correcting (and not a
+        // legitimate export pause) for 2s -> run the settle here, at most
+        // every 4s. It rebuilds the anchors; the watchdog above logs the
+        // recovery.
+        if (rideNow !== "running" && rideNow !== "paused" && hairRideOffSince && performance.now() - hairRideOffSince > 2000 && performance.now() - hairRideLastHeal > 4000) {
+          const store = accessoryMeshesRef.current;
+          let hairInScene = false;
+          for (const [url, entries] of Object.entries(store || {})) { if (url.includes("/head/hair/") && (entries || []).some((e) => e.mesh && e.mesh.parent)) { hairInScene = true; break; } }
+          if (hairInScene) {
+            hairRideLastHeal = performance.now();
+            console.warn(`[MiniGlbViewer] hair ride self-heal: not correcting (${rideNow}) for ${((performance.now() - hairRideOffSince) / 1000).toFixed(1)}s with hair in the scene - settling the layers again.`);
+            try { settleLayers(loadedRootRef.current, store, accessoriesLatestRef.current, mixerRef.current); } catch (e) { console.error("[MiniGlbViewer] hair ride self-heal settle failed:", e); }
+          }
         }
       }
       const rendererSize = renderer.getSize(new THREE.Vector2());
@@ -4739,11 +4813,17 @@ function rebindGarmentsForExport(root, bodySkinMesh) {
             reattach();
             restoreLayerCaches();
             reapplySkinLayers();
+            // Session 173 - the body-only export paused the hair ride and never
+            // resumed it (only the dressed path's restoreLive did), so after the
+            // wizard's leave-Appearance export the hair melted into the garment
+            // again for the rest of the session (Magnus: "works for a while,
+            // then starts to melt again").
+            pauseHairRide(accessoryMeshesRef.current, false);
             const blob = new Blob([result], { type: "model/gltf-binary" });
             console.log(`[MiniGlbViewer] exportMorphedGlbBlob (body only): produced ${blob.size} bytes, ${animations.length} animation(s) included`);
             resolve(blob);
           },
-          (err) => { reattach(); restoreLayerCaches(); reapplySkinLayers(); reject(err); },
+          (err) => { reattach(); restoreLayerCaches(); reapplySkinLayers(); pauseHairRide(accessoryMeshesRef.current, false); reject(err); },
           { binary: true, animations }
         );
         return;

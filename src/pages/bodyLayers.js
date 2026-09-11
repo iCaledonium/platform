@@ -419,7 +419,10 @@ export function fitOuterLayers(root, store, body = null) {
   const hair = [];
   for (const [url, entries] of Object.entries(store || {})) {
     const meshes = (entries || []).filter((e) => e.mesh && e.mesh.visible !== false);
-    if (url.includes("/torso/") || url.includes("/legs/")) clothing.push(...meshes);
+    // Session 174 (Magnus: "it shall work with bra and none bra") - visible
+    // underwear is clothing too; a bra hidden under a top is invisible and
+    // drops out through the filter above, as before.
+    if (url.includes("/torso/") || url.includes("/legs/") || url.includes("/underwear/")) clothing.push(...meshes);
     else if (url.includes("/head/hair/")) hair.push(...entries.filter((e) => e.mesh));
   }
   if (!hair.length) return [];
@@ -804,7 +807,7 @@ export function fitOuterLayers(root, store, body = null) {
 // frame's correction) and invalidated by a manual-fit change until the
 // next settle rebuilds the anchors.
 const HAIR_RIDE_REACH = 0.06;   // anchor a hair vertex to fabric within 6cm of it at settle (10cm anchored 2000 more and read as melting on the shoulders in the desktop app; the 41 residual tips were anchored anyway)
-const HAIR_RIDE_GAP = 0.008;    // and never let it come closer than 8mm to that fabric in motion
+const HAIR_RIDE_GAP = 0.02;     // and never let it come closer than 2cm to that fabric in motion - the same float the settle gives it (8mm let strands sink into the pleat valleys of the blouse back, below the ridge tops, and read as inside the fabric)
 const HAIR_RIDE_SECOND_ANCHOR = false;   // see anchor 2 in prepareHairRide
 const rideState = new WeakMap();  // store -> { cloth, cvMesh, cvVi, posed, paused, frame }
 const _rq = new THREE.Vector3(), _racc = new THREE.Vector3(), _rt = new THREE.Vector3(), _rm = new THREE.Matrix4();
@@ -834,18 +837,42 @@ function rideMatrix(mesh, i, out) {
   return out.copy(mesh.bindMatrixInverse).multiply(_rsum).multiply(mesh.bindMatrix);
 }
 
-export function prepareHairRide(store) {
+// Session 174 - the ride also anchors to the SKIN: with no top and no bra
+// the strands still rest on bare shoulders and chest, and the head turn
+// still moves them relative to it. `body` is getBodySurfaceBVH's cache
+// (intact, morphed bind-space surface + the primitives it was merged from);
+// a hair vertex anchors to whichever is nearer within reach, fabric or
+// skin. Skin anchors skip the head (roots live inside the scalp) and any
+// vertex already inside the body (a root), so nothing pulls hair out of the
+// skull.
+export function prepareHairRide(store, body = null) {
   const cloth = [], hair = [];
   for (const [url, entries] of Object.entries(store || {})) {
     for (const e of (entries || [])) {
       const m = e.mesh; if (!m || !m.isSkinnedMesh) continue;
       if (url.includes("/head/hair/")) hair.push(e);
-      else if ((url.includes("/torso/") || url.includes("/legs/")) && m.visible !== false && m.geometry.attributes.skinIndex) cloth.push(m);
+      else if ((url.includes("/torso/") || url.includes("/legs/") || url.includes("/underwear/")) && m.visible !== false && m.geometry.attributes.skinIndex) cloth.push(m);
     }
   }
   for (const e of hair) e.ride = null;
   rideState.delete(store);
-  if (!cloth.length || !hair.length) return null;
+  const bodyOk = !!(body && body.bvh && body.geom?.index && Array.isArray(body.parts) && body.parts.length);
+  if ((!cloth.length && !bodyOk) || !hair.length) return null;
+  // body: merged vertex -> (part, local), zone per merged vertex
+  let partOf = null, localOf = null, zoneOf = null;
+  if (bodyOk) {
+    const total = body.geom.attributes.position.count;
+    partOf = new Int32Array(total); localOf = new Uint32Array(total); zoneOf = new Array(total);
+    let off = 0;
+    body.parts.forEach((p, pi) => {
+      const z = ensureZones(p); const n = p.geometry.attributes.position.count;
+      for (let i = 0; i < n; i++) { partOf[off + i] = pi; localOf[off + i] = i; zoneOf[off + i] = z ? z[i] : "other"; }
+      off += n;
+    });
+    if (off !== total) { partOf = null; }
+  }
+  const bvKey = new Map(); const bvPart = [], bvLocal = [], bvBase = [];
+  const bvId = (mv) => { let id = bvKey.get(mv); if (id === undefined) { id = bvPart.length; bvKey.set(mv, id); bvPart.push(partOf[mv]); bvLocal.push(localOf[mv]); const bp = body.geom.attributes.position; bvBase.push(bp.getX(mv), bp.getY(mv), bp.getZ(mv)); } return id; };
   // cloth soup with (mesh, vertex) per corner
   const tri = []; const cMesh = []; const cVi = [];
   cloth.forEach((m, mi) => {
@@ -853,8 +880,8 @@ export function prepareHairRide(store) {
     const push = (vi) => { tri.push(pos.getX(vi), pos.getY(vi), pos.getZ(vi)); cMesh.push(mi); cVi.push(vi); };
     if (g.index) for (let i = 0; i < g.index.count; i++) push(g.index.getX(i)); else for (let i = 0; i < pos.count; i++) push(i);
   });
-  const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3));
-  const bvh = new MeshBVH(g);
+  let g = null, bvh = null;
+  if (tri.length) { g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3)); bvh = new MeshBVH(g); }
   // unique cloth vertex table
   const cvKey = new Map(); const cvMesh = [], cvVi = [];
   const cvId = (corner) => { const key = cMesh[corner] * 4294967296 + cVi[corner]; let id = cvKey.get(key); if (id === undefined) { id = cvMesh.length; cvKey.set(key, id); cvMesh.push(cMesh[corner]); cvVi.push(cVi[corner]); } return id; };
@@ -878,17 +905,40 @@ export function prepareHairRide(store) {
     sign[i] = _rd.subVectors(p, point).dot(_rn) >= 0 ? 1 : -1;
     return true;
   };
-  let anchored = 0, total = 0, second = 0;
+  // one SKIN anchor from a body face: corners are merged body vertex ids
+  const bhit = { point: new THREE.Vector3(), distance: 0, faceIndex: 0 };
+  const makeBodyAnchor = (faceIndex, point, corner, bary, sign, i) => {
+    const bp = body.geom.attributes.position, ix = body.geom.index, f = faceIndex * 3;
+    const m0 = ix.getX(f), m1 = ix.getX(f + 1), m2 = ix.getX(f + 2);
+    if (zoneOf[m0] === "head" || zoneOf[m1] === "head" || zoneOf[m2] === "head") return false;
+    _rc0.fromBufferAttribute(bp, m0); _rc1.fromBufferAttribute(bp, m1); _rc2.fromBufferAttribute(bp, m2);
+    _re1.subVectors(_rc1, _rc0); _re2.subVectors(_rc2, _rc0); _rd.subVectors(point, _rc0);
+    const d00 = _re1.dot(_re1), d01 = _re1.dot(_re2), d11 = _re2.dot(_re2), d20 = _rd.dot(_re1), d21 = _rd.dot(_re2);
+    const den = d00 * d11 - d01 * d01; if (Math.abs(den) < 1e-14) return false;
+    const v = (d11 * d20 - d01 * d21) / den, w = (d00 * d21 - d01 * d20) / den, u = 1 - v - w;
+    _rn.crossVectors(_re1, _re2); if (_rn.lengthSq() === 0) return false; _rn.normalize();
+    // the intact body winding is outward: a vertex on the inner side is a root, leave it
+    if (_rd.subVectors(p, point).dot(_rn) < 0) return false;
+    corner[i * 3] = bvId(m0); corner[i * 3 + 1] = bvId(m1); corner[i * 3 + 2] = bvId(m2);
+    bary[i * 3] = u; bary[i * 3 + 1] = v; bary[i * 3 + 2] = w;
+    sign[i] = 1;
+    return true;
+  };
+  let anchored = 0, total = 0, second = 0, skin = 0;
   for (const e of hair) {
     const pos = e.mesh.geometry.attributes.position; const N = pos.count; total += N;
     const base = new Float32Array(N * 3); for (let i = 0; i < N; i++) { base[i * 3] = pos.getX(i); base[i * 3 + 1] = pos.getY(i); base[i * 3 + 2] = pos.getZ(i); }
     const corner = new Int32Array(N * 3).fill(-1), bary = new Float32Array(N * 3), sign = new Int8Array(N);
     const corner2 = new Int32Array(N * 3).fill(-1), bary2 = new Float32Array(N * 3), sign2 = new Int8Array(N);
+    const cornerB = new Int32Array(N * 3).fill(-1), baryB = new Float32Array(N * 3), signB = new Int8Array(N);
     for (let i = 0; i < N; i++) {
       p.set(base[i * 3], base[i * 3 + 1], base[i * 3 + 2]);
       // anchor 1: the nearest fabric
       let first = -1;
-      if (bvh.closestPointToPoint(p, hit, 0, HAIR_RIDE_REACH) && makeAnchor(hit.faceIndex, hit.point, corner, bary, sign, i)) { first = hit.faceIndex; anchored++; }
+      if (bvh && bvh.closestPointToPoint(p, hit, 0, HAIR_RIDE_REACH) && makeAnchor(hit.faceIndex, hit.point, corner, bary, sign, i)) { first = hit.faceIndex; anchored++; }
+      // skin anchor: the nearest skin within reach (fabric or not - a strand
+      // on a bare shoulder has no fabric, one over a bra band has both)
+      if (partOf && body.bvh.closestPointToPoint(p, bhit, 0, HAIR_RIDE_REACH) && makeBodyAnchor(bhit.faceIndex, bhit.point, cornerB, baryB, signB, i)) skin++;
       // anchor 2: the fabric directly beneath, along the inward radial - the
       // surface the parity verdict measures against. DISABLED (Magnus, on the
       // desktop app: "still melts on both shoulders, you had it right but
@@ -898,7 +948,7 @@ export function prepareHairRide(store) {
       // sideways ray from a strand on the shoulder does not find the fabric
       // under that strand. Kept behind HAIR_RIDE_SECOND_ANCHOR for the record.
       _rd.set(-p.x, 0, -p.z);
-      if (HAIR_RIDE_SECOND_ANCHOR && _rd.lengthSq() > 1e-8) {
+      if (HAIR_RIDE_SECOND_ANCHOR && bvh && _rd.lengthSq() > 1e-8) {
         ray.origin.copy(p); ray.direction.copy(_rd.normalize());
         const hits = bvh.raycast(ray, THREE.DoubleSide);
         let near = null;
@@ -906,17 +956,32 @@ export function prepareHairRide(store) {
         if (near && near.faceIndex !== first && makeAnchor(near.faceIndex, near.point, corner2, bary2, sign2, i)) second++;
       }
     }
-    e.ride = { base, corner, bary, sign, corner2, bary2, sign2 };
+    e.ride = { base, corner, bary, sign, corner2, bary2, sign2, cornerB, baryB, signB };
   }
-  rideState.set(store, { cloth, cvMesh: Int32Array.from(cvMesh), cvVi: Uint32Array.from(cvVi), posed: new Float32Array(cvMesh.length * 3), paused: false, lastPushed: 0 });
-  return { anchored, second, total, clothVertices: cvMesh.length };
+  rideState.set(store, {
+    cloth, cvMesh: Int32Array.from(cvMesh), cvVi: Uint32Array.from(cvVi), posed: new Float32Array(cvMesh.length * 3),
+    bodyParts: bodyOk ? body.parts : null, bvPart: Int32Array.from(bvPart), bvLocal: Uint32Array.from(bvLocal), bvBase: Float32Array.from(bvBase), bposed: new Float32Array(bvPart.length * 3),
+    paused: false, lastPushed: 0,
+  });
+  return { anchored, second, skin, total, clothVertices: cvMesh.length, skinVertices: bvPart.length };
 }
 
+const HAIR_RIDE_PAUSE_MAX_MS = 15000;   // no export takes this long; a pause older than this was never resumed
 export function pauseHairRide(store, paused) {
   const st = rideState.get(store); if (!st) return;
   st.paused = !!paused;
+  st.pausedAt = paused ? performance.now() : 0;
   if (paused) restoreHairRide(store);
 }
+// What the ride is doing right now, for the render loop's watchdog and for
+// window.__skinDebug.hairRideStatus. Session 174: Magnus saw the hair melt
+// again "suddenly" with the resume fix deployed; the layer must say WHY it
+// is not correcting instead of silently doing nothing.
+const rideStatusOf = (state, extra) => {
+  const s = Object.assign({ state, at: performance.now() }, extra || {});
+  if (typeof window !== "undefined" && window.__skinDebug) window.__skinDebug.hairRideStatus = s;
+  return s;
+};
 
 export function restoreHairRide(store) {
   for (const entries of Object.values(store || {})) for (const e of (entries || [])) {
@@ -929,10 +994,19 @@ export function restoreHairRide(store) {
 
 // Per frame, after the mixer and after root.updateMatrixWorld(true).
 export function rideHairOnCloth(store) {
-  const st = rideState.get(store); if (!st || st.paused) return null;
-  const { cloth, cvMesh, cvVi, posed } = st;
+  const st = rideState.get(store);
+  if (!st) { rideStatusOf("no-anchors"); return null; }
+  if (st.paused) {
+    if (performance.now() - st.pausedAt > HAIR_RIDE_PAUSE_MAX_MS) {
+      // safety net: whatever paused the ride never resumed it
+      st.paused = false; st.pausedAt = 0;
+      console.warn(`[bodyLayers] hair ride was left paused for ${(HAIR_RIDE_PAUSE_MAX_MS / 1000).toFixed(0)}s+ (an export that never resumed it) - resuming on its own.`);
+    } else { rideStatusOf("paused", { forMs: Math.round(performance.now() - st.pausedAt) }); return null; }
+  }
+  const { cloth, cvMesh, cvVi, posed, bodyParts, bvPart, bvLocal, bvBase, bposed } = st;
   let skeleton = null;
   for (const m of cloth) { skeleton = m.skeleton; break; }
+  if (!skeleton && bodyParts) for (const m of bodyParts) { skeleton = m.skeleton; break; }
   if (!skeleton) return null;
   skeleton.update();
   // pose the anchored cloth vertices
@@ -941,24 +1015,32 @@ export function rideHairOnCloth(store) {
     ridePose(m, vi, pos.getX(vi), pos.getY(vi), pos.getZ(vi), _rP);
     posed[k * 3] = _rP.x; posed[k * 3 + 1] = _rP.y; posed[k * 3 + 2] = _rP.z;
   }
+  // and the anchored skin vertices, from the intact MORPHED bind positions
+  // (the GPU adds the morphs before skinning; the merged surface has them in)
+  if (bodyParts) for (let k = 0; k < bvPart.length; k++) {
+    const m = bodyParts[bvPart[k]];
+    if (m.skeleton !== skeleton) m.skeleton.update();
+    ridePose(m, bvLocal[k], bvBase[k * 3], bvBase[k * 3 + 1], bvBase[k * 3 + 2], _rP);
+    bposed[k * 3] = _rP.x; bposed[k * 3 + 1] = _rP.y; bposed[k * 3 + 2] = _rP.z;
+  }
   let checked = 0, pushed = 0, deepest = 0;
   for (const entries of Object.values(store || {})) for (const e of (entries || [])) {
     const r = e.ride; if (!r || !e.mesh) continue;
     const mesh = e.mesh, pos = mesh.geometry.attributes.position, N = pos.count;
     if (mesh.skeleton !== skeleton) mesh.skeleton.update();
     let touched = 0;
-    const planes = [[r.corner, r.bary, r.sign], [r.corner2, r.bary2, r.sign2]];
+    const planes = [[r.corner, r.bary, r.sign, posed], [r.corner2, r.bary2, r.sign2, posed], [r.cornerB, r.baryB, r.signB, bposed]];
     for (let i = 0; i < N; i++) {
       const bx = r.base[i * 3], by = r.base[i * 3 + 1], bz = r.base[i * 3 + 2];
-      if (r.corner[i * 3] < 0 && r.corner2[i * 3] < 0) continue;
+      if (r.corner[i * 3] < 0 && r.corner2[i * 3] < 0 && r.cornerB[i * 3] < 0) continue;
       checked++;
       ridePose(mesh, i, bx, by, bz, _rP);
-      // both planes; a push from the first moves the point the second sees
+      // every plane; a push from one moves the point the next sees
       _rd.set(0, 0, 0); let need = 0;
-      for (const [corner, bary, sign] of planes) {
+      for (const [corner, bary, sign, table] of planes) {
         const c0 = corner[i * 3]; if (c0 < 0) continue;
         const c1 = corner[i * 3 + 1], c2 = corner[i * 3 + 2];
-        _rc0.fromArray(posed, c0 * 3); _rc1.fromArray(posed, c1 * 3); _rc2.fromArray(posed, c2 * 3);
+        _rc0.fromArray(table, c0 * 3); _rc1.fromArray(table, c1 * 3); _rc2.fromArray(table, c2 * 3);
         _rA.copy(_rc0).multiplyScalar(bary[i * 3]).addScaledVector(_rc1, bary[i * 3 + 1]).addScaledVector(_rc2, bary[i * 3 + 2]);
         _rn.crossVectors(_re1.subVectors(_rc1, _rc0), _re2.subVectors(_rc2, _rc0));
         if (_rn.lengthSq() === 0) continue;
@@ -987,5 +1069,7 @@ export function rideHairOnCloth(store) {
   st.lastPushed = pushed;
   const stats = { checked, pushed, deepestMm: +(deepest * 1000).toFixed(1) };
   if (typeof window !== "undefined" && window.__skinDebug) window.__skinDebug.hairRide = stats;
+  if (checked === 0) { rideStatusOf("no-anchors", stats); return null; }   // every entry lost its anchors (a manual fit) and no settle followed
+  rideStatusOf("running", stats);
   return stats;
 }
