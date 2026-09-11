@@ -2461,10 +2461,38 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser, unautho
   // which is the retrospective ASK that incident's own CLOSES WHEN names as a
   // satisfaction.
   //
-  // WHAT IS NOT RELAXED, and must not be: the 'unauthorised' arm. A set declared
-  // to be of somebody else who has not agreed still refuses at every gate here,
-  // exactly as before. That is the arm with a real second person behind it, and
-  // a withdrawal ('no') must keep biting the build as well as the egress.
+  // SECOND OWNER DECISION, 2026-09-11, on the conduct-watch row for c2653aac
+  // (52 occurrences). The paragraph that stood here said the 'unauthorised' arm
+  // "is not relaxed, and must not be". It is now relaxed FOR LOCAL WORK, on the
+  // owner's judgement, and the reasoning that changed his mind is worth keeping
+  // because it is not the same as the blank case:
+  //
+  // A blank was a SILENCE. This arm is a VOLUNTEERED DECLARATION — the account
+  // holder affirmatively said "this is not me", which is strictly more
+  // information than a blank and looks like a better basis for a gate. What
+  // undoes it is the CLEARING CONDITION: subject_authorised='yes' is set by the
+  // same account holder. It is the identical self-assertion as ticking 'self',
+  // one step removed, and anyone willing to misdeclare who is in a photograph
+  // is equally willing to tick 'yes'. So this gate carries the same structural
+  // weakness as the blank gate removed earlier today — and is worse in one
+  // respect: its only effect on an HONEST owner is to demand an attestation of
+  // authorisation they may not have, so its two outcomes are "lie" or "stop".
+  // Neither protects the subject. A gate whose only outcomes are those two is
+  // not a safeguard, and keeping it taught the owner to tick a box.
+  //
+  // STILL ENFORCED, and this is what makes the above defensible rather than a
+  // capitulation: the RECORD is untouched (depicts='other' with
+  // subject_authorised NULL remains true and readable), and EGRESS still
+  // refuses — share links in sharelinks-routes.js:176 on
+  // (depicts='other' AND subject_authorised != 'yes'), and fork/copy in
+  // index.js via unauthorisedSubjectInLineage. Egress is where a second person
+  // can actually be affected; a local build on the owner's own machine is not.
+  //
+  // KNOWN GAP, disclosed rather than quietly closed: POST /api/actors/:id/deploy
+  // (index.js) has auth and permission-level checks but NO subject gate at all,
+  // so "hard refusal is scoped to egress" is not fully true today. Whether to
+  // gate deploy is the owner's call and was not made here — inventing that gate
+  // unasked is the loop this whole sequence exists to stop.
   const buildBlock = (actorId, where) => {
     const hit = subjectHit(actorId);
     if (!hit) return null;
@@ -2472,7 +2500,8 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser, unautho
       console.log(`[${where}] ${actorId}: PROCEEDING on an undeclared reference set — photo '${hit.state_slug}' on ${hit.actor_id}${hit.actor_id === actorId ? "" : " (an ancestor of this fork)"} ${subjectHitLog(hit)}. Local build/view is no longer gated on a blank (owner decision, conduct-watch d77839ee64201cb38d); egress is still refused.`);
       return null;
     }
-    return hit;
+    console.log(`[${where}] ${actorId}: PROCEEDING on an UNAUTHORISED reference set — photo '${hit.state_slug}' on ${hit.actor_id}${hit.actor_id === actorId ? "" : " (an ancestor of this fork)"} ${subjectHitLog(hit)}. Local build is no longer gated on a declared-'other' without recorded authorisation (owner decision, 2026-09-11); the record stands and egress is still refused.`);
+    return null;
   };
 
   // What the worlds should be loading, and whether it is still true.
@@ -2655,20 +2684,19 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser, unautho
     if (!photo.depicts) {
       console.log(`[generate-3d] ${actorId}: PROCEEDING on an undeclared profile photograph — nobody has said whose likeness this is. Egress is still refused; the editor still asks.`);
     }
-    // And a likeness of somebody else does not get solved on the uploader's
-    // say-so alone. Declaring the photographs are of another person answers
-    // WHOSE face this is; it does not answer whether that person agreed to it,
-    // and until 2026-09-09 nothing on this system could hold that answer, so a
-    // declared-'other' build and an authorised one were the same request.
-    // Deliberately narrow: this fires only on depicts === 'other'. 'self' and
-    // an undeclared row are untouched (the latter never gets here anyway), so
-    // no existing flow changes shape except the one this gate is about.
-    // 'no' blocks for the same reason a blank does -- neither is permission.
+    // This DIRECT check used to 400 here, bypassing buildBlock() entirely, and
+    // it is why relaxing buildBlock() alone left the change half-applied: the
+    // helper returned null while this line still refused the same request four
+    // lines later. Relaxed 2026-09-11 with the rest, same owner decision, and
+    // deliberately left in place as a LOG rather than deleted, so the solve of
+    // a declared-'other' set without recorded authorisation still leaves a
+    // trace in the journal. See buildBlock() above for the full reasoning; the
+    // short form is that subject_authorised='yes' is set by the same account
+    // holder who set depicts='other', so the gate's only outcomes on an honest
+    // owner were "lie" or "stop", and neither protected the subject.
+    // The RECORD is unchanged and EGRESS still refuses.
     if (photo.depicts === "other" && photo.subject_authorised !== "yes") {
-      return res.status(400).json({
-        error: "These photographs are declared to be of somebody else. Confirm that person authorised this likeness before building it.",
-        needs: "subject_authorised",
-      });
+      console.log(`[generate-3d] ${actorId}: PROCEEDING on a declared-'other' profile photograph with subject_authorised=${JSON.stringify(photo.subject_authorised)} — nobody has recorded that the subject agreed. Egress is still refused; the editor still asks.`);
     }
     // Session 169 (conduct-watch, resolution-manager) — both checks above read
     // the PROFILE row only, and the solve below does not. actor_media carries a
