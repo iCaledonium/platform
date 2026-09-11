@@ -2435,6 +2435,46 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser, unautho
     ? "carries no depicts declaration -- nobody has said whose likeness it is"
     : "is declared to be of somebody else with no recorded subject authorisation");
 
+  // ── 2026-09-11, OWNER DECISION: a blank no longer blocks LOCAL work ────────
+  //
+  // Until now every gate in this file refused on BOTH arms of subjectHit(): a
+  // declared-'other' with no recorded 'yes', AND a blank. The blank arm was
+  // added this morning so the retroactive path would bind on likenesses solved
+  // before the depicts column existed. It worked, and it was too broad.
+  //
+  // The owner's judgement, recorded on conduct-watch d77839ee64201cb38d and
+  // taken deliberately: `depicts` is OVERLOADED. A blank means both "nobody was
+  // ever asked" and "somebody was asked and has not answered", and the gate
+  // cannot tell them apart, so it assumed the worse one and refused everything.
+  // Meanwhile 'self' -- the answer that clears it -- is owner-asserted, verified
+  // by nothing, and read by no predicate anywhere: it is a checkbox that unlocks
+  // itself. Blocking a person from building their own likeness, on their own
+  // machine, from their own photographs, on the strength of a checkbox they can
+  // tick in two seconds, bought no protection for anybody. It only taught the
+  // owner to tick it.
+  //
+  // So the hard refusal is now scoped to EGRESS -- fork, share, publish, link,
+  // deploy -- which is where a second person can actually be affected, and which
+  // is enforced in index.js and sharelinks-routes.js and is NOT touched by this
+  // change. Local build and local viewing proceed on a blank, loudly: every one
+  // logs, and the editor still raises the amber "Declaration needed" notice,
+  // which is the retrospective ASK that incident's own CLOSES WHEN names as a
+  // satisfaction.
+  //
+  // WHAT IS NOT RELAXED, and must not be: the 'unauthorised' arm. A set declared
+  // to be of somebody else who has not agreed still refuses at every gate here,
+  // exactly as before. That is the arm with a real second person behind it, and
+  // a withdrawal ('no') must keep biting the build as well as the egress.
+  const buildBlock = (actorId, where) => {
+    const hit = subjectHit(actorId);
+    if (!hit) return null;
+    if (hit.reason === "undeclared") {
+      console.log(`[${where}] ${actorId}: PROCEEDING on an undeclared reference set — photo '${hit.state_slug}' on ${hit.actor_id}${hit.actor_id === actorId ? "" : " (an ancestor of this fork)"} ${subjectHitLog(hit)}. Local build/view is no longer gated on a blank (owner decision, conduct-watch d77839ee64201cb38d); egress is still refused.`);
+      return null;
+    }
+    return hit;
+  };
+
   // What the worlds should be loading, and whether it is still true.
   //
   // `fresh` is the whole point of the naming scheme: the published file carries
@@ -2459,7 +2499,18 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser, unautho
     // Shaped as "nothing built" rather than a 403 because that is the truthful
     // answer to this caller — there is no runtime model it may use — and it is
     // the one shape every existing caller already handles.
-    const runtimeBlock = subjectHit(req.params.id);
+    // Unlike the three routes below, this one is NOT owner-only -- any signed-in
+    // caller may reach it, which is how a share-holder and the bake read the
+    // model. So the blank relaxation is scoped to the OWNER here: for them this
+    // is local viewing of their own work, and for anybody else serving the model
+    // IS the egress the hard refusal was just narrowed to. An unauthorised
+    // 'other' is still withheld from everyone, owner included.
+    const runtimeOwner = db.prepare(`SELECT 1 AS ok FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
+    const runtimeHit = subjectHit(req.params.id);
+    const runtimeBlock = (runtimeHit && runtimeHit.reason === "undeclared" && runtimeOwner) ? null : runtimeHit;
+    if (runtimeHit && !runtimeBlock) {
+      console.log(`[runtime] ${req.params.id}: serving to OWNER on an undeclared reference set — ${subjectHitLog(runtimeHit)}. Egress gates still refuse.`);
+    }
     if (runtimeBlock) {
       console.log(`[runtime] ${req.params.id}: withheld — reference photo '${runtimeBlock.state_slug}' on ${runtimeBlock.actor_id}${runtimeBlock.actor_id === req.params.id ? "" : " (an ancestor of this fork)"} ${subjectHitLog(runtimeBlock)}`);
       return res.json({
@@ -2501,7 +2552,7 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser, unautho
       // output and writes it as the actor's runtime model — it is the wizard
       // FINISHING her — so an undeclared 'other' likeness could be completed
       // here with the solve gate never consulted.
-      const subjectBlock = subjectHit(actorId);
+      const subjectBlock = buildBlock(actorId, "runtime-glb");
       if (subjectBlock) {
         console.log(`[runtime-glb] ${actorId}: refused — the reference set ${subjectHitLog(subjectBlock)} (offending row on ${subjectBlock.actor_id}${subjectBlock.actor_id === actorId ? "" : ", an ancestor of this fork"}, slug '${subjectBlock.state_slug}')`);
         return res.status(403).json({
@@ -2594,11 +2645,15 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser, unautho
     // body built from a real person. If the record cannot say whose likeness
     // is being built, the build does not start. Unset is not treated as
     // "self" — a blank must never read as a declaration nobody made.
+    // 2026-09-11 (owner decision) -- this used to 400 here. It now proceeds and
+    // says so. See buildBlock() above for the reasoning; the short form is that
+    // refusing the owner their own solve on a blank bought nothing, because the
+    // answer that cleared it was a self-asserted checkbox read by no predicate.
+    // The egress gates in index.js / sharelinks-routes.js are unchanged, so this
+    // likeness still cannot be forked, shared, linked, published or deployed
+    // until the record says whose it is.
     if (!photo.depicts) {
-      return res.status(400).json({
-        error: "Say who is in the reference photographs before building a likeness from them.",
-        needs: "depicts",
-      });
+      console.log(`[generate-3d] ${actorId}: PROCEEDING on an undeclared profile photograph — nobody has said whose likeness this is. Egress is still refused; the editor still asks.`);
     }
     // And a likeness of somebody else does not get solved on the uploader's
     // say-so alone. Declaring the photographs are of another person answers
@@ -2637,7 +2692,7 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser, unautho
     // Session 171: this was the same own-actor query, inline. It is the SOLVE —
     // the path that turns photographs into a face and a body — so it takes the
     // lineage-aware form too, for the reason written on subjectHit above.
-    const unauthorisedRow = subjectHit(actorId);
+    const unauthorisedRow = buildBlock(actorId, "generate-3d");
     if (unauthorisedRow) {
       console.log(`[generate-3d] ${actorId}: refused — reference photo '${unauthorisedRow.state_slug}' on ${unauthorisedRow.actor_id}${unauthorisedRow.actor_id === actorId ? "" : " (an ancestor of this fork)"} ${subjectHitLog(unauthorisedRow)}`);
       return res.status(400).json({
@@ -2664,24 +2719,33 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser, unautho
     const localBodyFrontPath = hasAllBodyPhotos ? path.join(__dirname, "../public", bodyPhotoBySlug.body_front) : null;
     const localBodySidePath = hasAllBodyPhotos ? path.join(__dirname, "../public", bodyPhotoBySlug.body_side) : null;
     const localBodyBackPath = hasAllBodyPhotos ? path.join(__dirname, "../public", bodyPhotoBySlug.body_back) : null;
-    // The blank half of the same hole. A body photograph with no declaration on
-    // it is not "self" — it is a row that cannot say whose body is about to be
-    // solved, and the profile gate above already refuses precisely that for the
-    // face ("a blank must never read as a declaration nobody made"). Every
-    // legitimate path stamps these: CharacterWizard uploads all three body slots
-    // with the same `depicts` it sends for the profile, and PATCH
-    // /api/actors/:id/media/depicts rewrites the whole world_id IS NULL set, so
-    // this can only fire on a set built slot-by-slot against the API. Refuse the
-    // build rather than solve an undeclared body — and refuse rather than
-    // silently drop the body photos, because a caller who uploaded three
-    // photographs and got a generic body back would have no way to tell.
+    // The blank half of the same hole — and since 2026-09-11 no longer a refusal.
+    //
+    // The comment that stood here justified this 400 by pointing at the profile
+    // gate above: "already refuses precisely that for the face". That gate now
+    // PROCEEDS on a blank by owner decision, so this block was left arguing from
+    // a premise that had been removed twenty lines earlier, and it produced the
+    // inconsistent shape where an undeclared FACE solved and an undeclared BODY
+    // did not. Half-applied changes are how a gate ends up meaning something
+    // nobody chose.
+    //
+    // Same reasoning as the profile path, which is the owner's on conduct-watch
+    // d77839ee64201cb38d: a blank cannot tell "nobody was ever asked" from
+    // "asked and unanswered", and the answer that clears it is a self-asserted
+    // checkbox verified by nothing and read by no predicate. Refusing a person
+    // their own body solve, on their own machine, from their own photographs,
+    // on the strength of a box they can tick in two seconds, bought nobody any
+    // protection.
+    //
+    // UNCHANGED AND LOAD-BEARING, so that relaxing this does not read as
+    // relaxing everything: buildBlock(actorId, "generate-3d") ran at the top of
+    // this handler and still refuses the 'other'-without-authorisation arm,
+    // including a withdrawal ('no'). Egress -- fork, share, publish, link,
+    // deploy -- is enforced in index.js and sharelinks-routes.js and is not
+    // touched. Only the blank arm proceeds, and it says so every time.
     const undeclaredBody = hasAllBodyPhotos ? bodyPhotoRows.find(r => !r.depicts) : null;
     if (undeclaredBody) {
-      console.log(`[generate-3d] ${actorId}: refused — body photo '${undeclaredBody.state_slug}' carries no depicts declaration`);
-      return res.status(400).json({
-        error: "Say who is in the body photographs before building a likeness from them.",
-        needs: "depicts",
-      });
+      console.log(`[generate-3d] ${actorId}: PROCEEDING on an undeclared body photograph ('${undeclaredBody.state_slug}') — nobody has said whose body this is. Egress is still refused; the editor still asks.`);
     }
     if (bodyPhotoRows.length > 0 && !hasAllBodyPhotos) {
       console.log(`[generate-3d] ${actorId}: partial body photo set (${bodyPhotoRows.length}/3) — skipping photo-derived body shape`);
@@ -2732,7 +2796,7 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser, unautho
     // Same reasoning as the runtime-glb route above: this overwrites the
     // actor's canonical .glb from a client-supplied body, so it is a build
     // path and takes the build gate.
-    const subjectBlock = subjectHit(actorId);
+    const subjectBlock = buildBlock(actorId, "save-morphed-glb");
     if (subjectBlock) {
       console.log(`[save-morphed-glb] ${actorId}: refused — the reference set ${subjectHitLog(subjectBlock)} (offending row on ${subjectBlock.actor_id}${subjectBlock.actor_id === actorId ? "" : ", an ancestor of this fork"}, slug '${subjectBlock.state_slug}')`);
       return res.status(403).json({
