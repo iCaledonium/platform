@@ -800,6 +800,25 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
   }
 
   function stepFigure(fig, delta) {
+    // Seated, the idle clip keeps playing so she breathes — but idle also
+    // carries a standing sway (hips shifting, torso weight drifting to one
+    // side), and the sit pose is applied as deltas ON TOP of the mixer, so
+    // that whole dance rode through into the chair: hips wandering, torso
+    // leaning off the chair's centre line (Magnus, 2026-09-11: "dampen the
+    // idle hip movement", "his torso leans to the left too much"). Weight
+    // below 1 blends the clip toward the rest pose, which shrinks the sway's
+    // AMPLITUDE rather than just slowing it; the arms and legs are re-solved
+    // by the settle every frame, so they do not drift with it. Eased so
+    // sitting down and standing up shift the damping rather than snap it.
+    const idleAct = fig.actions?.idle;
+    if (idleAct) {
+      const seated = !!(fig.seatedOn || fig.sitting);
+      const k = Math.min(1, delta * 3);
+      const wTarget = seated ? 0.18 : 1;
+      const tTarget = seated ? 0.5 : 1;
+      idleAct.setEffectiveWeight(idleAct.getEffectiveWeight() + (wTarget - idleAct.getEffectiveWeight()) * k);
+      idleAct.timeScale += (tTarget - idleAct.timeScale) * k;
+    }
     fig.mixer.update(delta);
 
     // How high the foot bone sits when the sole is on the floor. Measured once,
@@ -870,6 +889,7 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
     // AFTER the pose: the pose decides the shape, this decides how high off the
     // floor that shape has to sit.
     stepSitting(fig, delta);
+    stepSettling(fig, delta);
   }
 
   // ── body interactions ─────────────────────────────────────────────────────
@@ -886,6 +906,9 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
   function releasePose(fig) {
     const p = fig.pose;
     fig.pose = null;
+    // The settle writes the same bones; leaving it running would keep her
+    // leaning on a chair she has stood up from.
+    fig.settling = null;
     if (!p?.tracks || !fig.rest) return;
     for (const tr of p.tracks) {
       const bone = p.bones?.get(tr.rigBone);
@@ -1089,18 +1112,150 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
   // It starts from the authored pose and nudges, rather than solving from
   // scratch: a few iterations from a plausible slap stay a plausible slap,
   // where a cold solve would happily find an elbow through the ribs.
+  // Aim ANY two-bone chain at a point. Written for the slap's hand-to-chin and
+  // now used for legs and arms alike: "the foot reaches the floor" and "the hand
+  // finds the seat" are the same problem as "the hand finds the jaw", and
+  // solving them the same way means one set of conventions to be wrong about.
+  function solveChain(fig, boneNames, endName, target, weight, iterations = 5) {
+    if (!(weight > 0.001) || !target) return;
+    const chain = boneNames.map(n => fig.group.getObjectByName(n));
+    const end = fig.group.getObjectByName(endName);
+    if (!end || chain.some(b => !b)) return;
+    solveCCD(fig, chain, end, target, weight, iterations);
+  }
+
   function solveArm(fig, target, weight) {
     if (!(weight > 0.001) || !target) return;
     const chain = ["r_upperarm", "r_forearm"].map(n => fig.group.getObjectByName(n));
     const hand = fig.group.getObjectByName("r_hand");
     if (!hand || chain.some(b => !b)) return;
+    solveCCD(fig, chain, hand, target, weight, 5);
+  }
+
+  // Point the FINGERS somewhere. CCD places the wrist and leaves the hand in
+  // whatever rotation the pose last gave it — standing, that is fingers
+  // hanging straight down, and a wrist held at lap height then drives them
+  // through the thigh (Magnus, 2026-09-11: "hands digged into his laps").
+  // The minimal rotation that takes the current finger direction to the
+  // desired one keeps the palm roughly as the solve left it while the
+  // fingers come up to lie along the surface.
+  // A hand's orientation is TWO directions, not one. Aligning only the
+  // fingers leaves the wrist's twist wherever the pose left it — fingers lay
+  // along the thigh while the palm still faced sideways (Magnus: "can't you
+  // twist the arm so the palms point on his laps?"). So build the full
+  // basis: fingers along `dirWorld`, and the index-to-pinky line horizontal
+  // the way a palm-down hand carries it — for the right hand that line runs
+  // fingers-cross-down, for the left, down-cross-fingers. The rotation that
+  // takes the measured current basis to that one is applied to the wrist,
+  // blended by settle weight.
+  function orientHand(fig, side, dirWorld, weight) {
+    if (!(weight > 0.001) || !dirWorld) return;
+    const hand = fig.group.getObjectByName(side + "_hand");
+    if (!hand) return;
+    let idx = null, pky = null, mid = null;
+    hand.traverse((o) => {
+      if (!o.isBone) return;
+      const n = o.name;
+      if (!idx && /index/i.test(n)) idx = o;
+      if (!pky && /pinky/i.test(n)) pky = o;
+      if (!mid && /mid/i.test(n)) mid = o;
+    });
+    const tip = mid || hand.children.find((c) => c.isBone && !/thumb/i.test(c.name)) || hand.children[0];
+    if (!tip) return;
+    hand.updateMatrixWorld(true);
+    const hp = hand.getWorldPosition(new THREE.Vector3());
+    const fCur = tip.getWorldPosition(new THREE.Vector3()).sub(hp);
+    if (fCur.lengthSq() < 1e-8) return;
+    fCur.normalize();
+
+    const basis = (f, a) => {
+      const e1 = f.clone().normalize();
+      const e2 = a.clone().addScaledVector(e1, -a.dot(e1)).normalize();
+      const e3 = e1.clone().cross(e2);
+      const m = new THREE.Matrix4().makeBasis(e1, e2, e3);
+      return new THREE.Quaternion().setFromRotationMatrix(m);
+    };
+
+    const down = new THREE.Vector3(0, -1, 0);
+    const fDes = dirWorld.clone().normalize();
+    // The convention was derived on paper and the body disagreed: built as
+    // r=f×down / l=down×f, both palms landed facing the CEILING. On this rig
+    // the index→pinky line runs the other way, so the handedness is the
+    // mirror of the anatomical guess. Trust the measured outcome over the
+    // derivation.
+    const aDes = side === "r" ? down.clone().cross(fDes) : fDes.clone().cross(down);
+    if (aDes.lengthSq() < 1e-6) return;
+
+    let dq;
+    if (idx && pky) {
+      const aCur = pky.getWorldPosition(new THREE.Vector3()).sub(idx.getWorldPosition(new THREE.Vector3()));
+      if (aCur.lengthSq() < 1e-8) return;
+      dq = basis(fDes, aDes).multiply(basis(fCur, aCur).invert());
+    } else {
+      // No finger bones to read the twist from: fall back to fingers-only.
+      dq = new THREE.Quaternion().setFromUnitVectors(fCur, fDes);
+    }
+    const wq = hand.getWorldQuaternion(new THREE.Quaternion());
+    const pq = hand.parent.getWorldQuaternion(new THREE.Quaternion()).invert();
+    const targetLocal = pq.multiply(dq).multiply(wq);
+    hand.quaternion.slerp(targetLocal, Math.min(1, weight));
+    hand.updateMatrixWorld(true);
+  }
+
+  // WHERE THE ELBOW POINTS. A two-bone CCD plants the wrist and is
+  // indifferent to the elbow, which therefore stays wherever the hanging
+  // pose left it — glued to the ribs (Magnus, twice: "arms pressed into his
+  // ribs"). But the elbow is free to ORBIT the shoulder-to-wrist axis
+  // without moving the hand a millimetre: the wrist lies ON that axis, and
+  // the forearm and hand are children of the upper arm, so one rotation of
+  // the upper arm about it swings the whole rigid arm. Swing the elbow
+  // toward outboard-and-slightly-back — where a resting arm carries it.
+  function swingElbowOut(fig, side, facing, weight) {
+    if (!(weight > 0.001) || facing == null) return;
+    const S = fig.group.getObjectByName(side + "_upperarm");
+    const E = fig.group.getObjectByName(side + "_forearm");
+    const H = fig.group.getObjectByName(side + "_hand");
+    if (!S || !E || !H) return;
+    S.updateMatrixWorld(true);
+    const sp = S.getWorldPosition(new THREE.Vector3());
+    const ep = E.getWorldPosition(new THREE.Vector3());
+    const hp = H.getWorldPosition(new THREE.Vector3());
+    const axis = hp.clone().sub(sp);
+    if (axis.lengthSq() < 1e-6) return;
+    axis.normalize();
+    // Radial part of the elbow's offset — where it points now.
+    const r = ep.clone().sub(sp);
+    r.addScaledVector(axis, -r.dot(axis));
+    if (r.lengthSq() < 1e-6) return;
+    r.normalize();
+    // Where it should point: outboard, with a touch of backward.
+    const across = facing + Math.PI / 2;
+    const sign = side === "l" ? 1 : -1;
+    const d = new THREE.Vector3(
+      Math.sin(across) * sign - Math.sin(facing) * 0.35, 0,
+      Math.cos(across) * sign - Math.cos(facing) * 0.35);
+    d.addScaledVector(axis, -d.dot(axis));
+    if (d.lengthSq() < 1e-6) return;
+    d.normalize();
+    const cos = Math.max(-1, Math.min(1, r.dot(d)));
+    const sin = new THREE.Vector3().crossVectors(r, d).dot(axis);
+    const angle = Math.atan2(sin, cos);
+    // Most of the way, never a violent snap.
+    const dq = new THREE.Quaternion().setFromAxisAngle(axis, angle * 0.8 * Math.min(1, weight));
+    const wq = S.getWorldQuaternion(new THREE.Quaternion());
+    const pq = S.parent.getWorldQuaternion(new THREE.Quaternion()).invert();
+    S.quaternion.copy(pq.multiply(dq).multiply(wq));
+    S.updateMatrixWorld(true);
+  }
+
+  function solveCCD(fig, chain, hand, target, weight, iterations) {
 
     // Remember the authored pose so the correction can be BLENDED in rather
     // than replacing it — off the contact frame the authored motion is what
     // you see, and at contact the aim wins.
     const before = chain.map(b => b.quaternion.clone());
 
-    for (let iter = 0; iter < 5; iter++) {
+    for (let iter = 0; iter < iterations; iter++) {
       for (const bone of chain) {
         bone.updateMatrixWorld(true);
         hand.updateMatrixWorld(true);
@@ -1152,6 +1307,513 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
   // the pose did to the legs, the root descends by however far the feet have
   // left the floor. Her hips end up wherever the leg angles put them, which is
   // what happens to a real body lowering onto a chair.
+  // ── settling into a chair ─────────────────────────────────────────────────
+  //
+  // What a body does once it has landed: the weight goes back against the
+  // backrest, and the hands come down until they find something. Both are
+  // CONTACT, so both are solved against the furniture rather than posed to a
+  // number — the chair decides how far back she can lean and where her hands
+  // stop, which is the whole reason this reads differently on a stool.
+  // The most she can lean before the back of her garment meets the backrest.
+  //
+  // Geometry, not a constant: how far her back surface currently sits in front
+  // of the rest, over how tall her torso is, is the sine of the angle that
+  // closes the gap. Anything more is fabric through wood.
+  function leanLimit(fig, prop, t, facing) {
+    const chest = fig.group.getObjectByName("spine3");
+    const hipBone = fig.group.getObjectByName("hip");
+    if (!chest || !hipBone) return 8;
+
+    const c = new THREE.Vector3(), h = new THREE.Vector3();
+    chest.getWorldPosition(c);
+    hipBone.getWorldPosition(h);
+
+    const yaw = prop.yaw ?? ((prop.rot || 0) * Math.PI) / 2;
+    // The backrest plane: a point on it, and the direction she faces.
+    const bx = prop.x - Math.sin(facing) * (t.hd * 0.82);
+    const bz = prop.z - Math.cos(facing) * (t.hd * 0.82);
+    const fx = Math.sin(facing), fz = Math.cos(facing);
+
+    // How far the chest is IN FRONT of the backrest, less the thickness of what
+    // she is wearing.
+    const ahead = (c.x - bx) * fx + (c.z - bz) * fz;
+    const gap = ahead - backSurfaceDepth(fig, facing);
+    const torso = Math.max(0.15, c.y - h.y);
+
+    const deg = Math.asin(Math.max(0, Math.min(1, gap / torso))) * 180 / Math.PI;
+    // Capped: past about 22 degrees it stops reading as sitting back and starts
+    // reading as lounging, whatever the geometry allows.
+    return Math.max(0, Math.min(22, deg));
+  }
+
+  function stepSettling(fig, delta) {
+    const st = fig.settling;
+    if (!st) return;
+    st.t = Math.min(st.dur, st.t + delta);
+    const u = st.dur > 0 ? st.t / st.dur : 1;
+    const w = u * u * (3 - 2 * u);
+
+    // Legs first: they decide where the body meets the floor, and the torso
+    // rotates about hips that the legs do not move.
+    if (st.legs) {
+      const hipBone = fig.group.getObjectByName("hip");
+      if (hipBone) {
+        const h = new THREE.Vector3();
+        hipBone.getWorldPosition(h);
+        const fx = Math.sin(st.facing), fz = Math.cos(st.facing);
+        const ax = Math.sin(st.facing + Math.PI / 2), az = Math.cos(st.facing + Math.PI / 2);
+        for (const sd of ["l", "r"]) {
+          const lat = sd === "l" ? 0.09 : -0.09;
+          const target = new THREE.Vector3(
+            h.x + fx * 0.42 + ax * lat,
+            st.floorAnkle,
+            h.z + fz * 0.42 + az * lat,
+          );
+          solveChain(fig, [sd + "_thigh", sd + "_shin"], sd + "_foot", target, w, 6);
+        }
+      }
+    }
+
+    // Lean. Only where there is something to lean ON: on a stool this stays
+    // upright, which is what sitting on a stool looks like.
+    if (st.back) {
+      const spine = fig.group.getObjectByName("spine1");
+      const chest = fig.group.getObjectByName("spine3");
+      for (const [bone, deg] of [[spine, st.lean * 0.6], [chest, st.lean * 0.4]]) {
+        if (!bone) continue;
+        const base = st.base.get(bone.name) || bone.quaternion.clone();
+        if (!st.base.has(bone.name)) st.base.set(bone.name, base.clone());
+        _e.set(deg * w * DEG, 0, 0);
+        _q.setFromEuler(_e);
+        bone.quaternion.copy(base).multiply(_q);
+      }
+    }
+
+    // Hands down until they meet the seat. Solved, not posed: the target is a
+    // point on the seat surface beside each hip, so a wider chair puts her
+    // hands wider without anybody editing an angle.
+    if (st.hands) {
+      // Same correction as the thigh, for the same reason: the target is where
+      // the WRIST BONE goes, and +3cm was a guess at how far the palm hangs
+      // below it. Guessed low, the hand melts into the seat. Measured halfway
+      // through the settle, when the hand is already near the surface and the
+      // fingers are in their final shape.
+      // Lower the hands until they COLLIDE with the lap (Magnus) — not the
+      // wrist to an offset, the hand's own lowest vertex (fingers included;
+      // they ARE the contact) down to the measured thigh top. Iterative,
+      // one nudge per frame for a few frames: moving the wrist re-solves the
+      // arm and re-poses the hand, so each pass measures the RESULT of the
+      // previous one rather than a prediction.
+      if (w >= 0.5 && (st.palmPass || 0) < 6 && st.handSurface) {
+        st.palmPass = (st.palmPass || 0) + 1;
+        for (const side of ["l", "r"]) {
+          const t = st.hands[side];
+          const base = st.handSurface[side];
+          if (!t || base == null) continue;
+          // The PALM half of the hand only. The whole-hand minimum is a
+          // fingertip, and the fingertips lie down the thigh's slope where
+          // the surface is LOWER than the reference point — so comparing a
+          // fingertip against the 55%-point top read "sunk" on hands that
+          // were hovering, and six passes RAISED them 9cm off the lap. Wrong
+          // reference, wrong direction, confidently. And lower ONLY: the ask
+          // is contact, and an overshoot reads as resting weight, where a
+          // hover reads as fear of the furniture.
+          const handB = fig.group.getObjectByName(side + "_hand");
+          let midB = null;
+          handB?.traverse((o) => { if (!midB && o.isBone && /mid/i.test(o.name)) midB = o; });
+          if (!handB || !midB) continue;
+          const span = limbSurface(fig, limbRegion(fig, side + "_hand"),
+            { boneFrom: side + "_hand", boneTo: midB.name, tMin: 0, tMax: 0.5 });
+          if (!span) continue;
+          const gap = span.minY - (base + 0.004);   // rest 4mm proud of the skin
+          if (gap > 0.003) t.y -= Math.min(gap, 0.02);
+        }
+      }
+      for (const side of ["l", "r"]) {
+        const t = st.hands[side];
+        if (!t) continue;
+        solveChain(fig, [side + "_upperarm", side + "_forearm"], side + "_hand", t, w, 8);
+        // Swivel first — it rolls the hand along with the arm — then set the
+        // palm, so the wrist ends palm-down on top of whatever the swivel did.
+        swingElbowOut(fig, side, st.facing, w);
+        orientHand(fig, side, st.fingerDir?.[side], w);
+      }
+    }
+
+    // It does NOT end. The held sit pose rewrites these same bones every frame,
+    // so a settle that finished and cleared itself was overwritten within one
+    // frame of completing — she leaned back and snapped upright again, too fast
+    // to see. Being settled is a STATE, like being seated: it keeps applying
+    // until the pose is released.
+    if (st.t >= st.dur && !st.finished) {
+      st.finished = true;
+      st.done?.();
+    }
+  }
+
+  // The lowest surface of the BODY at a given world XZ. backSurfaceDepth
+  // turned ninety degrees: fire UP from well below, so the first thing hit is
+  // the underside — of the thigh, of the palm, of whatever hangs lowest there
+  // — rather than a backface from inside the mesh.
+  //
+  // This is what a body actually rests ON. Everything above it is skeleton.
+  function underSurfaceY(fig, at, maxDrop = 0.7) {
+    if (!fig?.model) return null;
+    const start = new THREE.Vector3(at.x, at.y - maxDrop, at.z);
+    const rc = new THREE.Raycaster(start, new THREE.Vector3(0, 1, 0), 0, maxDrop);
+    const hits = rc.intersectObject(fig.model, true).filter(h => h.object.isSkinnedMesh || h.object.isMesh);
+    return hits.length ? hits[0].point.y : null;
+  }
+
+  // How far the underside of the thigh hangs below the thigh BONE, measured on
+  // this body in this pose — mid-thigh, halfway between hip and knee, which is
+  // the part spanning the seat.
+  // The WORLD height of the underside of the thigh, mid-way between hip and
+  // knee — the part that spans the seat.
+  //
+  // Returned as an absolute height, not as an offset from the hip bone. The
+  // first version returned the offset and it was wrong for a reason worth
+  // keeping: a seated thigh is not horizontal. Measured on Magnus, the knee
+  // sat 22cm BELOW the hip, so "hip bone minus surface at mid-thigh" measured
+  // the SLOPE of the leg and called it thickness — 0.19m — and lifted him that
+  // far off the chair. An absolute height has no such confusion in it.
+  function thighUnderY(fig) {
+    const hip = fig.group.getObjectByName("l_thigh");
+    const knee = fig.group.getObjectByName("l_shin");
+    if (!hip || !knee) return null;
+    const a = new THREE.Vector3(), b = new THREE.Vector3();
+    hip.getWorldPosition(a); knee.getWorldPosition(b);
+    const mid = a.clone().lerp(b, 0.5);
+    // Short ray. Fired from far below, the first thing hit at this XZ can be a
+    // foot rather than a thigh; 25cm cannot reach the floor from a thigh but
+    // comfortably clears any leg.
+    const span = limbSurface(fig, limbRegion(fig, "l_thigh", ["l_shin"]), { boneFrom: "l_thigh", boneTo: "l_shin", tMin: 0.3, tMax: 0.75, skipGarments: true });
+    const under = span ? span.yAt(0.15) : null;
+    if (under == null) return null;
+    const thickness = mid.y - under;
+    return thickness > 0.02 && thickness < 0.18 ? under : null;
+  }
+
+  // How far behind the chest the BACK OF HER actually is — found by firing a
+  // ray backwards through her own mesh and seeing what it hits last.
+  //
+  // This is the garment, not the skeleton. A blouse stands several centimetres
+  // clear of the spine, and leaning until the SPINE met the backrest drove the
+  // fabric straight through it. There is no cloth simulation here and no mesh
+  // collision; what there is, is the ability to ask the model where its surface
+  // is, which is enough to stop at it.
+  function backSurfaceDepth(fig, facing, boneName = "spine3") {
+    const chest = fig.group.getObjectByName(boneName);
+    if (!chest) return 0.12;
+    const from = chest.getWorldPosition(new THREE.Vector3());
+    // How far the surface of this body region reaches BEHIND the bone —
+    // buttocks, jeans, blouse included, since garments are skinned to the
+    // same bones and their vertices come along in the same query.
+    const back = new THREE.Vector3(-Math.sin(facing), 0, -Math.cos(facing));
+    // "hip" means the seat of the body — pelvis and its twists, minus the
+    // legs. "spine3" means the back of the chest — minus arms and head.
+    const region = boneName === "hip"
+      ? limbRegion(fig, "pelvis", ["l_thigh", "r_thigh"])
+      : limbRegion(fig, boneName, ["l_upperarm", "r_upperarm", "neck1"]);
+    const span = limbSurface(fig, region, { dir: back, origin: from });
+    if (!span || span.maxAlong == null || span.maxAlong <= 0) return 0.12;
+    return Math.max(0.04, Math.min(0.3, span.maxAlong));
+  }
+
+  // The TOP surface of the body at a world XZ — underSurfaceY's twin, fired
+  // downward. Kept deliberately short-range for the same reason the palm ray
+  // is: from far above, the first thing hit over a lap is an arm.
+  function topSurfaceY(fig, at, rise = 0.12) {
+    if (!fig?.model) return null;
+    const start = new THREE.Vector3(at.x, at.y + rise, at.z);
+    const rc = new THREE.Raycaster(start, new THREE.Vector3(0, -1, 0), 0, rise);
+    const hits = rc.intersectObject(fig.model, true).filter(h => h.object.isSkinnedMesh || h.object.isMesh);
+    // Raw, unjudged. The caller decides whether it is plausible — keeping the
+    // rejection separate from the miss is the difference between "the ray hit
+    // nothing" and "the ray hit something I refused to believe", and those
+    // need different fixes.
+    return hits.length ? hits[0].point.y : null;
+  }
+
+  // A point on top of the thigh, just past halfway to the knee — where a palm
+  // goes when it rests on the lap.
+  function lapTarget(fig, side, facing) {
+    const hip = fig.group.getObjectByName(side + "_thigh");
+    const knee = fig.group.getObjectByName(side + "_shin");
+    if (!hip || !knee) return null;
+    const a = new THREE.Vector3(), b = new THREE.Vector3();
+    hip.getWorldPosition(a); knee.getWorldPosition(b);
+    const at = a.clone().lerp(b, 0.55);
+    const span = limbSurface(fig, limbRegion(fig, side + "_thigh", [side + "_shin"]), { boneFrom: side + "_thigh", boneTo: side + "_shin", tMin: 0.4, tMax: 0.7 });
+    const raw = span ? span.maxY : null;
+    const ok = raw != null && raw > at.y + 0.01 && raw < at.y + 0.16;
+    // On the thigh's CENTRE LINE the hands sit between the legs and the
+    // elbows clamp to the ribs. A palm rests on the top-OUTER quadrant, so
+    // measure how far the skin reaches outboard of the bone and put the hand
+    // over the outer half of that. Wider wrists pull the elbows out with
+    // them — no pole constraint needed.
+    const across = facing != null ? facing + Math.PI / 2 : null;
+    let ox = 0, oz = 0;
+    if (across != null) {
+      const sign = side === "l" ? 1 : -1;
+      const out = new THREE.Vector3(Math.sin(across) * sign, 0, Math.cos(across) * sign);
+      const edge = limbSurface(fig, limbRegion(fig, side + "_thigh", [side + "_shin"]),
+        { boneFrom: side + "_thigh", boneTo: side + "_shin", tMin: 0.4, tMax: 0.7, dir: out, origin: at });
+      const reach = edge && edge.maxAlong != null ? Math.max(0.03, Math.min(0.12, edge.maxAlong)) : 0.06;
+      ox = out.x * reach * 0.55; oz = out.z * reach * 0.55;
+    }
+    const v = new THREE.Vector3(at.x + ox, ((ok ? raw : null) ?? at.y + 0.07) + 0.03, at.z + oz);
+    v.probe = { raw: raw == null ? null : +raw.toFixed(3), boneY: +at.y.toFixed(3), accepted: ok, verts: span ? span.count : 0 };
+    return v;
+  }
+
+  // Shoulder to elbow to wrist, on this body, in this pose.
+  function armLength(fig, side) {
+    const u = fig.group.getObjectByName(side + "_upperarm");
+    const f = fig.group.getObjectByName(side + "_forearm");
+    const h = fig.group.getObjectByName(side + "_hand");
+    if (!u || !f || !h) return null;
+    const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+    u.getWorldPosition(a); f.getWorldPosition(b); h.getWorldPosition(c);
+    return a.distanceTo(b) + b.distanceTo(c);
+  }
+
+  // ── measuring the DEFORMED body by its own vertices ───────────────────
+  //
+  // Raycasting these bodies is blind: rays fired straight through a solid
+  // thigh return ZERO hits (three r185, 17 SkinnedMeshes — verified with the
+  // rayTest accessor on 2026-09-11). Every surface helper then fell back to
+  // a constant, silently, and "measured" became fiction. So: stop asking
+  // rays, ask the vertices. Each vertex declares which bones own it
+  // (skinIndex/skinWeight); take one limb's vertices, run them through the
+  // same skinning the GPU does (applyBoneTransform), and read the surface
+  // off the result. Weight-filtering also ends the "ray found the wrong
+  // limb" class of bug outright — a thigh reading cannot see a hand, because
+  // hand vertices are not weighted to the thigh.
+  // A REGION of bones, not one bone. Genesis 9 does not weight vertices to
+  // the named limb bones at all — measured on Magnus's avatar, all 17 meshes
+  // carry ZERO vertices referencing l_thigh, yet the leg deforms, because the
+  // weights live on that bone's child TWIST bones (l_thightwist1/2, ...). Ask
+  // for the parent and you get silence; ask for the subtree and you get the
+  // limb. `excludes` cuts off where the next limb segment begins.
+  function limbRegion(fig, rootName, excludes = []) {
+    const root = fig.group.getObjectByName(rootName);
+    if (!root) return null;
+    const ex = new Set();
+    for (const e of excludes) {
+      const b = fig.group.getObjectByName(e);
+      if (b) b.traverse((o) => { if (o.isBone) ex.add(o.name); });
+    }
+    const names = new Set();
+    root.traverse((o) => { if (o.isBone && !ex.has(o.name)) names.add(o.name); });
+    return { key: rootName + "-" + excludes.join("+"), names };
+  }
+
+  function limbVertexIds(fig, mesh, region, minWeight = 0.3) {
+    const key = mesh.uuid + ":" + region.key;
+    fig._limbVerts = fig._limbVerts || new Map();
+    if (fig._limbVerts.has(key)) return fig._limbVerts.get(key);
+    const out = [];
+    const geo = mesh.geometry;
+    const si = geo?.attributes?.skinIndex, sw = geo?.attributes?.skinWeight;
+    const bones = mesh.skeleton?.bones;
+    if (si && sw && bones) {
+      const wanted = new Set();
+      bones.forEach((b, i) => { if (region.names.has(b.name)) wanted.add(i); });
+      if (wanted.size) {
+        for (let i = 0; i < si.count; i++) {
+          for (let k = 0; k < 4; k++) {
+            if (sw.getComponent(i, k) >= minWeight && wanted.has(si.getComponent(i, k))) { out.push(i); break; }
+          }
+        }
+      }
+    }
+    const arr = out.length ? new Uint32Array(out) : null;
+    fig._limbVerts.set(key, arr);
+    return arr;
+  }
+
+  // World-space extremes of one limb's surface, in its CURRENT pose.
+  // `boneFrom`/`boneTo` + tMin/tMax restrict to a stretch along the limb's
+  // own axis, so a thigh reading is the middle of the thigh rather than the
+  // knee or the buttock. `dir`+`origin` additionally report how far the
+  // surface reaches along an arbitrary direction — that is what the backrest
+  // clearance needs. Returns null rather than a guess when nothing matched:
+  // the caller decides what a miss means, visibly.
+  // `skipGarments`: a body SITS through its clothes — the support surface is
+  // flesh, and measuring the shorts hem as "the underside of the thigh"
+  // perched him 9cm above the chair with his feet off the floor. Clearance
+  // surfaces (backrest, lap top) keep the clothes; support surfaces skip
+  // them. Garment detection is by mesh name (body pieces are Genesis9*,
+  // clothes are not) — fragile across outfits, but honest about being so.
+  function limbSurface(fig, region, { boneFrom = null, boneTo = null, tMin = 0, tMax = 1, dir = null, origin = null, skipGarments = false } = {}) {
+    if (!region) return null;
+    if (!fig?.model) return null;
+    let a = null, axis = null, len = 0;
+    if (boneFrom && boneTo) {
+      const A = fig.group.getObjectByName(boneFrom), B = fig.group.getObjectByName(boneTo);
+      if (A && B) {
+        a = A.getWorldPosition(new THREE.Vector3());
+        const b = B.getWorldPosition(new THREE.Vector3());
+        axis = b.sub(a); len = axis.length(); if (len > 0) axis.normalize();
+      }
+    }
+    const v = new THREE.Vector3();
+    let minY = Infinity, maxY = -Infinity, maxAlong = -Infinity, count = 0;
+    const ys = [];
+    fig.model.traverse((mesh) => {
+      if (!mesh.isSkinnedMesh || typeof mesh.applyBoneTransform !== "function") return;
+      if (skipGarments && !/^Genesis/.test(mesh.name || "")) return;
+      const ids = limbVertexIds(fig, mesh, region);
+      if (!ids) return;
+      const pos = mesh.geometry.attributes.position;
+      for (const i of ids) {
+        v.fromBufferAttribute(pos, i);
+        mesh.applyBoneTransform(i, v);
+        v.applyMatrix4(mesh.matrixWorld);
+        if (axis && len > 0) {
+          const t = ((v.x - a.x) * axis.x + (v.y - a.y) * axis.y + (v.z - a.z) * axis.z) / len;
+          if (t < tMin || t > tMax) continue;
+        }
+        count++;
+        if (v.y < minY) minY = v.y;
+        if (v.y > maxY) maxY = v.y;
+        ys.push(v.y);
+        if (dir && origin) {
+          const along = (v.x - origin.x) * dir.x + (v.y - origin.y) * dir.y + (v.z - origin.z) * dir.z;
+          if (along > maxAlong) maxAlong = along;
+        }
+      }
+    });
+    if (!count) return null;
+    ys.sort((x, y) => x - y);
+    // yAt(0.15) = the height below which the lowest 15% of the surface lies.
+    // Flesh COMPRESSES: seat a rigid mesh on its absolute lowest vertex and
+    // the body perches on one polygon, feet in the air. Letting the lowest
+    // fraction of the surface "sink in" stands in for the centimetres a real
+    // thigh gives to a chair.
+    const yAt = (q) => ys[Math.min(ys.length - 1, Math.max(0, Math.floor(q * ys.length)))];
+    return { minY, maxY, count, maxAlong: dir ? maxAlong : null, yAt };
+  }
+
+  // Slide her forward until the back of her CLEARS the backrest.
+  //
+  // Placing the hips half a seat-depth back put her buttocks and the hem of her
+  // blouse out BEHIND the chair — she was not leaning through the wood, she was
+  // sitting behind it. Where the hips belong is not a fraction of the seat: it
+  // is wherever puts her back surface just in front of the rest, and only the
+  // body knows how thick it is.
+  function clearBackrest(fig, prop, t, facing) {
+    if (t.seatFacing == null) return;          // nothing behind her on a stool
+    const hipBone = fig.group.getObjectByName("hip");
+    if (!hipBone) return;
+    const h = new THREE.Vector3();
+    hipBone.getWorldPosition(h);
+
+    const fx = Math.sin(facing), fz = Math.cos(facing);
+    const bx = prop.x - fx * (t.hd * 0.82);
+    const bz = prop.z - fz * (t.hd * 0.82);
+
+    const ahead = (h.x - bx) * fx + (h.z - bz) * fz;
+    const depth = backSurfaceDepth(fig, facing, "hip");
+    const clearance = 0.015;
+    const push = clearance - (ahead - depth);
+    if (push > 0) {
+      fig.group.position.x += fx * push;
+      fig.group.position.z += fz * push;
+    }
+  }
+
+  // Work out what there is to settle against, then hand it to the frame loop.
+  function startSettling(fig, prop) {
+    const t = PROP_TYPES[prop.type];
+    if (!t) return;
+    const yaw = prop.yaw ?? ((prop.rot || 0) * Math.PI) / 2;
+    const facing = t.seatFacing == null ? fig.group.rotation.y : yaw + t.seatFacing;
+
+    // Before anything else: get her body in front of the backrest. Everything
+    // after this — how far she can lean, where her hands land — is measured
+    // from where she actually ends up.
+    clearBackrest(fig, prop, t, facing);
+    // ...and the matrices have to catch up before anything MEASURES her again.
+    // getWorldPosition reads matrixWorld, which three.js only recomputes at
+    // render: without this, the lean was measured against where she stood
+    // BEFORE the slide, found no room, and allowed zero degrees. She sat bolt
+    // upright and I nearly explained it as the garment colliding.
+    fig.group.updateMatrixWorld(true);
+
+    // A point on the seat surface beside each hip — where a hand would land.
+    const side = (sign) => {
+      const across = facing + Math.PI / 2;
+      return new THREE.Vector3(
+        prop.x + Math.sin(across) * sign * (t.hw * 0.9) - Math.sin(facing) * 0.02,
+        t.seat + 0.03,
+        prop.z + Math.cos(across) * sign * (t.hw * 0.9) - Math.cos(facing) * 0.02,
+      );
+    };
+
+    // Where the hands go — and the honest answer is "it depends on the body".
+    //
+    // Hands flat on the seat beside the hips is only natural if the seat is
+    // actually within reach. On Magnus's avatar it was not: his right shoulder
+    // sat 0.067 off the chair's centre line and the target 0.216 out, so the
+    // arm straightened, failed to arrive, and hung 6.7cm above the wood while
+    // the left hand — whose target happened to fall almost under its shoulder
+    // — landed fine. Solving harder would not have helped; the point was out
+    // of range.
+    //
+    // A person resolves that conflict by not doing it: palms go to the lap
+    // instead (Magnus, 2026-09-11). Elbow bend needs no special case — CCD
+    // bends the elbow on its own as soon as the target is closer than a
+    // straight arm, which is exactly what a reachable target means.
+    //
+    // Both hands move together. One on the seat and one on the lap is a
+    // fidget, not a rest.
+    const seatTargets = { l: side(+1), r: side(-1) };
+    const reachable = ["l", "r"].every((sd) => {
+      const sh = fig.group.getObjectByName(sd + "_upperarm");
+      const len = armLength(fig, sd);
+      if (!sh || !len) return true;
+      return sh.getWorldPosition(new THREE.Vector3()).distanceTo(seatTargets[sd]) <= len * 0.95;
+    });
+    const lap = { l: lapTarget(fig, "l", facing), r: lapTarget(fig, "r", facing) };
+    const onLap = !reachable && lap.l && lap.r;
+    const hands = onLap ? lap : seatTargets;
+    // On the lap the fingers lie along the thigh, toward the knee. On the
+    // seat they point forward, tipped slightly down onto the wood.
+    const fingerDir = {};
+    for (const sd of ["l", "r"]) {
+      if (onLap) {
+        const A = fig.group.getObjectByName(sd + "_thigh"), B = fig.group.getObjectByName(sd + "_shin");
+        fingerDir[sd] = A && B
+          ? B.getWorldPosition(new THREE.Vector3()).sub(A.getWorldPosition(new THREE.Vector3())).normalize()
+          : null;
+      } else {
+        fingerDir[sd] = new THREE.Vector3(Math.sin(facing), -0.25, Math.cos(facing)).normalize();
+      }
+    }
+
+    fig.settling = {
+      t: 0, dur: 0.45, base: new Map(), facing, seatY: t.seat,
+      restingOn: onLap ? "lap" : "seat",
+      // The surface under each hand, so the measured palm thickness can be
+      // added to the right thing — the seat is one height, two thighs are
+      // another two.
+      handSurface: { l: hands.l.y - 0.03, r: hands.r.y - 0.03 },
+      fingerDir,
+      floorAnkle: fig.seatedFloorAnkle ?? 0,
+      // Legs are SOLVED, not posed: hips are wherever the seat put them, so the
+      // fold that reaches the floor from there is arithmetic, not a constant.
+      legs: true,
+      // Lean only against a real backrest — a stool leaves her upright, which
+      // is what sitting on a stool looks like.
+      back: t.seatFacing != null,
+      lean: t.seatFacing == null ? 0 : -leanLimit(fig, prop, t, facing),
+      hands,
+      done: null,
+    };
+  }
+
   function stepSitting(fig, delta) {
     const st = fig.sitting;
     if (!st) return;
@@ -1171,17 +1833,24 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
     //
     // Blended over the last fifth of the movement so the handover is a settle,
     // not a step.
-    const seatY = st.seat != null ? seatHeightFor(fig, st.seat) : null;
+    // Raycast only over the last fifth, which is the only part where seatY is
+    // weighted above zero anyway: ~15 frames of skinned raycast rather than
+    // one per frame of the whole descent, and every one of them taken in a
+    // pose close to the one she will hold.
+    const seatY = st.seat != null ? seatHeightFor(fig, st.seat, e >= 0.78) : null;
     const footY = footHeightFor(fig, st.floorAnkle);
     if (seatY == null || footY == null) {
       if (footY != null) fig.group.position.y = footY;
     } else {
+      // The SEAT decides the height, and the legs are then solved to reach the
+      // floor from wherever that leaves them.
+      //
+      // This used to clamp to the feet — never lower than a foot-planted
+      // solution — which meant fixed leg angles decided how high she sat, and
+      // she perched 11cm above the chair. Fold cannot be a constant: it depends
+      // on the seat, and on the length of the legs doing the sitting.
       const k = Math.max(0, Math.min(1, (e - 0.8) / 0.2));
-      // Never below the feet. If resting on the seat would drive them through
-      // the floor, the floor wins — a body cannot sink into it, and the honest
-      // consequence is that she perches rather than sits back, which is at
-      // least a thing a person does.
-      fig.group.position.y = Math.max(footY + (seatY - footY) * k, footY);
+      fig.group.position.y = footY + (seatY - footY) * k;
     }
 
     if (st.t >= st.dur) {
@@ -1191,6 +1860,7 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
         fig.seatedY = fig.group.position.y;
         // Kept so standing up can hold the same floor on the way back.
         fig.seatedFloorAnkle = st.floorAnkle;
+        if (st.settleWith) startSettling(fig, st.settleWith);
       }
       st.done?.();
     }
@@ -1217,7 +1887,21 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
   }
 
   // The root height that would rest the thigh on a seat at `surface`.
-  function seatHeightFor(fig, surface) {
+  //
+  // `drop` is the measured distance from the thigh bone to the underside of
+  // the leg. THIGH_RADIUS is only the fallback: it is one number for every
+  // body, and Benny's legs are not Lindsey's — with her constant he sat with
+  // his thighs melted into the slab (Magnus, screenshot 2026-09-11). Clothing
+  // counts too; the ray hits the shorts, not the skin.
+  function seatHeightFor(fig, surface, measure) {
+    // Measured path: move the root by exactly the gap between where the
+    // underside of the leg IS and where the seat IS. Independent of how the
+    // leg happens to be angled this frame, and self-correcting — moving the
+    // root moves the surface with it, so this converges rather than oscillates.
+    if (measure) {
+      const under = thighUnderY(fig);
+      if (under != null) return fig.group.position.y + (surface - under);
+    }
     const thigh = fig.group.getObjectByName("l_thigh");
     if (!thigh) return null;
     const v = new THREE.Vector3();
@@ -1328,9 +2012,13 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
                 const seated = new Promise((resolve) => {
                   fig.sitting = {
                     t: 0, dur: 0.55, propId: prop.id, done: resolve, seat: t.seat, floorAnkle,
+                    settleWith: prop,
                     from: { x: fig.group.position.x, z: fig.group.position.z },
-                    // Hips finish over the seat, not over where she stood.
-                    to: { x: prop.x, z: prop.z },
+                    // Back ON the seat, not perched on the front of it: toward
+                    // the backrest by most of the seat's half-depth, so there
+                    // is something behind her to lean against.
+                    to: { x: prop.x - Math.sin(facing) * (t.hd * 0.5),
+                          z: prop.z - Math.cos(facing) * (t.hd * 0.5) },
                   };
                 });
                 playMotion(fig, "sit");
@@ -1621,8 +2309,95 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
       footInfo: (role) => {
         const f = a.figures?.[role];
         if (!f) return null;
-        return { sole: f.sole, rootY: +f.group.position.y.toFixed(3), seatedOn: f.seatedOn || null };
+        return { sole: f.sole, rootY: +f.group.position.y.toFixed(3), seatedOn: f.seatedOn || null,
+                 sitting: !!f.sitting, settling: !!f.settling,
+                 settleT: f.settling ? +f.settling.t.toFixed(2) : null,
+                 pose: f.pose ? f.pose.tracks.length : 0 };
       },
+      // What the sit decided about the hands, and what it measured to decide
+      // it. Added because "are the palms ON the lap or IN it" had no oracle
+      // outside this module — the seat surface is a constant anyone can read,
+      // a thigh's top is not.
+      sitRest: (role) => {
+        const f = a.figures?.[role];
+        const st = f?.settling;
+        if (!st) return null;
+        const p3 = (v) => (v ? { x: +v.x.toFixed(3), y: +v.y.toFixed(3), z: +v.z.toFixed(3) } : null);
+        return {
+          restingOn: st.restingOn || null,
+          handSurface: st.handSurface
+            ? { l: +st.handSurface.l.toFixed(3), r: +st.handSurface.r.toFixed(3) } : null,
+          palmPass: st.palmPass || 0,
+          target: { l: p3(st.hands?.l), r: p3(st.hands?.r) },
+          probe: { l: st.hands?.l?.probe || null, r: st.hands?.r?.probe || null },
+        };
+      },
+
+      // Does raycasting against this body work AT ALL? Every surface
+      // measurement in the sit rests on it, and every one of them fails
+      // SILENTLY to a fallback constant, so a blanket failure looks exactly
+      // like a body that happens to match my guesses.
+      rayTest: (role) => {
+        const f = a.figures?.[role];
+        if (!f?.model) return null;
+        let meshes = 0, skinned = 0;
+        f.model.traverse((o) => { if (o.isMesh) meshes++; if (o.isSkinnedMesh) skinned++; });
+        const hip = f.group.getObjectByName("l_thigh");
+        if (!hip) return { meshes, skinned, err: "no l_thigh" };
+        const at = hip.getWorldPosition(new THREE.Vector3());
+        const shoot = (from, dir, far) => {
+          const rc = new THREE.Raycaster(from, dir, 0, far);
+          const hits = rc.intersectObject(f.model, true);
+          return { n: hits.length, first: hits.length ? +hits[0].point.y.toFixed(3) : null };
+        };
+        return {
+          meshes, skinned,
+          boneY: +at.y.toFixed(3),
+          up: shoot(new THREE.Vector3(at.x, at.y - 0.25, at.z), new THREE.Vector3(0, 1, 0), 0.25),
+          down: shoot(new THREE.Vector3(at.x, at.y + 0.25, at.z), new THREE.Vector3(0, -1, 0), 0.25),
+          upFar: shoot(new THREE.Vector3(at.x, at.y - 1.2, at.z), new THREE.Vector3(0, 1, 0), 1.2),
+        };
+      },
+
+      // Why does the limb query see nothing? Report the raw skinning data of
+      // the first few meshes: attribute presence, bone-name samples, and how
+      // many vertices reference the named bone at any weight at all.
+      limbTest: (role, boneName) => {
+        const f = a.figures?.[role];
+        if (!f?.model) return null;
+        const out = [];
+        f.model.traverse((mesh) => {
+          if (!mesh.isSkinnedMesh || out.length >= 24) return;
+          const geo = mesh.geometry;
+          const si = geo?.attributes?.skinIndex, sw = geo?.attributes?.skinWeight;
+          const bones = mesh.skeleton?.bones || [];
+          const idx = bones.findIndex((b) => b.name === boneName);
+          let refs = 0, weighted = 0, maxW = 0;
+          if (si && sw && idx >= 0) {
+            for (let i = 0; i < si.count; i++) {
+              for (let k = 0; k < 4; k++) {
+                if (si.getComponent(i, k) === idx) {
+                  const w = sw.getComponent(i, k);
+                  if (w > 0.001) refs++;
+                  if (w >= 0.35) weighted++;
+                  if (w > maxW) maxW = w;
+                }
+              }
+            }
+          }
+          out.push({
+            name: mesh.name || "(unnamed)", verts: si ? si.count : null,
+            hasSkinIndex: !!si, hasSkinWeight: !!sw,
+            attrs: Object.keys(geo?.attributes || {}),
+            nBones: bones.length, boneIdx: idx,
+            boneSample: bones.slice(0, 4).map((b) => b.name),
+            refs, weighted, maxW: +maxW.toFixed(3), skel: mesh.skeleton ? mesh.skeleton.uuid.slice(0, 4) : null,
+            applyBT: typeof mesh.applyBoneTransform,
+          });
+        });
+        return out;
+      },
+
       // Told when the furniture changes, because placement happens in here.
       onProps: (fn) => { a.onProps = fn; return true; },
       props: () => (a.obstacles || []).filter(o => o.type),

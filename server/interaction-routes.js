@@ -31,6 +31,7 @@
 
 import { randomUUID } from "crypto";
 import express from "express";
+import { bootstrapSchema } from "./db.js";
 import { normalizeSteps, drivenRoles, normalizeCameras } from "../src/lib/interactionScript.js";
 import { normalizeAction, slugify as actionSlug } from "../src/lib/bodyActions.js";
 
@@ -94,13 +95,22 @@ export function mount(app, { db, authUser }) {
   // Added after the table shipped, so it goes on with ALTER rather than in the
   // CREATE — an existing row must keep its steps, and dropping the table to add
   // a column is how somebody's saved work disappears.
-  const cols = db.prepare(`PRAGMA table_info(interaction_scripts)`).all().map(c => c.name);
-  if (!cols.includes("cameras_json")) {
-    db.exec(`ALTER TABLE interaction_scripts ADD COLUMN cameras_json TEXT NOT NULL DEFAULT '[]'`);
-  }
-  if (!cols.includes("props_json")) {
-    db.exec(`ALTER TABLE interaction_scripts ADD COLUMN props_json TEXT NOT NULL DEFAULT '[]'`);
-  }
+  // The check and the ALTER run inside one IMMEDIATE transaction (conduct-watch,
+  // 2026-09-11): read-then-ALTER is not atomic, so two processes reaching this
+  // at the same moment could both see the column missing and both add it, and
+  // the loser dies on "duplicate column name" during mount. Narrower window
+  // than db.js's -- this file is mounted only by the server's own boot -- but
+  // the same defect, and a hand-run `node server/index.js` beside the unit is
+  // enough to open it.
+  bootstrapSchema(() => {
+    const cols = db.prepare(`PRAGMA table_info(interaction_scripts)`).all().map(c => c.name);
+    if (!cols.includes("cameras_json")) {
+      db.exec(`ALTER TABLE interaction_scripts ADD COLUMN cameras_json TEXT NOT NULL DEFAULT '[]'`);
+    }
+    if (!cols.includes("props_json")) {
+      db.exec(`ALTER TABLE interaction_scripts ADD COLUMN props_json TEXT NOT NULL DEFAULT '[]'`);
+    }
+  });
 
   // A prop is a TYPE, a place, a quarter-turn — and a SLOT, which is the whole
   // point of persisting them. The studio's table is a stand-in; when this plays
@@ -324,7 +334,7 @@ export function mount(app, { db, authUser }) {
     if (!user) return res.status(401).json({ error: "unauthorized" });
 
     const mine = db.prepare(`
-      SELECT a.id, a.name, a.gender, a.runtime_glb_url, a.updated_at,
+      SELECT a.id, a.name, a.gender, a.runtime_glb_url, a.updated_at, a.status,
              (SELECT url FROM actor_media WHERE actor_id = a.id AND media_type = 'photo'
                 AND state_slug IN ('photo_close','profile') LIMIT 1) AS photo_url
         FROM actors a
@@ -345,7 +355,19 @@ export function mount(app, { db, authUser }) {
       photo_url: a.photo_url || null,
       glb_url: a.runtime_glb_url || null,
       updated_at: a.updated_at,
-      unavailable: a.runtime_glb_url ? null : "no runtime model — finish the character in the wizard",
+      // Two different ways to be uncastable, and they are not the same thing.
+      // No runtime model means the body will not load at all. Draft means the
+      // body loads fine but the character is not finished — Lindsey had a
+      // baked runtime GLB while still in draft, so the model gate passed her
+      // and the studio offered a half-built character as though she were
+      // ready (found by Magnus, 2026-09-11). Status is checked first because
+      // it is the stronger statement about the character.
+      //
+      // Deliberately a denylist: anything that is not 'draft' stays castable,
+      // so a status added later does not silently empty this list.
+      unavailable: a.status === "draft"
+        ? "draft — finish the character before rehearsing with her"
+        : a.runtime_glb_url ? null : "no runtime model — finish the character in the wizard",
     }));
 
     res.json(cast);

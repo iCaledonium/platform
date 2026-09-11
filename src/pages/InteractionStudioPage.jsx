@@ -288,11 +288,19 @@ export default function InteractionStudioPage() {
     // person standing there, and "just her, alone" was unsayable on load.
     const byId = Object.fromEntries(castList.map(p => [p.id, p]));
     const next = {};
+    const dropped = [];
     ROLES.forEach(r => {
       const c = (row.cast || []).find(x => x.role === r);
-      next[r] = c?.actor_id && byId[c.actor_id] ? byId[c.actor_id] : null;
+      // A script can outlive its cast's eligibility: the body was castable when
+      // the script was saved and is draft again now. Leaving the role empty is
+      // right, but doing it silently would look like the script lost its cast,
+      // so the run log says which body was dropped and why.
+      const p = c?.actor_id ? byId[c.actor_id] : null;
+      if (p && p.unavailable) dropped.push(`${p.name} (${p.unavailable})`);
+      next[r] = p && !p.unavailable ? p : null;
     });
     setCast(next);
+    dropped.forEach(d => say(`${d} — left out of the cast`, "warn"));
   }
 
   async function remove(row) {
@@ -396,6 +404,9 @@ export default function InteractionStudioPage() {
       cameraNow: () => rigRef.current?.cameraNow?.(),
       pickPoint: (fn) => rigRef.current?.pickPoint?.(fn),
       footInfo: (role) => rigRef.current?.footInfo?.(role),
+      sitRest: (role) => rigRef.current?.sitRest?.(role),
+      rayTest: (role) => rigRef.current?.rayTest?.(role),
+      limbTest: (role, bone) => rigRef.current?.limbTest?.(role, bone),
       // Proxemics, on the debug handle as well as in the runner. Two
       // hand-assembled subsets of the same rig is two places to forget, and
       // this file has now forgotten each of them once.
@@ -576,7 +587,7 @@ export default function InteractionStudioPage() {
                     <option value="">— nobody —</option>
                     {castList.map(p => (
                       <option key={p.id} value={p.id} disabled={!!p.unavailable}>
-                        {p.name}{p.kind === "you" ? " (you)" : ""}{p.unavailable ? " — no runtime model" : ""}
+                        {p.name}{p.kind === "you" ? " (you)" : ""}{p.unavailable ? ` — ${p.unavailable}` : ""}
                       </option>
                     ))}
                   </select>
