@@ -1248,6 +1248,108 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
     S.updateMatrixWorld(true);
   }
 
+  // The thumb is the one digit orientHand cannot reach: the hand basis lays
+  // the PALM and FINGERS along the surface, but the thumb keeps whatever
+  // curl the standing pose gave it — which, palm-down on a thigh, points it
+  // straight into the flesh (Magnus, 2026-09-12: "palms on flesh YES but
+  // thumbs buried"). Aim it where a resting thumb lies: splayed inboard off
+  // the finger line, following the thigh's slope along the surface rather
+  // than diving through it.
+  function orientThumb(fig, side, fingerDir, facing, weight) {
+    if (!(weight > 0.001) || !fingerDir || facing == null) return;
+    const hand = fig.group.getObjectByName(side + "_hand");
+    if (!hand) return;
+    let t1 = null;
+    hand.traverse((o) => { if (!t1 && o.isBone && /thumb/i.test(o.name)) t1 = o; });
+    const tip = t1?.children.find((c) => c.isBone);
+    if (!t1 || !tip) return;
+    t1.updateMatrixWorld(true);
+    const a = t1.getWorldPosition(new THREE.Vector3());
+    const b = tip.getWorldPosition(new THREE.Vector3());
+    const cur = b.sub(a);
+    if (cur.lengthSq() < 1e-8) return;
+    cur.normalize();
+    const across = facing + Math.PI / 2;
+    const sign = side === "l" ? 1 : -1;
+    const inboard = new THREE.Vector3(-Math.sin(across) * sign, 0, -Math.cos(across) * sign);
+    const des = fingerDir.clone().multiplyScalar(0.55).addScaledVector(inboard, 0.7);
+    // The FULL palm-plane slope, not half. At half the thumb pointed below
+    // the palm plane, reached the thigh first, and PROPPED the whole hand
+    // like a kickstand — the per-vertex clearance honestly read "contact"
+    // while the palm floated 3cm in the air on it. Level with the palm, the
+    // thumb lies along the surface and the palm takes the contact.
+    des.y = fingerDir.y;
+    if (des.lengthSq() < 1e-6) return;
+    des.normalize();
+    const dq = new THREE.Quaternion().setFromUnitVectors(cur, des);
+    const wq = t1.getWorldQuaternion(new THREE.Quaternion());
+    const pq = t1.parent.getWorldQuaternion(new THREE.Quaternion()).invert();
+    t1.quaternion.slerp(pq.multiply(dq).multiply(wq), Math.min(1, weight));
+    t1.updateMatrixWorld(true);
+  }
+
+  // TRUE clearance between a hand and the thigh it rests on: every vertex
+  // of the hand — thumb and fingers included — against the thigh's top
+  // surface AT THAT VERTEX'S OWN STATION along the leg. Five rounds of
+  // comparing one point of the hand against one sample of the surface each
+  // failed a different way (fingertip vs crown, thumb as kickstand, palm
+  // heel floating while knuckles "touched"): a hand is an extended object
+  // on a curved surface, and only a per-vertex comparison says whether it
+  // is actually resting.
+  function lapHandClearance(fig, side) {
+    const hipB = fig.group.getObjectByName(side + "_thigh");
+    const kneeB = fig.group.getObjectByName(side + "_shin");
+    if (!hipB || !kneeB) return null;
+    const a = hipB.getWorldPosition(new THREE.Vector3());
+    const b = kneeB.getWorldPosition(new THREE.Vector3());
+    const axis = b.clone().sub(a);
+    const len = axis.length();
+    if (len < 0.05) return null;
+    axis.divideScalar(len);
+    const reg = limbRegion(fig, side + "_thigh", [side + "_shin"]);
+    const bands = [[0.42, 0.55], [0.55, 0.7], [0.7, 0.85]];
+    const sts = [], tops = [];
+    for (const [t0, t1] of bands) {
+      const sp = limbSurface(fig, reg, { boneFrom: side + "_thigh", boneTo: side + "_shin", tMin: t0, tMax: t1 });
+      if (!sp) return null;
+      sts.push((t0 + t1) / 2); tops.push(sp.maxY);
+    }
+    const topAt = (t) => {
+      if (t <= sts[0]) return tops[0];
+      if (t >= sts[2]) return tops[2];
+      if (t <= sts[1]) return tops[0] + (tops[1] - tops[0]) * (t - sts[0]) / (sts[1] - sts[0]);
+      return tops[1] + (tops[2] - tops[1]) * (t - sts[1]) / (sts[2] - sts[1]);
+    };
+    // The thumb is left OUT of the clearance. It points inboard, over the
+    // thigh's falling inner slope, but topAt() only knows the crown height
+    // at each station — so the thumb read "contact" while hovering over the
+    // fall and kept the palm propped in the air. A resting thumb drapes the
+    // inner slope carrying nothing; the palm and fingers are the contact.
+    const handB2 = fig.group.getObjectByName(side + "_hand");
+    let thumbB2 = null;
+    handB2?.traverse((o) => { if (!thumbB2 && o.isBone && /thumb/i.test(o.name)) thumbB2 = o; });
+    const handReg = limbRegion(fig, side + "_hand", thumbB2 ? [thumbB2.name] : []);
+    const v = new THREE.Vector3();
+    let minC = Infinity, n = 0;
+    fig.model.traverse((mesh) => {
+      if (!mesh.isSkinnedMesh || typeof mesh.applyBoneTransform !== "function") return;
+      const ids = limbVertexIds(fig, mesh, handReg);
+      if (!ids) return;
+      const pos = mesh.geometry.attributes.position;
+      for (const i of ids) {
+        v.fromBufferAttribute(pos, i);
+        mesh.applyBoneTransform(i, v);
+        v.applyMatrix4(mesh.matrixWorld);
+        const t = ((v.x - a.x) * axis.x + (v.y - a.y) * axis.y + (v.z - a.z) * axis.z) / len;
+        if (t < 0.4 || t > 0.9) continue;   // only the part of the hand over the thigh
+        const c = v.y - topAt(t);
+        if (c < minC) minC = c;
+        n++;
+      }
+    });
+    return n ? minC : null;
+  }
+
   function solveCCD(fig, chain, hand, target, weight, iterations) {
 
     // Remember the authored pose so the correction can be BLENDED in rather
@@ -1404,31 +1506,6 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
       // one nudge per frame for a few frames: moving the wrist re-solves the
       // arm and re-poses the hand, so each pass measures the RESULT of the
       // previous one rather than a prediction.
-      if (w >= 0.5 && (st.palmPass || 0) < 6 && st.handSurface) {
-        st.palmPass = (st.palmPass || 0) + 1;
-        for (const side of ["l", "r"]) {
-          const t = st.hands[side];
-          const base = st.handSurface[side];
-          if (!t || base == null) continue;
-          // The PALM half of the hand only. The whole-hand minimum is a
-          // fingertip, and the fingertips lie down the thigh's slope where
-          // the surface is LOWER than the reference point — so comparing a
-          // fingertip against the 55%-point top read "sunk" on hands that
-          // were hovering, and six passes RAISED them 9cm off the lap. Wrong
-          // reference, wrong direction, confidently. And lower ONLY: the ask
-          // is contact, and an overshoot reads as resting weight, where a
-          // hover reads as fear of the furniture.
-          const handB = fig.group.getObjectByName(side + "_hand");
-          let midB = null;
-          handB?.traverse((o) => { if (!midB && o.isBone && /mid/i.test(o.name)) midB = o; });
-          if (!handB || !midB) continue;
-          const span = limbSurface(fig, limbRegion(fig, side + "_hand"),
-            { boneFrom: side + "_hand", boneTo: midB.name, tMin: 0, tMax: 0.5 });
-          if (!span) continue;
-          const gap = span.minY - (base + 0.004);   // rest 4mm proud of the skin
-          if (gap > 0.003) t.y -= Math.min(gap, 0.02);
-        }
-      }
       for (const side of ["l", "r"]) {
         const t = st.hands[side];
         if (!t) continue;
@@ -1437,6 +1514,47 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
         // palm, so the wrist ends palm-down on top of whatever the swivel did.
         swingElbowOut(fig, side, st.facing, w);
         orientHand(fig, side, st.fingerDir?.[side], w);
+        orientThumb(fig, side, st.fingerDir?.[side], st.facing, w);
+      }
+
+      // Contact check — AFTER the solve, adjusting the target for the NEXT
+      // frame. It sat before the solve for three broken iterations, and in
+      // that position it can only ever measure the RAW POSE: the held sit
+      // pose rewrites the arm bones every frame before the settle runs, so a
+      // pre-solve measurement sees hands hanging at the sides — ten
+      // centimetres "sunk" — no matter where the solved hands actually are.
+      // It read that on every body, and dutifully raised the targets into
+      // the air. Only a post-solve skeleton knows where the hands ARE.
+      if (w >= 0.9 && (st.palmPass || 0) < 8) {
+        st.palmPass = (st.palmPass || 0) + 1;
+        for (const side of ["l", "r"]) {
+          const t = st.hands[side];
+          const base = st.handSurface?.[side];
+          if (!t || base == null) continue;
+          let gap;
+          if (st.restingOn === "lap") {
+            const c = lapHandClearance(fig, side);
+            if (c == null) continue;
+            gap = c - 0.004;   // rest 4mm proud of the skin
+          } else {
+            // On the flat SEAT one sample of the surface is the surface, so
+            // the simple palm-half reading is still right there.
+            const handB = fig.group.getObjectByName(side + "_hand");
+            let midB = null, thumbB = null;
+            handB?.traverse((o) => {
+              if (!o.isBone) return;
+              if (!midB && /mid/i.test(o.name)) midB = o;
+              if (!thumbB && /thumb/i.test(o.name)) thumbB = o;
+            });
+            if (!handB || !midB) continue;
+            const span = limbSurface(fig, limbRegion(fig, side + "_hand", thumbB ? [thumbB.name] : []),
+              { boneFrom: side + "_hand", boneTo: midB.name, tMin: 0, tMax: 0.5 });
+            if (!span) continue;
+            gap = span.minY - (base + 0.004);
+          }
+          if (gap > 0.003) t.y -= Math.min(gap, 0.02);
+          else if (gap < -0.006) t.y += Math.min(-gap, 0.015);
+        }
       }
     }
 
@@ -1560,7 +1678,9 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
       const edge = limbSurface(fig, limbRegion(fig, side + "_thigh", [side + "_shin"]),
         { boneFrom: side + "_thigh", boneTo: side + "_shin", tMin: 0.4, tMax: 0.7, dir: out, origin: at });
       const reach = edge && edge.maxAlong != null ? Math.max(0.03, Math.min(0.12, edge.maxAlong)) : 0.06;
-      ox = out.x * reach * 0.55; oz = out.z * reach * 0.55;
+      // 0.35, not 0.55: at 0.55 the hand sat on the outboard fall of the
+      // thigh while its height was referenced to the crown — a built-in gap.
+      ox = out.x * reach * 0.35; oz = out.z * reach * 0.35;
     }
     const v = new THREE.Vector3(at.x + ox, ((ok ? raw : null) ?? at.y + 0.07) + 0.03, at.z + oz);
     v.probe = { raw: raw == null ? null : +raw.toFixed(3), boneY: +at.y.toFixed(3), accepted: ok, verts: span ? span.count : 0 };
@@ -1777,7 +1897,25 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
       return sh.getWorldPosition(new THREE.Vector3()).distanceTo(seatTargets[sd]) <= len * 0.95;
     });
     const lap = { l: lapTarget(fig, "l", facing), r: lapTarget(fig, "r", facing) };
-    const onLap = !reachable && lap.l && lap.r;
+    // Reachable is not the same as AVAILABLE. On a heavy body the thighs
+    // spill over the point beside the hips where a seat-resting hand would
+    // go — Benny's arms pass the reach test and his hands then drive
+    // straight down into his own thigh flesh (Magnus, 2026-09-12: "the
+    // hands are buried in his thigh"). There is no collision system to
+    // catch that; what we can do is MEASURE it: how far this body's thigh
+    // flesh spills sideways from the chair's centre line, and if it covers
+    // the seat point, the seat is not on offer for this body. A hand needs
+    // ~4cm of clear wood.
+    const across = facing + Math.PI / 2;
+    const seatBlocked = ["l", "r"].some((sd) => {
+      const sign = sd === "l" ? 1 : -1;
+      const out = new THREE.Vector3(Math.sin(across) * sign, 0, Math.cos(across) * sign);
+      const spill = limbSurface(fig, limbRegion(fig, sd + "_thigh", [sd + "_shin"]),
+        { dir: out, origin: new THREE.Vector3(prop.x, t.seat, prop.z) });
+      if (!spill || spill.maxAlong == null) return false;
+      return spill.maxAlong > t.hw * 0.9 - 0.04;
+    });
+    const onLap = (!reachable || seatBlocked) && lap.l && lap.r;
     const hands = onLap ? lap : seatTargets;
     // On the lap the fingers lie along the thigh, toward the knee. On the
     // seat they point forward, tipped slightly down onto the wood.
@@ -1785,9 +1923,28 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
     for (const sd of ["l", "r"]) {
       if (onLap) {
         const A = fig.group.getObjectByName(sd + "_thigh"), B = fig.group.getObjectByName(sd + "_shin");
-        fingerDir[sd] = A && B
-          ? B.getWorldPosition(new THREE.Vector3()).sub(A.getWorldPosition(new THREE.Vector3())).normalize()
-          : null;
+        if (A && B) {
+          // Fingers follow the SURFACE, not the bone. The bone's axis runs
+          // through the middle of the leg and is shallower than the way the
+          // flesh falls off toward the knee, so bone-aligned fingers left an
+          // air wedge under the palm (Magnus, close-up 2026-09-12). Measure
+          // the top of the thigh at the palm's station and at the fingers'
+          // station, and aim the hand down that actual gradient.
+          const ap = A.getWorldPosition(new THREE.Vector3());
+          const bp = B.getWorldPosition(new THREE.Vector3());
+          const h = bp.clone().sub(ap); h.y = 0;
+          const horiz = h.length();
+          const dir = horiz > 0.01 ? h.divideScalar(horiz) : new THREE.Vector3(Math.sin(facing), 0, Math.cos(facing));
+          const reg = limbRegion(fig, sd + "_thigh", [sd + "_shin"]);
+          const near = limbSurface(fig, reg, { boneFrom: sd + "_thigh", boneTo: sd + "_shin", tMin: 0.45, tMax: 0.6 });
+          const far = limbSurface(fig, reg, { boneFrom: sd + "_thigh", boneTo: sd + "_shin", tMin: 0.7, tMax: 0.85 });
+          if (near && far && horiz > 0.01) {
+            dir.y = (far.maxY - near.maxY) / (horiz * 0.25);
+          } else {
+            dir.y = (bp.y - ap.y) / Math.max(0.01, horiz);
+          }
+          fingerDir[sd] = dir.normalize();
+        } else fingerDir[sd] = null;
       } else {
         fingerDir[sd] = new THREE.Vector3(Math.sin(facing), -0.25, Math.cos(facing)).normalize();
       }
