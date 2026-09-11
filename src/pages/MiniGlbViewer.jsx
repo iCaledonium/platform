@@ -1339,7 +1339,9 @@ function getBodySurfaceBVH(referenceMesh) {
   geom.setAttribute("position", new THREE.BufferAttribute(mergedPos, 3));
   geom.setIndex(new THREE.BufferAttribute(mergedIndex, 1));
   const bvh = new MeshBVH(geom);
-  const cached = { bvh, geom };
+  // Session 171 - the primitives too, in merge order: fitOuterLayers maps
+  // every merged vertex back to its body zone (head vs chest) through them.
+  const cached = { bvh, geom, parts };
   bodyParent.userData.shrinkwrapBVH = cached;
   console.log(`[MiniGlbViewer] Shrinkwrap: body surface BVH built by MERGING ${parts.length} body-skin primitive(s) [${parts.map((p) => `"${p.name}" ${p.geometry.attributes.position.count}v`).join(", ")}] -> ${totalVerts} verts / ${totalIndices / 3} tris total (intact index, not the culled live one), morphs applied, in ${(performance.now() - t0).toFixed(0)}ms.`);
   return cached;
@@ -2047,13 +2049,14 @@ function settleLayers(loadedRoot, store, accessories) {
     e.mesh.geometry.attributes.position.needsUpdate = true;
   }
 
-  // 2. Lift the hair over the clothing exactly as it is currently fitted,
-  //    manual transforms included — a top scaled up by its slider is a bigger
-  //    surface to rest on, which is precisely the case that exposed this.
-  fitOuterLayers(loadedRoot, store);
-
-  // 3. The layered shape becomes the manual-fit baseline, and the manual
-  //    transform re-applies on top — same order as the body refit.
+  // 2. The manual transform FIRST, from the raw shape. Session 171: this used
+  //    to come after the lift, with the layered shape as its baseline — so a
+  //    hair offset of -8cm (Lindsey's) dragged the freshly layered strands
+  //    back down into the blouse and 38mm into her chest, right after the
+  //    pass had verified zero. Same order as a garment's applyManualFit:
+  //    transform, THEN wrap. The baseline stays the raw shape, so a slider
+  //    drag between settles applies its transform exactly once (the doubling
+  //    this comment used to warn about cannot happen from a raw baseline).
   for (const { url, e } of hairEntries) {
     e.originalPositions = capturePositions(e.mesh.geometry.attributes.position);
     e.mesh.geometry.computeBoundingBox();
@@ -2062,6 +2065,18 @@ function settleLayers(loadedRoot, store, accessories) {
     const t = effectiveTransform(acc?.scale, acc?.offset, acc?.rotation, acc?.parts, e.matName);
     applyAccessoryScale(e.mesh, e.originalPositions, e.center, t.scale, t.offset, t.rotation);
   }
+
+  // 3. Lift the hair over the clothing exactly as it is currently fitted,
+  //    manual transforms included — a top scaled up by its slider is a bigger
+  //    surface to rest on, which is precisely the case that exposed this.
+  //    Session 171 - and out of the skin: the intact body surface goes along
+  //    so hair inside a chest or shoulder is lifted too (scalp exempt). This
+  //    is the shape that renders, so the ASSERT it logs is about what is on
+  //    screen.
+  let bodySurface = null;
+  try { const m = findBodySkinMesh(loadedRoot); if (m) bodySurface = getBodySurfaceBVH(m); }
+  catch (e) { console.warn("[MiniGlbViewer] settleLayers: no body surface for the hair skin rule:", e); }
+  fitOuterLayers(loadedRoot, store, bodySurface);
 
   applySkinLayers(loadedRoot, store);
 }

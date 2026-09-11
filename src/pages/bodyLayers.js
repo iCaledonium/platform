@@ -375,11 +375,44 @@ export function suspendSkinLayers(root) {
 // along the fabric normal — then smooth the displacements through the strand
 // topology so ribbons bend instead of kinking. Vertices nowhere near fabric —
 // which is almost all of the hair — are untouched.
-const HAIR_CLEARANCE = 0.004;   // hair rests ~4mm proud of cloth
-const HAIR_SEARCH = 0.06;       // strands deeper than 6cm inside are left alone
+const HAIR_CLEARANCE = 0.004;   // hair rests ~4mm proud of cloth, and of skin
+const HAIR_SEARCH = 0.15;       // a strand up to 15cm beneath the cloth is still brought out (parity makes "beneath" reliable; 4 of Lindsey's sat 8-11cm in)
 const HAIR_MAX_LIFT = 0.08;     // and no vertex teleports
+const HAIR_MAX_PASSES = 4;      // lift+smooth rounds before the assertion takes over
+const HAIR_FEATHER = 4;         // neighbour rings relaxed around a pinned vertex
+const HAIR_BODY_SEARCH = 0.05;  // no skin within 5cm means the vertex cannot be inside the body
 
-export function fitOuterLayers(root, store) {
+// Session 171 (Magnus: "assert that the hair doesn't melt into the garment and
+// skin"). The pass above was ONE lift round, smoothed at half strength, never
+// re-measured, and had no skin rule at all. Measured live on Lindsey Vaughn
+// after it reported "783 vertex(es) lifted": 5702 hair vertices were still
+// beneath the blouse (62mm at worst), 3344 more sat inside the clearance, and
+// 481 were inside her chest and shoulders. Same lesson as shrinkwrapToBody:
+// smoothing under-pushes the edge of a region, and a pass that never
+// re-measures cannot promise anything.
+//
+// Now the shrinkwrap discipline. A field of lifts is computed, smoothed and
+// applied for up to HAIR_MAX_PASSES rounds, re-measured after each; whatever
+// still violates is PINNED to its exact target with its free neighbours
+// feathered around it (Jacobi relaxation, pinned set as the boundary),
+// verified once more, and anything left is snapped raw. Two violation kinds,
+// in layer order, because the hair rests on the union of everything beneath it:
+//   skin  - a hair vertex INSIDE the body (3-ray parity against the intact
+//           body surface) whose nearest skin is not the head. Roots belong
+//           inside the scalp; nothing belongs inside a chest or a shoulder.
+//           Lifted to skin + clearance via the closest face.
+//   cloth - a hair vertex beneath the clothing (odd number of garment
+//           crossings along the outward radial from the torso axis - see the
+//           note at the rule), lifted to that ray's last crossing + clearance;
+//           or outside but inside the clearance, lifted along the face normal.
+// Scalp vertices (inside the body with head skin nearest) are never moved by
+// either rule, so a collar near the nape cannot pull roots out of the skull.
+// The body is optional: called without one, only the cloth rule runs.
+//
+// The verdict is logged per hair primitive as ASSERT PASS / ENFORCED / FAILED,
+// the same vocabulary as the garment wrap, so a screenshot claim ("hair melts
+// into the top") can be checked against numbers instead of eyes.
+export function fitOuterLayers(root, store, body = null) {
   const clothing = [];
   const hair = [];
   for (const [url, entries] of Object.entries(store || {})) {
@@ -387,7 +420,7 @@ export function fitOuterLayers(root, store) {
     if (url.includes("/torso/") || url.includes("/legs/")) clothing.push(...meshes);
     else if (url.includes("/head/hair/")) hair.push(...entries.filter((e) => e.mesh));
   }
-  if (!clothing.length || !hair.length) return [];
+  if (!hair.length) return [];
 
   // One triangle soup of the clothing as currently fitted, positions kept for
   // per-face normals (the BVH result hands back a faceIndex).
@@ -400,87 +433,270 @@ export function fitOuterLayers(root, store) {
     if (geo.index) for (let i = 0; i < geo.index.count; i++) push(geo.index.getX(i));
     else for (let i = 0; i < pos.count; i++) push(i);
   }
-  if (!tri.length) return [];
-  const g = new THREE.BufferGeometry();
-  g.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3));
-  const bvh = new MeshBVH(g);
+  let cbvh = null;
+  if (tri.length) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3));
+    cbvh = new MeshBVH(g);
+  }
+
+  // The intact body surface (getBodySurfaceBVH's cache: bvh + merged geom +
+  // the primitives it was merged from, in order) and one zone per merged
+  // vertex so "head" can be told from "chest".
+  let bbvh = null, bpos = null, bidx = null, bzones = null;
+  if (body && body.bvh && body.geom?.attributes?.position && Array.isArray(body.parts)) {
+    bbvh = body.bvh; bpos = body.geom.attributes.position; bidx = body.geom.index;
+    bzones = [];
+    for (const part of body.parts) {
+      const z = ensureZones(part);
+      const n = part.geometry.attributes.position.count;
+      for (let i = 0; i < n; i++) bzones.push(z ? z[i] : "other");
+    }
+    if (bzones.length !== bpos.count) { bbvh = null; bzones = null; }
+  }
+  if (!cbvh && !bbvh) return [];
 
   const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
-  const n = new THREE.Vector3(), h = new THREE.Vector3(), v = new THREE.Vector3();
-  const hit = {};
-  const faceNormal = (fi) => {
+  const n = new THREE.Vector3(), h = new THREE.Vector3(), v = new THREE.Vector3(), tmp = new THREE.Vector3();
+  const hit = { point: new THREE.Vector3(), distance: 0, faceIndex: 0 };
+  const bt = { point: new THREE.Vector3(), distance: 0, faceIndex: 0 };
+  const clothNormal = (fi) => {
     a.fromArray(tri, fi * 9); b.fromArray(tri, fi * 9 + 3); c.fromArray(tri, fi * 9 + 6);
-    n.subVectors(b, a).cross(v.subVectors(c, a)).normalize();
+    n.subVectors(b, a).cross(tmp.subVectors(c, a)).normalize();
     // Winding is not trusted: orient the normal outward from the torso axis,
     // which for a worn garment is always the right way to lift.
     h.set(hit.point.x, 0, hit.point.z);
     if (h.lengthSq() > 1e-8 && n.dot(h) < 0) n.negate();
     return n;
   };
+  const bodyNormal = (fi) => {
+    const f = fi * 3;
+    a.fromBufferAttribute(bpos, bidx ? bidx.getX(f) : f);
+    b.fromBufferAttribute(bpos, bidx ? bidx.getX(f + 1) : f + 1);
+    c.fromBufferAttribute(bpos, bidx ? bidx.getX(f + 2) : f + 2);
+    n.subVectors(b, a).cross(tmp.subVectors(c, a));
+    if (n.lengthSq() === 0) return null;
+    return n.normalize();
+  };
+  const bodyZoneAt = (fi) => bzones[bidx ? bidx.getX(fi * 3) : fi * 3];
+  // Same three rays and the same majority vote as shrinkwrapToBody.
+  const ray = new THREE.Ray(new THREE.Vector3(), new THREE.Vector3());
+  const rayDirs = [
+    new THREE.Vector3(0.093, 0.031, 0.995).normalize(),
+    new THREE.Vector3(0.719, 0.024, -0.694).normalize(),
+    new THREE.Vector3(-0.757, 0.041, -0.652).normalize(),
+  ];
+  const insideBody = (p) => {
+    let votes = 0;
+    for (const d of rayDirs) {
+      ray.origin.copy(p); ray.direction.copy(d);
+      const hits = bbvh.raycast(ray, THREE.DoubleSide);
+      let crossings = 0;
+      for (const x of hits) if (x.distance > 1e-6) crossings++;
+      if ((crossings & 1) === 1) votes++;
+    }
+    return votes >= 2;
+  };
+
+  // The lift for one vertex: 1 = out of the skin, 2 = out from under the
+  // cloth, 0 = nothing to do. Skin first - it is the layer beneath the cloth,
+  // and a vertex lifted out of the chest is re-measured against the blouse on
+  // the next pass.
+  const lift = new THREE.Vector3();
+  const evaluate = (p) => {
+    if (bbvh && bbvh.closestPointToPoint(p, bt, 0, HAIR_BODY_SEARCH) && insideBody(p)) {
+      const fn = bodyNormal(bt.faceIndex);
+      if (fn) {
+        lift.copy(bt.point).addScaledVector(fn, HAIR_CLEARANCE).sub(p);
+        if (lift.length() > HAIR_MAX_LIFT) lift.setLength(HAIR_MAX_LIFT);
+        return 1;
+      }
+    }
+    if (cbvh) {
+      // Beneath or outside is decided by PARITY along the outward radial from
+      // the torso axis, not by the sign of the closest face: on a pleated
+      // blouse the closest face is often the far wall of a fold, whose normal
+      // points the wrong way, and the first version of this rule lifted 1355
+      // vertices into 1427 "beneath" (measured live on Lindsey). A ray that
+      // crosses the garment an odd number of times starts under it, whatever
+      // the folds do; its LAST crossing is the outer surface the hair must rest
+      // on. An even count means outside, where the only remaining rule is the
+      // clearance to the nearest cloth, lifted along that face's normal
+      // oriented toward the vertex (safe now that the side is known).
+      h.set(p.x, 0, p.z);
+      if (h.lengthSq() > 1e-8) {
+        ray.origin.copy(p); ray.direction.copy(h.normalize());
+        const hits = cbvh.raycast(ray, THREE.DoubleSide);
+        let crossings = 0, far = null;
+        for (const x of hits) { if (x.distance <= 1e-6) continue; crossings++; if (!far || x.distance > far.distance) far = x; }
+        if ((crossings & 1) === 1 && far && far.distance <= HAIR_SEARCH) {
+          lift.copy(far.point).addScaledVector(ray.direction, HAIR_CLEARANCE).sub(p);
+          if (lift.length() > HAIR_MAX_LIFT) lift.setLength(HAIR_MAX_LIFT);
+          return 2;
+        }
+        if ((crossings & 1) === 1) return 0;   // deeper than the search: left alone, as before
+      }
+      // Outside but closer than the clearance: a soft NUDGE along the face
+      // normal, applied in the convergence passes but never counted, pinned
+      // or snapped. It cannot be asserted: in a pleat behind the neck a
+      // strand has fabric within 4mm on BOTH sides, and a rule that demands
+      // clearance from each oscillates forever (measured live: 1616 of 1623
+      // "still beneath" after the raw snap were exactly these). Hair resting
+      // on cloth is not hair melting into it.
+      if (cbvh.closestPointToPoint(p, hit, 0, HAIR_CLEARANCE)) {
+        const fn = clothNormal(hit.faceIndex);
+        if (fn.dot(tmp.subVectors(p, hit.point)) < 0) fn.negate();
+        lift.copy(fn).multiplyScalar(HAIR_CLEARANCE - hit.distance);
+        return 3;
+      }
+    }
+    return 0;
+  };
 
   const touched = [];
   const t0 = performance.now();
-  let movedTotal = 0;
 
   for (const entry of hair) {
     const geo = entry.mesh.geometry;
     const pos = geo.attributes.position;
     if (!pos) continue;
+    const N = pos.count;
 
-    const disp = new Float32Array(pos.count * 3);
-    let moved = 0;
-    for (let i = 0; i < pos.count; i++) {
-      v.set(pos.getX(i), pos.getY(i), pos.getZ(i));
-      const res = bvh.closestPointToPoint(v, hit, 0, HAIR_SEARCH);
-      if (!res) continue;
-      const fn = faceNormal(hit.faceIndex);
-      const depth = v.sub(hit.point).dot(fn);   // + outside, - beneath the cloth
-      if (depth >= HAIR_CLEARANCE || depth < -HAIR_SEARCH) continue;
-      const lift = Math.min(HAIR_CLEARANCE - depth, HAIR_MAX_LIFT);
-      disp[i * 3] = fn.x * lift; disp[i * 3 + 1] = fn.y * lift; disp[i * 3 + 2] = fn.z * lift;
-      moved++;
+    // Scalp mask, taken BEFORE anything moves: inside the body, head nearest.
+    const scalp = new Uint8Array(N);
+    if (bbvh) {
+      for (let i = 0; i < N; i++) {
+        v.set(pos.getX(i), pos.getY(i), pos.getZ(i));
+        if (bbvh.closestPointToPoint(v, bt, 0, HAIR_BODY_SEARCH) && bodyZoneAt(bt.faceIndex) === "head" && insideBody(v)) scalp[i] = 1;
+      }
     }
-    if (!moved) continue;
 
-    // Smooth through the strand topology — two passes of neighbour averaging,
-    // so a lifted ribbon carries its neighbours with it instead of kinking at
-    // the first untouched vertex.
+    // Strand topology, once, for the smoothing and the feather.
+    let adj = null;
     if (geo.index) {
-      const adj = new Map();
-      const link = (x, y) => {
-        (adj.get(x) || adj.set(x, new Set()).get(x)).add(y);
-      };
+      adj = Array.from({ length: N }, () => new Set());
       for (let i = 0; i < geo.index.count; i += 3) {
         const x = geo.index.getX(i), y = geo.index.getX(i + 1), z = geo.index.getX(i + 2);
-        link(x, y); link(y, x); link(y, z); link(z, y); link(x, z); link(z, x);
-      }
-      for (let pass = 0; pass < 2; pass++) {
-        const next = disp.slice();
-        for (const [i, ns] of adj) {
-          let sx = 0, sy = 0, sz = 0;
-          for (const j of ns) { sx += disp[j * 3]; sy += disp[j * 3 + 1]; sz += disp[j * 3 + 2]; }
-          const k = ns.size;
-          next[i * 3] = 0.5 * disp[i * 3] + 0.5 * (sx / k);
-          next[i * 3 + 1] = 0.5 * disp[i * 3 + 1] + 0.5 * (sy / k);
-          next[i * 3 + 2] = 0.5 * disp[i * 3 + 2] + 0.5 * (sz / k);
-        }
-        disp.set(next);
+        adj[x].add(y); adj[x].add(z); adj[y].add(x); adj[y].add(z); adj[z].add(x); adj[z].add(y);
       }
     }
 
-    for (let i = 0; i < pos.count; i++) {
-      if (!disp[i * 3] && !disp[i * 3 + 1] && !disp[i * 3 + 2]) continue;
-      pos.setXYZ(i, pos.getX(i) + disp[i * 3], pos.getY(i) + disp[i * 3 + 1], pos.getZ(i) + disp[i * 3 + 2]);
+    const disp = new Float32Array(N * 3);
+    const kindOf = new Uint8Array(N);   // 1 skin, 2 cloth (violations), 3 clearance nudge
+    const computeField = () => {
+      disp.fill(0); kindOf.fill(0);
+      let skin = 0, cloth = 0, near = 0;
+      for (let i = 0; i < N; i++) {
+        if (scalp[i]) continue;
+        v.set(pos.getX(i), pos.getY(i), pos.getZ(i));
+        const kind = evaluate(v);
+        if (!kind) continue;
+        disp[i * 3] = lift.x; disp[i * 3 + 1] = lift.y; disp[i * 3 + 2] = lift.z;
+        kindOf[i] = kind;
+        if (kind === 1) skin++; else if (kind === 2) cloth++; else near++;
+      }
+      return { skin, cloth, near, total: skin + cloth };
+    };
+    // Two passes of half-strength neighbour averaging, so a lifted ribbon
+    // carries its neighbours with it instead of kinking at the first
+    // untouched vertex (the original smoothing, unchanged).
+    const smoothed = (field) => {
+      if (!adj) return field;
+      let f = field;
+      for (let pass = 0; pass < 2; pass++) {
+        const next = f.slice();
+        for (let i = 0; i < N; i++) {
+          const ns = adj[i];
+          if (ns.size === 0) continue;
+          let sx = 0, sy = 0, sz = 0;
+          for (const j of ns) { sx += f[j * 3]; sy += f[j * 3 + 1]; sz += f[j * 3 + 2]; }
+          const k = ns.size;
+          next[i * 3] = 0.5 * f[i * 3] + 0.5 * (sx / k);
+          next[i * 3 + 1] = 0.5 * f[i * 3 + 1] + 0.5 * (sy / k);
+          next[i * 3 + 2] = 0.5 * f[i * 3 + 2] + 0.5 * (sz / k);
+        }
+        f = next;
+      }
+      for (let i = 0; i < N; i++) if (scalp[i]) { f[i * 3] = 0; f[i * 3 + 1] = 0; f[i * 3 + 2] = 0; }
+      return f;
+    };
+    const apply = (field) => {
+      let moved = 0;
+      for (let i = 0; i < N; i++) {
+        const dx = field[i * 3], dy = field[i * 3 + 1], dz = field[i * 3 + 2];
+        if (dx === 0 && dy === 0 && dz === 0) continue;
+        pos.setXYZ(i, pos.getX(i) + dx, pos.getY(i) + dy, pos.getZ(i) + dz);
+        moved++;
+      }
+      return moved;
+    };
+
+    let counts = computeField();
+    const initial = counts;
+    if (!initial.total) continue;
+    const trace = [`${initial.cloth}c/${initial.skin}s (+${initial.near} within clearance, nudged only)`];   // per-stage counts, for the log line
+
+    // 1. Converge: lift, smooth, apply, re-measure.
+    let passes = 0;
+    while (counts.total > 0 && passes < HAIR_MAX_PASSES) {
+      const moved = apply(smoothed(disp));
+      passes++;
+      counts = computeField();
+      trace.push(`p${passes}:${moved}m>${counts.cloth}c/${counts.skin}s`);
     }
+
+    // 2. Assert: pin the leftovers to their exact lift, feather the free
+    //    neighbours, verify, and snap raw whatever still violates.
+    let pinned = 0, feathered = 0, raw = 0;
+    if (counts.total > 0) {
+      const pin = new Uint8Array(N);
+      for (let i = 0; i < N; i++) if (kindOf[i] === 1 || kindOf[i] === 2) { pin[i] = 1; pinned++; }
+      let field = disp;
+      if (adj) {
+        for (let it = 0; it < HAIR_FEATHER; it++) {
+          const next = new Float32Array(field.length);
+          for (let i = 0; i < N; i++) {
+            if (pin[i]) { next[i * 3] = field[i * 3]; next[i * 3 + 1] = field[i * 3 + 1]; next[i * 3 + 2] = field[i * 3 + 2]; continue; }
+            const ns = adj[i];
+            if (ns.size === 0 || scalp[i]) continue;
+            let sx = 0, sy = 0, sz = 0;
+            for (const j of ns) { sx += field[j * 3]; sy += field[j * 3 + 1]; sz += field[j * 3 + 2]; }
+            const inv = 1 / ns.size;
+            next[i * 3] = sx * inv; next[i * 3 + 1] = sy * inv; next[i * 3 + 2] = sz * inv;
+          }
+          field = next;
+        }
+      }
+      feathered = apply(field) - pinned;
+      counts = computeField();
+      trace.push(`feather:${pinned}pin>${counts.cloth}c/${counts.skin}s`);
+      if (counts.total > 0) {
+        raw = counts.total;
+        let moved = 0;
+        for (let i = 0; i < N; i++) {
+          if (kindOf[i] !== 1 && kindOf[i] !== 2) continue;
+          pos.setXYZ(i, pos.getX(i) + disp[i * 3], pos.getY(i) + disp[i * 3 + 1], pos.getZ(i) + disp[i * 3 + 2]);
+          moved++;
+        }
+        counts = computeField();
+        trace.push(`raw:${moved}m>${counts.cloth}c/${counts.skin}s`);
+      }
+    }
+
     pos.needsUpdate = true;
     geo.computeVertexNormals?.();
-    movedTotal += moved;
     touched.push(entry);
+
+    const status = counts.total > 0
+      ? `ASSERT FAILED (${counts.cloth} still beneath cloth, ${counts.skin} still inside skin)`
+      : (pinned === 0 ? "ASSERT PASS (converged)"
+        : `ASSERT ENFORCED (${pinned} pinned to clearance, ${feathered} neighbours feathered${raw ? `, ${raw} snapped raw` : ""})`);
+    const line = `[bodyLayers] hair layering "${entry.mesh.name}": ${initial.cloth} beneath cloth, ${initial.skin} inside skin (scalp exempt: ${scalp.reduce((s, x) => s + x, 0)}) -> ${passes} pass(es), ${status} [${trace.join(" ")}].`;
+    if (counts.total > 0) console.warn(line); else console.log(line);
   }
 
-  if (movedTotal) {
-    console.log(`[bodyLayers] hair layered over clothing: ${movedTotal} vertex(es) lifted ` +
-      `across ${touched.length} hair primitive(s) in ${(performance.now() - t0).toFixed(0)}ms.`);
+  if (touched.length) {
+    console.log(`[bodyLayers] hair layered over ${cbvh ? "clothing" : "nothing"}${bbvh ? " and out of the skin" : " (no body surface given, skin rule skipped)"}: ${touched.length} hair primitive(s) in ${(performance.now() - t0).toFixed(0)}ms.`);
   }
   return touched;
 }
