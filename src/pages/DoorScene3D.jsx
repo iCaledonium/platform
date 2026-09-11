@@ -10,6 +10,7 @@ import { buildLanding } from "./Landing.js";
 import { loadDisplay, applyDisplay, DISPLAY_DEFAULTS, sunPosition } from "./exploreDisplay.js";
 import styles from "./Scene.module.css";
 import { attachKtx2 } from "../lib/gltfKtx2.js";
+import { prepareHairRide, rideHairOnCloth } from "./bodyLayers.js";
 
 // ── DoorScene3D ──────────────────────────────────────────────────────────────
 //
@@ -1123,6 +1124,8 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       }
       api.current.mixer?.update(dt);
       api.current.meMixer?.update(dt);
+      if (api.current.herRide) stepHairRide(api.current.herRide, api.current.her);
+      if (api.current.meRide)  stepHairRide(api.current.meRide,  api.current.me);
       // Session 153 — the scripted step to the threshold ENDS.
       //
       // Clearing this was wired to the pointer-lock event, so when the browser
@@ -2902,6 +2905,109 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   // Any of the three loaders can finish in any order (or not apply at
   // all — no avatar configured, not in third person); this only flips once
   // ALL that apply have.
+  // ── Hair rides the garment in the encounter too ──────────────────────────
+  //
+  // Session 173's ride (bodyLayers.prepareHairRide / rideHairOnCloth) fixes,
+  // per frame, the strand tips that dip under a yoke at the extreme of a
+  // pose, because the GPU skins hair and blouse with different bones. It was
+  // built for the editor, and the runtime GLB deliberately carries only the
+  // SETTLED shape (exports pause the ride) — so every character in this scene
+  // showed the motion residual the editor had already removed.
+  //
+  // Nothing about the file had to change. The runtime bake mutates the
+  // accessory meshes in place and GLTFExporter writes their userData into
+  // node extras, so each accessory arrives here tagged with the exact
+  // accessoryUrl the ride classifies on (/head/hair/, /torso/, /underwear/,
+  // /legs/). Rebuild the store the ride expects from those tags, build the
+  // body surface the way the editor does (merged skin primitives + BVH; the
+  // runtime file is morph-baked, so its positions are already the sculpt),
+  // and the same two functions run unchanged.
+  //
+  // Returns the store to ride each frame, or null when there is nothing to
+  // do — a body with no hair accessory (the player's own, as of 2026-09-12)
+  // costs exactly one traversal at load and nothing per frame.
+  function armHairRide(root, who) {
+    try {
+      const store = {};
+      const bodyParts = [];
+      let skinned = 0;
+      root.traverse(o => {
+        if (!o.isSkinnedMesh) return;
+        skinned++;
+        const u = o.userData || {};
+        if (u.isAccessoryMesh && typeof u.accessoryUrl === "string") {
+          (store[u.accessoryUrl] ||= []).push({ mesh: o });
+        } else if (!u.isAccessoryMesh && o.geometry?.index) {
+          bodyParts.push(o);
+        }
+      });
+      const hasHair = Object.keys(store).some(u => u.includes("/head/hair/"));
+      if (!hasHair) {
+        console.log(`[door] hair ride (${who}): no hair accessory on this body (${skinned} skinned mesh(es)) — inert.`);
+        return null;
+      }
+      // Body surface: positions + the file's index, merged, one BVH. The
+      // editor folds live morph influences in here; the runtime bake already
+      // did that, and dropped the targets, so positions are final.
+      let body = null;
+      if (bodyParts.length) {
+        let nV = 0, nI = 0;
+        for (const m of bodyParts) { nV += m.geometry.attributes.position.count; nI += m.geometry.index.count; }
+        const pos = new Float32Array(nV * 3), idx = new Uint32Array(nI);
+        let vOff = 0, iOff = 0;
+        for (const m of bodyParts) {
+          const P = m.geometry.attributes.position, I = m.geometry.index.array;
+          pos.set(P.array.subarray(0, P.count * 3), vOff * 3);
+          for (let i = 0; i < I.length; i++) idx[iOff + i] = I[i] + vOff;
+          vOff += P.count; iOff += I.length;
+        }
+        const geom = new THREE.BufferGeometry();
+        geom.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+        geom.setIndex(new THREE.BufferAttribute(idx, 1));
+        body = { bvh: new MeshBVH(geom), geom, parts: bodyParts };
+      }
+      const t0 = performance.now();
+      const r = prepareHairRide(store, body);
+      if (!r) {
+        console.warn(`[door] hair ride (${who}): anchors could not be built — hair keeps its settled shape.`);
+        return null;
+      }
+      console.log(`[door] hair ride (${who}): ${r.anchored} of ${r.total} hair vertex(es) anchored to fabric, ${r.skin} to skin; ` +
+                  `${r.clothVertices} fabric + ${r.skinVertices} skin vertex(es) posed per frame (${(performance.now() - t0).toFixed(0)}ms to arm).`);
+      return { store, who, frames: 0, ms: [], status: "running" };
+    } catch (e) {
+      console.warn(`[door] hair ride (${who}) failed to arm — hair keeps its settled shape:`, e);
+      return null;
+    }
+  }
+
+  // Per frame, after the mixer. Mirrors the editor's loop: matrices first,
+  // then the ride; report state transitions once, and the cost once.
+  function stepHairRide(ride, root) {
+    if (!ride || !root) return;
+    const t0 = performance.now();
+    let now = "running";
+    try {
+      root.updateMatrixWorld(true);
+      if (!rideHairOnCloth(ride.store)) now = "no-anchors";
+    } catch (e) {
+      now = "error";
+      if (!ride.errorLogged) { ride.errorLogged = true; console.error(`[door] hair ride (${ride.who}) threw (keeps trying each frame):`, e); }
+    }
+    if (now !== ride.status) {
+      console[now === "running" ? "log" : "warn"](`[door] hair ride (${ride.who}): ${now} (was ${ride.status}).`);
+      ride.status = now;
+    }
+    // The cost, said once: median over the first 300 frames after arming.
+    if (ride.frames < 300) {
+      ride.ms.push(performance.now() - t0);
+      if (++ride.frames === 300) {
+        const m = ride.ms.slice().sort((a, b) => a - b);
+        console.log(`[door] hair ride (${ride.who}): ${m[150].toFixed(2)}ms median / ${m[285].toFixed(2)}ms p95 per frame over 300 frames.`);
+      }
+    }
+  }
+
   function checkSceneReady() {
     const a = api.current;
     const flatOk = !!a.flatReady;
@@ -3205,6 +3311,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       // own words — see walkHerTo — so "come in, I'll put the kettle on" takes
       // her to the kitchen, and nothing else moves her at all.
       a.herRoom = "hall";
+      a.herRide = a.her ? armHairRide(a.her, "her") : null;
       a.herReady = true;
       checkSceneReady();
       if (readLab()?.stage === "inside" && a.doorOpen) placeHerForLab();
@@ -4025,6 +4132,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       a.scene.add(me);
       a.me = me;
       a.meLoading = false;   // cleared on success, not just on failure
+      a.meRide = armHairRide(me, "me");
 
       // Same two clips hers carries. Without a mixer he loads in bind pose —
       // arms straight out — which is what the first third-person shot showed.
