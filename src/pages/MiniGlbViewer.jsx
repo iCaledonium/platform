@@ -6,7 +6,7 @@ import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
 import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { MeshBVH } from "three-mesh-bvh";
-import { applySkinLayers, suspendSkinLayers, fitOuterLayers } from "./bodyLayers.js";
+import { applySkinLayers, suspendSkinLayers, fitOuterLayers, prepareHairRide, rideHairOnCloth, pauseHairRide } from "./bodyLayers.js";
 import { attachKtx2 } from "../lib/gltfKtx2.js";
 
 // Session 96: the three real, confirmed body-shape morphs (see
@@ -1563,8 +1563,8 @@ function transferSurfaceSkinToHair(hairEntries, store, mainSkinnedMesh) {
       else for (let i = 0; i < pos.count; i++) push(i);
     }
   }
-  let cbvh = null;
-  if (tri.length) { const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3)); cbvh = new MeshBVH(g); }
+  let cbvh = null, cgeom = null;
+  if (tri.length) { const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3)); cgeom = g; cbvh = new MeshBVH(g); }
   if (!cbvh && !bodyOk) return null;
 
   const p = new THREE.Vector3(), cand = new THREE.Vector3();
@@ -1589,8 +1589,11 @@ function transferSurfaceSkinToHair(hairEntries, store, mainSkinnedMesh) {
       p.set(pos.getX(i), pos.getY(i), pos.getZ(i));
       let m = null;
       if (cbvh && cbvh.closestPointToPoint(p, hit, 0, HAIR_SKIN_CLOTH_REACH)) {
+        // Session 173 - corners through the BVH's REORDERED index (it rewrites
+        // the index of the geometry it is built on); fc+k addressed the wrong
+        // triangle before.
         const fc = hit.faceIndex * 3; let best = -1, bestD = Infinity;
-        for (let k = 0; k < 3; k++) { cand.fromArray(tri, (fc + k) * 3); const d = cand.distanceToSquared(p); if (d < bestD) { bestD = d; best = fc + k; } }
+        for (let k = 0; k < 3; k++) { const ci = cgeom.index.getX(fc + k); cand.fromArray(tri, ci * 3); const d = cand.distanceToSquared(p); if (d < bestD) { bestD = d; best = ci; } }
         const sm = srcMesh[best]; m = readSkin(sm.geometry.attributes.skinIndex, sm.geometry.attributes.skinWeight, srcVert[best]);
         summary.cloth++;
       } else if (bodyOk && body.bvh.closestPointToPoint(p, hit, 0, HAIR_SKIN_BODY_REACH)) {
@@ -2181,6 +2184,7 @@ export function effectiveTransform(garmentScale, garmentOffset, garmentRotation,
 // clearance, so a garment scaled down now lands exactly on the skin instead of
 // inside it, and one scaled up is untouched.
 function applyManualFit(entry, t, bodyMesh) {
+  entry.ride = null;   // Session 173 - a moved garment or hair invalidates the ride anchors until the next settle rebuilds them
   applyAccessoryScale(entry.mesh, entry.originalPositions, entry.center, t.scale, t.offset, t.rotation);
   if (!bodyMesh || !entry.shrinkwrapEligible) return;
   shrinkwrapToBody(entry.mesh, bodyMesh, entry.url, { quiet: true });
@@ -2206,11 +2210,11 @@ function verifyHairUnderIdle(loadedRoot, store, mixer) {
   const actions = (mixer._actions || []).filter((a) => a.isRunning && a.isRunning());
   const action = actions[0];
   if (!action) return;
-  const hair = [], cloth = [];
+  const hair = [], cloth = [], rideOf = new Map();
   for (const [url, entries] of Object.entries(store || {})) {
     for (const e of entries || []) {
       const m = e.mesh; if (!m || !m.isSkinnedMesh) continue;
-      if (url.includes("/head/hair/")) hair.push(m);
+      if (url.includes("/head/hair/")) { hair.push(m); rideOf.set(m, e.ride || null); }
       else if ((url.includes("/torso/") || url.includes("/legs/")) && m.visible !== false) cloth.push(m);
     }
   }
@@ -2233,7 +2237,7 @@ function verifyHairUnderIdle(loadedRoot, store, mixer) {
   };
   const ray = new THREE.Ray(new THREE.Vector3(), new THREE.Vector3());
   const v = new THREE.Vector3(), h = new THREE.Vector3();
-  let worst = 0, worstMm = 0, worstAt = 0, total = 0;
+  let worst = 0, worstMm = 0, worstAt = 0, total = 0, worstAnchored = 0;
   const t1 = performance.now();
   try {
     for (let k = 0; k < HAIR_IDLE_SAMPLES; k++) {
@@ -2241,6 +2245,7 @@ function verifyHairUnderIdle(loadedRoot, store, mixer) {
       mixer.update(0);
       loadedRoot.updateMatrixWorld(true);
       skeleton.update();
+      rideHairOnCloth(store);   // Session 173 - the verdict is about what renders, ride included
       const tri = [];
       for (const m of cloth) {
         const s = skinned(m); const g = m.geometry;
@@ -2249,9 +2254,10 @@ function verifyHairUnderIdle(loadedRoot, store, mixer) {
       }
       const cg = new THREE.BufferGeometry(); cg.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3));
       const cbvh = new MeshBVH(cg);
-      let beneath = 0, deepest = 0; total = 0;
+      let beneath = 0, deepest = 0, anchoredHere = 0; total = 0;
       for (const m of hair) {
         const s = skinned(m); const n = m.geometry.attributes.position.count; total += n;
+        const ride = rideOf.get(m);
         for (let i = 0; i < n; i++) {
           v.set(s[i * 3], s[i * 3 + 1], s[i * 3 + 2]); h.set(v.x, 0, v.z);
           if (h.lengthSq() <= 1e-8) continue;
@@ -2259,19 +2265,24 @@ function verifyHairUnderIdle(loadedRoot, store, mixer) {
           const hits = cbvh.raycast(ray, THREE.DoubleSide);
           let crossings = 0, far = 0;
           for (const x of hits) { if (x.distance <= 1e-6) continue; crossings++; if (x.distance > far) far = x.distance; }
-          if ((crossings & 1) === 1) { beneath++; if (far > deepest) deepest = far; }
+          if ((crossings & 1) === 1) { beneath++; if (far > deepest) deepest = far; if (ride && ride.corner[i * 3] >= 0) anchoredHere++; }
         }
       }
-      if (beneath > worst) { worst = beneath; worstMm = deepest; worstAt = action.time; }
+      if (beneath > worst) { worst = beneath; worstMm = deepest; worstAt = action.time; worstAnchored = anchoredHere; }
     }
   } finally {
     action.time = t0; mixer.update(0); loadedRoot.updateMatrixWorld(true); skeleton.update();
+    try { rideHairOnCloth(store); } catch (e) { /* the render loop re-applies next frame */ }
   }
-  const line = `[MiniGlbViewer] Hair under idle: worst ${worst} of ${total} hair vertex(es) beneath the cloth (${(worstMm * 1000).toFixed(1)}mm, at ${worstAt.toFixed(2)}s of "${clip.name}") across ${HAIR_IDLE_SAMPLES} poses - ASSERT ${worst === 0 ? "PASS" : "RESIDUAL"} (${(performance.now() - t1).toFixed(0)}ms).`;
+  const line = `[MiniGlbViewer] Hair under idle: worst ${worst} of ${total} hair vertex(es) beneath the cloth (${(worstMm * 1000).toFixed(1)}mm, at ${worstAt.toFixed(2)}s of "${clip.name}") across ${HAIR_IDLE_SAMPLES} poses - ASSERT ${worst === 0 ? "PASS" : "RESIDUAL"}${worst ? ` (${worstAnchored} of them ride-anchored, ${worst - worstAnchored} not)` : ""} (${(performance.now() - t1).toFixed(0)}ms).`;
   if (worst === 0) console.log(line); else console.warn(line);
 }
 
 function settleLayers(loadedRoot, store, accessories, mixer = null) {
+  // Session 173 - the manual-fit effect's debounced settle can fire before the
+  // body has loaded; there is nothing to layer against yet (found live as a
+  // TypeError inside findBodySkinMesh(null) from the rig transfer).
+  if (!loadedRoot) return;
   // Hair gets the same four-step discipline the refit effect uses for
   // shrinkwrapped garments, and for the same reason: anything that bakes into
   // positions must restore its raw shape first, or repeated passes compound.
@@ -2328,6 +2339,14 @@ function settleLayers(loadedRoot, store, accessories, mixer = null) {
     const r = transferSurfaceSkinToHair(hairEntries.map((h) => h.e), store, findBodySkinMesh(loadedRoot));
     if (r) console.log(`[MiniGlbViewer] Hair rig follows its resting surface: ${r.cloth} vertex(es) near fabric, ${r.body} near skin, ${r.ramp} on the head-to-surface ramp, ${r.kept} kept the hair's own rig.`);
   } catch (e) { console.warn("[MiniGlbViewer] Hair rig transfer failed, hair keeps its own rig:", e); }
+
+  // 4b. Session 173 - anchors for the per-frame ride (see bodyLayers
+  //     prepareHairRide / rideHairOnCloth): what is left after the rig
+  //     transfer is corrected in the posed space, every frame.
+  try {
+    const r = prepareHairRide(store);
+    if (r) console.log(`[MiniGlbViewer] Hair ride: ${r.anchored} of ${r.total} hair vertex(es) anchored to the nearest fabric (${r.second} also to the fabric beneath them), ${r.clothVertices} fabric vertex(es) posed per frame; corrected per frame from here on.`);
+  } catch (e) { console.warn("[MiniGlbViewer] Hair ride anchors failed, hair keeps its settled shape only:", e); }
 
   applySkinLayers(loadedRoot, store);
 
@@ -3680,6 +3699,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
 
     let frameId;
     let mixerErrorLogged = false;
+    let hairRideErrorLogged = false;
     let zeroSizeAtRenderLogged = false;
     const animate = () => {
       frameId = requestAnimationFrame(animate);
@@ -3783,6 +3803,17 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
         }
       }
       if (!clipPlaying) applyPoseValues(morphMeshesRef.current, bodyPropsRef.current.poseValues);
+      // Session 173 - hair rides the garment in THIS frame's pose (bones are
+      // final here: mixer, scales and dials have all written). Needs the
+      // world matrices the renderer would otherwise compute later.
+      if (loadedRootRef.current && accessoryMeshesRef.current) {
+        try {
+          loadedRootRef.current.updateMatrixWorld(true);
+          rideHairOnCloth(accessoryMeshesRef.current);
+        } catch (err) {
+          if (!hairRideErrorLogged) { hairRideErrorLogged = true; console.error("[MiniGlbViewer] hair ride failed this frame (disabled for the session):", err); }
+        }
+      }
       const rendererSize = renderer.getSize(new THREE.Vector2());
       if ((rendererSize.width === 0 || rendererSize.height === 0) && !zeroSizeAtRenderLogged) {
         zeroSizeAtRenderLogged = true;
@@ -4650,6 +4681,7 @@ function rebindGarmentsForExport(root, bodySkinMesh) {
         console.log(`[exportSkinSnap:${tag}] runtime=${runtime} | ${rows.slice(0, 8).join(" | ")}`);
       };
       _skinSnap("before-suspend");
+      pauseHairRide(accessoryMeshesRef.current, true);   // Session 173 - the file carries the settled shape, not one frame's correction
       const reapplySkinLayers = runtime ? () => {} : suspendSkinLayers(loadedRootRef.current);
       _skinSnap("after-suspend");
       const allAnimations = Object.values(animationsRef.current || {});
@@ -4785,6 +4817,7 @@ function rebindGarmentsForExport(root, bodySkinMesh) {
         ? rebindGarmentsForExport(loadedRootRef.current, findBodySkinMesh(loadedRootRef.current))
         : () => {};
       const restoreLive = () => {
+        pauseHairRide(accessoryMeshesRef.current, false);   // Session 173
         // Order matters on the way back: rebinding and morphs were applied after
         // the garment positions were staged, so they come off first.
         unbind();

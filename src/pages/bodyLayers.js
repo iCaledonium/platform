@@ -462,8 +462,13 @@ export function fitOuterLayers(root, store, body = null) {
   const n = new THREE.Vector3(), h = new THREE.Vector3(), v = new THREE.Vector3(), tmp = new THREE.Vector3();
   const hit = { point: new THREE.Vector3(), distance: 0, faceIndex: 0 };
   const bt = { point: new THREE.Vector3(), distance: 0, faceIndex: 0 };
+  // Session 173 - MeshBVH REORDERS the index of the geometry it is built on,
+  // so a faceIndex from a query addresses the BVH's index, not the order the
+  // corners were pushed in. Reading `tri` at fi*9 (as this did since Session
+  // 152) picked an unrelated triangle's normal. Go through the index.
   const clothNormal = (fi) => {
-    a.fromArray(tri, fi * 9); b.fromArray(tri, fi * 9 + 3); c.fromArray(tri, fi * 9 + 6);
+    const ix = cbvh.geometry.index, f = fi * 3;
+    a.fromArray(tri, ix.getX(f) * 3); b.fromArray(tri, ix.getX(f + 1) * 3); c.fromArray(tri, ix.getX(f + 2) * 3);
     n.subVectors(b, a).cross(tmp.subVectors(c, a)).normalize();
     // Winding is not trusted: orient the normal outward from the torso axis,
     // which for a worn garment is always the right way to lift.
@@ -766,4 +771,215 @@ export function fitOuterLayers(root, store, body = null) {
     console.log(`[bodyLayers] hair layered over ${cbvh ? "clothing" : "nothing"}${bbvh ? " and out of the skin" : " (no body surface given, skin rule skipped)"}: ${touched.length} hair primitive(s) in ${(performance.now() - t0).toFixed(0)}ms.`);
   }
   return touched;
+}
+
+
+// ── Hair rides the garment, every frame ─────────────────────────────────────
+//
+// Session 173 (Magnus: "do number 2" - collision-aware skinning at render
+// time). Everything above fits the hair once, in bind pose, and then the
+// GPU skins hair and blouse with different bones: the head turns, the
+// chest breathes, and a few strand tips dip back under the yoke at the
+// extreme of the clip (measured: worst 256 of 24302 vertices, 33mm). No
+// bind-pose rule can remove that, so this layer removes it where it
+// happens - in the POSED space, per frame.
+//
+// At settle, every hair vertex within HAIR_RIDE_REACH of fabric remembers
+// the fabric triangle it rests on (the nearest one), the barycentric point
+// on it, and which side of it the hair is on. Each frame, after the mixer
+// has posed the bones, that triangle and the hair vertex are both skinned
+// on the CPU exactly as the GPU does it; if the vertex is closer than
+// HAIR_RIDE_GAP to its triangle's plane (or under it) it is pushed back out
+// along the posed normal, and the push is written into the BIND-space
+// position through the inverse of the vertex's own skinning matrix, so the
+// GPU still does the skinning and the hair is otherwise untouched. Vertices
+// that need no push are written back to their settled position, so the
+// layer is stateless from frame to frame. Only the anchor triangle's plane
+// is tested, never the whole garment: the anchor stays the nearest fabric
+// under the small relative motion an idle clip produces, and that makes
+// the per-frame cost a few thousand skinning ops instead of a BVH query
+// per vertex.
+//
+// Paused around exports (the file must carry the settled shape, not one
+// frame's correction) and invalidated by a manual-fit change until the
+// next settle rebuilds the anchors.
+const HAIR_RIDE_REACH = 0.10;   // anchor a hair vertex to fabric within 10cm of it at settle (6cm left 41 unanchored tips dipping at the head turn)
+const HAIR_RIDE_GAP = 0.008;    // and never let it come closer than 8mm to that fabric in motion
+const rideState = new WeakMap();  // store -> { cloth, cvMesh, cvVi, posed, paused, frame }
+const _rq = new THREE.Vector3(), _racc = new THREE.Vector3(), _rt = new THREE.Vector3(), _rm = new THREE.Matrix4();
+const _rsum = new THREE.Matrix4(), _rM = new THREE.Matrix4();
+const _rP = new THREE.Vector3(), _rA = new THREE.Vector3(), _rn = new THREE.Vector3(), _re1 = new THREE.Vector3(), _re2 = new THREE.Vector3();
+const _rc0 = new THREE.Vector3(), _rc1 = new THREE.Vector3(), _rc2 = new THREE.Vector3(), _rd = new THREE.Vector3();
+
+// posed position of (x,y,z) skinned with vertex i's bones of mesh
+function ridePose(mesh, i, x, y, z, out) {
+  const g = mesh.geometry, SI = g.attributes.skinIndex, SW = g.attributes.skinWeight, bm = mesh.skeleton.boneMatrices;
+  _rq.set(x, y, z).applyMatrix4(mesh.bindMatrix);
+  _racc.set(0, 0, 0);
+  const i0 = SI.getX(i), i1 = SI.getY(i), i2 = SI.getZ(i), i3 = SI.getW(i);
+  const w0 = SW.getX(i), w1 = SW.getY(i), w2 = SW.getZ(i), w3 = SW.getW(i);
+  if (w0) { _rm.fromArray(bm, i0 * 16); _rt.copy(_rq).applyMatrix4(_rm); _racc.addScaledVector(_rt, w0); }
+  if (w1) { _rm.fromArray(bm, i1 * 16); _rt.copy(_rq).applyMatrix4(_rm); _racc.addScaledVector(_rt, w1); }
+  if (w2) { _rm.fromArray(bm, i2 * 16); _rt.copy(_rq).applyMatrix4(_rm); _racc.addScaledVector(_rt, w2); }
+  if (w3) { _rm.fromArray(bm, i3 * 16); _rt.copy(_rq).applyMatrix4(_rm); _racc.addScaledVector(_rt, w3); }
+  return out.copy(_racc).applyMatrix4(mesh.bindMatrixInverse);
+}
+// the full bind->posed matrix of vertex i (bindMatrixInverse * sum(w*B) * bindMatrix), into out
+function rideMatrix(mesh, i, out) {
+  const g = mesh.geometry, SI = g.attributes.skinIndex, SW = g.attributes.skinWeight, bm = mesh.skeleton.boneMatrices;
+  const e = _rsum.elements; for (let k = 0; k < 16; k++) e[k] = 0;
+  const idx = [SI.getX(i), SI.getY(i), SI.getZ(i), SI.getW(i)], w = [SW.getX(i), SW.getY(i), SW.getZ(i), SW.getW(i)];
+  for (let k = 0; k < 4; k++) { if (!w[k]) continue; const o = idx[k] * 16; for (let c = 0; c < 16; c++) e[c] += bm[o + c] * w[k]; }
+  return out.copy(mesh.bindMatrixInverse).multiply(_rsum).multiply(mesh.bindMatrix);
+}
+
+export function prepareHairRide(store) {
+  const cloth = [], hair = [];
+  for (const [url, entries] of Object.entries(store || {})) {
+    for (const e of (entries || [])) {
+      const m = e.mesh; if (!m || !m.isSkinnedMesh) continue;
+      if (url.includes("/head/hair/")) hair.push(e);
+      else if ((url.includes("/torso/") || url.includes("/legs/")) && m.visible !== false && m.geometry.attributes.skinIndex) cloth.push(m);
+    }
+  }
+  for (const e of hair) e.ride = null;
+  rideState.delete(store);
+  if (!cloth.length || !hair.length) return null;
+  // cloth soup with (mesh, vertex) per corner
+  const tri = []; const cMesh = []; const cVi = [];
+  cloth.forEach((m, mi) => {
+    const g = m.geometry, pos = g.attributes.position;
+    const push = (vi) => { tri.push(pos.getX(vi), pos.getY(vi), pos.getZ(vi)); cMesh.push(mi); cVi.push(vi); };
+    if (g.index) for (let i = 0; i < g.index.count; i++) push(g.index.getX(i)); else for (let i = 0; i < pos.count; i++) push(i);
+  });
+  const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3));
+  const bvh = new MeshBVH(g);
+  // unique cloth vertex table
+  const cvKey = new Map(); const cvMesh = [], cvVi = [];
+  const cvId = (corner) => { const key = cMesh[corner] * 4294967296 + cVi[corner]; let id = cvKey.get(key); if (id === undefined) { id = cvMesh.length; cvKey.set(key, id); cvMesh.push(cMesh[corner]); cvVi.push(cVi[corner]); } return id; };
+  const hit = { point: new THREE.Vector3(), distance: 0, faceIndex: 0 };
+  const p = new THREE.Vector3();
+  const ray = new THREE.Ray(new THREE.Vector3(), new THREE.Vector3());
+  // one anchor from a (faceIndex, point on it): corners through the BVH's
+  // reordered index (see clothNormal), barycentric of the point, and which
+  // side of the face the hair vertex is on. Returns false for a degenerate face.
+  const makeAnchor = (faceIndex, point, corner, bary, sign, i) => {
+    const f = faceIndex * 3, ix = g.index;
+    const k0 = ix.getX(f), k1 = ix.getX(f + 1), k2 = ix.getX(f + 2);
+    _rc0.fromArray(tri, k0 * 3); _rc1.fromArray(tri, k1 * 3); _rc2.fromArray(tri, k2 * 3);
+    _re1.subVectors(_rc1, _rc0); _re2.subVectors(_rc2, _rc0); _rd.subVectors(point, _rc0);
+    const d00 = _re1.dot(_re1), d01 = _re1.dot(_re2), d11 = _re2.dot(_re2), d20 = _rd.dot(_re1), d21 = _rd.dot(_re2);
+    const den = d00 * d11 - d01 * d01; if (Math.abs(den) < 1e-14) return false;
+    const v = (d11 * d20 - d01 * d21) / den, w = (d00 * d21 - d01 * d20) / den, u = 1 - v - w;
+    _rn.crossVectors(_re1, _re2); if (_rn.lengthSq() === 0) return false; _rn.normalize();
+    corner[i * 3] = cvId(k0); corner[i * 3 + 1] = cvId(k1); corner[i * 3 + 2] = cvId(k2);
+    bary[i * 3] = u; bary[i * 3 + 1] = v; bary[i * 3 + 2] = w;
+    sign[i] = _rd.subVectors(p, point).dot(_rn) >= 0 ? 1 : -1;
+    return true;
+  };
+  let anchored = 0, total = 0, second = 0;
+  for (const e of hair) {
+    const pos = e.mesh.geometry.attributes.position; const N = pos.count; total += N;
+    const base = new Float32Array(N * 3); for (let i = 0; i < N; i++) { base[i * 3] = pos.getX(i); base[i * 3 + 1] = pos.getY(i); base[i * 3 + 2] = pos.getZ(i); }
+    const corner = new Int32Array(N * 3).fill(-1), bary = new Float32Array(N * 3), sign = new Int8Array(N);
+    const corner2 = new Int32Array(N * 3).fill(-1), bary2 = new Float32Array(N * 3), sign2 = new Int8Array(N);
+    for (let i = 0; i < N; i++) {
+      p.set(base[i * 3], base[i * 3 + 1], base[i * 3 + 2]);
+      // anchor 1: the nearest fabric
+      let first = -1;
+      if (bvh.closestPointToPoint(p, hit, 0, HAIR_RIDE_REACH) && makeAnchor(hit.faceIndex, hit.point, corner, bary, sign, i)) { first = hit.faceIndex; anchored++; }
+      // anchor 2: the fabric directly beneath, along the inward radial - the
+      // surface the parity verdict measures against; the nearest face alone
+      // left 41 anchored vertices dipping under a neighbouring fold
+      _rd.set(-p.x, 0, -p.z);
+      if (_rd.lengthSq() > 1e-8) {
+        ray.origin.copy(p); ray.direction.copy(_rd.normalize());
+        const hits = bvh.raycast(ray, THREE.DoubleSide);
+        let near = null;
+        for (const x of hits) { if (x.distance <= 1e-6 || x.distance > HAIR_RIDE_REACH) continue; if (!near || x.distance < near.distance) near = x; }
+        if (near && near.faceIndex !== first && makeAnchor(near.faceIndex, near.point, corner2, bary2, sign2, i)) second++;
+      }
+    }
+    e.ride = { base, corner, bary, sign, corner2, bary2, sign2 };
+  }
+  rideState.set(store, { cloth, cvMesh: Int32Array.from(cvMesh), cvVi: Uint32Array.from(cvVi), posed: new Float32Array(cvMesh.length * 3), paused: false, lastPushed: 0 });
+  return { anchored, second, total, clothVertices: cvMesh.length };
+}
+
+export function pauseHairRide(store, paused) {
+  const st = rideState.get(store); if (!st) return;
+  st.paused = !!paused;
+  if (paused) restoreHairRide(store);
+}
+
+export function restoreHairRide(store) {
+  for (const entries of Object.values(store || {})) for (const e of (entries || [])) {
+    if (!e.ride || !e.mesh) continue;
+    const pos = e.mesh.geometry.attributes.position, base = e.ride.base;
+    for (let i = 0; i < pos.count; i++) pos.setXYZ(i, base[i * 3], base[i * 3 + 1], base[i * 3 + 2]);
+    pos.needsUpdate = true;
+  }
+}
+
+// Per frame, after the mixer and after root.updateMatrixWorld(true).
+export function rideHairOnCloth(store) {
+  const st = rideState.get(store); if (!st || st.paused) return null;
+  const { cloth, cvMesh, cvVi, posed } = st;
+  let skeleton = null;
+  for (const m of cloth) { skeleton = m.skeleton; break; }
+  if (!skeleton) return null;
+  skeleton.update();
+  // pose the anchored cloth vertices
+  for (let k = 0; k < cvMesh.length; k++) {
+    const m = cloth[cvMesh[k]], vi = cvVi[k], pos = m.geometry.attributes.position;
+    ridePose(m, vi, pos.getX(vi), pos.getY(vi), pos.getZ(vi), _rP);
+    posed[k * 3] = _rP.x; posed[k * 3 + 1] = _rP.y; posed[k * 3 + 2] = _rP.z;
+  }
+  let checked = 0, pushed = 0, deepest = 0;
+  for (const entries of Object.values(store || {})) for (const e of (entries || [])) {
+    const r = e.ride; if (!r || !e.mesh) continue;
+    const mesh = e.mesh, pos = mesh.geometry.attributes.position, N = pos.count;
+    if (mesh.skeleton !== skeleton) mesh.skeleton.update();
+    let touched = 0;
+    const planes = [[r.corner, r.bary, r.sign], [r.corner2, r.bary2, r.sign2]];
+    for (let i = 0; i < N; i++) {
+      const bx = r.base[i * 3], by = r.base[i * 3 + 1], bz = r.base[i * 3 + 2];
+      if (r.corner[i * 3] < 0 && r.corner2[i * 3] < 0) continue;
+      checked++;
+      ridePose(mesh, i, bx, by, bz, _rP);
+      // both planes; a push from the first moves the point the second sees
+      _rd.set(0, 0, 0); let need = 0;
+      for (const [corner, bary, sign] of planes) {
+        const c0 = corner[i * 3]; if (c0 < 0) continue;
+        const c1 = corner[i * 3 + 1], c2 = corner[i * 3 + 2];
+        _rc0.fromArray(posed, c0 * 3); _rc1.fromArray(posed, c1 * 3); _rc2.fromArray(posed, c2 * 3);
+        _rA.copy(_rc0).multiplyScalar(bary[i * 3]).addScaledVector(_rc1, bary[i * 3 + 1]).addScaledVector(_rc2, bary[i * 3 + 2]);
+        _rn.crossVectors(_re1.subVectors(_rc1, _rc0), _re2.subVectors(_rc2, _rc0));
+        if (_rn.lengthSq() === 0) continue;
+        _rn.normalize().multiplyScalar(sign[i]);
+        const d = _rA.subVectors(_rP, _rA).dot(_rn);   // _rA now holds P - A
+        if (d >= HAIR_RIDE_GAP) continue;
+        const push = HAIR_RIDE_GAP - d;
+        _rP.addScaledVector(_rn, push); _rd.addScaledVector(_rn, push); need += push;
+      }
+      if (need === 0) {
+        if (pos.getX(i) !== bx || pos.getY(i) !== by || pos.getZ(i) !== bz) { pos.setXYZ(i, bx, by, bz); touched++; }
+        continue;
+      }
+      pushed++; if (need > deepest) deepest = need;
+      // posed-space push -> bind space through the inverse skinning matrix
+      rideMatrix(mesh, i, _rM).invert();
+      const m = _rM.elements;
+      const dx = m[0] * _rd.x + m[4] * _rd.y + m[8] * _rd.z;
+      const dy = m[1] * _rd.x + m[5] * _rd.y + m[9] * _rd.z;
+      const dz = m[2] * _rd.x + m[6] * _rd.y + m[10] * _rd.z;
+      pos.setXYZ(i, bx + dx, by + dy, bz + dz);
+      touched++;
+    }
+    if (touched) pos.needsUpdate = true;
+  }
+  st.lastPushed = pushed;
+  const stats = { checked, pushed, deepestMm: +(deepest * 1000).toFixed(1) };
+  if (typeof window !== "undefined" && window.__skinDebug) window.__skinDebug.hairRide = stats;
+  return stats;
 }
