@@ -1493,6 +1493,171 @@ function getBodyMorphTransfer(referenceMesh) {
   return cached;
 }
 
+// Session 172 (Magnus: "let the hair float upon the garment and mind the
+// idle movements"). The Charm hair is rigged to the HEAD bone alone (the
+// bone-usage scan below prints exactly that), so under the idle clip every
+// nod swings forty centimetres of strands as one rigid plate through a
+// blouse that follows the chest and shoulders. Measured live on Lindsey:
+// 0 hair vertices beneath the cloth in bind pose, 2328 (70mm) in the
+// animated pose, every one of them between chest and shoulder height. Hair
+// that rests on the body or on clothing must MOVE with what it rests on, so
+// every hair vertex below the head takes the skin weights of its nearest
+// body vertex - the same bones the garment beneath it follows - blended in
+// over the neck so a strand bends instead of snapping. Positions are not
+// touched: at bind pose nothing changes, which is why the layering
+// assertion made at bind pose (bodyLayers.fitOuterLayers) now also holds
+// while she breathes. Runs after the skinIndex remap (both sides index the
+// main skeleton) and before the rebind.
+const HAIR_SKIN_HEAD = /head|skull|face|jaw|eye|brow|lip|tongue|ear|nose|cheek|chin|mouth/i;
+const HAIR_SKIN_CLOTH_REACH = 0.03;   // hair within 3cm of fabric rests on it and takes ITS rig
+const HAIR_SKIN_BODY_REACH = 0.15;    // otherwise the nearest skin within 15cm
+const HAIR_SKIN_RAMP = 0.10;          // the head's rig fades into the surface rig over 10cm below the skull base (6cm folded the cards into a clump on the shoulder at the turn's extreme; 10cm leaves ~1% of the hair briefly beneath the yoke instead)
+const HAIR_SKIN_SMOOTH = 4;           // rig smoothing passes through the strand topology
+// Session 172, second cut: the first transfer copied the SKIN's weights at
+// load. Not enough - measured live, 186..1181 hair vertices still beneath
+// the blouse depending on the instant of the idle clip - because a loose
+// garment is rigged with its own weights, not the chest's, so hair that
+// rests on it must follow the FABRIC, not the skin under the fabric. Runs at
+// settle time, on the final layered shape, with every garment present.
+//
+// Third cut: a per-vertex SWITCH between the head's rig and the surface rig
+// tore strands - a card whose upper half turned with the head while its
+// lower half stayed on the yoke bunched into a visible clump above the
+// shoulder. So the surface rig is (a) smoothed through the strand topology
+// so neighbouring vertices agree on their bones, and (b) blended in by
+// height: the hair's own rig above the skull base, the surface rig from
+// HAIR_SKIN_RAMP below it, a straight ramp between - a strand twists over
+// ten centimetres instead of folding at a line. Always mixed from the hair's
+// ORIGINAL weights, so repeated settles cannot compound.
+function transferSurfaceSkinToHair(hairEntries, store, mainSkinnedMesh) {
+  if (!hairEntries.length || !mainSkinnedMesh?.skeleton) return null;
+  const skeleton = mainSkinnedMesh.skeleton, bones = skeleton.bones;
+  const body = getBodySurfaceBVH(mainSkinnedMesh);
+  const bodyOk = body && Array.isArray(body.parts) && body.geom?.index;
+  let partOf = null, localOf = null;
+  if (bodyOk) {
+    const total = body.geom.attributes.position.count;
+    partOf = new Uint8Array(total); localOf = new Uint32Array(total);
+    let off = 0;
+    body.parts.forEach((p, pi) => { const n = p.geometry.attributes.position.count; for (let i = 0; i < n; i++) { partOf[off + i] = pi; localOf[off + i] = i; } off += n; });
+  }
+  // skull base height in bind space, from the head bone's inverse bind matrix
+  let skullY = null;
+  {
+    const hi = bones.findIndex((b) => /^head/i.test(b.name));
+    if (hi >= 0 && skeleton.boneInverses?.[hi]) {
+      const m = new THREE.Matrix4().copy(skeleton.boneInverses[hi]).invert();
+      skullY = m.elements[13];
+    }
+  }
+  if (skullY === null) return null;
+  const tri = []; const srcMesh = []; const srcVert = [];
+  for (const [url, entries] of Object.entries(store || {})) {
+    if (!(url.includes("/torso/") || url.includes("/legs/"))) continue;
+    for (const e of entries || []) {
+      const m = e.mesh; if (!m || m.visible === false) continue;
+      const g = m.geometry, pos = g.attributes.position;
+      if (!pos || !g.attributes.skinIndex || !g.attributes.skinWeight) continue;
+      const push = (vi) => { tri.push(pos.getX(vi), pos.getY(vi), pos.getZ(vi)); srcMesh.push(m); srcVert.push(vi); };
+      if (g.index) for (let i = 0; i < g.index.count; i++) push(g.index.getX(i));
+      else for (let i = 0; i < pos.count; i++) push(i);
+    }
+  }
+  let cbvh = null;
+  if (tri.length) { const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3)); cbvh = new MeshBVH(g); }
+  if (!cbvh && !bodyOk) return null;
+
+  const p = new THREE.Vector3(), cand = new THREE.Vector3();
+  const hit = { point: new THREE.Vector3(), distance: 0, faceIndex: 0 };
+  const readSkin = (SI, SW, li) => { const m = new Map(); const idx = [SI.getX(li), SI.getY(li), SI.getZ(li), SI.getW(li)], w = [SW.getX(li), SW.getY(li), SW.getZ(li), SW.getW(li)]; for (let k = 0; k < 4; k++) if (w[k] > 0) m.set(idx[k], (m.get(idx[k]) || 0) + w[k]); return m; };
+  const summary = { cloth: 0, body: 0, kept: 0, ramp: 0 };
+  for (const e of hairEntries) {
+    const g = e.mesh.geometry, pos = g.attributes.position, hSI = g.attributes.skinIndex, hSW = g.attributes.skinWeight;
+    if (!pos || !hSI || !hSW) continue;
+    const N = pos.count;
+    if (!e.skinOriginal) {
+      const si = new Float32Array(N * 4), sw = new Float32Array(N * 4);
+      for (let i = 0; i < N; i++) { si[i * 4] = hSI.getX(i); si[i * 4 + 1] = hSI.getY(i); si[i * 4 + 2] = hSI.getZ(i); si[i * 4 + 3] = hSI.getW(i); sw[i * 4] = hSW.getX(i); sw[i * 4 + 1] = hSW.getY(i); sw[i * 4 + 2] = hSW.getZ(i); sw[i * 4 + 3] = hSW.getW(i); }
+      e.skinOriginal = { si, sw };
+    }
+    const { si: oSI, sw: oSW } = e.skinOriginal;
+
+    // 1. surface rig + height blend per vertex
+    let rig = new Array(N).fill(null);
+    let f = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      p.set(pos.getX(i), pos.getY(i), pos.getZ(i));
+      let m = null;
+      if (cbvh && cbvh.closestPointToPoint(p, hit, 0, HAIR_SKIN_CLOTH_REACH)) {
+        const fc = hit.faceIndex * 3; let best = -1, bestD = Infinity;
+        for (let k = 0; k < 3; k++) { cand.fromArray(tri, (fc + k) * 3); const d = cand.distanceToSquared(p); if (d < bestD) { bestD = d; best = fc + k; } }
+        const sm = srcMesh[best]; m = readSkin(sm.geometry.attributes.skinIndex, sm.geometry.attributes.skinWeight, srcVert[best]);
+        summary.cloth++;
+      } else if (bodyOk && body.bvh.closestPointToPoint(p, hit, 0, HAIR_SKIN_BODY_REACH)) {
+        const fc = hit.faceIndex * 3; let best = -1, bestD = Infinity;
+        for (let k = 0; k < 3; k++) { const vi = body.geom.index.getX(fc + k); cand.fromBufferAttribute(body.geom.attributes.position, vi); const d = cand.distanceToSquared(p); if (d < bestD) { bestD = d; best = vi; } }
+        const part = body.parts[partOf[best]], li = localOf[best];
+        const pSI = part.geometry.attributes.skinIndex, pSW = part.geometry.attributes.skinWeight;
+        if (pSI && pSW) {
+          m = readSkin(pSI, pSW, li);
+          let dom = null, dw = -1; for (const [b, w] of m) if (w > dw) { dw = w; dom = b; }
+          if (HAIR_SKIN_HEAD.test(bones[dom]?.name || "")) m = null; else summary.body++;
+        }
+      }
+      rig[i] = m;
+      f[i] = m ? Math.min(1, Math.max(0, (skullY - p.y) / HAIR_SKIN_RAMP)) : 0;
+    }
+
+    // 2. smooth rig and blend through the strand topology
+    if (g.index) {
+      const adj = Array.from({ length: N }, () => new Set());
+      for (let t = 0; t < g.index.count; t += 3) {
+        const a = g.index.getX(t), b = g.index.getX(t + 1), c = g.index.getX(t + 2);
+        adj[a].add(b); adj[a].add(c); adj[b].add(a); adj[b].add(c); adj[c].add(a); adj[c].add(b);
+      }
+      for (let it = 0; it < HAIR_SKIN_SMOOTH; it++) {
+        const nextRig = new Array(N).fill(null), nextF = new Float32Array(N);
+        for (let i = 0; i < N; i++) {
+          const ns = adj[i];
+          let sf = f[i], cnt = 1; const acc = new Map();
+          if (rig[i]) for (const [b, w] of rig[i]) acc.set(b, w);
+          let rigCnt = rig[i] ? 1 : 0;
+          for (const j of ns) {
+            sf += f[j]; cnt++;
+            if (rig[j]) { rigCnt++; for (const [b, w] of rig[j]) acc.set(b, (acc.get(b) || 0) + w); }
+          }
+          nextF[i] = sf / cnt;
+          if (rigCnt) { for (const [b, w] of acc) acc.set(b, w / rigCnt); nextRig[i] = acc; }
+        }
+        rig = nextRig; f = nextF;
+      }
+    }
+
+    // 3. mix from the original weights, top four bones, normalised
+    for (let i = 0; i < N; i++) {
+      const fb = rig[i] ? f[i] : 0;
+      if (fb <= 0) {
+        hSI.setXYZW(i, oSI[i * 4], oSI[i * 4 + 1], oSI[i * 4 + 2], oSI[i * 4 + 3]);
+        hSW.setXYZW(i, oSW[i * 4], oSW[i * 4 + 1], oSW[i * 4 + 2], oSW[i * 4 + 3]);
+        summary.kept++;
+        continue;
+      }
+      const mix = new Map();
+      for (let k = 0; k < 4; k++) { const w = oSW[i * 4 + k] * (1 - fb); if (w > 0) mix.set(oSI[i * 4 + k], (mix.get(oSI[i * 4 + k]) || 0) + w); }
+      for (const [b, w] of rig[i]) { const ww = w * fb; if (ww > 0) mix.set(b, (mix.get(b) || 0) + ww); }
+      const top = [...mix.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4);
+      let sum = 0; for (const [, w] of top) sum += w;
+      if (!(sum > 0)) { summary.kept++; continue; }
+      while (top.length < 4) top.push([0, 0]);
+      hSI.setXYZW(i, top[0][0], top[1][0], top[2][0], top[3][0]);
+      hSW.setXYZW(i, top[0][1] / sum, top[1][1] / sum, top[2][1] / sum, top[3][1] / sum);
+      if (fb < 1) summary.ramp++;
+    }
+    hSI.needsUpdate = true; hSW.needsUpdate = true;
+  }
+  return summary;
+}
+
 const _mtP = new THREE.Vector3();
 const _mtTarget = { point: new THREE.Vector3() };
 const _mtA = new THREE.Vector3(), _mtB = new THREE.Vector3(), _mtC = new THREE.Vector3();
@@ -2028,7 +2193,85 @@ function applyManualFit(entry, t, bodyMesh) {
 // shape, and only then is the skin mask computed. One function, because three
 // call sites (settled load, finished load, body refit) were each going to
 // repeat the sequence and drift.
-function settleLayers(loadedRoot, store, accessories) {
+// Session 172 - "mind the idle movements": the layering assertion is made in
+// bind pose, so here it is re-measured in MOTION. Eight poses of the running
+// clip are evaluated on the CPU (skinning hair and clothing from the bone
+// matrices exactly as the GPU does), each hair vertex is tested with the same
+// radial-parity rule as bodyLayers.fitOuterLayers, and the worst pose is
+// logged as an ASSERT line. Runs off the settle's own frame so a slider drag
+// does not pay for it; restores the clip's time when done.
+const HAIR_IDLE_SAMPLES = 8;
+function verifyHairUnderIdle(loadedRoot, store, mixer) {
+  if (!mixer || !loadedRoot) return;
+  const actions = (mixer._actions || []).filter((a) => a.isRunning && a.isRunning());
+  const action = actions[0];
+  if (!action) return;
+  const hair = [], cloth = [];
+  for (const [url, entries] of Object.entries(store || {})) {
+    for (const e of entries || []) {
+      const m = e.mesh; if (!m || !m.isSkinnedMesh) continue;
+      if (url.includes("/head/hair/")) hair.push(m);
+      else if ((url.includes("/torso/") || url.includes("/legs/")) && m.visible !== false) cloth.push(m);
+    }
+  }
+  if (!hair.length || !cloth.length) return;
+  const skeleton = hair[0].skeleton;
+  const clip = action.getClip(); const dur = clip.duration || 0; const t0 = action.time;
+  if (!(dur > 0)) return;
+  const mat = new THREE.Matrix4(), acc = new THREE.Vector3(), q = new THREE.Vector3(), t = new THREE.Vector3();
+  const skinned = (m) => {
+    const g = m.geometry, P = g.attributes.position, SI = g.attributes.skinIndex, SW = g.attributes.skinWeight;
+    const bm = m.skeleton.boneMatrices; const out = new Float32Array(P.count * 3);
+    for (let i = 0; i < P.count; i++) {
+      q.fromBufferAttribute(P, i).applyMatrix4(m.bindMatrix); acc.set(0, 0, 0);
+      const idx = [SI.getX(i), SI.getY(i), SI.getZ(i), SI.getW(i)], w = [SW.getX(i), SW.getY(i), SW.getZ(i), SW.getW(i)];
+      for (let k = 0; k < 4; k++) { if (!w[k]) continue; mat.fromArray(bm, idx[k] * 16); t.copy(q).applyMatrix4(mat); acc.addScaledVector(t, w[k]); }
+      acc.applyMatrix4(m.bindMatrixInverse);
+      out[i * 3] = acc.x; out[i * 3 + 1] = acc.y; out[i * 3 + 2] = acc.z;
+    }
+    return out;
+  };
+  const ray = new THREE.Ray(new THREE.Vector3(), new THREE.Vector3());
+  const v = new THREE.Vector3(), h = new THREE.Vector3();
+  let worst = 0, worstMm = 0, worstAt = 0, total = 0;
+  const t1 = performance.now();
+  try {
+    for (let k = 0; k < HAIR_IDLE_SAMPLES; k++) {
+      action.time = (k / HAIR_IDLE_SAMPLES) * dur;
+      mixer.update(0);
+      loadedRoot.updateMatrixWorld(true);
+      skeleton.update();
+      const tri = [];
+      for (const m of cloth) {
+        const s = skinned(m); const g = m.geometry;
+        const push = (i) => tri.push(s[i * 3], s[i * 3 + 1], s[i * 3 + 2]);
+        if (g.index) for (let i = 0; i < g.index.count; i++) push(g.index.getX(i)); else for (let i = 0; i < g.attributes.position.count; i++) push(i);
+      }
+      const cg = new THREE.BufferGeometry(); cg.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3));
+      const cbvh = new MeshBVH(cg);
+      let beneath = 0, deepest = 0; total = 0;
+      for (const m of hair) {
+        const s = skinned(m); const n = m.geometry.attributes.position.count; total += n;
+        for (let i = 0; i < n; i++) {
+          v.set(s[i * 3], s[i * 3 + 1], s[i * 3 + 2]); h.set(v.x, 0, v.z);
+          if (h.lengthSq() <= 1e-8) continue;
+          ray.origin.copy(v); ray.direction.copy(h.normalize());
+          const hits = cbvh.raycast(ray, THREE.DoubleSide);
+          let crossings = 0, far = 0;
+          for (const x of hits) { if (x.distance <= 1e-6) continue; crossings++; if (x.distance > far) far = x.distance; }
+          if ((crossings & 1) === 1) { beneath++; if (far > deepest) deepest = far; }
+        }
+      }
+      if (beneath > worst) { worst = beneath; worstMm = deepest; worstAt = action.time; }
+    }
+  } finally {
+    action.time = t0; mixer.update(0); loadedRoot.updateMatrixWorld(true); skeleton.update();
+  }
+  const line = `[MiniGlbViewer] Hair under idle: worst ${worst} of ${total} hair vertex(es) beneath the cloth (${(worstMm * 1000).toFixed(1)}mm, at ${worstAt.toFixed(2)}s of "${clip.name}") across ${HAIR_IDLE_SAMPLES} poses - ASSERT ${worst === 0 ? "PASS" : "RESIDUAL"} (${(performance.now() - t1).toFixed(0)}ms).`;
+  if (worst === 0) console.log(line); else console.warn(line);
+}
+
+function settleLayers(loadedRoot, store, accessories, mixer = null) {
   // Hair gets the same four-step discipline the refit effect uses for
   // shrinkwrapped garments, and for the same reason: anything that bakes into
   // positions must restore its raw shape first, or repeated passes compound.
@@ -2078,7 +2321,18 @@ function settleLayers(loadedRoot, store, accessories) {
   catch (e) { console.warn("[MiniGlbViewer] settleLayers: no body surface for the hair skin rule:", e); }
   fitOuterLayers(loadedRoot, store, bodySurface);
 
+  // 4. Session 172 - the hair's RIG follows the surface it now rests on
+  //    (fabric first, skin otherwise), so the layering above survives the
+  //    idle clip: see transferSurfaceSkinToHair.
+  try {
+    const r = transferSurfaceSkinToHair(hairEntries.map((h) => h.e), store, findBodySkinMesh(loadedRoot));
+    if (r) console.log(`[MiniGlbViewer] Hair rig follows its resting surface: ${r.cloth} vertex(es) near fabric, ${r.body} near skin, ${r.ramp} on the head-to-surface ramp, ${r.kept} kept the hair's own rig.`);
+  } catch (e) { console.warn("[MiniGlbViewer] Hair rig transfer failed, hair keeps its own rig:", e); }
+
   applySkinLayers(loadedRoot, store);
+
+  // 5. Session 172 - and measured in motion, off this frame.
+  if (mixer) setTimeout(() => { try { verifyHairUnderIdle(loadedRoot, store, mixer); } catch (e) { console.warn("[MiniGlbViewer] hair-under-idle check failed:", e); } }, 60);
 }
 
 function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loadedRoot, dracoLoader, isMounted, manualScale, manualOffset, manualRotation, manualParts, accessoryMeshesStore, statureHeightM = null, manualTint = null, manualHidden = false) {
@@ -3672,7 +3926,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
         // Session 152 — a removed garment uncovers skin. Recompute the layer
         // culling from what is actually left in the store, or she keeps a
         // hole shaped like the jeans she just took off.
-        settleLayers(loadedRoot, store, accessories);
+        settleLayers(loadedRoot, store, accessories, mixerRef.current);
         {
           let sceneTop = loadedRootRef.current;
           while (sceneTop && sceneTop.parent) sceneTop = sceneTop.parent;
@@ -3701,7 +3955,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
       // end of the additions path below. Whether this run loaded anything or
       // found it all done, the wardrobe is now settled, and settled is exactly
       // when the mask must be true.
-      settleLayers(loadedRoot, store, accessories);
+      settleLayers(loadedRoot, store, accessories, mixerRef.current);
       return () => { cancelled = true; };
     }
     // Session 103 — CANCELLATION MUST CLEAN ITS HALF-WORK: during a
@@ -3751,7 +4005,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
       // After every garment in this batch has loaded AND shrunk-wrapped
       // (shrinkwrap must see the full body surface, so culling comes last),
       // hide the skin the active wardrobe covers.
-      if (!cancelled) settleLayers(loadedRoot, store, accessories);
+      if (!cancelled) settleLayers(loadedRoot, store, accessories, mixerRef.current);
     });
     return () => {
       cancelled = true;
@@ -4034,7 +4288,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
       // through the top. Same cure as the fit itself: recompute after every
       // refit, against the garments as just re-wrapped and the body as it now
       // is.
-      settleLayers(loadedRootRef.current, store, accessories);
+      settleLayers(loadedRootRef.current, store, accessories, mixerRef.current);
     };
     refitTimerRef.current = setTimeout(runRefit, 300);
     return () => { if (refitTimerRef.current) clearTimeout(refitTimerRef.current); };
@@ -4088,7 +4342,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
     // drag costs one settle, not sixty.
     if (layerSettleTimerRef.current) clearTimeout(layerSettleTimerRef.current);
     layerSettleTimerRef.current = setTimeout(() => {
-      settleLayers(loadedRootRef.current, accessoryMeshesRef.current, accessories);
+      settleLayers(loadedRootRef.current, accessoryMeshesRef.current, accessories, mixerRef.current);
     }, 350);
     // Dependency key covers scale, offset, per-part adjustments, tint AND
     // hidden — all re-apply live on every drag/pick/occlusion change, with

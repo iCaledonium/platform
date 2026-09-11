@@ -375,7 +375,7 @@ export function suspendSkinLayers(root) {
 // along the fabric normal — then smooth the displacements through the strand
 // topology so ribbons bend instead of kinking. Vertices nowhere near fabric —
 // which is almost all of the hair — are untouched.
-const HAIR_CLEARANCE = 0.004;   // hair rests ~4mm proud of cloth, and of skin
+const HAIR_CLEARANCE = 0.012;  // hair floats ~12mm proud of cloth, and of skin (Session 172: 4mm z-fought with the fabric on screen and read as "melting")
 const HAIR_SEARCH = 0.15;       // a strand up to 15cm beneath the cloth is still brought out (parity makes "beneath" reliable; 4 of Lindsey's sat 8-11cm in)
 const HAIR_MAX_LIFT = 0.08;     // and no vertex teleports
 const HAIR_MAX_PASSES = 4;      // lift+smooth rounds before the assertion takes over
