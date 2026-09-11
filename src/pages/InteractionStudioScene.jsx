@@ -762,13 +762,22 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
     });
   }
 
-  function walkTo(fig, x, z, { speed = 0.95 } = {}) {
+  function walkTo(fig, x, z, { speed = 0.95, direct = false } = {}) {
     return new Promise((resolve) => {
       // A second walk order replaces the first rather than queueing behind it:
       // whoever asked last is who you are watching.
       fig.walk?.resolve?.();
       const back = fig.current;
       if (fig.clips.walk) playClip(fig, "walk", { loop: true, fade: 0.35 });
+
+      // `direct` walks OFF the map, deliberately. Sitting into a chair at a
+      // table means entering space the planner rightly calls illegal — the
+      // gap between seat and table is narrower than a body radius. A person
+      // does it anyway; that last metre is a squeeze, not a route.
+      if (direct) {
+        fig.walk = { to: new THREE.Vector3(x, 0, z), queue: [], speed, resolve, back, blocked: false };
+        return;
+      }
 
       // The route is planned HERE, once, against the room as it stands at the
       // moment the step begins — not baked into the script. That is the whole
@@ -890,6 +899,7 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
     // floor that shape has to sit.
     stepSitting(fig, delta);
     stepSettling(fig, delta);
+    stepPulling(fig, delta);
   }
 
   // ── body interactions ─────────────────────────────────────────────────────
@@ -1971,6 +1981,45 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
     };
   }
 
+  // Pulling a chair: the hands take the top of the backrest, then the chair
+  // and the body move as ONE PIECE — same delta to the prop entry (which the
+  // path planner reads), to the rendered group, and to the root. The body
+  // slides backward rather than stepping; honest limitation, the feet do not
+  // animate here yet.
+  function stepPulling(fig, delta) {
+    const st = fig.pulling;
+    if (!st) return;
+    st.t += delta;
+    const e = Math.min(1, st.t / st.dur);
+    // Take hold first, then move: the grab blends in over the first quarter
+    // second, the pull itself runs through the middle, smoothstepped so the
+    // chair leaves and arrives gently rather than being yanked.
+    const grabW = Math.min(1, st.t / 0.25);
+    const m = Math.max(0, Math.min(1, (e - 0.18) / 0.72));
+    const k = m * m * (3 - 2 * m);
+    const dx = st.dir.x * st.dist * k, dz = st.dir.z * st.dist * k;
+    st.prop.x = st.fromProp.x + dx;
+    st.prop.z = st.fromProp.z + dz;
+    if (st.propGroup) st.propGroup.position.set(st.prop.x, 0, st.prop.z);
+    fig.group.position.x = st.fromFig.x + dx;
+    fig.group.position.z = st.fromFig.z + dz;
+    fig.group.updateMatrixWorld(true);
+
+    // Hands on the top corners of the backrest, wherever the chair is NOW.
+    const up = new THREE.Vector3(0, 1, 0);
+    for (const [side, sign] of [["l", 1], ["r", -1]]) {
+      const local = new THREE.Vector3(sign * st.grabHalfWidth, st.grabHeight, -st.backLocalZ);
+      local.applyAxisAngle(up, st.yaw);
+      local.x += st.prop.x; local.z += st.prop.z;
+      solveChain(fig, [side + "_upperarm", side + "_forearm"], side + "_hand", local, grabW, 6);
+    }
+
+    if (st.t >= st.dur) {
+      fig.pulling = null;
+      st.done?.(true);
+    }
+  }
+
   function stepSitting(fig, delta) {
     const st = fig.sitting;
     if (!st) return;
@@ -2139,9 +2188,50 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
             // chair, which is the direction a seated person faces. Derived from
             // the seated heading rather than guessed, so a chair turned any way
             // is still entered from the front.
-            const approachFrom = { x: prop.x + Math.sin(facing) * 0.55,
-                                   z: prop.z + Math.cos(facing) * 0.55 };
-            return walkTo(fig, approachFrom.x, approachFrom.z, { speed: 1.0 })
+            // How far out in front the entry point can be: as far as 0.55m,
+            // but never inside another piece of furniture — a chair pulled
+            // 0.6m from a table leaves the old entry point INSIDE the table,
+            // and a walk ordered to an illegal goal fell back to a straight
+            // line THROUGH the chair (Magnus: "he walked thru the chair and
+            // sat down!").
+            const inReal = (px, pz, o, m = 0.05) =>
+              Math.abs(px - o.x) < o.hw + m && Math.abs(pz - o.z) < o.hd + m;
+            const others = (a.obstacles || []).filter((o) => o.type && o.id !== prop.id);
+            let frontD = 0.55;
+            while (frontD > 0.3 && others.some((o) => inReal(prop.x + Math.sin(facing) * frontD,
+                                                            prop.z + Math.cos(facing) * frontD, o))) {
+              frontD -= 0.05;
+            }
+            const approachFrom = { x: prop.x + Math.sin(facing) * frontD,
+                                   z: prop.z + Math.cos(facing) * frontD };
+
+            // If the straight line from here to the entry point crosses the
+            // chair itself, go around: a PLANNED walk to the chair's side
+            // corner, then the squeeze. Sampled, not solved — twenty points
+            // along the segment against one rectangle.
+            const crossesChair = (() => {
+              const fx = fig.group.position.x, fz = fig.group.position.z;
+              for (let i = 1; i <= 20; i++) {
+                const q = i / 20;
+                if (inReal(fx + (approachFrom.x - fx) * q, fz + (approachFrom.z - fz) * q, prop, 0.12)) return true;
+              }
+              return false;
+            })();
+
+            const approachSeat = () => {
+              if (!crossesChair) return walkTo(fig, approachFrom.x, approachFrom.z, { speed: 1.0 });
+              const across = facing + Math.PI / 2;
+              // Round whichever corner is nearer to where he stands.
+              const side = ((fig.group.position.x - prop.x) * Math.sin(across)
+                          + (fig.group.position.z - prop.z) * Math.cos(across)) >= 0 ? 1 : -1;
+              const corner = {
+                x: prop.x - Math.sin(facing) * 0.05 + Math.sin(across) * side * (t.hw + 0.38),
+                z: prop.z - Math.cos(facing) * 0.05 + Math.cos(across) * side * (t.hw + 0.38),
+              };
+              return walkTo(fig, corner.x, corner.z, { speed: 1.0 })
+                .then(() => walkTo(fig, approachFrom.x, approachFrom.z, { speed: 0.8, direct: true }));
+            };
+            return approachSeat()
               // She arrives looking AT the chair, because she just walked to
               // it. Sitting means turning around first — the seat ends up
               // behind her, and this is the 180 that puts it there.
@@ -2181,6 +2271,47 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
                 playMotion(fig, "sit");
                 return seated;
               });
+          },
+
+          pullProp: (ref, distance = 0.6) => {
+            const prop = findProp(a.obstacles, ref);
+            if (!prop) {
+              console.warn("[rig] pull_prop: no prop", ref, "in", (a.obstacles || []).map(o => o.id));
+              return Promise.resolve({ missing: ref });
+            }
+            const t = PROP_TYPES[prop.type];
+            if (!t) return Promise.resolve({ notPullable: ref });
+            const yaw = prop.yaw ?? ((prop.rot || 0) * Math.PI) / 2;
+            // The way a sitter would face; the pull is the opposite way —
+            // out from under whatever the seat is tucked against.
+            const facing = yaw + (t.seatFacing ?? 0);
+            const bx = Math.sin(facing), bz = Math.cos(facing);
+            const grab = { x: prop.x - bx * (t.hd + 0.42), z: prop.z - bz * (t.hd + 0.42) };
+            return walkTo(fig, grab.x, grab.z, { speed: 0.95 })
+              .then(() => turnTo(fig, Math.atan2(prop.x - fig.group.position.x,
+                                                 prop.z - fig.group.position.z)))
+              .then(() => new Promise((resolve) => {
+                fig.pulling = {
+                  t: 0, dur: 1.1, prop, dist: distance, yaw,
+                  fromProp: { x: prop.x, z: prop.z },
+                  fromFig: { x: fig.group.position.x, z: fig.group.position.z },
+                  dir: { x: -bx, z: -bz },
+                  propGroup: a.furniture?.children?.find?.((g) => g.userData?.propId === prop.id) || null,
+                  grabHeight: (t.h ?? 0.9) - 0.02,
+                  grabHalfWidth: t.hw * 0.65,
+                  backLocalZ: t.hd * 0.82,
+                  done: resolve,
+                };
+              }))
+              // Deliberately NOT pushed back into the page's props state. The
+              // first version did, "so the panel and saves would know" — and
+              // every run then STARTED from where the last one ended: run it
+              // three times and the chair marched 1.8m across the room
+              // (Magnus: "pulls the chair further and further back"). A run
+              // may borrow the scene, never keep it — the pull is a runtime
+              // effect on the planner's map and the meshes; the AUTHORED
+              // position stays what the author placed.
+              ;
           },
 
           standUp: () => {

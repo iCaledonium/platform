@@ -171,6 +171,15 @@ export const STEP_TYPES = {
     fields: ["role", "prop", "distance", "speed"],
     describe: (s) => `${s.role || "?"} walks to the ${s.prop || "?"}`,
   },
+  pull_prop: {
+    label: "Pull out a prop",
+    // Furniture has STATES. A chair tucked under a table offers no seat —
+    // sitting on it starts with pulling it out, the way it does in a kitchen.
+    // The step names the prop for the same reason walk_to_prop does, and the
+    // distance is how far out it comes.
+    fields: ["role", "prop", "distance"],
+    describe: (s) => `${s.role || "?"} pulls out the ${s.prop || "?"}`,
+  },
   sit_on: {
     label: "Sit on a prop",
     // Named furniture again, for the same reason walk_to_prop names it: "sit on
@@ -308,7 +317,7 @@ export function rolesNotAvailable(script, available) {
 // construct. Defaults per type, because the sensible answer differs: a looping
 // clip you want to continue under everything after it, a walk you almost
 // always want to finish.
-const DEFAULT_WAIT = { clip: false, walk_to: true, approach: true, turn_to: true, say: true, walk_to_prop: true, sit_on: true, stand_up: true, interaction: true, reaction: true, space: true, wait: true };
+const DEFAULT_WAIT = { clip: false, walk_to: true, approach: true, turn_to: true, say: true, walk_to_prop: true, pull_prop: true, sit_on: true, stand_up: true, interaction: true, reaction: true, space: true, wait: true };
 
 export function defaultStep(type, role = "a") {
   const base = { id: stepId(), type, wait: DEFAULT_WAIT[type] ?? true };
@@ -316,6 +325,7 @@ export function defaultStep(type, role = "a") {
     case "clip":     return { ...base, role, clip: "idle", loop: true, fade: 0.35 };
     case "walk_to":  return { ...base, role, x: 0, z: 0, speed: 0.95 };
     case "walk_to_prop": return { ...base, role, prop: "", distance: 0.55, speed: 0.95 };
+    case "pull_prop": return { ...base, role, prop: "", distance: 0.6 };
     case "sit_on":   return { ...base, role, prop: "" };
     case "stand_up": return { ...base, role };
     case "approach": return { ...base, role, target: role === "a" ? "b" : "a", distance: 0.7, speed: 0.95 };
@@ -384,6 +394,11 @@ export function normalizeSteps(raw) {
       // not approached to the same coordinate.
       out.distance = num(s.distance, 0.55, 0.1, 4);
       out.speed = num(s.speed, 0.95, 0.1, 3);
+    } else if (type === "pull_prop") {
+      out.role = role();
+      out.prop = String(s.prop || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 40);
+      if (!out.prop) errors.push(`${at}: nothing to pull`);
+      out.distance = num(s.distance, 0.6, 0.2, 1.5);
     } else if (type === "sit_on") {
       out.role = role();
       out.prop = String(s.prop || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 40);
@@ -635,6 +650,11 @@ async function perform(step, rig, sleep, onEvent, ctx = {}) {
   const who = rig.performer?.(step.role);
   if (!who) { onEvent({ type: "warning", text: `no body cast as “${step.role}” — skipping` }); return; }
 
+  if (step.type === "pull_prop") {
+    if (!who.pullProp) { onEvent({ type: "warning", text: "this rig cannot move furniture — skipping" }); return; }
+    return who.pullProp(step.prop, step.distance);
+  }
+
   if (step.type === "sit_on") {
     if (!who.sitOn) { onEvent({ type: "warning", text: "this rig cannot sit anyone down — skipping" }); return; }
     return who.sitOn(step.prop);
@@ -806,6 +826,19 @@ export function estimateTimeline(script, { marks, actionDuration, contactAt, pro
         // time; give it a visible sliver rather than nothing so the step can
         // still be selected and corrected.
         dur = 0.2;
+      }
+    } else if (step.type === "pull_prop" && who) {
+      const pr = propAt?.(step.prop);
+      if (pr) {
+        // Walk behind the backrest, take hold, step back with the chair.
+        const f = (pr.yaw ?? 0) + (pr.seatFacing ?? 0);
+        const gx = pr.x - Math.sin(f) * 0.75, gz = pr.z - Math.cos(f) * 0.75;
+        dur = Math.hypot(gx - who.x, gz - who.z) / 0.95 + TURN_SECONDS + 1.1;
+        who.x = gx - Math.sin(f) * (step.distance || 0.6);
+        who.z = gz - Math.cos(f) * (step.distance || 0.6);
+        who.facing = face(who, pr);
+      } else {
+        dur = 0.3;
       }
     } else if (step.type === "sit_on" && who) {
       const pr = propAt?.(step.prop);

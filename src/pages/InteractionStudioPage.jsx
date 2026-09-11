@@ -201,7 +201,13 @@ export default function InteractionStudioPage() {
     // and resetting first would send them back across the room and answer a
     // different question than the one asked. You selected step 3 to stand them
     // where step 3 finds them; playing the step must not undo that.
-    if (scriptToRun.resetMarks !== false) rig.reset();
+    if (scriptToRun.resetMarks !== false) {
+      rig.reset();
+      // The scene from the top includes the FURNITURE: a pull_prop moved the
+      // chair on the rig's map last run, and without this the next run
+      // starts from the moved room instead of the authored one.
+      rig.setObstacles?.(props);
+    }
     const handle = runScript(scriptToRun, {
       // The studio owns both figures, and says so. An encounter's rig will
       // declare ["a"] and the runner will refuse anything that drives the
@@ -645,7 +651,7 @@ export default function InteractionStudioPage() {
                 <button style={{ ...btn(running ? "plain" : "primary") }} onClick={running ? stop : run}>
                   {running ? "Stop" : "▶ Run script"}
                 </button>
-                <button style={btn()} onClick={() => rigRef.current?.reset?.()}>Reset marks</button>
+                <button style={btn()} onClick={() => { rigRef.current?.reset?.(); rigRef.current?.setObstacles?.(props); }}>Reset marks</button>
                 <select
                   value=""
                   style={{ ...btn(placing ? "primary" : "plain"), width: 108 }}
