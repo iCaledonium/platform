@@ -375,11 +375,13 @@ export function suspendSkinLayers(root) {
 // along the fabric normal — then smooth the displacements through the strand
 // topology so ribbons bend instead of kinking. Vertices nowhere near fabric —
 // which is almost all of the hair — are untouched.
-const HAIR_CLEARANCE = 0.012;  // hair floats ~12mm proud of cloth, and of skin (Session 172: 4mm z-fought with the fabric on screen and read as "melting")
+const HAIR_CLEARANCE = 0.02;   // hair floats ~2cm proud of cloth (and 2cm out of skin) - a visible gap, not a decal (Session 172: 4mm z-fought with the fabric on screen and read as "melting")
 const HAIR_SEARCH = 0.15;       // a strand up to 15cm beneath the cloth is still brought out (parity makes "beneath" reliable; 4 of Lindsey's sat 8-11cm in)
 const HAIR_MAX_LIFT = 0.08;     // and no vertex teleports
 const HAIR_MAX_PASSES = 4;      // lift+smooth rounds before the assertion takes over
 const HAIR_FEATHER = 4;         // neighbour rings relaxed around a pinned vertex
+const HAIR_ENVELOPE_RINGS = 8;  // a cloth lift spreads this many rings along the strand ...
+const HAIR_ENVELOPE_DECAY = 0.85; // ... shrinking by this much per ring, so a LOCK rises off the fabric intact
 const HAIR_BODY_SEARCH = 0.05;  // no skin within 5cm means the vertex cannot be inside the body
 
 // Session 171 (Magnus: "assert that the hair doesn't melt into the garment and
@@ -503,11 +505,24 @@ export function fitOuterLayers(root, store, body = null) {
   // and a vertex lifted out of the chest is re-measured against the blouse on
   // the next pass.
   const lift = new THREE.Vector3();
-  const evaluate = (p) => {
+  const away = new THREE.Vector3();
+  // mode "normal": lift a beneath-cloth vertex to the NEAREST fabric point
+  // along that face's normal, oriented away from the body - a lock that
+  // entered the blouse behind the shoulder comes out over the back, one in
+  // front comes out over the chest, and nothing is dragged sideways onto the
+  // yoke (Session 172: the radial exit did exactly that, smearing locks onto
+  // the yoke where Magnus circled them). mode "exit": the radial ray's last
+  // crossing, used once the normal lift has had its passes, because inside a
+  // pleat the nearest face can be a fold wall and the normal lift can
+  // oscillate there; the exit lift always converges. clearScale ramps the
+  // float down next to the scalp so a root-pinned card cannot pivot out
+  // like a flag (seen live at 2cm).
+  const evaluate = (p, mode, clearScale) => {
+    const clear = HAIR_CLEARANCE * clearScale;
     if (bbvh && bbvh.closestPointToPoint(p, bt, 0, HAIR_BODY_SEARCH) && insideBody(p)) {
       const fn = bodyNormal(bt.faceIndex);
       if (fn) {
-        lift.copy(bt.point).addScaledVector(fn, HAIR_CLEARANCE).sub(p);
+        lift.copy(bt.point).addScaledVector(fn, clear).sub(p);
         if (lift.length() > HAIR_MAX_LIFT) lift.setLength(HAIR_MAX_LIFT);
         return 1;
       }
@@ -530,7 +545,18 @@ export function fitOuterLayers(root, store, body = null) {
         let crossings = 0, far = null;
         for (const x of hits) { if (x.distance <= 1e-6) continue; crossings++; if (!far || x.distance > far.distance) far = x; }
         if ((crossings & 1) === 1 && far && far.distance <= HAIR_SEARCH) {
-          lift.copy(far.point).addScaledVector(ray.direction, HAIR_CLEARANCE).sub(p);
+          if (mode === "normal" && cbvh.closestPointToPoint(p, hit, 0, HAIR_SEARCH)) {
+            const fn = clothNormal(hit.faceIndex);
+            // orient away from the body when the body is known; the radial
+            // orientation inside clothNormal is the fallback
+            if (bbvh && bbvh.closestPointToPoint(hit.point, bt, 0, 0.5)) {
+              away.subVectors(hit.point, bt.point);
+              if (away.lengthSq() > 1e-10 && fn.dot(away) < 0) fn.negate();
+            }
+            lift.copy(hit.point).addScaledVector(fn, clear).sub(p);
+          } else {
+            lift.copy(far.point).addScaledVector(ray.direction, clear).sub(p);
+          }
           if (lift.length() > HAIR_MAX_LIFT) lift.setLength(HAIR_MAX_LIFT);
           return 2;
         }
@@ -543,10 +569,10 @@ export function fitOuterLayers(root, store, body = null) {
       // clearance from each oscillates forever (measured live: 1616 of 1623
       // "still beneath" after the raw snap were exactly these). Hair resting
       // on cloth is not hair melting into it.
-      if (cbvh.closestPointToPoint(p, hit, 0, HAIR_CLEARANCE)) {
+      if (cbvh.closestPointToPoint(p, hit, 0, clear)) {
         const fn = clothNormal(hit.faceIndex);
         if (fn.dot(tmp.subVectors(p, hit.point)) < 0) fn.negate();
-        lift.copy(fn).multiplyScalar(HAIR_CLEARANCE - hit.distance);
+        lift.copy(fn).multiplyScalar(clear - hit.distance);
         return 3;
       }
     }
@@ -581,15 +607,20 @@ export function fitOuterLayers(root, store, body = null) {
       }
     }
 
+    // the float ramps from 40% at the skull base (lowest scalp root) to 100%
+    // ten centimetres below it
+    let scalpBaseY = null;
+    for (let i = 0; i < N; i++) if (scalp[i]) { const y = pos.getY(i); if (scalpBaseY === null || y < scalpBaseY) scalpBaseY = y; }
+    const clearScaleAt = (y) => scalpBaseY === null ? 1 : Math.min(1, Math.max(0.4, 0.4 + 0.6 * (scalpBaseY - y) / 0.10));
     const disp = new Float32Array(N * 3);
     const kindOf = new Uint8Array(N);   // 1 skin, 2 cloth (violations), 3 clearance nudge
-    const computeField = () => {
+    const computeField = (mode = "exit") => {
       disp.fill(0); kindOf.fill(0);
       let skin = 0, cloth = 0, near = 0;
       for (let i = 0; i < N; i++) {
         if (scalp[i]) continue;
         v.set(pos.getX(i), pos.getY(i), pos.getZ(i));
-        const kind = evaluate(v);
+        const kind = evaluate(v, mode, clearScaleAt(v.y));
         if (!kind) continue;
         disp[i * 3] = lift.x; disp[i * 3 + 1] = lift.y; disp[i * 3 + 2] = lift.z;
         kindOf[i] = kind;
@@ -620,6 +651,39 @@ export function fitOuterLayers(root, store, body = null) {
       for (let i = 0; i < N; i++) if (scalp[i]) { f[i * 3] = 0; f[i * 3 + 1] = 0; f[i * 3 + 2] = 0; }
       return f;
     };
+    // Session 172 - an ENVELOPE lift was tried here (each vertex takes the
+    // largest radial lift within HAIR_ENVELOPE_RINGS, decaying per ring, so a
+    // lock rises off the fabric as a whole). Measured live it satisfied the
+    // assertion (idle residual 73) but the sideways radial pushed whole locks
+    // out past the shoulders into wings - visibly worse than the flat lock it
+    // was meant to fix. Kept, unused, as the record of that; the per-vertex
+    // lift with a 2cm float is what runs.
+    const enveloped = (field) => {
+      if (!adj) return field;
+      let mag = new Float32Array(N);
+      for (let i = 0; i < N; i++) if (kindOf[i] === 2) mag[i] = Math.hypot(field[i * 3], field[i * 3 + 1], field[i * 3 + 2]);
+      for (let r = 0; r < HAIR_ENVELOPE_RINGS; r++) {
+        const next = mag.slice();
+        for (let i = 0; i < N; i++) {
+          if (scalp[i]) continue;
+          let m = mag[i];
+          for (const j of adj[i]) { const c = mag[j] * HAIR_ENVELOPE_DECAY; if (c > m) m = c; }
+          next[i] = m;
+        }
+        mag = next;
+      }
+      const out = field.slice();
+      for (let i = 0; i < N; i++) {
+        if (mag[i] <= 0 || scalp[i] || kindOf[i] === 1) continue;
+        h.set(pos.getX(i), 0, pos.getZ(i));
+        if (h.lengthSq() <= 1e-8) continue;
+        h.normalize();
+        const own = Math.hypot(out[i * 3], out[i * 3 + 1], out[i * 3 + 2]);
+        const m = Math.max(mag[i], own);
+        out[i * 3] = h.x * m; out[i * 3 + 1] = h.y * m; out[i * 3 + 2] = h.z * m;
+      }
+      return out;
+    };
     const apply = (field) => {
       let moved = 0;
       for (let i = 0; i < N; i++) {
@@ -631,18 +695,21 @@ export function fitOuterLayers(root, store, body = null) {
       return moved;
     };
 
-    let counts = computeField();
+    let counts = computeField("normal");
     const initial = counts;
     if (!initial.total) continue;
-    const trace = [`${initial.cloth}c/${initial.skin}s (+${initial.near} within clearance, nudged only)`];   // per-stage counts, for the log line
+    const trace = [`${initial.cloth}c/${initial.skin}s (+${initial.near} within clearance, nudged only)`];
 
-    // 1. Converge: lift, smooth, apply, re-measure.
+    // 1. Converge: lift, smooth, apply, re-measure. The first two passes lift
+    //    toward the nearest fabric (mode "normal"); the rest use the radial
+    //    exit, which always converges.
     let passes = 0;
     while (counts.total > 0 && passes < HAIR_MAX_PASSES) {
-      const moved = apply(smoothed(disp));
+      const moved = apply(smoothed(disp));   // (the envelope variant spread locks into wings over the shoulders - see enveloped)
       passes++;
-      counts = computeField();
-      trace.push(`p${passes}:${moved}m>${counts.cloth}c/${counts.skin}s`);
+      const mode = passes < 2 ? "normal" : "exit";
+      counts = computeField(mode);
+      trace.push(`p${passes}:${moved}m>${counts.cloth}c/${counts.skin}s${mode === "normal" ? "n" : "x"}`);
     }
 
     // 2. Assert: pin the leftovers to their exact lift, feather the free
