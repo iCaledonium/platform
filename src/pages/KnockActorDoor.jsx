@@ -70,6 +70,15 @@ export default function KnockActorDoor() {
         }
         if (!actor) { setProblem("actor"); return; }
 
+        // The player's own body, for the third-person camera.
+        //
+        // NOT from /api/me: that is the platform account record and carries no
+        // simulator model columns, so reading user.runtime_glb_url there was
+        // always undefined and the scene silently fell back to a proxy. The
+        // models live on the presence actors — which is where the actor's own
+        // glbUrl below comes from — and the player is an actor in this world
+        // like any other. Runtime build only, deliberately: the raw export is
+        // ~100 MB and will not cross the tunnel.
         const homeId = actor.home_place_id;
         const location =
           locations.find(l => homeId && (l.place_id === homeId || l.id === homeId)) ||
@@ -81,6 +90,12 @@ export default function KnockActorDoor() {
         if (!location) { setProblem("door"); return; }
 
         const playerActorId = user?.worlds?.find(w => w.world_id === worldId)?.actor_id;
+
+        let playerActor = null;
+        for (const l of locations) {
+          const hit = (l.actors || []).find(a => a.actor_id === playerActorId);
+          if (hit) { playerActor = hit; break; }
+        }
 
         // Session 153 — always ask the server; never infer from the tab.
         //
@@ -143,6 +158,7 @@ export default function KnockActorDoor() {
           world,
           user,
           actor,
+          playerActor,
           sceneData: { location, encounter_id, trigger: "knock", mode: "scene", rejoined },
         });
       } catch {
@@ -235,7 +251,7 @@ export default function KnockActorDoor() {
       // Runtime build ONLY. The raw player export is ~93 MB against her
       // 26 MB runtime, and fetching it from the page fails outright —
       // third person runs camera-only rather than hang on it.
-      playerGlbUrl={ctx.user?.runtime_glb_url || null}
+      playerGlbUrl={ctx.playerActor?.runtime_glb_url || null}
       onLeave={handleLeave}
     />
   );

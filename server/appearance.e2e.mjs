@@ -16,6 +16,7 @@
 
 import Database from "better-sqlite3";
 import crypto from "crypto";
+import { summariseActorMedia } from "./actor-media-audit.js";
 import os from "os";
 import path from "path";
 // The composer under test on the server side is the one the wizard ships, so
@@ -56,6 +57,37 @@ function cleanup() {
     for (const id of createdActors) {
       for (const t of ["actor_psychology","actor_big5","actor_disc","actor_hds","actor_lifestyle","actor_economic"]) {
         db.prepare(`DELETE FROM ${t} WHERE actor_id = ?`).run(id);
+      }
+      // conduct-watch signal 7 -- an e2e harness is an actor delete path too, and
+      // an unattributed delete here is exactly as unreadable after the fact as one
+      // through the API. Same row the API writes (see recordActorDeletion in
+      // server/index.js) and same transaction as the delete: `via` names the
+      // script, `acting_user_id` names the account whose token it minted.
+      const before = db.prepare(`SELECT name, owner_id, age, status, media_folder FROM actors WHERE id = ?`).get(id);
+      // 2026-09-10 (conduct-watch): the ROWS, not just the count. depicts and
+      // subject_authorised die with actor_media, so this read is the only
+      // chance to freeze what the media declared onto the tombstone.
+      const mediaRows = db.prepare(`SELECT id, media_type, filename, depicts, subject_authorised
+                                      FROM actor_media WHERE actor_id = ?`).all(id);
+      const mediaSummary = summariseActorMedia(mediaRows);
+      // 2026-09-09: written BEFORE the DELETE. `actors` now carries an AFTER
+      // DELETE trigger (server/db.js) that writes an UNATTRIBUTED fallback row
+      // when no audited path claimed the delete, and it can only see audit rows
+      // that already exist when the DELETE runs -- recording afterwards would
+      // leave this harness's own cleanup looking unattributed on the board.
+      if (before) {
+        db.prepare(`INSERT INTO actor_deletions
+            (id, actor_id, actor_name, owner_id, acting_user_id, acting_email, via,
+             actor_status, media_folder, media_count, actor_age,
+             media_depicts, media_subject_authorised, media_manifest, deleted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          crypto.randomUUID(), id, before?.name ?? null, before?.owner_id ?? null,
+          OWNER, db.prepare(`SELECT email FROM users WHERE id = ?`).get(OWNER)?.email ?? null,
+          "server/appearance.e2e.mjs", before?.status ?? null,
+          before?.media_folder ?? null, mediaRows.length, before?.age ?? null,
+          mediaSummary.depicts, mediaSummary.subjectAuthorised, mediaSummary.manifest,
+          now(),
+        );
       }
       db.prepare(`DELETE FROM actors WHERE id = ?`).run(id);
     }

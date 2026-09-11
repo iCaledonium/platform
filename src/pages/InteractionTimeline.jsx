@@ -324,7 +324,7 @@ export default function InteractionTimeline({ steps, cameras, selected, selected
                      color: "#fff", fontSize: 10, lineHeight: "22px", padding: "0 8px",
                      whiteSpace: "nowrap", overflow: "hidden",
                      border: selectedCam === sh.index ? "2px solid #2f2c28" : "1px solid rgba(0,0,0,.15)",
-                     cursor: sh.index >= 0 ? "pointer" : "default", position: "absolute",
+                     cursor: sh.index >= 0 ? "pointer" : "default",
                    }}>
                 {sh.camera ? describeCamera(sh.camera) : ""}
                 {selectedCam === sh.index && sh.index >= 0 && (

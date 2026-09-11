@@ -1095,6 +1095,37 @@ const ACCESSORY_SHRINKWRAP = {
   // that are already outside the body, so the drape survives; the bust region
   // gets pushed out to surface+2.5mm like every other fitted garment.
   pathFragments: ["/underwear/", "/legs/", "/feet/", "/torso/top/top_long_angie_top"],
+  // Session 157 — the /torso/ retraction above was written as a FOLDER
+  // category, and a shirt is not filed under /torso/. "Basic Shirt" lives at
+  // /underwear/top/underwear_shirt_basic_shirt, so it matches "/underwear/"
+  // and gets the exact resolver that was pulled from tops for tearing their
+  // shoulders open — confirmed live on this body: black shirt, shoulders and
+  // armpit ripped into shards, the same picture the Angie top produced.
+  //
+  // Excluded by name rather than by narrowing "/underwear/" to
+  // "/underwear/bottom/", because that would also drop bras — and a bra band
+  // is one of the two garments the band guard below was built for, so it
+  // genuinely wants this pass. Tightness is not derivable from the folder,
+  // which is the whole reason this config lists specific garments; this is the
+  // same admission in the other direction.
+  // Session 162 - exclusion LIFTED, and the reason it existed is now handled
+  // upstream. The shirt was excluded because the resolver tore its shoulders
+  // open, but that tearing was the resolver being asked to move vertices
+  // CENTIMETRES: clothing carries no morph targets, so it lagged the morphed
+  // body wholesale. Garments now carry the body's proportion morphs first (see
+  // transferBodyMorphToGarment), leaving shrinkwrap the residual millimetres it
+  // was actually built for.
+  //
+  // Excluding it instead left the body protruding straight through the fabric -
+  // skin islands across the entire torso, confirmed live on this avatar - which
+  // is exactly what the note above predicts: "Culling cannot fix a garment the
+  // body protrudes through at its own edge - only fitting can."
+  //
+  // If the shoulders tear again after this, put the path back and SAY SO in the
+  // comment: that would mean the tearing has a second cause independent of
+  // displacement size (the pleat-parity misread), and the answer is a tightness
+  // gate, not this list.
+  excludeFragments: [],
   clearanceMeters: 0.0025, // fabric rests ~2.5mm above the skin
   maxSearchMeters: 0.12,   // vertices with no body surface within 12cm are ignored
   // Session 152, second iteration — direction, not distance, was the disease.
@@ -1147,6 +1178,10 @@ const ACCESSORY_SHRINKWRAP = {
   // correctness beats cosmetics for the last few vertices — and the
   // result is logged as an explicit ASSERT PASS/ENFORCED line.
   maxPasses: 4,
+  // Session 170 - how many neighbour rings the finisher feathers over. See the
+  // "pinned feather" note in shrinkwrapToBody: this is what replaced the raw,
+  // unsmoothed hard-snap that corrugated cup edges.
+  featherIterations: 4,
 };
 
 // Skeleton-landmark registration (Session 101, v7 of the fitting
@@ -1178,10 +1213,6 @@ const ACCESSORY_REGISTRATION = {
 // `mainSkinnedMesh` used for skeleton/bindMatrix reference is simply the
 // FIRST SkinnedMesh in traversal order — "Genesis_9_Eyelashes_Mesh",
 // 2028 verts — which is perfectly fine for binding (all 13 meshes share
-  // Session 170 - how many neighbour rings the finisher feathers over. See the
-  // "pinned feather" note in shrinkwrapToBody: this is what replaced the raw,
-  // unsmoothed hard-snap that corrugated cup edges.
-  featherIterations: 4,
 // one skeleton) but catastrophically wrong as a "body surface": the
 // shrinkwrap parity test was asking whether underwear vertices sit
 // inside the EYELASHES, answered 0/N every time, and silently no-opped
@@ -1223,6 +1254,27 @@ function findBodySkinMesh(referenceMesh) {
 // shells are separate meshes NOT included here, and the skin has holes
 // at the head — both irrelevant for below-neck garments with the
 // horizontal parity rays.
+// Session 170 (Magnus: "something is really wrong with the bra fitting") —
+// the body's LIVE index is not the body. bodyLayers culls skin under fabric
+// by REWRITING geometry.index, so once a garment is worn the skin triangles
+// under it are gone from the live index — and both merges below built their
+// collision surface from exactly that culled index. Measured live on Frida's
+// bra: Genesis9_4 carried 18432 live vs 22008 intact index entries (1192
+// triangles missing, 481 orphaned vertices, all in the bust). Against that
+// holed surface the 3-ray parity test found 2 of 1927 cup vertices inside
+// instead of 399, so the shrinkwrap pushed nothing, the cups sat up to 37mm
+// inside the breast, and the culled ring showed through as a sawtooth edge.
+// Every rebuild after the first culling pass hit this (body morph refit,
+// manual-fit re-wrap, morph transfer); only the very first fit on a fresh
+// load ever saw the whole body. The intact index is captured at load
+// (fullIndex, Session 162) — build from it, never from the live one.
+function intactBodyIndex(srcGeom) {
+  const full = srcGeom.userData && srcGeom.userData.fullIndex;
+  const liveCount = srcGeom.index ? srcGeom.index.count : 0;
+  if (ArrayBuffer.isView(full) && full.length >= liveCount && full.length % 3 === 0) return full;
+  return srcGeom.index ? srcGeom.index.array : null;
+}
+
 function getBodySurfaceBVH(referenceMesh) {
   const largest = findBodySkinMesh(referenceMesh);
   const bodyParent = largest.parent || largest;
@@ -1254,27 +1306,6 @@ function getBodySurfaceBVH(referenceMesh) {
   const mergedIndex = new Uint32Array(totalIndices);
   let vOff = 0;
   let iOff = 0;
-// Session 170 (Magnus: "something is really wrong with the bra fitting") —
-// the body's LIVE index is not the body. bodyLayers culls skin under fabric
-// by REWRITING geometry.index, so once a garment is worn the skin triangles
-// under it are gone from the live index — and both merges below built their
-// collision surface from exactly that culled index. Measured live on Frida's
-// bra: Genesis9_4 carried 18432 live vs 22008 intact index entries (1192
-// triangles missing, 481 orphaned vertices, all in the bust). Against that
-// holed surface the 3-ray parity test found 2 of 1927 cup vertices inside
-// instead of 399, so the shrinkwrap pushed nothing, the cups sat up to 37mm
-// inside the breast, and the culled ring showed through as a sawtooth edge.
-// Every rebuild after the first culling pass hit this (body morph refit,
-// manual-fit re-wrap, morph transfer); only the very first fit on a fresh
-// load ever saw the whole body. The intact index is captured at load
-// (fullIndex, Session 162) — build from it, never from the live one.
-function intactBodyIndex(srcGeom) {
-  const full = srcGeom.userData && srcGeom.userData.fullIndex;
-  const liveCount = srcGeom.index ? srcGeom.index.count : 0;
-  if (ArrayBuffer.isView(full) && full.length >= liveCount && full.length % 3 === 0) return full;
-  return srcGeom.index ? srcGeom.index.array : null;
-}
-
   for (const p of parts) {
     const srcGeom = p.geometry;
     const base = srcGeom.attributes.position;
@@ -1844,41 +1875,9 @@ function shrinkwrapToBody(accessoryMesh, mainSkinnedMesh, accessoryUrl, opts = {
   // verification pass reports (and raw-snaps) anything that still violates,
   // so nothing this adds can end inside the body.
   let enforced = 0;
+  let feathered = 0;
   if (residual > 0) {
     const { violations } = computeField(disp);
-    for (let i = 0; i < posAttr.count; i++) {
-      const dx = disp[i * 3], dy = disp[i * 3 + 1], dz = disp[i * 3 + 2];
-      if (dx !== 0 || dy !== 0 || dz !== 0) {
-        posAttr.setXYZ(i, posAttr.getX(i) + dx, posAttr.getY(i) + dy, posAttr.getZ(i) + dz);
-        rawSnapped++;
-      }
-    }
-    if (rawSnapped && !opts.quiet) console.log(`[MiniGlbViewer] Shrinkwrap feather: ${rawSnapped} vertex(es) still violated after feathering "${accessoryMesh.name}" and were snapped raw.`);
-    residual = check.violations;
-  }
-  posAttr.needsUpdate = true;
-
-  const status = (residual === 0 && enforced === 0 ? "ASSERT PASS (converged)" : (enforced > 0 ? `ASSERT ENFORCED (${enforced} vertices pinned to clearance, ${feathered} neighbours feathered, after ${passes} smoothed passes)` : "ASSERT PASS"))
-    + (buried > 0 ? ` — ${buried} vertex(es) left buried in flesh (push exceeded ${(ACCESSORY_SHRINKWRAP.maxResolveMeters * 100).toFixed(1)}cm cap)` : "");
-  if (!opts.quiet) console.log(`[MiniGlbViewer] Shrinkwrap v6: "${accessoryMesh.name}" (${accessoryUrl}) — initial violations ${firstViolations}/${posAttr.count} (max push ${(firstMaxPush * 1000).toFixed(1)}mm), ${passes} resolve+smooth pass(es), ${status}, clearance ${(clearance * 1000).toFixed(1)}mm, ${(performance.now() - t0).toFixed(0)}ms.`);
-}
-
-// Applies a scale AND a translation offset to an accessory mesh's
-// geometry, always computing from the TRUE baseline (pre-scale)
-// positions passed in, never from whatever the geometry's current,
-// possibly-already-transformed state is — that's what makes this safe
-// to call repeatedly on every slider drag without compounding
-// transforms. Deliberately operates on raw vertex data (not the mesh's
-// own .position/.scale transforms — those must stay identity for the
-// skeletal-binding math), consistent with how this always worked.
-// Offset is in model space, native units (meters): Y up/down,
-// Z front/back, X sideways. Added AFTER scaling, as a constant shift
-// of the whole garment — the tool for placement fixes (e.g. a crotch
-// hem riding too high) that scaling around the bbox center can never
-// express. Name kept as applyAccessoryScale (working function, never
-  let feathered = 0;
-// renamed); offset defaults to zero so every existing call stays valid.
-export function applyAccessoryScale(mesh, originalPositions, center, scale, offset = { x: 0, y: 0, z: 0 }, rotation = { x: 0, y: 0, z: 0 }) {
     const pinned = new Uint8Array(posAttr.count);
     for (let i = 0; i < posAttr.count; i++) {
       if (disp[i * 3] !== 0 || disp[i * 3 + 1] !== 0 || disp[i * 3 + 2] !== 0) { pinned[i] = 1; enforced++; }
@@ -1911,6 +1910,38 @@ export function applyAccessoryScale(mesh, originalPositions, center, scale, offs
     // so the guarantee is unchanged - this should be zero or near it.
     const check = computeField(disp);
     let rawSnapped = 0;
+    for (let i = 0; i < posAttr.count; i++) {
+      const dx = disp[i * 3], dy = disp[i * 3 + 1], dz = disp[i * 3 + 2];
+      if (dx !== 0 || dy !== 0 || dz !== 0) {
+        posAttr.setXYZ(i, posAttr.getX(i) + dx, posAttr.getY(i) + dy, posAttr.getZ(i) + dz);
+        rawSnapped++;
+      }
+    }
+    if (rawSnapped && !opts.quiet) console.log(`[MiniGlbViewer] Shrinkwrap feather: ${rawSnapped} vertex(es) still violated after feathering "${accessoryMesh.name}" and were snapped raw.`);
+    residual = check.violations;
+  }
+  posAttr.needsUpdate = true;
+
+  const status = (residual === 0 && enforced === 0 ? "ASSERT PASS (converged)" : (enforced > 0 ? `ASSERT ENFORCED (${enforced} vertices pinned to clearance, ${feathered} neighbours feathered, after ${passes} smoothed passes)` : "ASSERT PASS"))
+    + (buried > 0 ? ` — ${buried} vertex(es) left buried in flesh (push exceeded ${(ACCESSORY_SHRINKWRAP.maxResolveMeters * 100).toFixed(1)}cm cap)` : "");
+  if (!opts.quiet) console.log(`[MiniGlbViewer] Shrinkwrap v6: "${accessoryMesh.name}" (${accessoryUrl}) — initial violations ${firstViolations}/${posAttr.count} (max push ${(firstMaxPush * 1000).toFixed(1)}mm), ${passes} resolve+smooth pass(es), ${status}, clearance ${(clearance * 1000).toFixed(1)}mm, ${(performance.now() - t0).toFixed(0)}ms.`);
+}
+
+// Applies a scale AND a translation offset to an accessory mesh's
+// geometry, always computing from the TRUE baseline (pre-scale)
+// positions passed in, never from whatever the geometry's current,
+// possibly-already-transformed state is — that's what makes this safe
+// to call repeatedly on every slider drag without compounding
+// transforms. Deliberately operates on raw vertex data (not the mesh's
+// own .position/.scale transforms — those must stay identity for the
+// skeletal-binding math), consistent with how this always worked.
+// Offset is in model space, native units (meters): Y up/down,
+// Z front/back, X sideways. Added AFTER scaling, as a constant shift
+// of the whole garment — the tool for placement fixes (e.g. a crotch
+// hem riding too high) that scaling around the bbox center can never
+// express. Name kept as applyAccessoryScale (working function, never
+// renamed); offset defaults to zero so every existing call stays valid.
+export function applyAccessoryScale(mesh, originalPositions, center, scale, offset = { x: 0, y: 0, z: 0 }, rotation = { x: 0, y: 0, z: 0 }) {
   const posAttr = mesh.geometry.attributes.position;
   // Rotation is given in DEGREES (UI-friendly), applied around this
   // part's own center, AFTER scale and BEFORE offset: scale sizes the
@@ -2501,14 +2532,27 @@ function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loade
         // refit effect restores this and re-runs shrinkwrap whenever the
         // body morphs change, so garments always wear the CURRENT body.
         const prefitPositions = capturePositions(accessoryMesh.geometry.attributes.position);
-        const shrinkwrapEligible = ACCESSORY_SHRINKWRAP.pathFragments.some((f) => accessoryUrl.includes(f));
+        const shrinkwrapEligible =
+          ACCESSORY_SHRINKWRAP.pathFragments.some((f) => accessoryUrl.includes(f)) &&
+          !(ACCESSORY_SHRINKWRAP.excludeFragments || []).some((f) => accessoryUrl.includes(f));
 
         // Shrinkwrap pass (see ACCESSORY_SHRINKWRAP above) — body-aware
         // penetration resolution, per vertex, against the actual body
         // surface. Runs before the baseline capture below so the fitted
         // shape IS the baseline every slider works from.
+        // Session 162 - proportion morphs first (see transferBodyMorphToGarment),
+        // so shrinkwrap below only ever resolves the residual millimetres.
+        // AFTER the prefit capture above deliberately: prefit must stay
+        // body-shape-independent so the refit effect can re-transfer for a
+        // NEW body instead of compounding onto an old one.
+        transferBodyMorphToGarment(accessoryMesh, mainSkinnedMesh, accessoryUrl);
         if (shrinkwrapEligible) {
           shrinkwrapToBody(accessoryMesh, mainSkinnedMesh, accessoryUrl);
+        }
+        // Seam weld runs LAST, after every stage that moves vertices.
+        {
+          const welded = weldGarmentSeams(accessoryMesh, prefitPositions, accessoryUrl);
+          if (welded) console.log(`[MiniGlbViewer] Seam weld: ${welded} coincident vertex group(s) snapped back together on "${accessoryMesh.name}" (${accessoryUrl}).`);
         }
 
         // Remap skinIndex in place — 4 bone influences per vertex, values
@@ -3080,6 +3124,36 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
         if (!mounted) return;
         loadedRoot = gltf.scene;
         loadedRootRef.current = loadedRoot;
+        // Session 162 - record every body mesh's intact index AT LOAD, before
+        // anything can cull it.
+        //
+        // fullIndex used to be written only by settleLayers, as a side effect of
+        // culling. Measured live during an export: EVERY body mesh reported
+        // "full=none isView=false", so suspendSkinLayers had nothing to restore
+        // and silently did nothing - before-suspend and after-suspend snapshots
+        // were identical - and the editable export serialised the culled body.
+        // That is how the holes got baked in, and why recovering a round-tripped
+        // fullIndex did not help: the property was never set in the first place.
+        //
+        // The mask's own log shows why it cannot be trusted to set it: the pass
+        // ran three times, once "across 3 body mesh(es)" and twice "across 0",
+        // so which meshes carry the property depends on which run touched them.
+        // Capturing here makes it unconditional and independent of that.
+        try {
+          let captured = 0;
+          loadedRoot.traverse((o) => {
+            if (!o.isSkinnedMesh || (o.userData && o.userData.isAccessoryMesh)) return;
+            const g = o.geometry;
+            if (!g || !g.index) return;
+            if (!ArrayBuffer.isView(g.userData.fullIndex)) {
+              g.userData.fullIndex = g.index.array.slice();
+              captured++;
+            }
+          });
+          if (captured) console.log(`[MiniGlbViewer] fullIndex captured at load for ${captured} body mesh(es) - the intact index, before any culling.`);
+        } catch (e) {
+          console.error("[MiniGlbViewer] could not capture fullIndex at load:", e);
+        }
         scene.add(loadedRoot);
 
         // Session 142 — STRIP BAKED-IN WARDROBE AT LOAD. Root cause of
@@ -3871,17 +3945,45 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
   const layerSettleTimerRef = useRef(null);
   useEffect(() => {
     if (refitTimerRef.current) clearTimeout(refitTimerRef.current);
-    refitTimerRef.current = setTimeout(() => {
+    // Session 162 - RETRY instead of giving up.
+    //
+    // This fires 300ms after the body changes. On a draft load the body (45MB)
+    // and the garments are usually still loading at that moment, so it hit the
+    // guard below and returned - and never ran again, because the effect only
+    // re-fires when the body values change AGAIN. The garments kept the fit
+    // they were given for the PREVIOUS body, which is the tearing the user
+    // sees: shorts shaped for one body on a body that has since moved.
+    //
+    // Reloading the page fixed it every time, because a reload runs the whole
+    // sequence in order from scratch - body, then garments, then transfer,
+    // shrinkwrap and weld against the body actually present. Nobody would
+    // think to reload, so the normal flow has to reach the same end state.
+    let refitAttempts = 0;
+    const runRefit = () => {
       const mainMesh = mainMeshRef.current;
       const store = accessoryMeshesRef.current;
       const urls = Object.keys(store);
-      if (!mainMesh || urls.length === 0) return;
+      if (!mainMesh || urls.length === 0) {
+        // Not ready yet - not "nothing to do". Keep looking for up to ~30s,
+        // which comfortably covers a large body plus a full wardrobe.
+        if (refitAttempts++ < 60) {
+          refitTimerRef.current = setTimeout(runRefit, 500);
+        } else {
+          console.warn("[MiniGlbViewer] Body refit: gave up waiting for the body/garments to be ready after ~30s - garments may still be fitted to a previous body.");
+        }
+        return;
+      }
+      refitAttempts = 0;
 
       // Invalidate the BVH cache — next getBodySurfaceBVH rebuilds it
       // from the body's CURRENT morph influences.
       const largest = findBodySkinMesh(mainMesh);
       const parent = largest.parent || largest;
       delete parent.userData.shrinkwrapBVH;
+      // Session 162 - the morph-transfer binding ages exactly like the BVH:
+      // both describe the body as it was. Drop it or garments carry the
+      // PREVIOUS body's displacement.
+      delete parent.userData.morphTransfer;
 
       const t0 = performance.now();
       let refitted = 0;
@@ -3918,7 +4020,8 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
       // refit, against the garments as just re-wrapped and the body as it now
       // is.
       settleLayers(loadedRootRef.current, store, accessories);
-    }, 300);
+    };
+    refitTimerRef.current = setTimeout(runRefit, 300);
     return () => { if (refitTimerRef.current) clearTimeout(refitTimerRef.current); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bodyTorsoLength, bodyArmsLength, bodyLegsLength, bodyHeight, JSON.stringify(extraMorphValues)]);
@@ -3972,8 +4075,12 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
     layerSettleTimerRef.current = setTimeout(() => {
       settleLayers(loadedRootRef.current, accessoryMeshesRef.current, accessories);
     }, 350);
-    // Dependency key covers scale, offset, per-part adjustments AND
-    // tint — all re-apply live on every drag/pick, with no model reload.
+    // Dependency key covers scale, offset, per-part adjustments, tint AND
+    // hidden — all re-apply live on every drag/pick/occlusion change, with
+    // no model reload. `hidden` matters on its own: removing a top changes
+    // the BRA's occlusion state without touching the bra's own scale/
+    // offset/parts/tint, so it has to be in this key or the visibility flip
+    // above would never re-run.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [JSON.stringify(accessories.map(a => [a.scale, a.offset, a.rotation, a.parts, a.tint, a.hidden]))]);
 
@@ -4261,7 +4368,21 @@ function rebindGarmentsForExport(root, bodySkinMesh) {
       // lose every hidden triangle — real data loss, compounding on each save.
       // Suspend for those; the runtime file KEEPS the culling, deliberately:
       // a world loads a body that cannot poke through its clothes.
+      // Session 162 TEMP DIAGNOSTIC - remove once the culling-on-export bug is closed.
+      const _skinSnap = (tag) => {
+        const rows = [];
+        (loadedRootRef.current || { traverse: () => {} }).traverse((m) => {
+          if (!m.isSkinnedMesh || (m.userData && m.userData.isAccessoryMesh)) return;
+          const g = m.geometry;
+          const fi = g.userData && g.userData.fullIndex;
+          const fullLen = fi ? (fi.length !== undefined ? fi.length : Object.keys(fi).length) : null;
+          rows.push(`${(m.name || "?").slice(0, 14)} drawn=${g.index ? g.index.count / 3 : 0} full=${fullLen ? fullLen / 3 : "none"} isView=${ArrayBuffer.isView(fi)}`);
+        });
+        console.log(`[exportSkinSnap:${tag}] runtime=${runtime} | ${rows.slice(0, 8).join(" | ")}`);
+      };
+      _skinSnap("before-suspend");
       const reapplySkinLayers = runtime ? () => {} : suspendSkinLayers(loadedRootRef.current);
+      _skinSnap("after-suspend");
       const allAnimations = Object.values(animationsRef.current || {});
 
       // Session 152 — a clip cannot animate targets the file no longer has.
@@ -4309,6 +4430,8 @@ function rebindGarmentsForExport(root, bodySkinMesh) {
         });
         for (const { mesh, parent } of detached) parent.remove(mesh);
         const reattach = () => { for (const { mesh, parent } of detached) parent.add(mesh); };
+        // Session 162 TEMP DIAGNOSTIC - state at the moment of serialisation.
+        _skinSnap("at-parse");
         exporter.parse(
           loadedRootRef.current,
           (result) => {

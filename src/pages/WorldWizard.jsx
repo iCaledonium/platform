@@ -2,6 +2,11 @@ import { useState, useEffect, useRef } from "react";
 import { CAPABILITIES, LlmCapabilityGrid } from "./LlmConfigPanel.jsx";
 import { isPreciseHome, IMPRECISE_HOME_HINT } from "../lib/placePrecision.js";
 
+// Same helper as UserMenu.jsx: the avatar fallback when there is no photo_url.
+function initialsOf(name) {
+  return (name || "").split(" ").map(n => n[0]).join("").slice(0, 2).toUpperCase() || "?";
+}
+
 const CITIES = [
   {n:"Stockholm",    lat:59.33, lng:18.07,  tz:"Europe/Stockholm",               x:528,y:85},
   {n:"Oslo",         lat:59.91, lng:10.75,  tz:"Europe/Oslo",                    x:509,y:84},
@@ -338,14 +343,30 @@ export default function WorldWizard({ onClose, onCreated }) {
                 <div style={{display:"flex",flexWrap:"wrap",gap:12}}>
                   {[...users.filter(u=>u._isMe), ...invitees].map(u => {
                     const override = portraits[u.id];
-                    const src = override?.preview || u.photo_url || `/media/users/${u.id}/photo.png`;
+                    // photo_url (or the local file you just picked), never a guessed
+                    // path. POST /api/users/me/photo keeps whatever extension you
+                    // uploaded, so the old hard-coded /media/users/<id>/photo.png only
+                    // ever resolved for a PNG and 404'd itself away for every .jpg
+                    // account. Same defect already fixed in UserMenu.jsx and
+                    // HomePage.jsx; initials are the fallback here too.
+                    const src = override?.preview || u.photo_url || null;
                     return (
                       <div key={u.id} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:5}}>
                         <div style={{position:"relative",width:56,height:56}}>
-                          <img src={src} onError={e=>{e.target.style.display="none"}}
-                            style={{width:56,height:56,borderRadius:"50%",objectFit:"cover",
-                              objectPosition:"top center",border:"1.5px solid rgba(0,0,0,0.1)",
-                              background:"rgba(0,0,0,0.05)"}}/>
+                          <div style={{position:"absolute",top:0,left:0,width:56,height:56,
+                            borderRadius:"50%",border:"1.5px solid rgba(0,0,0,0.1)",
+                            background:"rgba(0,0,0,0.05)",display:"flex",alignItems:"center",
+                            justifyContent:"center",fontSize:17,color:"#a8a5a0",
+                            letterSpacing:".04em",userSelect:"none"}}>
+                            {initialsOf(u.name || u.email)}
+                          </div>
+                          {src && (
+                            <img src={src} onError={e=>{e.target.style.display="none"}}
+                              style={{position:"absolute",top:0,left:0,width:56,height:56,
+                                borderRadius:"50%",objectFit:"cover",
+                                objectPosition:"top center",border:"1.5px solid rgba(0,0,0,0.1)",
+                                background:"rgba(0,0,0,0.05)"}}/>
+                          )}
                           <label style={{position:"absolute",bottom:0,right:0,width:18,height:18,
                             borderRadius:"50%",background:"#1a1814",display:"flex",
                             alignItems:"center",justifyContent:"center",cursor:"pointer",

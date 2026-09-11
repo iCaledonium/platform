@@ -118,6 +118,7 @@ export default function DeveloperPage() {
                 <p className={devStyles.keyMeta}>
                   {worldName(k.world_id)} · created {k.inserted_at?.slice(0,10)}
                   {k.last_used_at ? ` · last used ${k.last_used_at.slice(0,10)}` : " · never used"}
+                  {k.expires_at ? ` · expires ${k.expires_at.slice(0,10)}` : ""}
                 </p>
               </div>
               <span className={devStyles.keyHash}>{k.key_prefix}</span>

@@ -63,7 +63,7 @@ const MAX_TTL_DAYS     = 365;
 
 const hashToken = (t) => crypto.createHash("sha256").update(t).digest("hex");
 
-export function mount(app, { db, authUser }) {
+export function mount(app, { db, authUser, unauthorisedSubjectInLineage }) {
   // ── Schema ──────────────────────────────────────────────────────────────────
   //
   // Created here rather than in db.js for the same reason memberships is: this
@@ -138,6 +138,58 @@ export function mount(app, { db, authUser }) {
     return { user, actor };
   }
 
+  // Session 158 (conduct-watch, resolution-manager) — the subject-authorisation
+  // predicate. The shares, deploy and fork gates in index.js cover in-org
+  // sharing, deployment and forking; the two routes in THIS file are the widest
+  // egresses on the platform (a link is a secret that works for anyone holding
+  // it, a listing is aimed at every signed-in account) and neither had the gate.
+  //
+  // 2026-09-11 (conduct-watch, resolution-manager) — this was a LOCAL COPY of
+  // the predicate and it had drifted twice over, in both directions that matter:
+  //
+  //   1. it matched declared-'other' rows only, so a reference set carrying NO
+  //      declaration at all fell out of the predicate and a likeness that could
+  //      not be BUILT (generate3d.js refuses a blank outright) could still be
+  //      minted into a share link and published to the gallery. That is the
+  //      incident this comment is being written for.
+  //   2. it read the actor's OWN actor_media only, while index.js walks the
+  //      whole fork ancestry (session 170/171). actor_media is deliberately
+  //      absent from FORK_TABLES, so a fork holds ZERO reference rows: the
+  //      own-actor read found an empty set and PASSED. A withdrawal recorded on
+  //      an original therefore stopped fork/deploy/share and the 3D build, and
+  //      did NOT stop the copy being linked or published — the two widest exits.
+  //
+  // Both are fixed by using the SAME function index.js uses, injected at mount,
+  // rather than a second definition that can drift again. The fallback keeps the
+  // previous own-actor shape if nothing is injected, so mounting without it
+  // degrades to the old behaviour rather than throwing.
+  //
+  // Returns the offending row ({ actor_id, state_slug, reason }) or null.
+  function subjectUnauthorised(actorId) {
+    if (typeof unauthorisedSubjectInLineage === "function") return unauthorisedSubjectInLineage(actorId);
+    return db.prepare(
+      `SELECT actor_id, state_slug,
+              CASE WHEN depicts IS NULL OR depicts = '' THEN 'undeclared' ELSE 'unauthorised' END AS reason
+         FROM actor_media
+        WHERE actor_id = ? AND media_type = 'photo' AND world_id IS NULL
+          AND ( depicts IS NULL OR depicts = ''
+                OR (depicts = 'other' AND (subject_authorised IS NULL OR subject_authorised != 'yes')) )
+        ORDER BY CASE WHEN depicts IS NULL OR depicts = '' THEN 0 ELSE 1 END
+        LIMIT 1`
+    ).get(actorId) || null;
+  }
+  // A blank declaration and a withheld authorisation are different unanswered
+  // questions, and a refusal that asks the wrong one sends the owner to the
+  // wrong control. 'undeclared' is cleared by PATCH /api/actors/:id/media/depicts,
+  // 'unauthorised' by PATCH /api/actors/:id/media/authorisation.
+  function subjectRefusal(hit, act) {
+    return hit.reason === "undeclared"
+      ? { error: `This character is built from reference photographs that do not say whose likeness they are. Say who is in the reference photographs before ${act}.`,
+          needs: "depicts" }
+      : { error: `This character is built from photographs declared to be of somebody else. Record that they authorised the likeness before ${act}.`,
+          needs: "subject_authorised" };
+  }
+
   // ── The one place a share is granted to somebody who was not named ──────────
   //
   // Used by both the link claim and the gallery adoption. Everything the two
@@ -200,6 +252,16 @@ export function mount(app, { db, authUser }) {
     const ok = requireOwner(req, res);
     if (!ok) return;
     const { user, actor } = ok;
+
+    // A link leaves the account by definition — that is the product. Building
+    // an unauthorised likeness is contained while it stays in one account;
+    // minting a secret URL for it is the step that stops being contained, and
+    // it is wider than the in-org share this gate already guards, because a
+    // link has no named recipient at all.
+    const linkSubjectHit = subjectUnauthorised(actor.id);
+    if (linkSubjectHit) {
+      return res.status(403).json(subjectRefusal(linkSubjectHit, "making a share link for her"));
+    }
 
     const permission = req.body?.permission ?? "read";
     if (!LINK_PERMISSIONS.includes(permission)) {
@@ -447,6 +509,14 @@ export function mount(app, { db, authUser }) {
     const ok = requireOwner(req, res);
     if (!ok) return;
     const { actor } = ok;
+
+    // The widest egress there is: this sets visibility='public' and lists her
+    // for every signed-in account on the platform. Same gate as the link route
+    // above, for the same reason and with the same predicate.
+    const publishSubjectHit = subjectUnauthorised(actor.id);
+    if (publishSubjectHit) {
+      return res.status(403).json(subjectRefusal(publishSubjectHit, "publishing her to the gallery"));
+    }
 
     const permission = req.body?.permission ?? "read";
     if (!LINK_PERMISSIONS.includes(permission)) {

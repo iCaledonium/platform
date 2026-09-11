@@ -5,6 +5,18 @@ import VisitorPresenceView from "./VisitorPresenceView.jsx";
 
 const SIMULATOR_URL = "https://anima.simulator.ngrok.dev";
 
+// Conduct watch 2026-09-09 (incident: "personal media is served unauthenticated
+// over the simulator's public tunnel"). Simulator-relative media paths are now
+// requested SAME-ORIGIN from the platform instead of straight off
+// https://anima.simulator.ngrok.dev. nginx here has an authenticated
+// `location /media/cities/` stanza (auth_request /api/auth/check) that proxies to
+// the simulator over the LAN, so ambient portraits still render for a signed-in
+// user -- exactly how /media/users/ photos have always been loaded -- while the
+// simulator's own public tunnel now refuses them (PersonalMediaGuard, 403).
+// Absolute URLs are passed through untouched.
+const simMedia = (u) => (!u ? null : u.startsWith("http") ? u : u.startsWith("/media/") ? u : SIMULATOR_URL + u);
+
+
 /**
  * Standalone full-page knock encounter route.
  * world, user, sceneData all come from sessionStorage — no API needed.
@@ -69,9 +81,7 @@ export default function KnockEncounterPage() {
   if (sceneData.trigger === "knock_user_door" || sceneData.trigger === "actor_approach") {
     const playerActorId = user?.worlds?.find(w => w.world_id === world.id)?.actor_id;
     const primaryActor  = sceneData.location?.actors?.find(a => a.actor_id !== playerActorId);
-    const actorPhoto    = primaryActor?.photo_url
-      ? (primaryActor.photo_url.startsWith("http") ? primaryActor.photo_url : `${SIMULATOR_URL}${primaryActor.photo_url}`)
-      : null;
+    const actorPhoto    = simMedia(primaryActor?.photo_url);
 
     return (
       <VisitorPresenceView

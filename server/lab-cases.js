@@ -367,17 +367,40 @@ export async function runCase(c, { PORT = 4002 } = {}) {
                      : (c.fail_detail ? `${c.fail_detail} (returned ${n}, expected ${label})`
                                       : `returned ${n}, but the case asserts ${label}`) });
       } else {
-        let status = 0;
-        try {
-          // Anonymous on purpose: an authored probe asserts what a request with
-          // no session gets, which is the shape of every door check in the lab.
-          const r = await fetch(`http://127.0.0.1:${PORT}${c.probe_path}`, {
-            method: c.probe_method || "GET",
-            headers: { "Content-Type": "application/json" },
-            ...(c.probe_method === "POST" ? { body: "{}" } : {}),
-          });
-          status = r.status;
-        } catch (e) { status = 0; }
+        // A probe that never got an answer is NOT an answer. This used to
+        // collapse a transport failure into `status = 0` and then compare it,
+        // so an unreachable server read as a correctly-blocked door for every
+        // assertion the number 0 happens to satisfy — `ne 200`, `lt 200`,
+        // `ne 401` — which is precisely the shape of a door check, the thing
+        // this harness exists for. A single shot cannot tell "blocked" from
+        // "never asked", so: retry ONLY when no HTTP response arrived at all
+        // (never on a real status — a POST probe must not have its side effect
+        // repeated), and if every attempt dies at the transport, say that
+        // instead of scoring it.
+        const ATTEMPTS = 3;
+        let status = null;
+        let transportErr = null;
+        for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+          try {
+            // Anonymous on purpose: an authored probe asserts what a request with
+            // no session gets, which is the shape of every door check in the lab.
+            const r = await fetch(`http://127.0.0.1:${PORT}${c.probe_path}`, {
+              method: c.probe_method || "GET",
+              headers: { "Content-Type": "application/json" },
+              ...(c.probe_method === "POST" ? { body: "{}" } : {}),
+            });
+            status = r.status;
+            transportErr = null;
+            break;
+          } catch (e) {
+            transportErr = String((e && e.message) || e);
+            if (attempt < ATTEMPTS) await new Promise((r) => setTimeout(r, 150));
+          }
+        }
+        if (status === null) {
+          return { name: c.name, verdict: "fail",
+            detail: `${c.probe_method || "GET"} ${c.probe_path} never answered: ${ATTEMPTS} attempts all failed at the transport (${transportErr}). The case could not be evaluated — this is NOT evidence the path is blocked.` };
+        }
         const ok = compare(status, c.op, Number(c.expected));
         checks.push({ name: c.name, verdict: ok ? "pass" : "fail",
           detail: ok ? (c.pass_detail || `${c.probe_method} ${c.probe_path} answered ${status}, and the case asserts ${label}`)

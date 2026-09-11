@@ -69,15 +69,14 @@ export default function LabTestManagerPage() {
     (async () => {
       try {
         const r = await fetch("/api/worlds", { credentials: "include" });
-        if (r.status === 401) { setAuthed(false); setWorlds([]); return; }
+        if (r.status === 401) { setAuthed(false); return; }
         const ws = await r.json();
         // Anything that is not an array is not a world list. Storing one
         // costs the whole app: there is no error boundary above this page.
-        if (!Array.isArray(ws)) { setWorlds([]); setError("the world list came back in a shape this page cannot read"); return; }
-        setWorlds(ws);
+        if (!Array.isArray(ws)) { setError("the world list came back in a shape this page cannot read"); return; }
         const running = ws.find(w => w.status === "running") || ws[0];
         if (running) setWorldId(running.id);
-      } catch (e) { setWorlds([]); setError(String(e.message || e)); }
+      } catch (e) { setError(String(e.message || e)); }
     })();
     loadRuns();
   }, [loadRuns]);

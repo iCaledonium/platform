@@ -11,8 +11,10 @@ import { ShareLabPage, DeployLabPage } from "./pages/GlobalBoardPage.jsx";
 import SignupLabPage       from "./pages/SignupLabPage.jsx";
 import BehaviorLabPage     from "./pages/BehaviorLabPage.jsx";
 import AvatarLabPage       from "./pages/AvatarLabPage.jsx";
+import SignInLabPage       from "./pages/SignInLabPage.jsx";
 import WizardLabPage       from "./pages/WizardLabPage.jsx";
 import TransportLabPage    from "./pages/TransportLabPage.jsx";
+import InteractionStudioPage from "./pages/InteractionStudioPage.jsx";
 import WatcherPanel, { watcherIsFollowing } from "./components/WatcherPanel.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
 import EnrollPage from "./pages/EnrollPage.jsx";
@@ -75,8 +77,14 @@ function LabWatcherOverlay() {
   if (!show) return null;
   let bound = null;
   if (location.pathname.startsWith("/lab/actor/apartment/encounter")) bound = "Feature - Actor Apartment Encounter";
+  // Session 157 — the Interaction Studio is a bench like any other and
+  // binds its own conversation. It lives under /lab precisely so this
+  // rule reaches it: scripting what two bodies do to each other is work
+  // you narrate to the watcher while you do it.
+  else if (location.pathname.startsWith("/lab/studio/interaction")) bound = "Feature - Interaction Studio";
   else if (location.pathname.startsWith("/lab/transport") || location.pathname.startsWith("/lab/world/transport")) bound = "Runtime - Transport Engine";
   else if (location.pathname.startsWith("/lab/user/signup")) bound = "Feature - User Signup and Creation";
+  else if (location.pathname.startsWith("/lab/user/signin")) bound = "Feature - User Sign In";
   else if (location.pathname.startsWith("/lab/user/avatar")) bound = "Feature - User Avatar";
   else if (location.pathname.startsWith("/lab/character/wizard")) bound = "Feature - Character Wizard";
   else if (location.pathname.startsWith("/lab/character/share")) bound = "Feature - Character Sharing";
@@ -419,11 +427,15 @@ export default function App() {
         <Route path="/lab/home/resolutionmanager" element={<ResolutionManagerPage />} />
         <Route path="/lab/home/restartbroker" element={<RestartBrokerPage />} />
         <Route path="/lab/actor/apartment/encounter" element={<LabPage />} />
+        {/* Session 157 — the Interaction Studio. Reached from the Developer
+            section on /home; lives here so the watcher rule above covers it. */}
+        <Route path="/lab/studio/interaction" element={<InteractionStudioPage />} />
         <Route path="/lab/world/transport/actor" element={<TransportLabPage />} />
         <Route path="/lab/transport/actor" element={<Navigate to="/lab/world/transport/actor" replace />} />
         <Route path="/lab/user/signup" element={<SignupLabPage />} />
         <Route path="/lab/world/behavior" element={<BehaviorLabPage />} />
         <Route path="/lab/user/avatar" element={<AvatarLabPage />} />
+        <Route path="/lab/user/signin" element={<SignInLabPage />} />
         <Route path="/lab/character/wizard" element={<WizardLabPage />} />
         <Route path="/lab/character/share"  element={<ShareLabPage />} />
         <Route path="/lab/character/deploy" element={<DeployLabPage />} />

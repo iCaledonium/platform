@@ -128,7 +128,7 @@ export default function WizardLabPage() {
           <span style={{ ...label, color: GOLD + ".65)" }}>authoring</span>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={() => navigate("/actors/new")} style={chip(false)}>Open the wizard</button>
+          <button onClick={() => navigate("/actors/new?lab=wizard")} style={chip(false)}>Open the wizard</button>
           <button onClick={() => navigate("/lab/home")} style={chip(false)}>Back to the lab</button>
         </div>
       </div>

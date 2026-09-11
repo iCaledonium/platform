@@ -867,6 +867,390 @@ function SaveStatus({ status, error, onRetry }) {
 }
 
 // ── Main editor page ──────────────────────────────────────────────────────────
+// ── Session 172 (conduct-watch, resolution-manager) — the declaration itself, ─
+// ── asked retrospectively ────────────────────────────────────────────────────
+//
+// SubjectAuthorisationNotice below is the route back to the AUTHORISATION
+// question. There was no route back to the question BEFORE it — "who is in
+// these photographs?" — and the hole that leaves is narrower but worse.
+//
+// Every declaration gate on this system is PROSPECTIVE. generate3d.js refuses
+// the NEXT solve on a blank ("a blank must never read as a declaration nobody
+// made"); the shares, publish, deploy and fork gates refuse the next egress.
+// Not one of them ever looks back. So a reference set uploaded BEFORE the
+// depicts column existed (2026-09-04), and since solved into a COMPLETED
+// likeness with built artefacts on disk, is asked about by nothing at all: the
+// rows do not say 'self' and do not say 'other', and the amber notice below
+// renders only on depicts === 'other', so a wholly blank set showed the owner
+// nothing whatsoever. The record could not say whose face had been built, and
+// no surface on the box was trying to find out.
+//
+// This asks. It keys off a BLANK — the state that had no advocate anywhere —
+// and it renders whether or not the likeness is already built, because an
+// already-built one is precisely the case the prospective gates cannot reach.
+//
+// What it deliberately does NOT do is answer. Nothing here writes a default
+// and 'self' is never inferred from ownership: an unattended backfill would be
+// the blank reading as a declaration nobody made, which is the one thing the
+// solve gate exists to prevent. Only the owner's own click writes, through the
+// same PATCH /api/actors/:id/media/depicts the wizard uses, which rewrites the
+// whole world_id IS NULL reference set.
+function ReferenceDeclarationNotice({ actorId, mediaPhotos, canEdit, hasSolve }) {
+  const undeclared = useMemo(
+    () => (mediaPhotos || []).filter(m => !m.depicts),
+    [mediaPhotos]
+  );
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved]   = useState(null);
+  const [err, setErr]       = useState(null);
+
+  if (!undeclared.length) return null;
+
+  const n = undeclared.length;
+  // 2026-09-11 (conduct-watch, resolution-manager) -- mediaPhotos now carries
+  // the reference VOICE RECORDING as well as the photographs, because a
+  // recorded voice is a likeness too and nothing was asking whose it was. The
+  // question is the same question -- the declaration is about the PERSON, and
+  // PATCH media/depicts writes the whole reference set in one go -- but this
+  // notice must not call a recording a photograph, so the noun follows what is
+  // actually undeclared.
+  const nAudio = undeclared.filter(m => m.media_type === "audio").length;
+  const nPhoto = n - nAudio;
+  const material = nAudio && nPhoto ? "reference photographs and voice recordings"
+                 : nAudio ? (nAudio === 1 ? "reference voice recording" : "reference voice recordings")
+                 : (nPhoto === 1 ? "reference photograph" : "reference photographs");
+  const tone = { bg:"rgba(176,92,8,.10)", border:"rgba(176,92,8,.3)", text:"#854f0b" };
+
+  // 2026-09-11 (conduct-watch, resolution-manager) -- WHY the question came
+  // back. Replacing a reference photograph clears that row's declaration on
+  // purpose ("a different photograph is a different question"), but until today
+  // the clearing was silent: an owner who had already answered saw this notice
+  // reappear with nothing to distinguish it from never having been asked. The
+  // server now records what the replaced row had declared, so the notice can
+  // say it. This is a RECORD being read back, not a declaration -- the answer
+  // still has to be given again, and nothing below is pre-selected from it.
+  const clearedRow = (undeclared || [])
+    .filter(m => m.depicts_cleared_from)
+    .sort((a, b) => String(b.depicts_cleared_at || "").localeCompare(String(a.depicts_cleared_at || "")))[0];
+  const clearedWhen = clearedRow?.depicts_cleared_at
+    ? new Date(clearedRow.depicts_cleared_at).toLocaleDateString()
+    : null;
+  const clearedNote = clearedRow
+    ? ` This question came back because a reference photograph was replaced${clearedWhen ? ` on ${clearedWhen}` : ""}. The record said ${clearedRow.depicts_cleared_from === "self" ? "they were of you" : "they were of somebody else"} \u2014 but that answer was about the photograph that was replaced, not about the new one, so it was not carried over.`
+    : "";
+
+  const voiceLine = nAudio
+    ? ` One of them is a reference VOICE RECORDING: the voice server is handed it to speak new words in that voice, which is a likeness in the same sense a face is. Speaking in it is refused until this is answered.`
+    : "";
+  const body = hasSolve
+    ? `A 3D likeness has already been built from this character's reference photographs, and ${n === 1 ? "one item of reference material carries" : `${n} items of reference material carry`} no statement of whose likeness it is. The build gates only ask before a solve, so they never asked about this one. Nothing here is an accusation — the record is simply silent, and a blank does not mean "me". Say who is in the ${material} so it says something.${voiceLine}`
+    : `${n} item${n === 1 ? "" : "s"} of reference material on this character (${material}) ${n === 1 ? "carries" : "carry"} no statement of whose likeness ${n === 1 ? "it is" : "they are"}. A blank is not a declaration that they are of you — building the 3D likeness, sharing, publishing and deploying stay refused until it is answered.${voiceLine}`;
+
+  function declare(v) {
+    if (!v || saving) return;
+    setSaving(true); setErr(null);
+    fetch(`/api/actors/${actorId}/media/depicts`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ depicts: v }),
+    })
+      .then(async r => {
+        const j = await r.json().catch(() => null);
+        if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
+        return j;
+      })
+      .then(() => { setSaving(false); setSaved(v); })
+      .catch(e => { setSaving(false); setErr(e?.message || "could not save"); });
+  }
+
+  return (
+    <div style={{ marginBottom:20, padding:"14px 16px", borderRadius:12, background:tone.bg, border:`1px solid ${tone.border}` }}>
+      <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".16em", textTransform:"uppercase", color:tone.text, marginBottom:6 }}>
+        Declaration needed
+      </div>
+      <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12.5, color:"#4a4740", lineHeight:1.6, maxWidth:720 }}>
+        {body}{clearedNote}
+      </div>
+      {canEdit && !saved && (
+        <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap", marginTop:12 }}>
+          <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11.5, color:"#6b6760" }}>
+            Who is in this character's {material}?
+          </span>
+          <select value="" disabled={saving} onChange={e => declare(e.target.value)}
+            style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12.5, color:"#1a1814", background:"rgba(255,255,255,.9)", border:`1px solid ${tone.border}`, borderRadius:8, padding:"7px 10px", outline:"none" }}>
+            <option value="">— Not stated —</option>
+            <option value="self">They are of me</option>
+            <option value="other">They are of somebody else</option>
+          </select>
+          {saving && <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#a8a5a0" }}>Saving…</span>}
+          {err && <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#c0392b" }}>Could not save: {err}</span>}
+        </div>
+      )}
+      {/* The answer rewrites the whole reference set server-side, but this page
+          already holds a stale copy of mediaPhotos, and answering "somebody
+          else" opens a SECOND question (the authorisation notice below) that
+          only renders off fresh rows. Say what was recorded and offer the
+          reload rather than firing one implicitly — there may be uncommitted
+          field edits in the panels underneath. */}
+      {saved && (
+        <div style={{ marginTop:12, display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
+          <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, color:"#0f6e56" }}>
+            {saved === "self"
+              ? `Recorded: this character's ${material} are of you.`
+              : `Recorded: this character's ${material} are of somebody else. Reload to answer whether that person authorised this likeness — building, sharing, publishing, deploying and speaking in the voice are refused until it is answered.`}
+          </span>
+          <button type="button" onClick={() => window.location.reload()}
+            style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, letterSpacing:".05em", textTransform:"uppercase", padding:"5px 11px", borderRadius:7, border:`1px solid ${tone.border}`, background:"transparent", color:tone.text, cursor:"pointer" }}>
+            Reload
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Session 151 — the subject-authorisation declaration, outside the wizard ───
+//
+// The declaration was ASKED in exactly one place — CharacterWizard's "Who is in
+// these photographs?" step, when depicts === "other" — and READ BACK in nine
+// (solve, runtime-glb, save-morphed-glb, runtime read, shares, share-links,
+// publish, deploy, fork), all of which refuse with a 403. Close the draft with
+// the question unanswered and the app said nothing about it anywhere: not the
+// gallery card, not this page, not GET /api/actors. The owner met a wall of
+// refusals whose only remedy was a dropdown he had no route back to.
+//
+// This is that route. It states the position in words, and it carries the same
+// control the wizard carries, wired to the same endpoint. It renders whenever
+// any reference photograph is declared to be of somebody else — including when
+// the answer is already "yes", because "this likeness is authorised" is a fact
+// worth being able to see and re-check, not just a gate that silently passes.
+//
+// Clearing back to "not stated" is deliberately not offered, matching
+// PATCH /api/actors/:id/media/authorisation, which refuses to write NULL: a
+// silent clear would read later as "never asked" rather than as "withdrawn".
+function SubjectAuthorisationNotice({ actorId, mediaPhotos, canEdit, stillDeployed }) {
+  const others = useMemo(
+    () => (mediaPhotos || []).filter(m => m.depicts === "other"),
+    [mediaPhotos]
+  );
+  // What the rows say now, collapsed the same way the gates collapse it: the
+  // declaration is about the PERSON in the photographs, not about one file, so
+  // anything short of unanimous "yes" is not authorised.
+  const declared = others.length && others.every(m => m.subject_authorised === "yes") ? "yes"
+                 : others.some(m => m.subject_authorised === "no") ? "no"
+                 : "";
+  const [override, setOverride] = useState(null);
+  const [saving, setSaving]     = useState(false);
+  const [err, setErr]           = useState(null);
+  // Session 152 -- answering "No" is RETROACTIVE, one-way, and reaches copies
+  // other accounts forked. PATCH .../media/authorisation unlists the actor,
+  // revokes every live share link, deletes every claim and undeploys her from
+  // every simulator world, across the whole forked_from tree; answering "yes"
+  // again restores none of it. The control used to fire that on a single
+  // select change, with nothing said before and nothing shown after -- so a
+  // mis-click silently cost a listing, every minted link and every colleague's
+  // access. Two things fix that, and both are here: ask first, naming what the
+  // click costs, and then show the receipt the endpoint already returns.
+  const [confirmNo, setConfirmNo] = useState(false);
+  const [revoked, setRevoked]     = useState(null);
+  const current = override ?? declared;
+
+  // conduct-watch 2026-09-09 -- DURABILITY. `revoked.still_deployed` below is
+  // the receipt for one click: it lived in that HTTP response and nowhere else,
+  // so "the subject said no and she is STILL IN A WORLD" vanished the moment
+  // the tab was closed, and never existed at all when the sweep failed while
+  // nobody was looking. GET /api/actors/:id now derives the same fact from the
+  // rows every gate reads (withdrawal_still_deployed), so it is here on every
+  // load, for the owner and for anyone holding a share.
+  //
+  // Precedence: a retry in this session is the freshest truth, then a
+  // withdrawal made in this session, then what the server said on load.
+  const [retried, setRetried] = useState(null);
+  const [retrying, setRetrying] = useState(false);
+  const [retryErr, setRetryErr] = useState(null);
+  const outstanding = retried ?? (revoked ? (revoked.still_deployed || []) : (stillDeployed || []));
+
+  function retryRevocation() {
+    setRetrying(true); setRetryErr(null);
+    fetch(`/api/actors/${actorId}/media/authorisation/retry-revocation`, { method: "POST" })
+      .then(async r => {
+        const j = await r.json().catch(() => null);
+        // Even a 500 here reports the authoritative remaining list -- take it.
+        if (Array.isArray(j?.withdrawal_still_deployed)) setRetried(j.withdrawal_still_deployed);
+        if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
+        return j;
+      })
+      .then(() => setRetrying(false))
+      .catch(e => { setRetrying(false); setRetryErr(e?.message || "could not retry"); });
+  }
+
+  if (!others.length) return null;
+
+  const ok   = current === "yes";
+  const tone = ok ? { bg:"rgba(29,158,117,.08)", border:"rgba(29,158,117,.25)", text:"#0f6e56" }
+                  : { bg:"rgba(176,92,8,.10)",   border:"rgba(176,92,8,.3)",    text:"#854f0b" };
+
+  const body = ok
+    ? `${others.length} reference photograph${others.length === 1 ? " is" : "s are"} declared to be of somebody other than you, and that person authorised this likeness.`
+    : current === "no"
+      ? `${others.length} reference photograph${others.length === 1 ? " is" : "s are"} declared to be of somebody other than you, and that person was declared NOT to have authorised this likeness. Building the 3D likeness, sharing, publishing and deploying this character are refused while that stands.`
+      : `${others.length} reference photograph${others.length === 1 ? " is" : "s are"} declared to be of somebody other than you, and nobody has answered whether that person authorised this likeness. Building the 3D likeness, sharing, publishing and deploying this character are refused until it is answered.`;
+
+  function declare(v) {
+    if (!v) return;
+    // "yes" grants nothing by itself and is reversible; "no" spends things that
+    // cannot be got back, so it goes through the confirmation below instead.
+    if (v === "no") { setErr(null); setRevoked(null); setConfirmNo(true); return; }
+    write(v);
+  }
+
+  function write(v) {
+    setSaving(true); setErr(null);
+    fetch(`/api/actors/${actorId}/media/authorisation`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subject_authorised: v }),
+    })
+      .then(async r => {
+        const j = await r.json().catch(() => null);
+        if (!r.ok) {
+          const e = new Error(j?.error || `HTTP ${r.status}`);
+          // A 500 out of the revocation sweep still means the DECLARATION was
+          // written and every prospective gate now refuses -- it is the taking
+          // back of what was already granted that did not finish. Reflect the
+          // new value rather than leaving the control showing the old one.
+          e.recorded = j?.subject_authorised === v;
+          throw e;
+        }
+        return j;
+      })
+      .then(j => {
+        setSaving(false); setOverride(v);
+        setRevoked(v === "no" ? (j?.revoked || null) : null);
+      })
+      .catch(e => {
+        setSaving(false);
+        if (e.recorded) setOverride(v);
+        setErr(e?.message || "could not save");
+      });
+  }
+
+  return (
+    <div style={{ marginBottom:20, padding:"14px 16px", borderRadius:12, background:tone.bg, border:`1px solid ${tone.border}` }}>
+      <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".16em", textTransform:"uppercase", color:tone.text, marginBottom:6 }}>
+        Subject authorisation
+      </div>
+      <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12.5, color:"#4a4740", lineHeight:1.6, maxWidth:720 }}>
+        {body}
+      </div>
+      {canEdit && (
+        <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap", marginTop:12 }}>
+          <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11.5, color:"#6b6760" }}>
+            Did that person authorise this likeness?
+          </span>
+          <select value={current} disabled={saving} onChange={e => declare(e.target.value)}
+            style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12.5, color:"#1a1814", background:"rgba(255,255,255,.9)", border:`1px solid ${tone.border}`, borderRadius:8, padding:"7px 10px", outline:"none" }}>
+            <option value="">— Not stated —</option>
+            <option value="yes">Yes, they authorised it</option>
+            <option value="no">No</option>
+          </select>
+          {saving && <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#a8a5a0" }}>Saving…</span>}
+          {err && <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#c0392b" }}>Could not save: {err}</span>}
+        </div>
+      )}
+
+      {/* THE STANDING BANNER. Server-derived, so it survives closing the tab,
+          and it appears for a withdrawal whose sweep failed while nobody was
+          watching -- the two cases the click-receipt could not cover. */}
+      {outstanding.length > 0 && (
+        <div style={{ marginTop:14, padding:"13px 15px", borderRadius:10, background:"rgba(192,57,43,.08)", border:"1px solid rgba(192,57,43,.32)" }}>
+          <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12.5, fontWeight:600, color:"#c0392b", marginBottom:5 }}>
+            Withdrawn, but still in {outstanding.length} simulator world{outstanding.length === 1 ? "" : "s"}
+          </div>
+          <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, color:"#4a4740", lineHeight:1.6, maxWidth:660 }}>
+            The subject was declared NOT to have authorised this likeness, and she has
+            not been removed from {outstanding.map(u => u.world_name || u.world_id).join(", ")} —
+            the simulator refused or was unreachable when the withdrawal was made.
+            She is running in {outstanding.length === 1 ? "that world" : "those worlds"} right now.
+            Nothing new can be built, published, shared or deployed from these photographs
+            either way. The platform retries this by itself as soon as the simulator answers
+            again; the button removes her now.
+          </div>
+          {canEdit && (
+            <button type="button" disabled={retrying} onClick={retryRevocation}
+              style={{ marginTop:9, fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11.5, letterSpacing:".05em", textTransform:"uppercase", padding:"7px 14px", borderRadius:8, border:"1px solid rgba(192,57,43,.35)", background:"transparent", color:"#993c1d", cursor:"pointer" }}>
+              {retrying ? "Removing…" : "Remove her now"}
+            </button>
+          )}
+          {retryErr && (
+            <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#c0392b", marginTop:7 }}>
+              Retry did not finish: {retryErr}
+            </div>
+          )}
+        </div>
+      )}
+      {retried !== null && retried.length === 0 && (
+        <div style={{ marginTop:14, padding:"11px 13px", borderRadius:10, background:"rgba(29,158,117,.10)", border:"1px solid rgba(29,158,117,.28)", fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, color:"#0f6e56" }}>
+          Removed from every simulator world. The withdrawal is now fully carried out.
+        </div>
+      )}
+
+      {/* Ask before withdrawing, naming what the click costs. In-page and not
+          window.confirm(), which is silently suppressed in some embedded
+          browser contexts -- same reason ActorsGalleryPage stopped using it. */}
+      {confirmNo && (
+        <div style={{ marginTop:14, padding:"14px 16px", borderRadius:10, background:"rgba(192,57,43,.06)", border:"1px solid rgba(192,57,43,.28)" }}>
+          <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12.5, fontWeight:600, color:"#c0392b", marginBottom:8 }}>
+            Withdrawing takes back what was already granted
+          </div>
+          <ul style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, color:"#4a4740", lineHeight:1.6, margin:"0 0 12px 18px", padding:0, maxWidth:640 }}>
+            <li>This character is unlisted from the gallery.</li>
+            <li>Every share link minted for her is revoked and stops working.</li>
+            <li>Everyone who claimed her from a link loses access to her.</li>
+            <li>She is removed from every simulator world she is deployed in.</li>
+            <li>Every copy forked from her is swept the same way, including copies owned by other accounts.</li>
+            <li>Answering "Yes" again later restores none of it.</li>
+          </ul>
+          <div style={{ display:"flex", gap:8 }}>
+            <button type="button" onClick={() => setConfirmNo(false)}
+              style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12.5, padding:"8px 16px", borderRadius:9, border:"1px solid rgba(0,0,0,.12)", background:"none", color:"#6b6760", cursor:"pointer" }}>
+              Cancel
+            </button>
+            <button type="button" disabled={saving} onClick={() => { setConfirmNo(false); write("no"); }}
+              style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12.5, padding:"8px 16px", borderRadius:9, border:"none", background:"#c0392b", color:"#faf8f4", cursor:"pointer" }}>
+              Withdraw and revoke
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* The receipt. The endpoint has always returned this summary; nothing
+          read it, so an owner could not see what the click actually cost --
+          and, worse, could not see when the simulator was down and she was
+          therefore STILL IN A WORLD after the subject said no. */}
+      {revoked && (
+        <div style={{ marginTop:14, padding:"14px 16px", borderRadius:10, background:"rgba(255,255,255,.6)", border:"1px solid rgba(0,0,0,.10)" }}>
+          <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".16em", textTransform:"uppercase", color:"#6b6760", marginBottom:6 }}>
+            What the withdrawal revoked
+          </div>
+          <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12.5, color:"#4a4740", lineHeight:1.6, maxWidth:640 }}>
+            {revoked.unpublished || 0} gallery listing(s) unlisted · {revoked.links_revoked || 0} share link(s) revoked · {revoked.claims_revoked || 0} claim(s) removed · removed from {(revoked.undeployed || []).length} world(s)
+            {(revoked.actors || []).length > 1 && ` · across ${(revoked.actors || []).length} character(s) in the copy tree`}
+          </div>
+          {(revoked.undeployed || []).length > 0 && (
+            <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12, color:"#6b6760", marginTop:6 }}>
+              Removed from: {(revoked.undeployed || []).map(u => u.world_name || u.world_id).join(", ")}
+            </div>
+          )}
+          {/* The "still in a world" block that used to sit here is now the
+              STANDING banner above, which reads the same fact from the server on
+              every load instead of only from this click's response. */}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ActorsEditorPage() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -1122,6 +1506,8 @@ export default function ActorsEditorPage() {
               a fallback for controls that never blur. */}
           <div style={{ flex:1, overflowY:"auto", padding:"24px 28px" }}
             onBlur={() => { if (Object.keys(pending.current).length) commitNow(); }}>
+            <ReferenceDeclarationNotice actorId={id} mediaPhotos={data?.mediaPhotos} canEdit={isOwner} hasSolve={!!(data?.measurements || data?.actor?.glb_url)} />
+            <SubjectAuthorisationNotice actorId={id} mediaPhotos={data?.mediaPhotos} canEdit={isOwner} stillDeployed={data?.withdrawal_still_deployed} />
             {panels[tab] || null}
           </div>
         </div>

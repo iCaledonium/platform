@@ -1,7 +1,11 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import styles from "./PresenceView.module.css";
 
-const SIMULATOR_URL = "https://anima.simulator.ngrok.dev";
+// The browser never talks to the simulator directly. Personal media (reference
+// frames, actor video) must not transit the public tunnel, and the simulator's
+// internal API is not exposed to browser clients — the platform proxies every
+// call. The /api/* routes used below authenticate the session and forward over
+// the LAN with the service token, which stays on the platform host.
 
 
 export default function VisitorPresenceView({ world, user, sceneData, actorName, actorPhoto, actorId: actorIdProp, encounter_id, onLeave }) {
@@ -435,8 +439,7 @@ export default function VisitorPresenceView({ world, user, sceneData, actorName,
         if (payload.encounter_id === encounter_id) {
           setMissingMedia(null);
           // Refresh media list
-          fetch(`${SIMULATOR_URL}/internal/worlds/${worldId}/encounter/${encounter_id}/media`, {
-            headers: { "x-service-token": SERVICE_TOKEN }
+          fetch(`/api/worlds/${worldId}/encounter/${encounter_id}/media`, {
           }).then(r => r.ok ? r.json() : null).then(d => { if (d?.media) setMediaList(d.media); }).catch(() => {});
         }
         break;
@@ -561,8 +564,7 @@ export default function VisitorPresenceView({ world, user, sceneData, actorName,
   // Fetch available media for the sidebar
   useEffect(() => {
     if (!worldId || !actorId || !encounter_id) return;
-    fetch(`${SIMULATOR_URL}/internal/worlds/${worldId}/encounter/${encounter_id}/media`, {
-        headers: { "x-service-token": "d1ea19ea6e778fb309358333b7a74d72378cbd076e3a47f6489db003e6a454b7" }
+    fetch(`/api/worlds/${worldId}/encounter/${encounter_id}/media`, {
       })
       .then(r => r.ok ? r.json() : null)
       .then(d => { if (d?.media) setMediaList(d.media); })
@@ -1128,13 +1130,11 @@ export default function VisitorPresenceView({ world, user, sceneData, actorName,
             {mediaPanelOpen && encounter_id && (
               <button
                 onClick={() => {
-                  fetch(`${SIMULATOR_URL}/internal/worlds/${worldId}/encounter/${encounter_id}/rescan_media`, {
+                  fetch(`/api/worlds/${worldId}/encounter/${encounter_id}/rescan_media`, {
                     method: "POST",
-                    headers: { "x-service-token": "d1ea19ea6e778fb309358333b7a74d72378cbd076e3a47f6489db003e6a454b7" }
                   }).then(r => r.ok ? r.json() : null).then(d => {
                     if (d?.count !== undefined) {
-                      fetch(`${SIMULATOR_URL}/internal/worlds/${worldId}/encounter/${encounter_id}/media`, {
-                        headers: { "x-service-token": "d1ea19ea6e778fb309358333b7a74d72378cbd076e3a47f6489db003e6a454b7" }
+                      fetch(`/api/worlds/${worldId}/encounter/${encounter_id}/media`, {
                       }).then(r => r.ok ? r.json() : null).then(d => { if (d?.media) setMediaList(d.media); }).catch(() => {});
                     }
                   }).catch(() => {});
@@ -1302,27 +1302,22 @@ export default function VisitorPresenceView({ world, user, sceneData, actorName,
         actorId={missingMedia.actor_id || actorId}
         worldId={missingMedia.world_id || worldId}
         encounter_id={encounter_id}
-        SIMULATOR_URL={SIMULATOR_URL}
-        SERVICE_TOKEN="d1ea19ea6e778fb309358333b7a74d72378cbd076e3a47f6489db003e6a454b7"
         currentLocation={missingMedia.location || currentLocation}
         onUploaded={() => {
           setMissingMedia(null);
           // Refresh media list
-          fetch(`${SIMULATOR_URL}/internal/worlds/${worldId}/encounter/${encounter_id}/media`, {
-            headers: { "x-service-token": "d1ea19ea6e778fb309358333b7a74d72378cbd076e3a47f6489db003e6a454b7" }
+          fetch(`/api/worlds/${worldId}/encounter/${encounter_id}/media`, {
           }).then(r => r.ok ? r.json() : null).then(d => { if (d?.media) setMediaList(d.media); }).catch(() => {});
           // Resume encounter
-          fetch(`${SIMULATOR_URL}/internal/worlds/${worldId}/encounter/${encounter_id}/resume`, {
+          fetch(`/api/worlds/${worldId}/encounter/${encounter_id}/resume`, {
             method: "POST",
-            headers: { "x-service-token": "d1ea19ea6e778fb309358333b7a74d72378cbd076e3a47f6489db003e6a454b7" }
           }).catch(() => {});
         }}
         onDismiss={() => {
           setMissingMedia(null);
           // Resume encounter even if dismissed
-          fetch(`${SIMULATOR_URL}/internal/worlds/${worldId}/encounter/${encounter_id}/resume`, {
+          fetch(`/api/worlds/${worldId}/encounter/${encounter_id}/resume`, {
             method: "POST",
-            headers: { "x-service-token": "d1ea19ea6e778fb309358333b7a74d72378cbd076e3a47f6489db003e6a454b7" }
           }).catch(() => {});
         }}
       />
@@ -1331,7 +1326,7 @@ export default function VisitorPresenceView({ world, user, sceneData, actorName,
   );
 }
 
-function MissingMediaModal({ missingMedia, actorId, worldId, encounter_id, SIMULATOR_URL, SERVICE_TOKEN, currentLocation, onUploaded, onDismiss }) {
+function MissingMediaModal({ missingMedia, actorId, worldId, encounter_id, currentLocation, onUploaded, onDismiss }) {
   const [dragging,      setDragging]      = useState(false);
   const [uploading,     setUploading]     = useState(false);
   const [generating,    setGenerating]    = useState(false);
@@ -1367,19 +1362,19 @@ function MissingMediaModal({ missingMedia, actorId, worldId, encounter_id, SIMUL
   useEffect(() => {
     setPromptLoaded(false); setFramesLoaded(false);
 
-    fetch(`${SIMULATOR_URL}/internal/actors/${actorId}/generate_prompt?position=${missingMedia.position}&outfit=${missingMedia.outfit}&action=${missingMedia.action}&suffix=${suffix}`, {
-      headers: { "x-service-token": SERVICE_TOKEN }
+    fetch(`/api/actors/${actorId}/generate_prompt?world_id=${worldId}&position=${missingMedia.position}&outfit=${missingMedia.outfit}&action=${missingMedia.action}&suffix=${suffix}`, {
     })
       .then(r => r.ok ? r.json() : null)
       .then(d => { if (d?.prompt) setPrompt(d.prompt); setPromptLoaded(true); })
       .catch(() => setPromptLoaded(true));
 
-    fetch(`${SIMULATOR_URL}/internal/actors/${actorId}/suggest_frames?world_id=${worldId}&position=${missingMedia.position}&outfit=${missingMedia.outfit}&suffix=${suffix}&location=${location}`, {
-      headers: { "x-service-token": SERVICE_TOKEN }
+    fetch(`/api/actors/${actorId}/suggest_frames?world_id=${worldId}&position=${missingMedia.position}&outfit=${missingMedia.outfit}&suffix=${suffix}&location=${location}`, {
     })
       .then(r => r.ok ? r.json() : null)
       .then(d => {
-        const fixUrl = u => u ? u.replace(/https?:\/\/localhost:\d+/, SIMULATOR_URL) : u;
+        const fixUrl = u => (typeof u === "string" && /^https?:\/\/[^/]+\/internal\/frames\//.test(u))
+          ? `/api/actors/${actorId}/frame/${u.split("/").pop()}?world_id=${worldId}`
+          : u;
         if (d?.start_url) { setStartUrl(fixUrl(d.start_url)); setStartPath(d.start_path); }
         if (d?.end_url)   { setEndUrl(fixUrl(d.end_url));     setEndPath(d.end_path); }
         setFramesLoaded(true);
@@ -1392,9 +1387,8 @@ function MissingMediaModal({ missingMedia, actorId, worldId, encounter_id, SIMUL
     const form = new FormData();
     form.append("file", file, `${role}_frame.jpg`);
     try {
-      const res = await fetch(`${SIMULATOR_URL}/internal/actors/${actorId}/upload_frame`, {
+      const res = await fetch(`/api/actors/${actorId}/upload_frame?world_id=${worldId}`, {
         method: "POST",
-        headers: { "x-service-token": SERVICE_TOKEN },
         body: form,
       });
       if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
@@ -1411,9 +1405,8 @@ function MissingMediaModal({ missingMedia, actorId, worldId, encounter_id, SIMUL
       const form = new FormData();
       form.append("file", file, finalFilename);
       form.append("world_id", worldId);
-      const res = await fetch(`${SIMULATOR_URL}/internal/worlds/${worldId}/actors/${actorId}/upload_video`, {
+      const res = await fetch(`/api/worlds/${worldId}/actors/${actorId}/upload_video`, {
         method: "POST",
-        headers: { "x-service-token": SERVICE_TOKEN },
         body: form,
       });
       if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
@@ -1425,9 +1418,9 @@ function MissingMediaModal({ missingMedia, actorId, worldId, encounter_id, SIMUL
     if (!prompt.trim()) { setError("Prompt required"); return; }
     setGenerating(true); setGenStatus("pending"); setError(null);
     try {
-      const res = await fetch(`${SIMULATOR_URL}/internal/worlds/${worldId}/encounter/${encounter_id}/generate_media`, {
+      const res = await fetch(`/api/worlds/${worldId}/encounter/${encounter_id}/generate_media`, {
         method: "POST",
-        headers: { "x-service-token": SERVICE_TOKEN, "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           actor_id:   actorId,
           position:   missingMedia.position,

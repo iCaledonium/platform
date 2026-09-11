@@ -19,9 +19,17 @@ import { KTX2Loader } from "three/examples/jsm/loaders/KTX2Loader.js";
 // the life of the tab, against eight call sites that would otherwise each need
 // their renderer in scope.
 //
-// The transcoder is self-hosted from /basis/ (copied out of three's own
-// examples) rather than a CDN, so it keeps working offline and cannot drift out
-// of step with the bundled three version.
+// The transcoder is self-hosted rather than pulled from a CDN, so it keeps
+// working offline and cannot drift out of step with the bundled three version.
+//
+// It is served from /assets/ specifically, and that is not arbitrary. nginx
+// serves this app from an explicit route ALLOWLIST — there is no catch-all, and
+// anything unlisted resolves against /var/www/anima and 404s. /basis/ was the
+// obvious home and returned 404 through the public domain while working
+// perfectly on localhost:4002, which is exactly the shape of bug that only
+// shows up in a browser. /assets/ is already allowlisted and already rooted at
+// dist/, so the files are copied there by the build script (see package.json)
+// — vite cannot do it itself because publicDir is deliberately false.
 
 let shared = null;
 
@@ -31,7 +39,7 @@ export function getKtx2Loader() {
     // Small and never rendered to — this exists purely so detectSupport can
     // read the GPU's texture-format extensions.
     const probe = new THREE.WebGLRenderer();
-    shared = new KTX2Loader().setTranscoderPath("/basis/").detectSupport(probe);
+    shared = new KTX2Loader().setTranscoderPath("/assets/").detectSupport(probe);
     probe.dispose();
   } catch (e) {
     console.warn("[ktx2] no WebGL context for format detection — " +

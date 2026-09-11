@@ -91,7 +91,7 @@ export async function wizardChecks() {
   return boundChecks();
 }
 
-export function mount(app, { db, authUser, PORT }) {
+export function mount(app, { db, authUser, PORT, recordActorDeletion }) {
   const pass = (name, detail) => ({ verdict: "pass", name, detail });
   const fail = (name, detail) => ({ verdict: "fail", name, detail });
   const skip = (name, detail) => ({ verdict: "skip", name, detail });
@@ -409,8 +409,18 @@ export function mount(app, { db, authUser, PORT }) {
   // Force-remove a throwaway the production path could not: clears an avatar
   // pointer that would block the delete, drops the satellite rows, removes the
   // folder. Only ever called on a row this bench created.
-  function forceRemove(actorId, folder) {
+  function forceRemove(actorId, folder, user) {
     try {
+      // conduct-watch signal 7 -- read the identity BEFORE the delete, and the
+      // media count before actor_media is swept, so the audit row below can name
+      // what went away.
+      const before = db.prepare(`SELECT id, name, owner_id, age, status, media_folder FROM actors WHERE id = ?`).get(actorId);
+      // 2026-09-10 (conduct-watch): the ROWS, not just the count -- depicts and
+      // subject_authorised die with actor_media, and the tombstone is what has
+      // to answer the likeness question afterwards. See summariseActorMedia in
+      // server/actor-media-audit.js.
+      const mediaRows = db.prepare(`SELECT id, media_type, filename, depicts, subject_authorised
+                                      FROM actor_media WHERE actor_id = ?`).all(actorId);
       db.prepare(`UPDATE users SET avatar_actor_id = NULL WHERE avatar_actor_id = ?`).run(actorId);
       const tables = ["actor_psychology", "actor_big5", "actor_disc", "actor_hds", "actor_economic",
         "actor_lifestyle", "actor_mental_health", "actor_education", "actor_upbringing",
@@ -418,6 +428,22 @@ export function mount(app, { db, authUser, PORT }) {
         "actor_expense_defaults", "actor_deployments"];
       db.transaction(() => {
         for (const t of tables) { try { db.prepare(`DELETE FROM ${t} WHERE actor_id = ?`).run(actorId); } catch { /* table may not exist */ } }
+        // conduct-watch signal 7 -- this bench's force-cleanup is an actor delete
+        // path too, and it takes the media folder with it. Every path that removes
+        // an `actors` row must write the attribution row, in the SAME transaction
+        // as the delete (see recordActorDeletion in server/index.js). It only ever
+        // runs on a row this bench created, but "the lab did it" is a fact worth
+        // recording rather than assuming: without it the row and its folder go
+        // away naming nobody, which is indistinguishable after the fact from a
+        // real character deleted by an unknown account.
+        //
+        // 2026-09-09: recorded BEFORE the DELETE, because `actors` now carries an
+        // AFTER DELETE trigger (server/db.js) that writes an UNATTRIBUTED fallback
+        // row when no audited path claimed the delete. It can only see audit rows
+        // that already exist when the DELETE runs.
+        if (before) {
+          recordActorDeletion({ actor: before, user, via: "wizard lab probe cleanup (forceRemove)", mediaRows });
+        }
         db.prepare(`DELETE FROM actors WHERE id = ?`).run(actorId);
       })();
       if (folder) rmSync(join(MEDIA_ROOT, "media/actors", folder), { recursive: true, force: true });
@@ -522,7 +548,7 @@ export function mount(app, { db, authUser, PORT }) {
     } catch (e) {
       checks.push(fail("the lifecycle probe ran to the end", "it threw: " + e.message));
     } finally {
-      if (id) forceRemove(id, folder);
+      if (id) forceRemove(id, folder, user);
     }
     res.json({ ok: checks.every(c => c.verdict !== "fail"), ran_at: new Date().toISOString(), checks });
   });
@@ -573,7 +599,7 @@ export function mount(app, { db, authUser, PORT }) {
     } finally {
       for (const id of made) {
         const row = db.prepare(`SELECT media_folder FROM actors WHERE id = ?`).get(id);
-        if (row) forceRemove(id, row.media_folder);
+        if (row) forceRemove(id, row.media_folder, user);
       }
     }
     res.json({ ok: checks.every(c => c.verdict !== "fail"), ran_at: new Date().toISOString(), checks });
@@ -637,7 +663,7 @@ export function mount(app, { db, authUser, PORT }) {
     } catch (e) {
       checks.push(fail("the worn-draft probe ran to the end", "it threw: " + e.message));
     } finally {
-      if (id) forceRemove(id, folder);
+      if (id) forceRemove(id, folder, user);
       // Put the caller back exactly as they were. Direct, because adopting
       // through the endpoint would re-push a body the worlds already hold.
       db.prepare(`UPDATE users SET avatar_actor_id = ?, updated_at = datetime('now') WHERE id = ?`)

@@ -469,6 +469,71 @@ export default function CharacterWizard({ user, worlds, mode = "character" }) {
   // "unanswered" and sends nothing at all, leaving the column NULL --
   // a blank must never read later as a declaration that was made.
   const [depicts, setDepicts] = useState("");
+  // 2026-09-11 (conduct-watch, resolution-manager) — the depicts PATCH can now
+  // REFUSE (403) when a withdrawal stands on this reference set, so the select
+  // can no longer assume its own optimistic value was accepted.
+  const [depictsErr, setDepictsErr] = useState(null);
+  // 2026-09-11 (conduct-watch, resolution-manager) — what the SERVER already
+  // holds for each photo slot, keyed by state_slug, so a pick can tell a FIRST
+  // fill of an empty slot from a REPLACEMENT of a photograph a declaration was
+  // already given about. Hydrated in loadDraft, kept current by every upload
+  // response. Presence of a key means "a row exists for this slot".
+  const [slotRows, setSlotRows] = useState({});
+  // Set when replacing a photograph blanked the declaration, so the question
+  // can say why it is being asked again instead of silently reverting to
+  // "Not stated". { slug, was }.
+  const [depictsCleared, setDepictsCleared] = useState(null);
+  // ...and, when the answer is "somebody else", whether that somebody agreed.
+  // Same contract as `depicts`: "" is unanswered and sends nothing, so a blank
+  // never lands in the record as permission nobody gave.
+  const [subjectAuthorised, setSubjectAuthorised] = useState("");
+  // Session 152 -- answering "No" here is RETROACTIVE and one-way on the
+  // server: PATCH .../media/authorisation unlists the character, revokes every
+  // live share link, deletes every claim, undeploys her from every simulator
+  // world, and does the same to every copy forked from her (including copies
+  // owned by other accounts). Answering "Yes" again restores none of it. The
+  // question used to fire that straight off the select with nothing asked
+  // beforehand and nothing shown after, so answering carelessly cost all of it
+  // silently. Confirm first, then show the receipt the endpoint returns --
+  // above all `still_deployed`, which is the simulator saying she is STILL IN
+  // THAT WORLD after the subject said no.
+  const [authWithdrawConfirm, setAuthWithdrawConfirm] = useState(false);
+  const [authRevoked, setAuthRevoked] = useState(null);
+  const [authSaving,  setAuthSaving]  = useState(false);
+  const [authErr,     setAuthErr]     = useState(null);
+
+  function writeSubjectAuthorisation(v) {
+    if (!v || !actorId) return;
+    setAuthSaving(true); setAuthErr(null);
+    fetch(`/api/actors/${actorId}/media/authorisation`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subject_authorised: v }),
+    })
+      .then(async r => {
+        const j = await r.json().catch(() => null);
+        if (!r.ok) {
+          const e = new Error(j?.error || `HTTP ${r.status}`);
+          // A 500 out of the revocation sweep still means the DECLARATION was
+          // written and every prospective gate now refuses; it is the taking
+          // back of what was already granted that did not finish.
+          e.recorded = j?.subject_authorised === v;
+          throw e;
+        }
+        return j;
+      })
+      .then(j => {
+        setAuthSaving(false);
+        setSubjectAuthorised(v);
+        setAuthRevoked(v === "no" ? (j?.revoked || null) : null);
+        console.log("[CharacterWizard] subject authorisation declared:", j);
+      })
+      .catch(e => {
+        setAuthSaving(false);
+        if (e.recorded) setSubjectAuthorised(v);
+        setAuthErr(e?.message || "could not save");
+        console.error("[CharacterWizard] authorisation declaration FAILED:", e);
+      });
+  }
   // Session 103 — the XTTS voice sample: { url } (server) or { file, url:objectURL } (just picked).
   const [voiceSample, setVoiceSample] = useState(null);
   // Session 103 — the profile photo shown in the viewer's loading
@@ -1242,8 +1307,16 @@ export default function CharacterWizard({ user, worlds, mode = "character" }) {
     const mediaBySlug = Object.fromEntries((data.mediaPhotos || []).map(m => [m.state_slug, m.url]));
     // Restore the declaration the same way the photos themselves restore --
     // reopening a draft must not present an answered question as unanswered.
+    // Which slots already have a row on the server, and what each one declares.
+    // handleSlotFile reads this to know whether a pick is a first fill or a
+    // replacement -- see the note there.
+    setSlotRows(Object.fromEntries(
+      (data.mediaPhotos || []).filter(m => m.media_type !== "audio").map(m => [m.state_slug, m.depicts || ""])
+    ));
     const declaredRow = (data.mediaPhotos || []).find(m => m.depicts);
     if (declaredRow) setDepicts(declaredRow.depicts);
+    const authRow = (data.mediaPhotos || []).find(m => m.subject_authorised);
+    if (authRow) setSubjectAuthorised(authRow.subject_authorised);
     const voiceRow = (data.mediaPhotos || []).find(m => m.state_slug === "voice_sample" || m.media_type === "audio");
     setVoiceSample(voiceRow ? { url: voiceRow.url } : null);
     for (const [suffix, slug] of [["_front.jpeg", "body_front"], ["_side.jpeg", "body_side"], ["_back.jpeg", "body_back"]]) {
@@ -1615,13 +1688,46 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
       // "uploading"). With an actorId present, upload immediately —
       // the row is what photo_url/mediaPhotos restore from.
       if (actorId) {
+        // 2026-09-11 (conduct-watch, resolution-manager) -- A DIFFERENT
+        // PHOTOGRAPH IS A DIFFERENT QUESTION, AND THAT HAS TO HOLD HERE TOO.
+        //
+        // POST /api/actors/:id/media replaces a slot by DELETE+INSERT and
+        // deliberately does NOT carry the replaced row's `depicts` onto the new
+        // one: the declaration is never inferred, because a guessed 'self'
+        // reads later as evidence somebody actually gave that answer.
+        //
+        // This handler used to defeat that from the primary UI. `depicts` is
+        // hydrated out of the existing actor_media rows when a draft loads, so
+        // picking a REPLACEMENT photograph restated the old answer on the way
+        // up and a swapped-in photograph of a different person inherited
+        // 'self' -- and with it the skipped subject-authorisation question --
+        // with no owner action at all.
+        //
+        // So the answer travels with a FIRST fill of an empty slot only. That
+        // is the "answer the question, then pick the photo" ordering, where the
+        // set-wide PATCH ran before the row existed and so never reached it.
+        // Replacing a photograph that already has a row sends nothing, and the
+        // question is put back to the owner in words below the select.
+        const replacing = Object.prototype.hasOwnProperty.call(slotRows, slug) || !!photos[slug];
         const fd = new FormData();
         fd.append("photo", file);
         fd.append("state_slug", slug);
         fd.append("media_type", "photo");
-        if (depicts) fd.append("depicts", depicts);
+        if (depicts && !replacing) fd.append("depicts", depicts);
+        if (replacing && depicts) { setDepicts(""); setDepictsErr(null); setDepictsCleared({ slug, was: depicts }); }
         fetch(`/api/actors/${actorId}/media`, { method: "POST", body: fd })
-          .then(r => r.json()).then(d => console.log(`[CharacterWizard] photo slot '${slug}' uploaded to actor_media:`, d))
+          .then(r => r.json()).then(d => {
+            console.log(`[CharacterWizard] photo slot '${slug}' uploaded to actor_media:`, d);
+            if (!d || !d.id) { console.error(`[CharacterWizard] photo slot '${slug}' upload REFUSED:`, d); return; }
+            setSlotRows(prev => ({ ...prev, [slug]: d.depicts || "" }));
+            // The select shows the record, not the last thing that was typed.
+            // If the row that just landed carries no declaration, the reference
+            // set now contains an undeclared photograph and the control must
+            // not keep reading "Me" -- that would be the UI telling the owner
+            // an answer stands when every gate can already see it does not.
+            if (!d.depicts) setDepicts("");
+            if (d.depicts_cleared_from) setDepictsCleared({ slug, was: d.depicts_cleared_from });
+          })
           .catch(err => console.error(`[CharacterWizard] photo slot '${slug}' upload FAILED:`, err));
       }
     }
@@ -1692,6 +1798,10 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
       // the wizard says it in words next to the field instead of surfacing a
       // bare 400 from the pipeline.
       if (!depicts) throw new Error("Say who is in these photographs before generating — the record has to be able to name whose likeness this is.");
+      // Mirrors the second server-side gate in generate3d.js, for the same
+      // reason the depicts check is mirrored here: say it in words next to the
+      // field rather than surfacing a bare 400 out of the pipeline.
+      if (depicts === "other" && subjectAuthorised !== "yes") throw new Error("These photographs are of somebody else. Confirm they authorised this likeness before generating it.");
       setCharacter3DStatus("uploading_photo");
       const fd = new FormData();
       fd.append("photo", photos.profile);
@@ -2372,24 +2482,132 @@ IWM: ${assessments.iwm||"not run"} | Attachment: ${assessments.attachment||"not 
               <select style={S.select} value={depicts} onChange={e=>{
                 const v = e.target.value;
                 setDepicts(v);
+                setDepictsCleared(null);
                 // The photographs are normally already on the server by the
                 // time this is answered — handleSlotFile uploads on pick — so
                 // the answer has to be able to reach rows that already exist.
                 // Without this the declaration was only ever carried by the
                 // NEXT upload, and in the common ordering by none at all.
+                setDepictsErr(null);
                 if (v && actorId) {
+                  // The server refuses a re-declaration that would take a
+                  // recorded withdrawal out of the scope every gate reads, so a
+                  // non-ok answer has to put the select back where it was: a
+                  // control that keeps showing "Me" after the server said no is
+                  // telling the owner the refusal is gone when it is not.
+                  const prev = depicts;
                   fetch(`/api/actors/${actorId}/media/depicts`, {
                     method: "PATCH", headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ depicts: v }),
-                  }).then(r=>r.json()).then(d=>console.log("[CharacterWizard] depicts declared:", d))
-                    .catch(err=>console.error("[CharacterWizard] depicts declaration FAILED:", err));
+                  }).then(async r => {
+                    const d = await r.json().catch(() => null);
+                    if (!r.ok) throw new Error(d?.error || `HTTP ${r.status}`);
+                    console.log("[CharacterWizard] depicts declared:", d);
+                  }).catch(err => {
+                    console.error("[CharacterWizard] depicts declaration FAILED:", err);
+                    setDepicts(prev);
+                    setDepictsErr(err?.message || "could not save");
+                  });
                 }
               }}>
                 <option value="">— Not stated —</option>
                 <option value="self">Me</option>
                 <option value="other">Someone else</option>
               </select>
+              {depictsErr && (
+                <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11.5,color:"#c0392b",marginTop:8}}>Could not save: {depictsErr}</div>
+              )}
+              {depictsCleared && !depicts && (
+                <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11.5,color:"#7a5a12",background:"rgba(176,92,8,0.07)",border:"1px solid rgba(176,92,8,0.22)",borderRadius:8,padding:"9px 11px",marginTop:8,lineHeight:1.55}}>
+                  This question is being asked again because the {(PHOTO_SLOTS.concat(BODY_PHOTO_SLOTS).find(s2 => s2.slug === depictsCleared.slug)?.label || depictsCleared.slug).toLowerCase()} photograph was replaced. The record said {depictsCleared.was === "self" ? "these photographs were of you" : "these photographs were of somebody else"} — but that answer was about the photograph that was replaced, not about the new one, so it was not carried over. Answer it for the photograph that is there now.
+                </div>
+              )}
             </Field>
+
+            {depicts === "other" && (
+              <Field label="Did that person authorise this likeness?" hint="Recorded exactly as you answer it and never guessed. A face and a body get built from these photographs, so the record has to be able to say the person in them agreed to that.">
+                <select style={S.select} value={subjectAuthorised} onChange={e=>{
+                  const v = e.target.value;
+                  // "No" spends things that cannot be got back, and reaches
+                  // copies this wizard cannot see. Confirm it before sending.
+                  // The select is controlled, so declining leaves it where it
+                  // was; nothing is written until the confirmation is taken.
+                  if (v === "no" && actorId) { setAuthErr(null); setAuthRevoked(null); setAuthWithdrawConfirm(true); return; }
+                  setSubjectAuthorised(v);
+                  // Same reasoning as the depicts PATCH above: the photographs
+                  // are already on the server by the time this is answered.
+                  if (v && actorId) writeSubjectAuthorisation(v);
+                }}>
+                  <option value="">— Not stated —</option>
+                  <option value="yes">Yes, they authorised it</option>
+                  <option value="no">No</option>
+                </select>
+
+                {/* In-page and not window.confirm(), which is silently
+                    suppressed in some embedded browser contexts -- the same
+                    reason ActorsGalleryPage stopped using it. */}
+                {authWithdrawConfirm && (
+                  <div style={{marginTop:10, padding:"13px 15px", borderRadius:10, background:"rgba(192,57,43,.06)", border:"1px solid rgba(192,57,43,.28)"}}>
+                    <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:12.5,fontWeight:600,color:"#c0392b",marginBottom:7}}>
+                      Answering "No" takes back what was already granted
+                    </div>
+                    <ul style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:12,color:"#4a4740",lineHeight:1.6,margin:"0 0 11px 18px",padding:0}}>
+                      <li>This character is unlisted from the gallery.</li>
+                      <li>Every share link minted for her is revoked and stops working.</li>
+                      <li>Everyone who claimed her from a link loses access to her.</li>
+                      <li>She is removed from every simulator world she is deployed in.</li>
+                      <li>Every copy forked from her is swept the same way, including copies owned by other accounts.</li>
+                      <li>Answering "Yes" again later restores none of it.</li>
+                    </ul>
+                    <div style={{display:"flex",gap:8}}>
+                      <button type="button" onClick={()=>setAuthWithdrawConfirm(false)}
+                        style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:12.5,padding:"8px 16px",borderRadius:9,border:"1px solid rgba(0,0,0,.12)",background:"none",color:"#6b6760",cursor:"pointer"}}>
+                        Cancel
+                      </button>
+                      <button type="button" disabled={authSaving} onClick={()=>{ setAuthWithdrawConfirm(false); writeSubjectAuthorisation("no"); }}
+                        style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:12.5,padding:"8px 16px",borderRadius:9,border:"none",background:"#c0392b",color:"#faf8f4",cursor:"pointer"}}>
+                        Withdraw and revoke
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {authSaving && (
+                  <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11.5,color:"#a8a5a0",marginTop:8}}>Saving…</div>
+                )}
+                {authErr && (
+                  <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11.5,color:"#c0392b",marginTop:8}}>Could not save: {authErr}</div>
+                )}
+
+                {/* The receipt. The endpoint has always returned this summary;
+                    nothing read it, so the cost of the answer was invisible. */}
+                {authRevoked && (
+                  <div style={{marginTop:10, padding:"13px 15px", borderRadius:10, background:"rgba(255,255,255,.6)", border:"1px solid rgba(0,0,0,.10)"}}>
+                    <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:10,letterSpacing:".16em",textTransform:"uppercase",color:"#6b6760",marginBottom:6}}>
+                      What the withdrawal revoked
+                    </div>
+                    <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:12.5,color:"#4a4740",lineHeight:1.6}}>
+                      {authRevoked.unpublished || 0} gallery listing(s) unlisted · {authRevoked.links_revoked || 0} share link(s) revoked · {authRevoked.claims_revoked || 0} claim(s) removed · removed from {(authRevoked.undeployed || []).length} world(s)
+                      {(authRevoked.actors || []).length > 1 && ` · across ${(authRevoked.actors || []).length} character(s) in the copy tree`}
+                    </div>
+                    {(authRevoked.still_deployed || []).length > 0 && (
+                      <div style={{marginTop:10, padding:"11px 13px", borderRadius:9, background:"rgba(192,57,43,.08)", border:"1px solid rgba(192,57,43,.3)"}}>
+                        <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:12.5,fontWeight:600,color:"#c0392b",marginBottom:5}}>
+                          Still in {(authRevoked.still_deployed || []).length} world(s) — not removed
+                        </div>
+                        <div style={{fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:12,color:"#4a4740",lineHeight:1.6}}>
+                          The simulator did not confirm removal from {(authRevoked.still_deployed || []).map(u => u.world_name || u.world_id).join(", ")}, so she is still in {(authRevoked.still_deployed || []).length === 1 ? "that world" : "those worlds"} despite the withdrawal. Retry once the simulator is running.
+                        </div>
+                        <button type="button" disabled={authSaving} onClick={()=>writeSubjectAuthorisation("no")}
+                          style={{marginTop:9,fontFamily:"'DM Sans',system-ui,sans-serif",fontSize:11.5,letterSpacing:".05em",textTransform:"uppercase",padding:"7px 14px",borderRadius:8,border:"1px solid rgba(192,57,43,.35)",background:"transparent",color:"#993c1d",cursor:"pointer"}}>
+                          {authSaving ? "Retrying…" : "Retry removal"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </Field>
+            )}
 
             {/* Advanced, collapsed by default — default flow (one
                 reference photo) stays exactly as it was. This adds

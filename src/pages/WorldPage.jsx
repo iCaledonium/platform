@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import WorldEnterOverlay from "./WorldEnterOverlay.jsx";
 import WorldInstruments from "./WorldInstruments.jsx";
+import { labReturnPath } from "../labReturn.js";
 
 // ── WorldPage ─────────────────────────────────────────────────────────────────
 //
@@ -81,7 +82,7 @@ export default function WorldPage() {
     <div style={{ minHeight:"100vh", background:"#eeecea", display:"flex", flexDirection:"column",
       alignItems:"center", justifyContent:"center", gap:12, fontFamily:"'DM Sans',system-ui,sans-serif" }}>
       <p style={{ fontSize:13, color:"#a8a5a0", margin:0 }}>That world doesn't exist, or you're not a member of it.</p>
-      <a onClick={() => navigate("/home")} style={{ fontSize:12, color:"#b05c08", cursor:"pointer" }}>← Back to home</a>
+      <a onClick={() => navigate(labReturnPath() || "/home")} style={{ fontSize:12, color:"#b05c08", cursor:"pointer" }}>← Back to home</a>
     </div>
   );
 
@@ -95,7 +96,7 @@ export default function WorldPage() {
         Nobody is awake in there. Start the world and its characters boot; until then there is nothing to enter.
       </p>
       <div style={{ display:"flex", gap:8, marginTop:4 }}>
-        <button onClick={() => navigate("/home")}
+        <button onClick={() => navigate(labReturnPath() || "/home")}
           style={{ fontSize:12, letterSpacing:".06em", textTransform:"uppercase", padding:"9px 18px", borderRadius:9,
             border:"1px solid rgba(0,0,0,.12)", background:"none", color:"#6b6760", cursor:"pointer" }}>← Home</button>
         {world.role === "owner" && (
@@ -136,7 +137,7 @@ export default function WorldPage() {
   // happens here, on a surface that knows who is looking.
   return (
     <>
-      <WorldEnterOverlay world={world} user={user} onClose={() => navigate("/home")} />
+      <WorldEnterOverlay world={world} user={user} onClose={() => navigate(labReturnPath() || "/home")} />
       <WorldInstruments world={world} />
     </>
   );

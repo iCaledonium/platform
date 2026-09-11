@@ -75,6 +75,9 @@ export default function TransportLabPage() {
   const [dest, setDest] = useState("");
   const [mode, setMode] = useState(MODES[0]);
   const [arrivalState, setArrivalState] = useState("work_deep");
+  // Default on: arming a sleeping actor tests nothing, because the engine
+  // zeroes her drives while she naps. Opt out to watch her sleep through it.
+  const [wakeOnArm, setWakeOnArm] = useState(true);
   const [compress, setCompress] = useState(0);
 
   const [garage, setGarage] = useState([]);
@@ -121,6 +124,12 @@ export default function TransportLabPage() {
 
   // Same ambient filter as the door lab: the ambient cast populates venues and
   // has no home, no work and no schedule, so none of them can be sent anywhere.
+  //
+  // The player is excluded for the same reason and a stronger one. actor_type
+  // "user" is a person at a keyboard, not a simulated actor: no employer, no
+  // schedule, no commute to depart on. Offering him made the board go red with
+  // "unresolvable: work_place_id=nil" — the bench asking a question about a
+  // life that nobody is living. He cannot be sent anywhere either.
   useEffect(() => {
     if (!worldId) return;
     (async () => {
@@ -128,12 +137,17 @@ export default function TransportLabPage() {
         const p = await fetch(`/api/worlds/${worldId}/presence`, { credentials: "include" }).then(r => r.json());
         const list = (p?.locations || []).flatMap(l => (l.actors || [])
           .filter(a => !a.is_ambient && a.actor_type !== "ambient")
+          .filter(a => !a.is_user && a.actor_type !== "user")
           .map(a => ({ id: a.actor_id, name: a.name })));
         const seen = new Set();
         const uniq = list.filter(a => !seen.has(a.id) && seen.add(a.id))
                          .sort((a, b) => (a.name || "").localeCompare(b.name || ""));
         setActors(uniq);
-        if (uniq.length && !uniq.some(a => a.id === actorId)) setActorId(uniq[0].id);
+        // A world with no simulable actor (TEST WORLD 2 holds only the player)
+        // must clear the selection rather than keep a stale one from the
+        // previous world, which would run every check against the wrong actor.
+        if (!uniq.length) setActorId("");
+        else if (!uniq.some(a => a.id === actorId)) setActorId(uniq[0].id);
       } catch (e) { setError(String(e)); }
     })();
   }, [worldId]);
@@ -162,10 +176,14 @@ export default function TransportLabPage() {
   }
 
   const doArm = () => run("arm", async () => {
-    const r = await call("arm", { minutes_before: 30, minutes_after: 180 });
+    const r = await call("arm", { minutes_before: 30, minutes_after: 180, wake: wakeOnArm });
+    const wokeBit =
+      r.woke === "woken"       ? " She was asleep and has been woken." :
+      r.woke === "already_awake" ? " She was already awake." :
+      r.woke === "not_running"   ? " Wake requested, but no ActorServer is running — not delivered." : "";
     note("ok", `Armed — ${r.day} ${r.block.start}–${r.block.end}`,
-      `Contract authored over now. Original kept: ${r.original.work_days} ${r.original.work_blocks}. ` +
-      `Next tick should offer "go to work".`);
+      `Contract authored over now. Original kept: ${r.original.work_days} ${r.original.work_blocks}.` +
+      `${wokeBit} Next tick should offer "go to work".`);
     await refresh();
   });
 
@@ -307,8 +325,11 @@ export default function TransportLabPage() {
           </div>
           <div>
             <div style={{ ...label, marginBottom: 6 }}>Actor</div>
-            <select value={actorId} onChange={e => setActorId(e.target.value)} style={input}>
-              {actors.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+            <select value={actorId} onChange={e => setActorId(e.target.value)} style={input}
+                    disabled={!actors.length}>
+              {actors.length
+                ? actors.map(a => <option key={a.id} value={a.id}>{a.name}</option>)
+                : <option value="">no simulable actor in this world — only the player lives here</option>}
             </select>
           </div>
         </div>
@@ -418,6 +439,23 @@ export default function TransportLabPage() {
                 and a lab that lied about the time would have every circadian read in the engine quietly disagreeing with it.
                 The original is kept and restored on disarm, along with any absence the armed window recorded.
               </div>
+              <label style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 11,
+                              lineHeight: 1.7, color: "rgba(255,255,255,.5)", cursor: armed ? "default" : "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={wakeOnArm}
+                  disabled={!canAct || armed}
+                  onChange={(e) => setWakeOnArm(e.target.checked)}
+                  style={{ marginTop: 2, accentColor: GOLD + "1)" }}
+                />
+                <span>
+                  Wake her if she is asleep. A sleeping actor cannot want anything — the engine zeroes the
+                  drive multipliers for <i>napping</i> and <i>sleeping</i>, so she will sleep through her own
+                  contracted block and accrue absence she cannot notice. Waking is an event in her life,
+                  not a lab detail: it writes residues, a sleep memory and a feed entry, recorded as
+                  <span style={{ ...mono }}> :test_lab_wake</span>.
+                </span>
+              </label>
               <div style={{ display: "flex", gap: 8 }}>
                 <button style={btn(!armed)} disabled={!canAct || armed} onClick={doArm}>Arm — put her inside a working block</button>
                 <button style={btn(false)} disabled={!canAct || !armed} onClick={doDisarm}>Disarm & restore</button>
@@ -492,6 +530,23 @@ export default function TransportLabPage() {
                 <div style={{ fontSize: 11.5, color: "rgba(255,255,255,.75)" }}>{c.name}</div>
                 <div style={{ fontSize: 10.5, color: "rgba(255,255,255,.4)", lineHeight: 1.6, marginTop: 2 }}>{c.detail}</div>
               </div>
+              {c.verdict === "fail" && (
+                <button
+                  title="Hand this failure to the watcher: diagnose, fix within its charter, re-run the check"
+                  onClick={() => window.dispatchEvent(new CustomEvent("watcher:ask", { detail: { text:
+                    `Developer pressed FIX on the failing transport scorecard check "${c.name}". Its detail: ${c.detail} — ` +
+                    "Diagnose the root cause and FIX it within your charter: snapshot first if anything state-destroying, " +
+                    "state writes only through the test endpoints, code changes compile-proofed (staged if a restart is " +
+                    "needed — do not restart just for this; say so instead). When done, re-run this lab's checks endpoint " +
+                    "and report whether it went green, or exactly why it must stay red." } }))}
+                  style={{ alignSelf: "flex-start", flex: "none", padding: "4px 10px", borderRadius: 5,
+                    cursor: "pointer", background: "rgba(201,151,58,.12)",
+                    border: "0.5px solid rgba(201,151,58,.4)", color: "rgba(201,151,58,.9)",
+                    fontSize: 9.5, letterSpacing: ".1em", textTransform: "uppercase",
+                    fontFamily: "'DM Sans',system-ui,sans-serif" }}>
+                  Fix
+                </button>
+              )}
             </div>
           ))}
         </div>

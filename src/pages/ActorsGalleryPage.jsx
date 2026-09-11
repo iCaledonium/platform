@@ -524,6 +524,55 @@ function ActorCard({ actor, shared, owned, onShare, onDelete, onDeploy, onUndepl
       <p style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", fontSize:18, fontWeight:500, color:"#1a1814", marginBottom:3, lineHeight:1.1 }}>{actor.name}</p>
       <p style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#a8a5a0", marginBottom:10, lineHeight:1.5 }}>{actor.occupation||"—"}</p>
 
+      {/* Session 151 — an outstanding subject-authorisation declaration, said out loud.
+          Every build and egress path refuses a character whose reference photographs are
+          declared to be of somebody else without a 'yes' — but the question was only ever
+          asked inside the character wizard, so once the draft was closed nothing in the app
+          said the answer was missing. The result was a wall of 403s with no visible cause
+          and no route back to the dropdown. This chip is that route: it is the same
+          predicate the gates use (server-side, see GET /api/actors), and clicking the card
+          opens the character, where the declaration can be answered. */}
+      {/* 2026-09-11 (conduct-watch) — 'undeclared' is the third state, added when the
+          egress gates were widened to refuse a reference set carrying no declaration at
+          all (the build gates always did). It is a DIFFERENT question from the other two
+          — "who is in these photographs", not "did they agree" — so it gets its own words
+          and sends the owner to the declaration control rather than the authorisation one.
+          Without this branch the card would have gone silent for exactly the characters
+          the gates had just started refusing. */}
+      {(actor.subject_authorisation === "undeclared" || actor.subject_authorisation === "pending" || actor.subject_authorisation === "no") && (
+        <div
+          title={actor.subject_authorisation === "no"
+            ? "The person in this character's reference photographs was declared NOT to have authorised this likeness. Building, sharing, publishing and deploying are refused. Open the character to review it."
+            : actor.subject_authorisation === "undeclared"
+            ? "Nothing on this character's reference photographs says whose likeness they are. Building, sharing, publishing and deploying are refused until somebody says. Open the character to answer it."
+            : "Nobody has said whether the person in this character's reference photographs authorised this likeness. Building, sharing, publishing and deploying are refused until it is answered. Open the character to answer it."}
+          style={{ display:"inline-flex", alignItems:"center", gap:5, fontFamily:"'DM Sans',system-ui,sans-serif",
+            fontSize:9, letterSpacing:".06em", textTransform:"uppercase", padding:"3px 8px", borderRadius:5,
+            background:"rgba(176,92,8,.12)", color:"#854f0b", border:"1px solid rgba(176,92,8,.3)", marginBottom:10 }}>
+          <span style={{ width:4, height:4, borderRadius:"50%", background:"#b05c08", flexShrink:0 }} />
+          {actor.subject_authorisation === "no" ? "Subject declined"
+            : actor.subject_authorisation === "undeclared" ? "Declaration needed"
+            : "Authorisation needed"}
+        </div>
+      )}
+
+      {/* 2026-09-09 (conduct-watch) -- the chip above says the subject declined;
+          this one says she is STILL IN A WORLD anyway, because the undeploy the
+          withdrawal fired was refused or never reached the simulator. Derived
+          server-side (GET /api/actors, withdrawal_still_deployed) so it is not
+          dependent on anyone still having the page open from when it happened.
+          Open the character to retry the removal. */}
+      {actor.withdrawal_still_deployed > 0 && (
+        <div
+          title={`The subject withdrew authorisation, but this character has not been removed from ${actor.withdrawal_still_deployed} simulator world(s) — the simulator refused or was unreachable. Open the character to remove her now.`}
+          style={{ display:"inline-flex", alignItems:"center", gap:5, fontFamily:"'DM Sans',system-ui,sans-serif",
+            fontSize:9, letterSpacing:".06em", textTransform:"uppercase", padding:"3px 8px", borderRadius:5,
+            background:"rgba(192,57,43,.12)", color:"#c0392b", border:"1px solid rgba(192,57,43,.35)", marginBottom:10 }}>
+          <span style={{ width:4, height:4, borderRadius:"50%", background:"#c0392b", flexShrink:0 }} />
+          Still deployed after withdrawal
+        </div>
+      )}
+
       {/* Session 150 — the "In Play · <world>" sections are gone, so the card
           carries that fact itself.
           

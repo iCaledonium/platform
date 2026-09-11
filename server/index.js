@@ -10,6 +10,7 @@ import zlib from "zlib";
 import { fileURLToPath } from "url";
 import multer from "multer";
 import db from "./db.js";
+import { summariseActorMedia } from "./actor-media-audit.js";
 import { registerGenerate3DRoutes, deleteActorTmpFolder, appearanceHash } from "./generate3d.js";
 import { mergeAnimationIntoActorGlb, removeAnimationFromActorGlb, parseDufFrames } from "./animations.js";
 import { educationFromCv } from "./cv_edu.mjs";
@@ -22,6 +23,7 @@ import { mount as mountShareLinkRoutes } from "./sharelinks-routes.js";
 import { mount as mountShareLabRoutes } from "./sharelab-routes.js";
 import { mount as mountDeployLabRoutes } from "./deploylab-routes.js";
 import { mount as mountRoutineLabRoutes } from "./routinelab-routes.js";
+import { mount as mountInteractionRoutes } from "./interaction-routes.js";
 
 // Session 102 — drafts carry their wizard adjustment state (all morph
 // slider values, the named body sliders, pose values, reference URLs,
@@ -220,7 +222,71 @@ app.use((req, res, next) => {
 // authUser() the routes use, so the log cannot disagree with the authorisation.
 // Resolved on 'finish' so the status and duration are real. Static asset paths
 // are excluded: they carry no actor and would bury the signal.
-const ATTRIB_SKIP = /^\/(assets|js|media|favicon|static|phoenix|live)\b/;
+// Behaviour watch, 2026-09-09: `media` was in this list, so a media fetch that
+// reaches THIS process produced no [req] line in either arm -- served or refused --
+// and the bytes under /media/actors|worlds|users are a real person's reference
+// photographs, body models and voice. Most browser media on this host is served by
+// nginx from disk (the ANIMA-INVARIANT auth_request stanzas) and lands in nginx
+// access.log, but anything that reaches :4002 /media directly -- LAN clients,
+// server-to-server fetches, anything bypassing nginx -- was completely unattributed.
+// That is precisely the traffic that most needs a record. The simulator dropped
+// /media from its own @skip the same day (request_log.ex) for the same reason, so
+// one grep still reads both hosts. Bulk assets stay skipped: they carry no subject.
+// ── Who the served media bytes DEPICT ────────────────────────────────────
+// Conduct watch, 2026-09-09: the [req] line below records WHO ASKED (account,
+// auth, ip) but said nothing about WHOSE photograph, body model or voice was
+// handed over. The simulator's matching line (request_log.ex) already resolves a
+// subject=/minor=/subject_age= triple from the actor id in the media path, and
+// emits a separate [minor-media] record when the subject is a declared minor,
+// precisely so a child-safety audit can grep ONE stable token instead of having
+// to know the URL layout. This host emitted neither, so a `minor=yes` read
+// across both journals came back clean on the platform BY CONSTRUCTION rather
+// than by measurement -- a false clean, which is the failure mode this bench
+// exists to catch. Resolved server-side against `actors`, never from a
+// caller-supplied string.
+//
+// Paths whose subject lives on the SIMULATOR (/media/cities, /media/worlds)
+// resolve to `remote:<id>` when this host has no row: the ambient cast is not
+// stored here, so absence is EXPECTED and must not be reported as an orphan
+// (that would manufacture a scary finding out of normal topology). The
+// simulator's own [req]/[minor-media] lines are authoritative for those.
+// /media/actors is this host's own canonical media, so a missing row there IS
+// an orphaned file. Non-personal categories (places, accessories, homes, poses)
+// carry no subject at all.
+const SUBJ_BY_FOLDER = db.prepare(`SELECT id, age FROM actors WHERE media_folder = ?`);
+const SUBJ_BY_ID = db.prepare(`SELECT id, age FROM actors WHERE id = ?`);
+function mediaSubject(p) {
+  const none = { subject: "-", minor: "-", age: "-" };
+  try {
+    const seg = String(p || "").split("/").filter(Boolean).map(decodeURIComponent);
+    if (seg[0] !== "media") return none;
+    let a = null;
+    let fallback = null;
+    if (seg[1] === "actors" && seg[2]) {
+      a = SUBJ_BY_FOLDER.get(seg[2]) || SUBJ_BY_ID.get(seg[2]);
+      fallback = `orphan:${seg[2]}`;
+    } else if (seg[1] === "worlds" && seg[3] === "actors" && seg[4]) {
+      a = SUBJ_BY_ID.get(seg[4]);
+      fallback = `remote:${seg[4]}`;
+    } else if (seg[1] === "cities" && seg[3] === "ambient_actors" && seg[4]) {
+      a = SUBJ_BY_ID.get(seg[4]);
+      fallback = `remote:${seg[4]}`;
+    } else if (seg[1] === "users" && seg[2]) {
+      // A user's own media folder. `users` carries no declared age on this
+      // host, so the honest answer is "unknown" -- never "no".
+      return { subject: `user:${seg[2]}`, minor: "unknown", age: "-" };
+    } else {
+      return none;
+    }
+    if (!a) return { subject: fallback, minor: "unknown", age: "-" };
+    if (a.age === null || a.age === undefined) return { subject: `actor:${a.id}`, minor: "unknown", age: "-" };
+    return { subject: `actor:${a.id}`, minor: a.age < 18 ? "yes" : "no", age: String(a.age) };
+  } catch (_e) {
+    // Attribution must never be able to break a request it is only observing.
+    return { subject: "unresolved", minor: "unknown", age: "-" };
+  }
+}
+const ATTRIB_SKIP = /^\/(assets|js|favicon|static|phoenix|live)\b/;
 app.use((req, res, next) => {
   if (ATTRIB_SKIP.test(req.path)) return next();
   const started = Date.now();
@@ -236,11 +302,98 @@ app.use((req, res, next) => {
     } catch (_e) {
       account = "unresolved";
     }
-    const fwd = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+    // Conduct watch, 2026-09-05: `ip=` has to be evidence, not testimony.
+    // This line used to prefer the first x-forwarded-for value over the socket
+    // peer, so any caller that could reach :4002 could author an arbitrary ip=
+    // into the request record. nginx in front of this app (sites-enabled/anima)
+    // now appends $proxy_add_x_forwarded_for, so the LAST element of xff is the
+    // peer nginx actually saw; everything to its left is caller-supplied and
+    // still forgeable. express `trust proxy` is deliberately left off, so
+    // req.ip IS this process's socket peer. Same field shape as the simulator's
+    // [req] line (request_log.ex) so one grep reads both hosts.
+    const peer = req.ip || (req.socket && req.socket.remoteAddress) || "-";
+    const xffRaw = String(req.headers["x-forwarded-for"] || "").replace(/\s+/g, "");
+    // Caller-controlled values are sanitised before they enter the line: a
+    // space (or an `=`-bearing token) in a path or a forwarded header would
+    // otherwise inject a whole extra `account=` field and forge a log entry
+    // for a request nobody made. Same reason as the simulator's safe/1.
+    const safe = (v) => (String(v == null ? "" : v).replace(/[^A-Za-z0-9._:\/\[\]@%,+-]/g, "?").slice(0, 300) || "-");
+    // originalUrl, NOT req.path: express STRIPS the mount prefix from req.url
+    // while a mounted handler runs (`app.use("/media", express.static(...))`),
+    // and only restores it if that handler calls next(). A media handler ends
+    // the response instead, so by the time this 'finish' callback runs req.path
+    // has lost its leading /media and every subject resolved to "-". Verified
+    // live: probes logged subject=- before this line was changed.
+    // ── Media served by nginx from disk, witnessed via the auth subrequest ──
+    // Conduct watch, 2026-09-09: nginx serves /media/actors|users|worlds straight
+    // from DISK (the ANIMA-INVARIANT auth_request stanzas in sites-enabled/anima),
+    // so a browser media fetch never runs a route in this process and the line
+    // above resolved subject=- for the ORDINARY path by which a real person's
+    // reference photographs, body models and voice are handed over. An auditor
+    // grepping `minor=yes` across both application journals therefore got an
+    // answer that looked complete and was not -- a false clean, the exact failure
+    // mode this bench exists to catch.
+    //
+    // But those stanzas carry `auth_request /api/auth/check`, and THAT subrequest
+    // does reach this process, carrying the browser's real path in X-Original-URI.
+    // The fetch is witnessable here after all, so attribute it from that URI
+    // instead of from /api/auth/check. No nginx stanza is touched and nothing is
+    // loosened: this only reads a header nginx already sends.
+    //
+    // NOTE ON res.statusCode for these lines: on the auth-check path it is the
+    // ACCESS-CONTROL outcome (200 = nginx was cleared to serve the bytes, 401 =
+    // refused), not the byte-transfer status. For an audit that is the more
+    // useful of the two, but it is a different question from the one the same
+    // field answers on a direct /media hit -- read it with via= alongside.
+    //
+    // Trusted ONLY on the auth-check path and ONLY from loopback: /api/auth/check
+    // is `internal;` in nginx, so it is unreachable from outside, and nginx
+    // proxies it from localhost. Anywhere else X-Original-URI is an unverified
+    // caller string and is ignored, so it cannot forge a [minor-media] record for
+    // a request nobody made. Same claim-vs-corroborated split as xff=/probe=/ua=.
+    const fromLoopback = peer === "127.0.0.1" || peer === "::1" || peer === "::ffff:127.0.0.1";
+    const origUri = (req.path === "/api/auth/check" && fromLoopback)
+      ? String(req.headers["x-original-uri"] || "").split("?")[0]
+      : "";
+    // What the browser actually asked for when we know it, else our own URL.
+    const attribPath = origUri || req.originalUrl.split("?")[0];
+    const subj = mediaSubject(attribPath);
+    // WHO ASKED, as far as the caller is willing to say. Conduct watch,
+    // 2026-09-09: the auditor that probes this host over the public tunnel was
+    // the loudest caller in its own journal and had no way to subtract itself,
+    // because this line carried no marker for it. The simulator grew probe=/ua=
+    // on the same day (request_log.ex probe/1, user_agent/1) and this is its
+    // mirror, same names, same 40/120 char caps, so one grep still reads both
+    // hosts. BOTH are CLAIMS, in the same class as xff= and never in the class
+    // of account=/subject=, which are corroborated against a row: a caller can
+    // set either header to anything. That is sound for the job it does --
+    // self-exclusion only ever needs a cooperative marker -- but it means an
+    // audit excludes on probe=, which only removes traffic that identified
+    // itself, and reads ua= as corroboration alongside ip=/auth=. Never audit
+    // by dropping ua=curl/* wholesale: that also hides the scripted caller an
+    // audit exists to find.
+    const tag = (v, n) => safe(String(v == null ? "" : v).slice(0, n));
+    const probe = tag(req.headers["x-anima-audit-probe"], 40);
+    const ua = tag(req.headers["user-agent"], 120);
     console.log(
-      `[req] ${req.method} ${req.originalUrl.split("?")[0]} ${res.statusCode} ` +
-      `${Date.now() - started}ms account=${account} auth=${how} ip=${fwd || req.ip || "-"}`
+      `[req] ${req.method} ${safe(req.originalUrl.split("?")[0])} ${res.statusCode} ` +
+      `${Date.now() - started}ms account=${safe(account)} auth=${safe(how)} ` +
+      `ip=${safe(peer)} xff=${safe(xffRaw)} ` +
+      `subject=${safe(subj.subject)} minor=${safe(subj.minor)} subject_age=${safe(subj.age)} ` +
+      `probe=${probe} ua=${ua} for=${safe(origUri || "-")}`
     );
+    // The one line a child-safety audit can grep for WITHOUT knowing the media
+    // URL layout, and which carries the OUTCOME. Same token and field shape as
+    // the simulator's [minor-media] line, so one grep reads both hosts. It is an
+    // audit record, not an alarm.
+    if (subj.minor === "yes") {
+      console.log(
+        `[minor-media] ${req.method} ${safe(attribPath)} ${res.statusCode} ` +
+        `${Date.now() - started}ms subject=${safe(subj.subject)} subject_age=${safe(subj.age)} ` +
+        `auth=${safe(how)} ip=${safe(peer)} xff=${safe(xffRaw)} ` +
+        `probe=${probe} ua=${ua} via=${origUri ? "auth_request" : "direct"}`
+      );
+    }
   });
   next();
 });
@@ -933,6 +1086,10 @@ app.post("/api/auth/verify", (req, res) => {
   const handoffExp  = new Date(Date.now() + 60 * 1000).toISOString();
   db.prepare(`INSERT INTO auth_handoff_tickets (ticket_hash, user_id, expires_at, inserted_at)
               VALUES (?, ?, ?, datetime('now'))`).run(handoffHash, userId, handoffExp);
+  // Most sign-ins are web-only and never open the desktop app, so this ticket
+  // is usually born to die unredeemed. Reap it when it expires rather than
+  // leaving a dead session-grant lying about until the next tick.
+  scheduleHandoffReap(handoffExp);
 
   // Push presence online to simulator
   const membership = db.prepare(`SELECT actor_id FROM world_memberships WHERE user_id = ? LIMIT 1`).get(userId);
@@ -982,7 +1139,7 @@ app.post("/api/auth/handoff/ticket", (req, res) => {
               VALUES (?, ?, ?, datetime('now'))`).run(hash, user.id, expires);
 
   // Housekeeping: a ticket is worthless after a minute, so do not keep them.
-  db.prepare(`DELETE FROM auth_handoff_tickets WHERE julianday(expires_at) < julianday('now', '-1 hour')`).run();
+  scheduleHandoffReap(expires);
 
   res.json({ ticket: raw, expires_in: HANDOFF_TTL_SECONDS,
              url: `anima://auth?ticket=${raw}` });
@@ -992,12 +1149,32 @@ app.post("/api/auth/handoff/ticket", (req, res) => {
 // with minting a new one - if nobody minted, nothing swept. Timer, tickets only:
 // auth_tokens is deliberately NOT reaped here (the lab CLI holds short-lived
 // shell sessions and a broad reaper would kill them mid-call).
+//
+// 2026-09-09: the timer swept, but only rows expired for more than an HOUR, on a
+// ten-minute tick - so a dead ticket sat visible for up to ~70 minutes after it
+// stopped being redeemable. That is the whole gap the sign-in board reports as
+// "no handoff ticket is left lying around": /api/auth/verify mints a ticket on
+// EVERY sign-in whether or not the desktop app is ever opened, so a plain web
+// login leaves an unburned row behind by design. There is nothing to keep once
+// expires_at passes - redeem answers 401 for an expired ticket and 401 for an
+// unknown one - so the grace is gone, and each mint now schedules its own reap
+// so the row goes as it dies instead of at the next tick. The interval stays as
+// the backstop for rows that outlived a restart.
 function sweepHandoffTickets() {
   try {
     const r = db.prepare(`DELETE FROM auth_handoff_tickets
-                           WHERE julianday(expires_at) < julianday('now', '-1 hour')`).run();
+                           WHERE julianday(expires_at) <= julianday('now')`).run();
     if (r.changes) console.log(`[handoff sweep] removed ${r.changes} expired ticket(s)`);
   } catch (e) { console.error("[handoff sweep]", e.message); }
+}
+// Reap one ticket the instant it expires. Unref'd: never holds the loop open.
+function scheduleHandoffReap(expiresAtISO) {
+  try {
+    const ms = new Date(expiresAtISO).getTime() - Date.now();
+    if (!Number.isFinite(ms)) return sweepHandoffTickets();
+    const t = setTimeout(sweepHandoffTickets, Math.max(0, ms) + 1000);
+    if (typeof t.unref === "function") t.unref();
+  } catch (e) { console.error("[handoff sweep] schedule", e.message); }
 }
 sweepHandoffTickets();
 setInterval(sweepHandoffTickets, 10 * 60 * 1000).unref();
@@ -1601,6 +1778,29 @@ app.post("/api/me/avatar", async (req, res) => {
   db.prepare(`UPDATE users SET avatar_actor_id = ?, updated_at = datetime('now') WHERE id = ?`)
     .run(actorId, user.id);
 
+  // Adopting a character as your own avatar is a first-person statement about
+  // its reference photographs, so record it. actor_media.depicts was NULL on
+  // every row on the system, which left signal 4 ("is this uploader building a
+  // likeness of somebody who is not them") unanswerable even for the one actor
+  // the account had explicitly said IS them. This is the same derivation
+  // avatarlab-routes.js already treats as true-by-construction -- the
+  // authenticated OWNER of this actor is declaring it to be themselves -- and
+  // not an inference from a name or from a photograph.
+  //
+  // Only NULLs are filled. An explicit 'other' already on file is a
+  // contradiction (a likeness of someone else, adopted as your own face) and is
+  // exactly what the conduct watch exists to see, so it is left standing rather
+  // than quietly overwritten. The slot whitelist keeps this to the photographs
+  // that actually build a face and a body.
+  const selfDeclared = db.prepare(`UPDATE actor_media SET depicts = 'self', updated_at = ?
+     WHERE actor_id = ? AND media_type = 'photo' AND world_id IS NULL
+       AND depicts IS NULL
+       AND state_slug IN ('profile','body_front','body_side','body_back')`)
+    .run(new Date().toISOString(), actorId);
+  if (selfDeclared.changes) {
+    console.log(`[media depicts] avatar adoption: actor ${actorId} user ${user.id} -> self (${selfDeclared.changes} row(s))`);
+  }
+
   // Adopting it is not finished until it is in the worlds. Doing this here means
   // "this is me" cannot be true on the platform and false everywhere it counts.
   // A push failure does not undo the adoption — the profile IS yours either way
@@ -1935,6 +2135,16 @@ app.delete("/api/worlds/:id", async (req, res) => {
   const affectedActorIds = db.prepare(`SELECT DISTINCT platform_actor_id FROM actor_deployments WHERE world_id = ? AND undeployed_at IS NULL`).all(id).map(r => r.platform_actor_id);
   db.prepare(`DELETE FROM world_memberships WHERE world_id = ?`).run(id);
   db.prepare(`DELETE FROM actor_deployments WHERE world_id = ?`).run(id);
+  // Same defect as single-actor undeploy, one level up: sweep targets pinned to
+  // a world that no longer exists can never resolve again either. Drop them.
+  try {
+    const prunedTargets =
+      db.prepare(`DELETE FROM lab_suite_targets WHERE world_id = ?`).run(id).changes +
+      db.prepare(`DELETE FROM lab_sweep_targets WHERE world_id = ?`).run(id).changes;
+    if (prunedTargets) console.log(`[world-delete] pruned ${prunedTargets} lab sweep target(s) naming ${id}`);
+  } catch (e) {
+    console.warn("[world-delete] lab target prune failed:", e.message);
+  }
   const nowStatus = new Date().toISOString();
   for (const actorId of affectedActorIds) {
     const stillDeployed = db.prepare(`SELECT 1 FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL LIMIT 1`).get(actorId);
@@ -2501,6 +2711,14 @@ app.get("/api/keys", (req, res) => {
 // aged out. Default TTL, overridable per key and by env.
 const API_KEY_TTL_DAYS = Number(process.env.API_KEY_TTL_DAYS || 90);
 
+// The complete scope vocabulary. apiKeyRequiredScope() below only ever asks for
+// these seven, so a key carrying anything else carries a string that authorises
+// nothing while reading, in the UI and in `GET /api/keys`, as though it did.
+const API_KEY_ALLOWED_SCOPES = new Set([
+  "messages:read", "messages:write", "contacts:read",
+  "calendar:read", "feed:read", "world:read", "world:control",
+]);
+
 // ── POST /api/keys  { name, world_id, scopes[] } ──────────────────────────────
 app.post("/api/keys", (req, res) => {
   const cookieHeader = req.headers["cookie"] || "";
@@ -2512,7 +2730,22 @@ app.post("/api/keys", (req, res) => {
   const { name, world_id, scopes, expires_in_days } = req.body;
   const ttlDays = Number(expires_in_days) > 0 ? Number(expires_in_days) : API_KEY_TTL_DAYS;
   const ttlModifier = `+${ttlDays} days`;
-  if (!name || !world_id || !scopes?.length) return res.status(400).json({ error: "name, world_id, scopes required" });
+  if (!name || !world_id || !Array.isArray(scopes) || !scopes.length) return res.status(400).json({ error: "name, world_id, scopes required" });
+
+  // Session 165 — this route used to mint a key for any world_id in the body,
+  // with any strings in `scopes`, for any logged-in account. Nothing downstream
+  // was breached (every /api/worlds/* route goes through requireWorld(), which
+  // 404s a non-member, and apiKeyDenial() binds the key to the world it names),
+  // but the api_keys row is the credential of record: it outlives the session
+  // that minted it and would spring to life the moment a membership was granted
+  // or a route was added that trusted authUser() without requireWorld(). Same
+  // two guards POST /api/worlds/:world_id/issue-key already applies.
+  const badScopes = scopes.filter(sc => !API_KEY_ALLOWED_SCOPES.has(sc));
+  if (badScopes.length) return res.status(400).json({ error: `unknown scope(s): ${badScopes.join(", ")}` });
+  const membership = db.prepare(`SELECT role FROM world_memberships WHERE user_id = ? AND world_id = ? LIMIT 1`).get(user.id, world_id);
+  // 404, not 403, for the same reason requireWorld() does: a 403 would confirm
+  // to a stranger that the world exists.
+  if (!membership) return res.status(404).json({ error: "world not found" });
   const raw = `sk-an-${crypto.randomBytes(32).toString("hex")}`;
   const keyHash = crypto.createHash("sha256").update(raw).digest("hex");
   const prefix = raw.slice(0, 12) + "••••••••" + raw.slice(-4);
@@ -2825,6 +3058,44 @@ app.get("/api/pending-messages", async (req, res) => {
   } catch { res.json({ count: 0 }); }
 });
 
+// ── upstream SSE reader teardown ──────────────────────────────────────────────
+// Cancelling a reader whose upstream socket has already errored makes cancel()
+// reject with the stream's stored error — undici's `TypeError: terminated` with
+// a `SocketError: other side closed` / UND_ERR_SOCKET cause. That is the NORMAL
+// shape of a browser disconnecting at the same moment the simulator restarts,
+// and the read loops in the SSE proxies below already swallow the identical
+// error on purpose ("client disconnected"). But cancel() returns a promise that
+// nobody awaited, so the same benign condition surfaced instead as an
+// [unhandledRejection] stack trace — one per connected client, per simulator
+// restart (fault-triage fingerprint cb97e8f0b6fa1b91, 2026-09-11).
+//
+// This does NOT silence the error class: an UNEXPECTED cancel() failure is still
+// logged, and is now logged with its own identifiable tag and call site instead
+// of arriving anonymously at the global unhandledRejection handler. Only the
+// known teardown codes — the ones the read loop already discards — are dropped.
+const EXPECTED_READER_TEARDOWN_CODES = new Set([
+  "UND_ERR_SOCKET",
+  "UND_ERR_ABORTED",
+  "ECONNRESET",
+  "ERR_STREAM_PREMATURE_CLOSE",
+  "ABORT_ERR",
+]);
+function cancelUpstreamReader(reader, where) {
+  // Promise.resolve().then() also covers a synchronous throw from cancel().
+  return Promise.resolve()
+    .then(() => reader.cancel())
+    .catch((err) => {
+      const code = err?.code ?? err?.cause?.code;
+      const name = err?.name ?? err?.cause?.name;
+      const expected =
+        EXPECTED_READER_TEARDOWN_CODES.has(code) ||
+        name === "AbortError" ||
+        err?.message === "terminated";
+      if (expected) return;
+      console.error(`[stream] ${where}: unexpected reader.cancel() failure on client teardown:`, err);
+    });
+}
+
 // ── GET /api/stream — SSE proxy ───────────────────────────────────────────────
 app.get("/api/stream", async (req, res) => {
   const cookieHeader = req.headers["cookie"] || "";
@@ -2868,7 +3139,7 @@ app.get("/api/stream", async (req, res) => {
   const reader = simRes.body.getReader();
   const decoder = new TextDecoder();
 
-  req.on("close", () => { reader.cancel(); });
+  req.on("close", () => { cancelUpstreamReader(reader, "GET /api/stream"); });
 
   try {
     while (true) {
@@ -2964,9 +3235,132 @@ app.get("/api/actors/:id/shares", (req, res) => {
 // without limit, and never synced back. What it is NOT is a share: the original
 // keeps its own shares, and the fork starts with none.
 //
-// forked_from is provenance only. It carries no behaviour except the clash check
-// at deploy, and answers "where did this character come from" months later, when
-// nobody remembers.
+// forked_from is provenance PLUS two behaviours: the clash check at deploy, and
+// (session 170) the subject-authorisation lineage above — a copy inherits the
+// original's declared reference set, so withdrawing authorisation on the source
+// reaches every copy already taken from it. It also still answers "where did
+// this character come from" months later, when nobody remembers.
+// Session 170 (conduct-watch, resolution-manager) — a fork's DECLARED REFERENCE
+// SET is its own actor_media rows PLUS every ancestor's, walked up forked_from.
+//
+// actor_media is deliberately absent from FORK_TABLES (see below), so a fork
+// taken from a clean source holds zero reference rows for life — while
+// glb_url / dressed_glb_url / runtime_glb_url / draft_state carry the BUILT
+// LIKENESS over verbatim. All three subject-authorisation gates are predicates
+// over actor_media, and a predicate over an empty set matches nothing. So a
+// fork taken while the source was authorised kept sharing and deploying that
+// face forever, even after the subject WITHDREW on the source (PATCH
+// /api/actors/:id/media/authorisation writes 'no' on the source's rows only).
+// Withdrawal reached the original and none of its copies.
+//
+// Fixed by resolving the gate against the ancestry instead of copying media.
+// The alternative — carrying the world_id IS NULL rows into the fork — was
+// rejected twice over: it aliases the source's media URLs into another
+// account and couples the fork to the source's file lifecycle (see the
+// resolved orphan-media-sweep incident), AND it does not actually close this
+// finding, because the copied rows would be frozen at fork time and a later
+// withdrawal on the source would still not reach them.
+//
+// UNION along the chain, not "only when the fork has no rows of its own": the
+// latter is switched off by uploading any single unrelated photo to the fork,
+// and a gate a user can disable by uploading a file is not a gate.
+//
+// This makes forked_from carry behaviour. It already did — the clash check at
+// deploy — and the comment below has been corrected to say so.
+const SUBJECT_LINEAGE_MAX_DEPTH = 16;
+function subjectLineageIds(actorId) {
+  const ids = [];
+  let cur = actorId;
+  for (let i = 0; cur && i < SUBJECT_LINEAGE_MAX_DEPTH; i++) {
+    if (ids.includes(cur)) break;              // forked_from is a tree, but never trust it to be
+    ids.push(cur);
+    let row = null;
+    try { row = db.prepare(`SELECT forked_from FROM actors WHERE id = ?`).get(cur); }
+    catch { break; }
+    cur = row && row.forked_from ? row.forked_from : null;
+  }
+  return ids;
+}
+// Returns the offending row ({ actor_id, state_slug, reason }) or null, walked
+// over the whole fork ancestry rather than one actor id.
+//
+// 2026-09-11 (conduct-watch, resolution-manager) — WIDENED to catch a BLANK
+// declaration as well as an unauthorised declared-'other' one. Until now every
+// EGRESS gate matched depicts='other' only, while the BUILD gates in
+// generate3d.js refused a blank explicitly ('a blank must never read as a
+// declaration nobody made'). A NULL/'' depicts therefore fell out of this
+// predicate and share, share link, publish, deploy and fork all passed: the
+// system refused to BUILD a likeness from photographs that say nothing about
+// whose likeness it is, and then let the thing it had already built walk out of
+// the box, reference media and all. Stricter inside than outside is backwards.
+// Both sides now ask the same question.
+//
+// `reason` says WHICH question is unanswered so the refusal can ask the right
+// one: 'undeclared' → nobody has said who is in these photographs;
+// 'unauthorised' → they are declared to be of somebody else and that person has
+// not agreed (or has withdrawn). When both are present 'undeclared' is reported
+// first — it is the earlier question, and PATCH /api/actors/:id/media/depicts
+// (owner-only, rewrites the whole world_id IS NULL set) is the route that
+// clears it, exactly as the build gates' `needs: "depicts"` already assumes.
+// A 'self' declaration passes here, unchanged.
+function unauthorisedSubjectInLineage(actorId) {
+  for (const id of subjectLineageIds(actorId)) {
+    const row = db.prepare(
+      `SELECT actor_id, state_slug, media_type,
+              CASE WHEN depicts IS NULL OR depicts = '' THEN 'undeclared' ELSE 'unauthorised' END AS reason
+         FROM actor_media
+        WHERE actor_id = ? AND media_type IN ('photo','audio') AND world_id IS NULL
+          AND ( depicts IS NULL OR depicts = ''
+                OR (depicts = 'other' AND (subject_authorised IS NULL OR subject_authorised != 'yes')) )
+        ORDER BY CASE WHEN depicts IS NULL OR depicts = '' THEN 0 ELSE 1 END
+        LIMIT 1`
+    ).get(id);
+    if (row) return row;
+  }
+  return null;
+}
+// Which field the caller must fill in to clear the refusal above. Mirrors the
+// build gates in generate3d.js, which answer `needs: "depicts"` for a blank and
+// `needs: "subject_authorised"` for an unauthorised 'other'.
+function subjectRefusalNeeds(hit) {
+  return hit && hit.reason === "undeclared" ? "depicts" : "subject_authorised";
+}
+// A refusal the user cannot clear is worse than no refusal at all, so an
+// ancestor hit says so plainly: the fork's owner does not own the source's
+// actor_media and has no UI path to PATCH it.
+//
+// 2026-09-11 (conduct-watch, resolution-manager) -- A RECORDED VOICE IS A
+// LIKENESS, so the gate above now matches reference AUDIO too, and a refusal
+// about a voice sample must not tell the owner it is about a photograph. The
+// sentences below were written about photographs; rather than fork four of
+// them, the audio case restates the same sentence in the right noun.
+function subjectRefusalText(hit, actorId, who, verb) {
+  const t = subjectRefusalTextPhoto(hit, actorId, who, verb);
+  if (!hit || hit.media_type !== "audio") return t;
+  return t
+    .replace(/reference photographs/g, "reference voice recordings")
+    .replace(/photographs/g, "voice recordings")
+    .replace(/photograph/g, "voice recording");
+}
+function subjectRefusalTextPhoto(hit, actorId, who, verb) {
+  const gerund = verb === "shared" ? "sharing" : verb === "copied" ? "taking a copy of" : "deploying";
+  // 2026-09-11 — a blank declaration and a withheld authorisation are different
+  // unanswered questions and must not be reported with the same sentence. A
+  // person told to "record that they authorised the likeness" when in fact
+  // nobody has yet said whose likeness it is has been sent to the wrong control.
+  const undeclared = hit && hit.reason === "undeclared";
+  if (hit && hit.actor_id !== actorId) {
+    if (undeclared) {
+      return `${who} was copied from a character built from photographs that carry no statement of whose likeness they are. This copy carries the same likeness, so it cannot be ${verb}. Ask the original's owner to say who is in those photographs, or rebuild this character from your own reference photographs.`;
+    }
+    return `${who} was copied from a character built from photographs of somebody else, and that person's authorisation has been withdrawn on the original. This copy carries the same likeness, so it cannot be ${verb}. Ask the original's owner to record authorisation again, or rebuild this character from your own reference photographs.`;
+  }
+  if (undeclared) {
+    return `${who} is built from reference photographs that do not say whose likeness they are. Say who is in the reference photographs before ${gerund} it.`;
+  }
+  return `${who} is built from photographs declared to be of somebody else. Record that they authorised the likeness before ${gerund} it.`;
+}
+
 const FORK_TABLES = [
   "actor_psychology", "actor_big5", "actor_disc", "actor_hds",
   "actor_lifestyle", "actor_economic", "actor_mental_health",
@@ -2987,6 +3381,38 @@ app.post("/api/actors/:id/fork", (req, res) => {
 
   const src = db.prepare(`SELECT * FROM actors WHERE id = ?`).get(req.params.id);
   if (!src) return res.status(404).json({ error: "not found" });
+
+  // Session 158 (conduct-watch, resolution-manager) — fork is the FOURTH egress,
+  // and it is the one that made the other three silent.
+  //
+  // The copy below takes every actors column except a short exclusion list, so
+  // draft_state (the referenceMeasurements solve) and glb_url / dressed_glb_url /
+  // runtime_glb_url carry the BUILT LIKENESS over verbatim — while actor_media is
+  // deliberately absent from FORK_TABLES, so the copy holds zero reference rows.
+  // All three existing subject-authorisation gates (the 3D solve in generate3d.js,
+  // the shares route below, the deploy route) are predicates over actor_media, and
+  // a predicate over an empty set matches nothing: fork an actor whose references
+  // are declared to be of somebody else and the copy shares and deploys with every
+  // gate silent, still wearing the original's face.
+  //
+  // Forking is itself an egress — it hands ownership to whoever forked, and the
+  // original owner never sees the copy again — so it takes the same gate as
+  // sharing, applied to the SOURCE actor, where the declaration actually lives.
+  //
+  // Same predicate as the shares and deploy routes, deliberately: scoped to the
+  // declared reference set (world_id IS NULL) and to declared-'other' rows only,
+  // so actors with no declaration — every actor predating the depicts column —
+  // fork exactly as before.
+  //
+  // Evaluated over the SOURCE's whole fork ancestry (session 170), so forking a
+  // fork cannot launder a withdrawal that landed further up the chain.
+  const unauthorisedSubject = unauthorisedSubjectInLineage(req.params.id);
+  if (unauthorisedSubject) {
+    return res.status(403).json({
+      error: subjectRefusalText(unauthorisedSubject, req.params.id, src.first_name || src.name || "This character", "copied") + " Nothing was copied.",
+      needs: subjectRefusalNeeds(unauthorisedSubject),
+    });
+  }
 
   const newId = randomUUID();
   const now = new Date().toISOString();
@@ -3062,6 +3488,22 @@ app.post("/api/actors/:id/shares", (req, res) => {
     .get(user.org_id, email);
   if (!target) return res.status(404).json({ error: "user not found" });
   if (target.id === user.id) return res.status(400).json({ error: "cannot share with yourself" });
+  // Building an unauthorised likeness of a real person is contained while it
+  // stays in one account; sharing it is the step that stops being contained.
+  // Same gate as the 3D solve, at the other end of the pipeline: a reference
+  // set the owner has declared is of somebody else does not leave the account
+  // until the record says that person agreed. Scoped to declared-'other' rows
+  // only, so actors with no declaration (every actor that predates the depicts
+  // column) share exactly as before.
+  // Session 170 — over the whole fork ancestry, so a copy stops sharing when the
+  // subject withdraws on the original it was taken from.
+  const unauthorised = unauthorisedSubjectInLineage(req.params.id);
+  if (unauthorised) {
+    return res.status(403).json({
+      error: subjectRefusalText(unauthorised, req.params.id, "This character", "shared"),
+      needs: subjectRefusalNeeds(unauthorised),
+    });
+  }
   const now = new Date().toISOString();
   try {
     // owner_id records the CREATOR, not whoever performed the share — otherwise a
@@ -3091,7 +3533,37 @@ app.get("/api/actors/shared", (req, res) => {
   const actors = db.prepare(`
     SELECT a.id, a.name, a.age, a.gender, a.occupation, a.status,
            p.attachment_style, b.openness, b.neuroticism, s.permission, s.can_reshare, a.forked_from,
-           (SELECT url FROM actor_media WHERE actor_id = a.id AND media_type = 'photo' AND state_slug IN ('photo_close','profile') LIMIT 1) as photo_url
+           (SELECT url FROM actor_media WHERE actor_id = a.id AND media_type = 'photo' AND state_slug IN ('photo_close','profile') LIMIT 1) as photo_url,
+           -- Session 151 -- same summary as GET /api/actors, and for the same reason:
+           -- the build and egress gates evaluate the whole fork ancestry, not the
+           -- owner, so a RECIPIENT of a shared character meets the identical wall of
+           -- 403s. The card is shared between both lists, so it needs the field on both.
+           -- 2026-09-11 (conduct-watch) -- widened alongside the gates to report
+           -- 'undeclared': a reference photograph carrying NO depicts at all now
+           -- refuses build AND egress, so the card has to be able to say so.
+           -- Reported ahead of 'no'/'pending' because it is the earlier question.
+           (SELECT CASE
+                     WHEN COUNT(*) = 0 THEN NULL
+                     WHEN SUM(CASE WHEN depicts IS NULL OR depicts = '' THEN 1 ELSE 0 END) > 0 THEN 'undeclared'
+                     WHEN SUM(CASE WHEN subject_authorised = 'no'  THEN 1 ELSE 0 END) > 0 THEN 'no'
+                     WHEN SUM(CASE WHEN subject_authorised = 'yes' THEN 1 ELSE 0 END) = COUNT(*) THEN 'yes'
+                     ELSE 'pending'
+                   END
+              FROM actor_media
+             WHERE actor_id = a.id AND media_type IN ('photo','audio') AND world_id IS NULL
+               AND (depicts IS NULL OR depicts = '' OR depicts = 'other')) as subject_authorisation,
+           -- 2026-09-09 (conduct-watch) -- how many worlds she is STILL IN after the
+           -- subject withdrew authorisation, derived exactly as the editor's standing
+           -- banner derives it. Normally 0. Anything above 0 is a likeness the subject
+           -- said no to that is still running inside a simulator world, and a list of
+           -- cards is the only surface seen without opening anything. On BOTH lists for
+           -- the same reason the line above is: the card component is shared.
+           (SELECT COUNT(*) FROM actor_deployments d
+             WHERE d.platform_actor_id = a.id AND d.undeployed_at IS NULL
+               AND EXISTS (SELECT 1 FROM actor_media m
+                            WHERE m.actor_id = a.id AND m.media_type IN ('photo','audio')
+                              AND m.world_id IS NULL AND m.depicts = 'other'
+                              AND m.subject_authorised = 'no')) as withdrawal_still_deployed
     FROM actor_shares s
     JOIN actors a ON a.id = s.actor_id
     LEFT JOIN actor_psychology p ON p.actor_id = a.id
@@ -3133,6 +3605,29 @@ app.post("/api/actors/:id/media", upload.fields([{name:"photo",maxCount:1},{name
   // NULL, which reads as "not declared" instead of as an answer nobody gave.
   const depicts = ["self", "other"].includes(req.body.depicts) ? req.body.depicts : null;
 
+  // 2026-09-11 (conduct-watch, resolution-manager) — the same rule as the PATCH
+  // depicts handler below, because this route is the second way to restate the
+  // declaration: the write at the bottom DELETEs the row for this slot and
+  // INSERTs a fresh one, so before today a re-upload of the same slot dropped
+  // that row's subject_authorised on the floor, and a re-upload of every slot
+  // erased a recorded 'no' from the reference set entirely. Replacing a
+  // photograph is not an answer to whether the person in it agreed.
+  const uploadWithdrawal = (!world_id && (media_type === "photo" || media_type === "audio" || isAudio))
+    ? db.prepare(
+        `SELECT 1 FROM actor_media
+          WHERE actor_id = ? AND media_type IN ('photo','audio') AND world_id IS NULL
+            AND subject_authorised = 'no' LIMIT 1`
+      ).get(req.params.id)
+    : null;
+  if (uploadWithdrawal && depicts === "self") {
+    console.warn(`[media upload] REFUSED actor: ${req.params.id} user: ${user.id} depicts=self: subject_authorised='no' stands on this reference set`);
+    return res.status(403).json({
+      error: "These reference photographs carry a withdrawal: the person in them is recorded as having refused. A new photograph cannot be declared as being of you while that refusal stands. If they have agreed again — or the refusal was recorded by mistake — record that on the authorisation question first.",
+      needs: "subject_authorised",
+      subject_authorised: "no",
+    });
+  }
+
   // Photos/audio: stored under /media/actors/{slug}/worlds/{world_id}/ when world-specific
   // This avoids the nginx proxy rule which intercepts /media/worlds/ and sends to simulator
   // Videos: stored at /media/worlds/{world_id}/actors/{slug}/ (nginx proxies missing ones to simulator)
@@ -3168,12 +3663,69 @@ app.post("/api/actors/:id/media", upload.fields([{name:"photo",maxCount:1},{name
   const now = new Date().toISOString();
   const id  = randomUUID();
 
+  // The row this upload replaces, read BEFORE the delete: what the subject said
+  // about these photographs has to survive the file being swapped (see the
+  // withdrawal note above). subject_authorised is carried across unconditionally
+  // — it is a statement by the person in the photographs and no upload is an
+  // answer to it. `depicts` is carried across ONLY while a withdrawal stands, and
+  // only when this upload does not state one: that keeps the replaced row inside
+  // the `depicts = 'other'` scope that every gate and the unenforced-withdrawal
+  // sweep read, so re-uploading the set cannot blank the declaration the 'no' is
+  // attached to and make the withdrawal invisible. Outside that case a blank stays
+  // blank, which is the fail-safe the 2026-09-11 blank-depicts branch relies on.
+  const replacedRow = db.prepare(
+    // id/filename are read purely so the [media removed] line below can name the
+    // specific photograph this upload destroys (conduct-watch, 2026-09-11).
+    `SELECT id, filename, depicts, subject_authorised FROM actor_media
+      WHERE actor_id = ? AND state_slug = ? AND media_type = ?
+        AND (world_id = ? OR (world_id IS NULL AND ? IS NULL)) LIMIT 1`
+  ).get(req.params.id, state_slug, media_type, world_id, world_id);
+  const depictsToStore = depicts
+    ?? (uploadWithdrawal ? (replacedRow?.depicts ?? null) : null);
+  const authorisedToStore = replacedRow?.subject_authorised ?? null;
+
+  // 2026-09-11 (conduct-watch, resolution-manager) -- THE CLEARING STAYS, THE
+  // SILENCE GOES.
+  //
+  // Outside a standing withdrawal the line above deliberately drops the
+  // replaced row's declaration: "a different photograph is a different
+  // question" (the PUT /api/actors/:id photo swap below says it in those
+  // words), and db.js says of this column that it is NEVER inferred, because a
+  // guessed 'self' reads later as evidence somebody gave that answer. Carrying
+  // a 'self' forward onto a file nobody has looked at would be exactly that
+  // guess, so it is not done here.
+  //
+  // What WAS wrong is that the drop destroyed the answer outright and said
+  // nothing. Afterwards the row was indistinguishable from one nobody was ever
+  // asked about, the editor re-raised "Declaration needed" with no explanation
+  // of where the answer went, and conduct-watch signal 4 -- a predicate over
+  // exactly this column -- read the blank as "never asked". So the previous
+  // answer is now RECORDED on the replacement row (never re-asserted: depicts
+  // itself stays NULL and no gate reads these two columns), the clearing is
+  // logged, and the response carries it so the UI can say what happened.
+  const clearedFrom = (!depicts && replacedRow?.depicts && !depictsToStore)
+    ? replacedRow.depicts : null;
+  const clearedAt = clearedFrom ? now : null;
+  if (clearedFrom) {
+    console.warn(`[media upload] depicts CLEARED by replace actor: ${req.params.id} user: ${user.id} slot: ${state_slug} was: ${clearedFrom} -- the new photograph carries no declaration and the build/egress gates refuse until it is answered again`);
+  }
+
+  // conduct-watch, 2026-09-11: this DELETE destroys a reference photograph and,
+  // until now, said so in the journal only in the narrow case where it also
+  // cleared a depicts answer (the warning just above). The actor_media_delete_audit
+  // trigger in db.js freezes the ROW; a trigger cannot see the CALLER, and the
+  // finding was specifically that a create-and-remove cycle left no attributable
+  // trace. Records only -- nothing here can make the upload fail.
+  if (replacedRow) {
+    console.log(`[media removed] by replace actor: ${req.params.id} user: ${user.id} media: ${replacedRow.id} slot: ${state_slug} type: ${media_type} depicts: ${replacedRow.depicts ?? "unset"} subject_authorised: ${replacedRow.subject_authorised ?? "unset"} file: ${replacedRow.filename}`);
+  }
+
   db.prepare(`DELETE FROM actor_media WHERE actor_id = ? AND state_slug = ? AND media_type = ? AND (world_id = ? OR (world_id IS NULL AND ? IS NULL))`)
     .run(req.params.id, state_slug, media_type, world_id, world_id);
-  db.prepare(`INSERT INTO actor_media (id, actor_id, world_id, media_type, filename, url, state_slug, depicts, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-    .run(id, req.params.id, world_id, media_type, filename, url, state_slug, depicts, now, now);
+  db.prepare(`INSERT INTO actor_media (id, actor_id, world_id, media_type, filename, url, state_slug, depicts, subject_authorised, depicts_cleared_from, depicts_cleared_at, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, req.params.id, world_id, media_type, filename, url, state_slug, depictsToStore, authorisedToStore, clearedFrom, clearedAt, now, now);
 
-  res.json({ id, url, state_slug, media_type, filename, depicts });
+  res.json({ id, url, state_slug, media_type, filename, depicts: depictsToStore, subject_authorised: authorisedToStore, depicts_cleared_from: clearedFrom, depicts_cleared_at: clearedAt });
 });
 
 // ── PATCH /api/actors/:id/media/depicts ─ declare whose likeness these are ──
@@ -3196,11 +3748,412 @@ app.patch("/api/actors/:id/media/depicts", (req, res) => {
   // would read later as "never asked" rather than as "withdrawn".
   const depicts = ["self", "other"].includes(req.body?.depicts) ? req.body.depicts : null;
   if (!depicts) return res.status(400).json({ error: "depicts must be 'self' or 'other'" });
+
+  // 2026-09-11 (conduct-watch, resolution-manager) — A WITHDRAWAL MUST NOT BE
+  // CLEARABLE BY RESTATING WHO IS IN THE PHOTOGRAPH.
+  //
+  // The UPDATE below rewrites the whole non-world reference set with no
+  // condition on the current value. Every build and egress gate on the platform
+  // is a predicate over `depicts = 'other'` (generate3d.js solve / runtime-glb /
+  // save-morphed-glb, unauthorisedSubjectInLineage above for fork/deploy/shares/
+  // build, sharelinks-routes.js link/publish), and so is the unenforced-
+  // withdrawal surface (unenforcedWithdrawalWorlds / actorsWithUnenforcedWithdrawal
+  // below). So an owner whose subject had recorded subject_authorised='no' could
+  // PATCH depicts='self' here and every one of those predicates would stop
+  // matching at once: the 'no' would still be sitting in the column, read by
+  // nothing, and the character would build, fork, deploy, share, link and publish
+  // again — with the standing banner gone too, because the sweep stopped seeing
+  // her. The declaration is owner-only and the subject has no account, so the
+  // person whose likeness it is could not undo it.
+  //
+  // The refusal is deliberately NOT scoped to the current `depicts` value: a 'no'
+  // recorded anywhere in this reference set is a refusal by the person in these
+  // photographs, and re-declaring the set is not the control that answers it.
+  // PATCH /api/actors/:id/media/authorisation is — recording 'yes' again is an
+  // explicit, logged statement that they agreed, which is exactly the act that
+  // should be required, rather than a side effect of restating who they are.
+  //
+  // A NULL/'' (never asked) or 'yes' authorisation is untouched by this and stays
+  // freely re-declarable, because that really is just correcting a mis-declaration.
+  const standingWithdrawal = db.prepare(
+    `SELECT 1 FROM actor_media
+      WHERE actor_id = ? AND media_type IN ('photo','audio') AND world_id IS NULL
+        AND subject_authorised = 'no' LIMIT 1`
+  ).get(req.params.id);
+  if (standingWithdrawal && depicts !== "other") {
+    console.warn(`[media depicts] REFUSED actor: ${req.params.id} user: ${user.id} -> ${depicts}: subject_authorised='no' stands on this reference set`);
+    return res.status(403).json({
+      error: "These reference photographs carry a withdrawal: the person in them is recorded as having refused. Saying they are of you instead would not undo that, so it cannot be re-declared while the refusal stands. If they have agreed again — or the refusal was recorded by mistake — record that on the authorisation question first.",
+      needs: "subject_authorised",
+      subject_authorised: "no",
+    });
+  }
+
+  // 2026-09-11 (conduct-watch, resolution-manager) -- A RE-DECLARATION DISPLACES
+  // AN ANSWER, AND THE DISPLACED ANSWER IS NOW RECORDED.
+  //
+  // This UPDATE used to leave nothing behind but a bumped updated_at. The value
+  // a person had previously stated about a real named person's photographs was
+  // overwritten in place, and afterwards nothing on this host could say what it
+  // had been -- measured live on 2026-09-11, four rows carrying a standing
+  // consent flag re-declared at 05:45:38Z with depicts_cleared_from NULL on all
+  // four. Had the new value been 'self', every gate predicate would have stopped
+  // matching at once and the record would not have said why.
+  //
+  // depicts_cleared_from/_at already hold exactly this fact one path over (a
+  // photograph replaced by upload) and are read by NO gate -- they are a RECORD,
+  // never a declaration. So the row's own prior value goes into them whenever it
+  // was a real answer and this PATCH displaces it with a different one. The CASE
+  // expressions read the row's pre-UPDATE values, which is what keeps this a
+  // single statement over the whole reference set. The editor's "this question
+  // came back" notice is scoped to rows with NO current declaration, so a row
+  // re-declared here is not touched by carrying the record onto it.
+  //
+  // The durable half of this lives in server/db.js: actor_media carries AFTER
+  // UPDATE / AFTER DELETE triggers writing actor_media_audit, so a change or a
+  // removal by ANY path -- including one that never comes through this handler --
+  // is recorded with its before and its after.
   const now = new Date().toISOString();
-  const r = db.prepare(`UPDATE actor_media SET depicts = ?, updated_at = ? WHERE actor_id = ? AND media_type = 'photo' AND world_id IS NULL`)
-    .run(depicts, now, req.params.id);
+  const r = db.prepare(
+    `UPDATE actor_media
+        SET depicts_cleared_from = CASE WHEN COALESCE(depicts, '') <> '' AND depicts <> ?
+                                        THEN depicts ELSE depicts_cleared_from END,
+            depicts_cleared_at   = CASE WHEN COALESCE(depicts, '') <> '' AND depicts <> ?
+                                        THEN ?      ELSE depicts_cleared_at   END,
+            depicts    = ?,
+            updated_at = ?
+      WHERE actor_id = ? AND media_type IN ('photo','audio') AND world_id IS NULL`
+  ).run(depicts, depicts, now, depicts, now, req.params.id);
   console.log(`[media depicts] actor: ${req.params.id} user: ${user.id} -> ${depicts} (${r.changes} row(s))`);
   res.json({ ok: true, depicts, updated: r.changes });
+});
+
+// ── Withdrawal is retroactive ───────────────────────────────────────────────
+//
+// conduct-watch, 2026-09-09: PATCH /api/actors/:id/media/authorisation wrote
+// subject_authorised='no' across the reference set and returned. It touched
+// nothing else. All nine read-back gates (generate3d.js solve / runtime-glb /
+// save-morphed-glb / runtime-read, index.js fork / deploy, sharelinks-routes.js
+// shares / link / publish) are PROSPECTIVE — they refuse the NEXT act. So after
+// the subject said no, the likeness stayed listed in the gallery for every
+// signed-in account, every live share link stayed redeemable, every claim
+// already taken stayed granted, and she stayed standing in whatever simulator
+// world she had been deployed to, with her reference media already shipped
+// there over the LAN at deploy time.
+//
+// A refusal that only binds the future is not a refusal. Withdrawal now sweeps
+// what was already granted.
+//
+// Split in two on purpose:
+//   * The three platform-local surfaces (listing, links, claims) are swept in
+//     ONE transaction against local SQLite. They cannot fail on a network and
+//     they are what actually matters — they are the surfaces a stranger can
+//     reach right now.
+//   * The simulator arm is best-effort PER DEPLOYMENT, because an undeploy is a
+//     round-trip to another host. The withdrawal itself must never fail because
+//     the simulator is down: a subject saying no and getting a 502 is the worst
+//     available outcome. When the simulator does not confirm the erase, the
+//     deployment row is left LIVE and completely untouched — the same rule
+//     POST /api/actors/:id/undeploy already enforces, and for the same reason
+//     (recording her as undeployed when she is not is worse than failing) — and
+//     the response names the worlds that still hold her so the caller knows.
+//
+// Deliberately wider than the actor named in the request. subjectLineageIds()
+// walks UP forked_from, so the gates on a copy already read an ancestor's 'no'
+// and the copy can no longer be built, deployed, shared or published. But the
+// copy's OWN already-granted egress lives on the copy's own rows, and nothing
+// walked down to it. So the sweep walks DOWN as well: every actor whose gate
+// now reads 'no' gets the same revocation, including copies held by other
+// accounts. That crosses ownership on purpose — the declaration is about the
+// person in the photographs, not about one account's copy of them, and a
+// refusal that stops at the account boundary is trivially defeated by forking
+// first and withdrawing second.
+//
+// One-way. Setting 'yes' again re-opens the gates but restores nothing: a
+// listing, a link and a claim are each their own fresh act by their own author.
+function subjectDescendantIds(actorId) {
+  const ids = [actorId];
+  let frontier = [actorId];
+  // forked_from is a tree, but never trust it to be — bound the walk exactly
+  // the way subjectLineageIds() bounds its walk upward.
+  for (let depth = 0; depth < 32 && frontier.length; depth++) {
+    let kids = [];
+    try {
+      kids = db.prepare(
+        `SELECT id FROM actors WHERE forked_from IN (${frontier.map(() => "?").join(",")})`
+      ).all(...frontier).map(r => r.id).filter(id => !ids.includes(id));
+    } catch (e) {
+      console.warn("[authorisation withdrawn] descendant walk failed:", e.message);
+      break;
+    }
+    ids.push(...kids);
+    frontier = kids;
+  }
+  return ids;
+}
+
+async function revokeGrantedEgressOnWithdrawal(actorIds, now) {
+  const summary = {
+    actors: actorIds, unpublished: 0, links_revoked: 0, claims_revoked: 0,
+    undeployed: [], still_deployed: [],
+  };
+  const inList = actorIds.map(() => "?").join(",");
+
+  db.transaction(() => {
+    summary.unpublished = db.prepare(
+      `UPDATE actors SET visibility = 'private', published_permission = NULL,
+       published_note = NULL, published_at = NULL, updated_at = ?
+       WHERE id IN (${inList}) AND visibility = 'public'`
+    ).run(now, ...actorIds).changes;
+
+    summary.links_revoked = db.prepare(
+      `UPDATE actor_share_links SET revoked_at = ?, updated_at = ?
+       WHERE actor_id IN (${inList}) AND revoked_at IS NULL`
+    ).run(now, now, ...actorIds).changes;
+
+    // EVERY claim, not only via_public = 1. DELETE /api/actors/:id/publish keeps
+    // existing claims unless asked, because unlisting is tidying a listing and
+    // "withdrawing something a person is already building on should be a
+    // deliberate act". This IS that deliberate act, and it is the subject's,
+    // not the owner's — there is no reading on which a claim survives it.
+    summary.claims_revoked = db.prepare(
+      `DELETE FROM actor_shares WHERE actor_id IN (${inList})`
+    ).run(...actorIds).changes;
+  })();
+
+  const live = db.prepare(
+    `SELECT * FROM actor_deployments WHERE platform_actor_id IN (${inList}) AND undeployed_at IS NULL`
+  ).all(...actorIds);
+
+  for (const d of live) {
+    const where = { world_id: d.world_id, world_name: d.world_name, actor_id: d.platform_actor_id };
+    let confirmed = false;
+    try {
+      const simRes = await fetch(
+        `${SIMULATOR_URL}/internal/actors/${d.simulator_actor_id}/undeploy`,
+        { method: "POST", headers: { "X-Service-Token": SERVICE_TOKEN } }
+      );
+      const simBody = await simRes.json().catch(() => null);
+      confirmed = simRes.ok && simBody?.ok !== false;
+      if (confirmed) {
+        console.log(`[authorisation withdrawn] simulator erased ${d.simulator_actor_id} from ${d.world_name} — ${simBody?.rows_deleted ?? "?"} row(s)`);
+      } else {
+        console.warn(`[authorisation withdrawn] simulator REFUSED undeploy of ${d.simulator_actor_id}: HTTP ${simRes.status}`, simBody);
+      }
+    } catch (e) {
+      console.warn(`[authorisation withdrawn] simulator UNREACHABLE for ${d.simulator_actor_id}:`, e.message);
+    }
+
+    if (!confirmed) {
+      // She is still in that world and the platform must not pretend otherwise.
+      console.error(`[authorisation withdrawn] STILL DEPLOYED after withdrawal: actor ${d.platform_actor_id} in ${d.world_name} (${d.world_id}) — retry undeploy once the simulator is healthy`);
+      summary.still_deployed.push(where);
+      continue;
+    }
+
+    // Same two archive steps POST /undeploy takes, in the same order and for
+    // the same reasons: copy the world video down off the simulator while it
+    // still exists, then mark ALL her media for that world archived even if the
+    // copy did not answer. Both best-effort; neither may fail an erase the
+    // simulator has already confirmed. This is the existing LAN-only
+    // server-to-server fetch, reused unchanged.
+    const a = db.prepare(`SELECT media_folder FROM actors WHERE id = ?`).get(d.platform_actor_id);
+    try {
+      await archiveWorldMedia(d.platform_actor_id, d.world_id, d.world_name, a?.media_folder, d.simulator_actor_id);
+    } catch (e) { console.warn("[authorisation withdrawn] archive failed:", e.message); }
+    try {
+      markWorldMediaArchived(d.platform_actor_id, d.world_id, d.world_name, now);
+    } catch (e) { console.warn("[authorisation withdrawn] archive marking failed:", e.message); }
+
+    db.prepare(`UPDATE actor_deployments SET undeployed_at = ?, deploy_status = 'undeployed' WHERE id = ?`)
+      .run(now, d.id);
+
+    // A sweep target naming an erased simulator actor can never resolve again.
+    try {
+      const pruned =
+        db.prepare(`DELETE FROM lab_suite_targets WHERE world_id = ? AND actor_id = ?`)
+          .run(d.world_id, d.simulator_actor_id).changes +
+        db.prepare(`DELETE FROM lab_sweep_targets WHERE world_id = ? AND actor_id = ?`)
+          .run(d.world_id, d.simulator_actor_id).changes;
+      if (pruned) console.log(`[authorisation withdrawn] pruned ${pruned} lab sweep target(s) naming ${d.simulator_actor_id}`);
+    } catch (e) { console.warn("[authorisation withdrawn] lab target prune failed:", e.message); }
+
+    summary.undeployed.push(where);
+  }
+
+  // Only drop to 'ready_to_deploy' once no live deployment remains anywhere.
+  for (const id of new Set(summary.undeployed.map(u => u.actor_id))) {
+    const stillDeployed = db.prepare(
+      `SELECT 1 FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL LIMIT 1`
+    ).get(id);
+    if (!stillDeployed) {
+      db.prepare(`UPDATE actors SET status = 'ready_to_deploy', updated_at = ? WHERE id = ? AND status = 'active'`)
+        .run(now, id);
+    }
+  }
+
+  return summary;
+}
+
+// ── The STANDING record that a withdrawal was not carried out ─────────
+//
+// conduct-watch, 2026-09-09: `revoked.still_deployed` above existed in exactly
+// two places — the HTTP response to the click that produced it, and one
+// console.error line. Navigate away, close the tab, or have the withdrawal
+// happen while the simulator was off and nobody was looking, and the fact that
+// the subject SAID NO while her likeness is STILL IN A SIMULATOR WORLD was
+// unreadable anywhere in the product. That is the one fact here that must never
+// be quietly lost.
+//
+// It is DERIVED on read rather than stored in a column. A stored flag can drift
+// out of agreement with the rows the gates themselves read, and a stale "all
+// clear" on this particular fact is worse than no record at all.
+//
+// Scoped to exactly what every other subject-authorisation gate scopes to
+// (media_type='photo', world_id IS NULL, depicts='other', any single 'no'
+// counts as withdrawn) joined to deployments that are still live
+// (undeployed_at IS NULL), so this surface and the gates can never disagree.
+function unenforcedWithdrawalWorlds(actorId) {
+  const withdrawn = db.prepare(
+    `SELECT 1 FROM actor_media
+      WHERE actor_id = ? AND media_type IN ('photo','audio') AND world_id IS NULL
+        AND depicts = 'other' AND subject_authorised = 'no' LIMIT 1`
+  ).get(actorId);
+  if (!withdrawn) return [];
+  return db.prepare(
+    `SELECT world_id, world_name FROM actor_deployments
+      WHERE platform_actor_id = ? AND undeployed_at IS NULL
+      ORDER BY COALESCE(world_name, world_id)`
+  ).all(actorId).map(d => ({ world_id: d.world_id, world_name: d.world_name, actor_id: actorId }));
+}
+
+// Every actor, for any owner, in that state — the retry sweep's worklist.
+function actorsWithUnenforcedWithdrawal() {
+  return db.prepare(
+    `SELECT DISTINCT d.platform_actor_id AS id
+       FROM actor_deployments d
+       JOIN actor_media m ON m.actor_id = d.platform_actor_id
+      WHERE d.undeployed_at IS NULL
+        AND m.media_type IN ('photo','audio') AND m.world_id IS NULL
+        AND m.depicts = 'other' AND m.subject_authorised = 'no'`
+  ).all().map(r => r.id);
+}
+
+// ── Retry the refused undeploy when the simulator comes back ─────────────
+//
+// Nothing retried it. The only ways a withdrawal stayed unenforced were the
+// simulator refusing or being unreachable, and both of those end on their own —
+// so the correct trigger is the simulator ANSWERING again, not a person
+// happening to still have the tab open and noticing the Retry button.
+//
+// Gated on a live probe on purpose: re-running the sweep blind every few
+// minutes against a host that is switched off would log a fresh failure each
+// time and achieve nothing. Checked shortly after boot too, because "the sweep
+// ran while nobody was looking" is exactly the case this is for.
+const WITHDRAWAL_RETRY_MS = 5 * 60 * 1000;
+async function retryUnenforcedWithdrawals() {
+  let pending;
+  try { pending = actorsWithUnenforcedWithdrawal(); }
+  catch (e) { console.error("[withdrawal retry] worklist read failed:", e.message); return; }
+  if (!pending.length) return;
+
+  let up = false;
+  try {
+    const probe = await fetch(`${SIMULATOR_URL}/internal/worlds?ids=`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN },
+    });
+    up = probe.ok;
+  } catch { up = false; }
+
+  if (!up) {
+    console.warn(`[withdrawal retry] ${pending.length} actor(s) are STILL DEPLOYED after the subject withdrew authorisation, and the simulator is not answering — will retry when it is. GET /api/actors/:id reports this as withdrawal_still_deployed.`);
+    return;
+  }
+
+  console.warn(`[withdrawal retry] simulator is answering — retrying the undeploy the withdrawal could not complete for ${pending.length} actor(s): ${pending.join(", ")}`);
+  try {
+    const summary = await revokeGrantedEgressOnWithdrawal(pending, new Date().toISOString());
+    console.log(`[withdrawal retry] removed from ${summary.undeployed.length} world(s); STILL DEPLOYED ${summary.still_deployed.length}`);
+  } catch (e) {
+    console.error("[withdrawal retry] sweep failed:", e.message);
+  }
+}
+// Unref'd: a pending retry never holds the process open.
+setTimeout(retryUnenforcedWithdrawals, 20 * 1000).unref();
+setInterval(retryUnenforcedWithdrawals, WITHDRAWAL_RETRY_MS).unref();
+
+// ── POST /api/actors/:id/media/authorisation/retry-revocation ───────────
+// The standing banner's Retry control. The only way to retry before this was to
+// re-PATCH subject_authorised='no', i.e. re-state a declaration in order to get
+// a side effect. This says what it means instead: owner-only, and a no-op
+// unless the withdrawal really is still unenforced.
+app.post("/api/actors/:id/media/authorisation/retry-revocation", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
+  if (!actor) return res.status(404).json({ error: "not found" });
+  const outstanding = unenforcedWithdrawalWorlds(req.params.id);
+  if (!outstanding.length) {
+    return res.json({ ok: true, retried: false, withdrawal_still_deployed: [] });
+  }
+  try {
+    const revoked = await revokeGrantedEgressOnWithdrawal([req.params.id], new Date().toISOString());
+    console.log(`[withdrawal retry] manual retry by ${user.id} for actor ${req.params.id} — undeployed ${revoked.undeployed.length}, STILL DEPLOYED ${revoked.still_deployed.length}`);
+    return res.json({
+      ok: true, retried: true, revoked,
+      withdrawal_still_deployed: unenforcedWithdrawalWorlds(req.params.id),
+    });
+  } catch (e) {
+    console.error("[withdrawal retry] manual retry failed:", e);
+    return res.status(500).json({
+      ok: false,
+      error: "Removing her from the simulator did not finish. She is still in the world(s) named, and nothing new can be built, published, shared or deployed from these photographs either way.",
+      detail: e.message,
+      withdrawal_still_deployed: unenforcedWithdrawalWorlds(req.params.id),
+    });
+  }
+});
+
+// ── PATCH /api/actors/:id/media/authorisation ─ did the subject agree ───────
+// The companion to the depicts declaration above. Shaped identically on
+// purpose: same ownership check, same whitelist, same whole-reference-set
+// scope (the statement is about the person in the photographs, not about one
+// file), same refusal to write NULL -- withdrawing permission is stated as
+// 'no', never by silently clearing it back to "never asked".
+app.patch("/api/actors/:id/media/authorisation", async (req, res) => {
+  const user = authUser(req);
+  if (!user) return res.status(401).json({ error: "unauthorized" });
+  const actor = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
+  if (!actor) return res.status(404).json({ error: "not found" });
+  const value = ["yes", "no"].includes(req.body?.subject_authorised) ? req.body.subject_authorised : null;
+  if (!value) return res.status(400).json({ error: "subject_authorised must be 'yes' or 'no'" });
+  const now = new Date().toISOString();
+  const r = db.prepare(`UPDATE actor_media SET subject_authorised = ?, updated_at = ? WHERE actor_id = ? AND media_type IN ('photo','audio') AND world_id IS NULL`)
+    .run(value, now, req.params.id);
+  console.log(`[media authorisation] actor: ${req.params.id} user: ${user.id} -> ${value} (${r.changes} row(s))`);
+
+  // 'no' means no retroactively — see the block above. Ordered after the write
+  // so every gate reads 'no' for the whole duration of the sweep.
+  let revoked = null;
+  if (value === "no") {
+    const ids = subjectDescendantIds(req.params.id);
+    try {
+      revoked = await revokeGrantedEgressOnWithdrawal(ids, now);
+      console.log(`[authorisation withdrawn] actor: ${req.params.id} by: ${user.id} — ${ids.length} actor(s) in the copy tree; unlisted ${revoked.unpublished}, revoked ${revoked.links_revoked} link(s), removed ${revoked.claims_revoked} claim(s), undeployed ${revoked.undeployed.length}, STILL DEPLOYED ${revoked.still_deployed.length}`);
+    } catch (e) {
+      // The withdrawal itself stands regardless: the declaration is written and
+      // every prospective gate already reads it. Surface the failure loudly and
+      // tell the caller the sweep did not complete rather than swallowing it.
+      console.error("[authorisation withdrawn] revocation sweep failed:", e);
+      return res.status(500).json({
+        ok: false, subject_authorised: value, updated: r.changes,
+        error: "The withdrawal was recorded and nothing new can be built, published, shared or deployed from these photographs. Taking back what was already granted did not finish — retry, and check the listing, the share links and the deployments.",
+        detail: e.message,
+      });
+    }
+  }
+
+  res.json({ ok: true, subject_authorised: value, updated: r.changes, revoked });
 });
 
 // ── PATCH /api/actors/:id/media/:mediaId/rename ──────────────────────────────
@@ -3230,6 +4183,13 @@ app.delete("/api/actors/:id/media/:mediaId", async (req, res) => {
     const filePath = path.join(__dirname, "../public", media.url);
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   } catch {}
+  // conduct-watch, 2026-09-11: signal 7's whole subject is burst-and-delete, and
+  // this -- the only explicit removal path for a reference photograph -- logged
+  // NOTHING. Two API-created actor_media rows vanished inside an hour with no
+  // DELETE anywhere in the journal, so the removal could not be attributed to a
+  // caller even in principle. Upload, depicts and authorisation all log; removal
+  // was the one consent-relevant mutation on this table that did not.
+  console.log(`[media removed] actor: ${req.params.id} user: ${user.id} media: ${media.id} slot: ${media.state_slug ?? "unset"} type: ${media.media_type} depicts: ${media.depicts ?? "unset"} subject_authorised: ${media.subject_authorised ?? "unset"} file: ${media.filename}`);
   db.prepare(`DELETE FROM actor_media WHERE id = ?`).run(req.params.mediaId);
   res.json({ deleted: req.params.mediaId });
 });
@@ -3453,8 +4413,28 @@ app.post("/api/actors/:id/undeploy", async (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
 
-  const actor = db.prepare(`SELECT * FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
+  // Session 157 (behavior-watch: undeploy is owner-only) - who may take her out.
+  //
+  // This used to load the actor as `WHERE id = ? AND owner_id = ?` bound to the
+  // caller, i.e. undeploy was silently template-owner-only. That was harmless
+  // only while deploy was accidentally owner-only too. Deploy now grants the
+  // "use" rung (share-holder may deploy someone else's character into a world
+  // THEY own), so the asymmetry became live: a share-holder could place her in
+  // their own world and then had no way to remove her from it.
+  //
+  // The rule is the inverse of deploy's, which needs "use" on the character AND
+  // `owner` on the world: undeploying is a world-level act, so an owner of the
+  // world she is standing in may evict her, and the character's own owner may
+  // always pull her out of anywhere. No share is required for the world-owner
+  // path - a co-owner of the world who was never shared the character still owns
+  // the world she is in.
+  //
+  // Entitlement is computed per DEPLOYMENT, not per actor, and the world list
+  // handed back on ambiguity is the filtered one, so a caller never learns which
+  // other worlds hold a character they have no standing over.
+  const actor = db.prepare(`SELECT * FROM actors WHERE id = ?`).get(req.params.id);
   if (!actor) return res.status(404).json({ error: "not found" });
+  const isTemplateOwner = actor.owner_id === user.id;
 
   // Session 150 — undeploy has to name a world.
   //
@@ -3464,11 +4444,26 @@ app.post("/api/actors/:id/undeploy", async (req, res) => {
   // join last, which is not a choice anyone made. The caller now passes
   // world_id, and if it is ambiguous we refuse and hand back the options rather
   // than guessing.
-  const liveDeployments = db.prepare(
+  const allLiveDeployments = db.prepare(
     `SELECT * FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL ORDER BY deployed_at DESC`
   ).all(req.params.id);
 
-  if (liveDeployments.length === 0) return res.status(404).json({ error: "no deployment found" });
+  // Keep only the deployments this caller has standing over (see above).
+  const liveDeployments = isTemplateOwner
+    ? allLiveDeployments
+    : allLiveDeployments.filter(d => {
+        const wm = db.prepare(
+          `SELECT role FROM world_memberships WHERE user_id = ? AND world_id = ? LIMIT 1`
+        ).get(user.id, d.world_id);
+        return wm && wm.role === "owner";
+      });
+
+  if (allLiveDeployments.length === 0) return res.status(404).json({ error: "no deployment found" });
+
+  // Nothing they may act on: answer exactly as if she did not exist, the same
+  // non-disclosure the old owner_id-bound load gave. A stranger must not learn
+  // that this character is deployed at all.
+  if (liveDeployments.length === 0) return res.status(404).json({ error: "not found" });
 
   const wantWorld = req.body?.world_id;
   let deployment;
@@ -3562,6 +4557,31 @@ app.post("/api/actors/:id/undeploy", async (req, res) => {
   // what it mirrors is a trap primed for the first route that trusts it.
   // Move both in one statement so they cannot drift again.
   db.prepare(`UPDATE actor_deployments SET undeployed_at = ?, deploy_status = 'undeployed' WHERE id = ?`).run(now, deployment.id);
+
+  // A sweep target that names an erased simulator actor.
+  //
+  // The nightly lab suite sweep benches (world_id, simulator_actor_id) pairs
+  // pinned in lab_suite_targets / lab_sweep_targets. Undeploy erased her rows in
+  // the simulator but left those pins standing, so every sweep after an undeploy
+  // benched a ghost: TransportLab.fetch_actor found no row, returned an empty
+  // map, and "her two fixed places resolve" failed with
+  // "unresolvable: home_place_id=nil" - a stale pin reported as a data defect.
+  // (Observed: Lindsey Vaughn undeployed from TEST WORLD 2026-09-06T01:17:49Z,
+  // incident filed by the 06:00Z sweep the same morning and every one since.)
+  // A redeploy mints a NEW simulator_actor_id, so a pin naming the erased one can
+  // never resolve again; dropping it is the only outcome that is ever right.
+  // Best-effort on purpose: lab bookkeeping must not fail an undeploy the
+  // simulator has already confirmed.
+  try {
+    const prunedTargets =
+      db.prepare(`DELETE FROM lab_suite_targets WHERE world_id = ? AND actor_id = ?`)
+        .run(deployment.world_id, deployment.simulator_actor_id).changes +
+      db.prepare(`DELETE FROM lab_sweep_targets WHERE world_id = ? AND actor_id = ?`)
+        .run(deployment.world_id, deployment.simulator_actor_id).changes;
+    if (prunedTargets) console.log(`[undeploy] pruned ${prunedTargets} lab sweep target(s) naming ${deployment.simulator_actor_id}`);
+  } catch (e) {
+    console.warn("[undeploy] lab target prune failed:", e.message);
+  }
 
   // Session 149 — actors.status was left at 'active' forever after
   // undeploy; nothing ever moved it back. An actor still deployed
@@ -3781,8 +4801,95 @@ app.post("/api/actors/:id/deploy", async (req, res) => {
     return res.status(502).json({ error: `Couldn't reach the simulator (${e.message}). Nothing was deployed.` });
   }
 
-  const actor = db.prepare(`SELECT * FROM actors WHERE id = ? AND owner_id = ?`).get(actorId, user.id);
-  if (!actor) return res.status(403).json({ error: "forbidden" });
+  // Session 153 (behavior-watch, resolution-manager) — load by id ALONE.
+  //
+  // This re-read used to bind `owner_id = user.id`, which silently undid the
+  // "use" gate a hundred lines above: a share-holder passed
+  // hasAccess(actorId, user, "use"), reached here, got undefined, and was
+  // answered with a bare 403 "forbidden" after clearing the very check written
+  // for them. The "use" rung therefore had no reachable implementation at all —
+  // only an owner could ever deploy — though ACCESS_RANK documents it as
+  // "deploy the owner's character into a world YOU own".
+  //
+  // Access was already decided above and is held in `acc`; re-deriving it from
+  // owner_id here was both wrong and redundant. POST /api/actors/:id/fork loads
+  // its source exactly this way after the same shape of gate.
+  //
+  // Nothing about the deploy needs the caller to own the template: the world
+  // instance created below belongs to the deployer's world, the template row is
+  // only read here, and the actor's media is fetched server-to-server by the
+  // simulator over the LAN, never handed to the caller.
+  //
+  // 404 rather than 403 on a miss: actorAccess() read this row moments ago, so
+  // an absence here means it was deleted mid-request, not that access was
+  // refused — and answering "forbidden" to someone who just passed the gate is
+  // the exact confusion this line caused.
+  const actor = db.prepare(`SELECT * FROM actors WHERE id = ?`).get(actorId);
+  if (!actor) return res.status(404).json({ error: "not found" });
+
+  // Session 152 (conduct-watch, resolution-manager) — the drafting exemption
+  // ends HERE, at the deployment boundary.
+  //
+  // ageFloorError() below deliberately returns null for an unset/empty age, and
+  // that is correct where it is used: the wizard saves drafts long before Age is
+  // filled in, and failing those would break creation. But nothing ever re-asked
+  // the question at deploy time. A character whose age was never entered — or
+  // cleared to "" through PUT /api/actors/:id, which that exemption accepts by
+  // design — was forwarded from here to the simulator with age: null and landed
+  // in a live world unbounded. An unknown age cannot be shown to clear 18, and
+  // the age is carried straight into NPC prompts and perception.
+  //
+  // The simulator refuses this too now (deploy_actor/2 422s an absent or
+  // unreadable age, same session). This check exists so the refusal happens
+  // BEFORE the model bake, the media upload and the deploy-payload write below,
+  // and so the answer says what to do about it instead of surfacing as
+  // "no simulator_actor_id returned" from the catch at the end of this route.
+  const deployAge =
+    typeof actor.age === "number" ? actor.age : parseInt(String(actor.age ?? "").trim(), 10);
+  if (!Number.isFinite(deployAge)) {
+    return res.status(400).json({
+      error: `${actor.first_name || actor.name || "This character"} has no age set. A character's age goes into NPC prompts and perception, so it has to be filled in before she can be deployed into a world — set it in the editor and try again. Nothing was deployed.`,
+      field: "age",
+      age_missing: true,
+    });
+  }
+  if (deployAge < AGE_FLOOR) {
+    return res.status(400).json({
+      error: `${actor.first_name || actor.name || "This character"} is recorded as ${deployAge}. Characters deployed into a world must be ${AGE_FLOOR} or over. Nothing was deployed.`,
+      field: "age",
+      floor: AGE_FLOOR,
+    });
+  }
+
+  // Session 158 (conduct-watch, resolution-manager) — the subject-authorisation
+  // declaration ends here too, at the same deployment boundary as the age floor
+  // above.
+  //
+  // actor_media.subject_authorised was added with two gates: the 3D solve
+  // (generate3d.js) and sharing (POST /api/actors/:id/shares). Deploy is the
+  // THIRD egress and had none, even though it is the widest of the three — the
+  // media block below ships every actor_media row to the simulator over the LAN
+  // and puts the likeness in front of whoever else is in that world. Building an
+  // unauthorised likeness is contained while it stays in one account; deploying
+  // it is the step that stops being contained, exactly like sharing.
+  //
+  // Same predicate as the shares route, deliberately: scoped to the declared
+  // reference set (world_id IS NULL) and to declared-'other' rows only, so
+  // actors with no declaration — every actor predating the depicts column —
+  // deploy exactly as before. World-scoped media is excluded even though deploy
+  // ships it, because PUT /api/actors/:id/media-depicts only writes
+  // subject_authorised on world_id IS NULL rows: gating on a world-scoped row
+  // would create a refusal with no UI path to clear it.
+  //
+  // Session 170 — over the whole fork ancestry, so a copy stops deploying when
+  // the subject withdraws on the original it was taken from.
+  const unauthorisedSubject = unauthorisedSubjectInLineage(actorId);
+  if (unauthorisedSubject) {
+    return res.status(403).json({
+      error: subjectRefusalText(unauthorisedSubject, actorId, actor.first_name || actor.name || "This character", "deployed") + " Nothing was deployed.",
+      needs: subjectRefusalNeeds(unauthorisedSubject),
+    });
+  }
 
   // Session 152 — refuse rather than ship the wrong body.
   //
@@ -5772,7 +6879,50 @@ app.get("/api/actors", (req, res) => {
   const actors = db.prepare(`
     SELECT a.id, a.name, a.age, a.gender, a.occupation, a.status, a.updated_at,
            p.attachment_style, b.openness, b.conscientiousness, b.extraversion, b.agreeableness, b.neuroticism,
-           (SELECT url FROM actor_media WHERE actor_id = a.id AND media_type = 'photo' AND state_slug IN ('photo_close','profile') LIMIT 1) as photo_url
+           (SELECT url FROM actor_media WHERE actor_id = a.id AND media_type = 'photo' AND state_slug IN ('photo_close','profile') LIMIT 1) as photo_url,
+           -- Session 151 -- the subject-authorisation declaration, summarised for the
+           -- gallery card. The declaration was only ever ASKED inside CharacterWizard's
+           -- 'Who is in these photographs?' step, and only ever READ BACK by the build
+           -- and egress gates (solve, runtime-glb, save-morphed-glb, runtime read,
+           -- shares, share-links, publish, deploy, fork), which refuse with a 403. So a
+           -- character whose reference photographs are declared to be of somebody else
+           -- and whose authorisation was never answered looked completely ordinary
+           -- everywhere in the app, right up until every button on it began failing,
+           -- with no surface anywhere saying why or offering the answer.
+           --
+           -- Summarised over exactly the set the gates scope themselves to
+           -- (world_id IS NULL, depicts = 'other'), so the card and the gate can never
+           -- disagree about who is blocked:
+           --   NULL      no photograph is declared to be of somebody else -- nothing to ask
+           --   'yes'     every such photograph is authorised -- the gates pass
+           --   'no'      the subject was declared NOT to have authorised it -- gates refuse
+           --   'pending' at least one is still unanswered -- gates refuse
+           -- 2026-09-11 (conduct-watch) -- widened alongside the gates to report
+           -- 'undeclared': a reference photograph carrying NO depicts at all now
+           -- refuses build AND egress, so the card has to be able to say so.
+           -- Reported ahead of 'no'/'pending' because it is the earlier question.
+           (SELECT CASE
+                     WHEN COUNT(*) = 0 THEN NULL
+                     WHEN SUM(CASE WHEN depicts IS NULL OR depicts = '' THEN 1 ELSE 0 END) > 0 THEN 'undeclared'
+                     WHEN SUM(CASE WHEN subject_authorised = 'no'  THEN 1 ELSE 0 END) > 0 THEN 'no'
+                     WHEN SUM(CASE WHEN subject_authorised = 'yes' THEN 1 ELSE 0 END) = COUNT(*) THEN 'yes'
+                     ELSE 'pending'
+                   END
+              FROM actor_media
+             WHERE actor_id = a.id AND media_type IN ('photo','audio') AND world_id IS NULL
+               AND (depicts IS NULL OR depicts = '' OR depicts = 'other')) as subject_authorisation,
+           -- 2026-09-09 (conduct-watch) -- how many worlds she is STILL IN after the
+           -- subject withdrew authorisation, derived exactly as the editor's standing
+           -- banner derives it. Normally 0. Anything above 0 is a likeness the subject
+           -- said no to that is still running inside a simulator world, and a list of
+           -- cards is the only surface seen without opening anything. On BOTH lists for
+           -- the same reason the line above is: the card component is shared.
+           (SELECT COUNT(*) FROM actor_deployments d
+             WHERE d.platform_actor_id = a.id AND d.undeployed_at IS NULL
+               AND EXISTS (SELECT 1 FROM actor_media m
+                            WHERE m.actor_id = a.id AND m.media_type IN ('photo','audio')
+                              AND m.world_id IS NULL AND m.depicts = 'other'
+                              AND m.subject_authorised = 'no')) as withdrawal_still_deployed
     FROM actors a
     LEFT JOIN actor_psychology p ON p.actor_id = a.id
     LEFT JOIN actor_big5 b ON b.actor_id = a.id
@@ -5914,17 +7064,21 @@ app.post("/api/actors/:id/draft-state", (req, res) => {
 //
 // Never updated, never deleted. The table (server/db.js) has no foreign keys
 // on purpose, so the record survives the actor and both accounts.
-function recordActorDeletion({ actor, user, via, mediaCount }) {
+function recordActorDeletion({ actor, user, via, mediaCount, mediaRows }) {
   // authUser() does not carry email, so resolve it here: an account id alone
   // stops being readable the moment the account is renamed or removed, and the
   // whole point of this row is that it is still legible long afterwards.
   const actingEmail = user?.id
     ? (db.prepare(`SELECT email FROM users WHERE id = ?`).get(user.id)?.email ?? null)
     : null;
+  // What the media declared, frozen before actor_media is swept.
+  const media = summariseActorMedia(mediaRows);
+  const count = Array.isArray(mediaRows) ? mediaRows.length : (mediaCount ?? null);
   db.prepare(`INSERT INTO actor_deletions
       (id, actor_id, actor_name, owner_id, acting_user_id, acting_email, via,
-       actor_status, media_folder, media_count, deleted_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+       actor_status, media_folder, media_count, actor_age,
+       media_depicts, media_subject_authorised, media_manifest, deleted_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
     randomUUID(),
     actor.id,
     actor.name ?? null,
@@ -5934,21 +7088,36 @@ function recordActorDeletion({ actor, user, via, mediaCount }) {
     via,
     actor.status ?? null,
     actor.media_folder ?? null,
-    mediaCount ?? null,
+    count,
+    // The declared age, carried onto the tombstone (2026-09-09): the whole
+    // point of this row for the child-safety sweep is that it can answer
+    // "did a declared minor exist here" after the actors row is gone.
+    actor.age ?? null,
+    // The declared likeness, carried onto the tombstone for the same reason
+    // (2026-09-10, conduct-watch): "one media file went away" does not answer
+    // "was it a third party, and had they authorised it", and actor_media is
+    // gone by the time anyone asks.
+    media.depicts,
+    media.subjectAuthorised,
+    media.manifest,
     new Date().toISOString(),
   );
-  console.log(`[actor-delete] ${actor.id} (${actor.name ?? "?"}) owner=${actor.owner_id ?? "?"} by=${user?.id ?? "?"} via=${via}`);
+  console.log(`[actor-delete] ${actor.id} (${actor.name ?? "?"}) owner=${actor.owner_id ?? "?"} by=${user?.id ?? "?"} via=${via} media=${count ?? "?"} depicts=${media.depicts ?? "unrecorded"} subject_authorised=${media.subjectAuthorised ?? "unrecorded"}`);
 }
 
 app.post("/api/actors/:id/abandon-draft", (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).end();
 
-  const actor = db.prepare(`SELECT id, name, owner_id, status, media_folder FROM actors WHERE id = ? AND owner_id = ? AND status = 'draft'`).get(req.params.id, user.id);
+  const actor = db.prepare(`SELECT id, name, owner_id, age, status, media_folder FROM actors WHERE id = ? AND owner_id = ? AND status = 'draft'`).get(req.params.id, user.id);
   if (!actor) return res.status(204).end(); // not a draft (already finished, or gone) — nothing to do
 
   // Read the urls before the transaction (it deletes the rows); unlink after it.
-  const mediaFiles = db.prepare(`SELECT url FROM actor_media WHERE actor_id = ?`).all(req.params.id);
+  // 2026-09-10 (conduct-watch): this read is also the ONLY chance to capture
+  // what the media declared -- depicts / subject_authorised die with the rows,
+  // and the tombstone is what has to answer the likeness question afterwards.
+  const mediaFiles = db.prepare(`SELECT id, media_type, filename, url, depicts, subject_authorised
+                                   FROM actor_media WHERE actor_id = ?`).all(req.params.id);
   const tables = ["actor_psychology","actor_big5","actor_disc","actor_hds","actor_economic",
     "actor_lifestyle","actor_mental_health","actor_education","actor_upbringing",
     "actor_diagnoses","actor_media","actor_shares","actor_assessment_results",
@@ -5977,9 +7146,15 @@ app.post("/api/actors/:id/abandon-draft", (req, res) => {
     // row whose files were already destroyed, still being worn. Clearing the
     // pointer here puts it inside the same transaction: all of it, or none.
     db.prepare(`UPDATE users SET avatar_actor_id = NULL, updated_at = datetime('now') WHERE avatar_actor_id = ?`).run(req.params.id);
-    const deleted = db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
-    // Attribution, in the same transaction as the delete (conduct-watch signal 7).
-    if (deleted.changes > 0) recordActorDeletion({ actor, user, via: "POST /api/actors/:id/abandon-draft", mediaCount: mediaFiles.length });
+    // Attribution, in the same transaction as the delete and now BEFORE it
+    // (conduct-watch signal 7; ordering changed 2026-09-09). `actors` carries
+    // an AFTER DELETE trigger (server/db.js) that writes an UNATTRIBUTED
+    // fallback row when no audited path claimed the delete, and it can only
+    // see audit rows that already exist when the DELETE runs. Recording first
+    // keeps the trigger quiet on this path; both writes are still in one
+    // transaction, so a rollback takes the audit row with it.
+    recordActorDeletion({ actor, user, via: "POST /api/actors/:id/abandon-draft", mediaRows: mediaFiles });
+    db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
   })();
   // Disk only AFTER the commit. A transaction that raises must not leave a live
   // row pointing at media that no longer exists.
@@ -5995,14 +7170,18 @@ app.delete("/api/actors/:id", (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "unauthorized" });
 
-  const actor = db.prepare(`SELECT id, name, owner_id, status, media_folder FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
+  const actor = db.prepare(`SELECT id, name, owner_id, age, status, media_folder FROM actors WHERE id = ? AND owner_id = ?`).get(req.params.id, user.id);
   if (!actor) return res.status(404).json({ error: "not found" });
 
   const deployment = db.prepare(`SELECT id FROM actor_deployments WHERE platform_actor_id = ? AND undeployed_at IS NULL`).get(req.params.id);
   if (deployment) return res.status(409).json({ error: "actor is deployed — undeploy first" });
 
   // Read the urls before the transaction (it deletes the rows); unlink after it.
-  const mediaFiles = db.prepare(`SELECT url FROM actor_media WHERE actor_id = ?`).all(req.params.id);
+  // 2026-09-10 (conduct-watch): this read is also the ONLY chance to capture
+  // what the media declared -- depicts / subject_authorised die with the rows,
+  // and the tombstone is what has to answer the likeness question afterwards.
+  const mediaFiles = db.prepare(`SELECT id, media_type, filename, url, depicts, subject_authorised
+                                   FROM actor_media WHERE actor_id = ?`).all(req.params.id);
 
   const tables = ["actor_psychology","actor_big5","actor_disc","actor_hds","actor_economic",
     "actor_lifestyle","actor_mental_health","actor_education","actor_upbringing",
@@ -6036,9 +7215,15 @@ app.delete("/api/actors/:id", (req, res) => {
     // row whose files were already destroyed, still being worn. Clearing the
     // pointer here puts it inside the same transaction: all of it, or none.
     db.prepare(`UPDATE users SET avatar_actor_id = NULL, updated_at = datetime('now') WHERE avatar_actor_id = ?`).run(req.params.id);
-    const deleted = db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
-    // Attribution, in the same transaction as the delete (conduct-watch signal 7).
-    if (deleted.changes > 0) recordActorDeletion({ actor, user, via: "DELETE /api/actors/:id", mediaCount: mediaFiles.length });
+    // Attribution, in the same transaction as the delete and now BEFORE it
+    // (conduct-watch signal 7; ordering changed 2026-09-09). `actors` carries
+    // an AFTER DELETE trigger (server/db.js) that writes an UNATTRIBUTED
+    // fallback row when no audited path claimed the delete, and it can only
+    // see audit rows that already exist when the DELETE runs. Recording first
+    // keeps the trigger quiet on this path; both writes are still in one
+    // transaction, so a rollback takes the audit row with it.
+    recordActorDeletion({ actor, user, via: "DELETE /api/actors/:id", mediaRows: mediaFiles });
+    db.prepare(`DELETE FROM actors WHERE id = ? AND owner_id = ?`).run(req.params.id, user.id);
   })();
   // Disk only AFTER the commit. A transaction that raises must not leave a live
   // row pointing at media that no longer exists.
@@ -6101,7 +7286,13 @@ app.get("/api/actors/:id", (req, res) => {
   // the photo is replaced -- without a ?v= stamp taken from this column, a
   // browser can legitimately keep serving whatever bytes it fetched from that
   // URL last time.
-  const mediaPhotos = db.prepare(`SELECT state_slug, url, depicts, updated_at FROM actor_media WHERE actor_id = ? AND media_type = 'photo' AND world_id IS NULL`).all(req.params.id);
+  // 2026-09-11 (conduct-watch, resolution-manager) -- reference AUDIO is in
+  // this list now. It was photo-only, so the editor's "Declaration needed"
+  // notice and the wizard could not see a voice sample at all: the one question
+  // the whole apparatus exists to ask was un-askable about a recorded voice.
+  // media_type comes back with it so the callers can tell the two apart --
+  // CharacterWizard already filters on exactly that field for its photo slots.
+  const mediaPhotos = db.prepare(`SELECT state_slug, media_type, url, depicts, subject_authorised, depicts_cleared_from, depicts_cleared_at, updated_at FROM actor_media WHERE actor_id = ? AND media_type IN ('photo','audio') AND world_id IS NULL`).all(req.params.id);
   // Session 150 — say plainly whether this caller owns the character.
   //
   // owner_id and permission were both already in the payload and the profile
@@ -6115,7 +7306,15 @@ app.get("/api/actors/:id", (req, res) => {
   // that is the ambiguity the ladder exists to remove.
   actor.is_owner = actor.owner_id === user.id;
 
-  res.json({ actor, psychology, big5, disc, hds, lifestyle, economic, mental, upbringing, education, diagnoses, expenses, mediaPhotos, measurements });
+  // The standing record of a withdrawal the simulator did not carry out. Always
+  // present (an empty array when there is nothing outstanding) so the client
+  // never has to tell "nothing is wrong" apart from "this server is too old to
+  // say". Read for ANY caller who may see the actor, not only the owner: a
+  // person holding a share on a likeness whose subject said no should be able
+  // to see that as well.
+  const withdrawal_still_deployed = unenforcedWithdrawalWorlds(id);
+
+  res.json({ actor, psychology, big5, disc, hds, lifestyle, economic, mental, upbringing, education, diagnoses, expenses, mediaPhotos, measurements, withdrawal_still_deployed });
 });
 
 // ── The age floor, in ONE place because age has TWO write paths ──────────────
@@ -6224,14 +7423,20 @@ app.put("/api/actors/:id", (req, res) => {
 
   // Upsert canonical profile photo into actor_media if provided
   if (photoUrl) {
-    const existing = db.prepare("SELECT id, url FROM actor_media WHERE actor_id = ? AND state_slug = 'profile' AND media_type = 'photo' AND world_id IS NULL").get(id);
+    const existing = db.prepare("SELECT id, url, depicts FROM actor_media WHERE actor_id = ? AND state_slug = 'profile' AND media_type = 'photo' AND world_id IS NULL").get(id);
     if (existing) {
       // A different photograph is a different question. Carrying the previous
       // `depicts` across a swapped url would let a statement made about one
       // photograph stand as a statement about another — the one thing this
       // column must never do — so a swap drops it back to "not declared".
+      // 2026-09-11 (conduct-watch): the drop stands -- see the upload route --
+      // but it is recorded now rather than silent, for the same reason it is
+      // there: a blank that used to be an answer must not read as "never asked".
       const swapped = existing.url !== photoUrl;
-      db.prepare(`UPDATE actor_media SET url = ?, updated_at = ?${swapped ? ", depicts = NULL" : ""} WHERE id = ?`).run(photoUrl, now, existing.id);
+      const wasDeclared = swapped ? (existing.depicts || null) : null;
+      if (wasDeclared) console.warn(`[media] depicts CLEARED by profile photo swap actor: ${id} slot: profile was: ${wasDeclared}`);
+      db.prepare(`UPDATE actor_media SET url = ?, updated_at = ?${swapped ? ", depicts = NULL" : ""}${wasDeclared ? ", depicts_cleared_from = ?, depicts_cleared_at = ?" : ""} WHERE id = ?`)
+        .run(photoUrl, now, ...(wasDeclared ? [wasDeclared, now] : []), existing.id);
     } else {
       db.prepare("INSERT INTO actor_media (id, actor_id, media_type, state_slug, url, inserted_at, updated_at) VALUES (?,?,?,?,?,?,?)")
         .run(randomUUID(), id, "photo", "profile", photoUrl, now, now);
@@ -6336,6 +7541,11 @@ function authUser(req) {
         }
         return null;
       }
+      // The key's own world binding is carried forward on the request. Routes in
+      // API_KEY_ACCOUNT_ALLOW bypass apiKeyDenial()'s world check by definition
+      // (they have no world in the path), so a route that reaches world-scoped
+      // material from an account-surface path has to re-apply it itself.
+      req._apiKeyRow = keyRow;
       return db.prepare(`SELECT id, name, org_id, user_type, org_role FROM users WHERE id = ? AND status != 'removed'`).get(keyRow.user_id);
     }
   }
@@ -6498,13 +7708,255 @@ app.get("/api/worlds/:world_id/cast/:actor_id/thread/:contact_id", async (req, r
   } catch { res.status(502).json({ error: "simulator unreachable" }); }
 });
 
+// ---- voiceDeclarationRefusal(actorId) --------------------------------------
+//
+// 2026-09-11 (conduct-watch, resolution-manager) -- THE PLATFORM WAS NOT THE
+// ONLY CALLER OF THE XTTS HOST, SO THIS GATE WAS A PROPERTY OF ONE HTTP ROUTE
+// RATHER THAN A PROPERTY OF THE ACT.
+//
+// The check below used to live inside the POST /api/tts handler. The simulator
+// speaks in these same cloned voices during an encounter --
+// encounter_process.ex call_chatterbox/3 POSTs the XTTS host directly with
+// reference_audio_filename: "<simulator actor id>.mp3" -- and asked nothing at
+// all. The declaration exists only on this host (the simulator's actor_media
+// has no depicts/subject_authorised columns), so the simulator cannot answer
+// the question locally; it has to ask here.
+//
+// Lifted out verbatim so there is exactly ONE implementation of "may this voice
+// be spoken in", shared by POST /api/tts and by POST
+// /api/internal/voice-declaration below. Both callers of the XTTS host now
+// apply the same standard, and cannot drift apart by being edited separately.
+//
+// Returns null when the voice may be spoken, or a refusal object when it may
+// not. No audio crosses this function in either direction: the answer is a
+// verdict, not media.
+function voiceDeclarationRefusal(actorId) {
+  const platformIds = db.prepare(
+    `SELECT DISTINCT platform_actor_id FROM actor_deployments WHERE simulator_actor_id = ?`
+  ).all(actorId).map(r => r.platform_actor_id).filter(Boolean);
+  const voiceIds    = [actorId, ...platformIds];
+  const voiceIdSlot = voiceIds.map(() => "?").join(",");
+
+  const voiceRef = db.prepare(
+    `SELECT id, actor_id, state_slug, depicts, subject_authorised,
+            CASE WHEN depicts IS NULL OR depicts = '' THEN 'undeclared' ELSE 'unauthorised' END AS reason
+       FROM actor_media
+      WHERE actor_id IN (${voiceIdSlot}) AND media_type = 'audio' AND world_id IS NULL
+        AND ( depicts IS NULL OR depicts = ''
+              OR (depicts = 'other' AND (subject_authorised IS NULL OR subject_authorised != 'yes')) )
+      ORDER BY CASE WHEN depicts IS NULL OR depicts = '' THEN 0 ELSE 1 END
+      LIMIT 1`
+  ).get(...voiceIds);
+  if (voiceRef) {
+    return {
+      reason: voiceRef.reason,
+      needs:  voiceRef.reason === "undeclared" ? "depicts" : "subject_authorised",
+      log:    `reference recording ${voiceRef.id} (actor ${voiceRef.actor_id}) is ${voiceRef.reason} (depicts: ${voiceRef.depicts ?? "unset"}, subject_authorised: ${voiceRef.subject_authorised ?? "unset"})`,
+      error:  voiceRef.reason === "undeclared"
+        ? "This character's reference recording carries no statement of whose voice it is. A recorded voice is a likeness in the same sense a face is, and a blank is not a declaration that it is yours. Say whose voice the recording is before speaking in it."
+        : "This character's reference recording is declared to be of somebody else, and that person has not authorised the likeness. Record their authorisation before speaking in their voice.",
+    };
+  }
+
+  const anyVoiceRow = db.prepare(
+    `SELECT 1 FROM actor_media WHERE actor_id IN (${voiceIdSlot}) AND media_type = 'audio' AND world_id IS NULL LIMIT 1`
+  ).get(...voiceIds);
+  if (!anyVoiceRow) {
+    return {
+      reason: "no_reference_recording",
+      needs:  "reference_recording",
+      log:    `no reference recording on this host ties this id to a declaration (resolved platform ids: ${platformIds.join(", ") || "none"})`,
+      error:  "No reference recording on this platform can be tied to this voice. Speaking new words in somebody's voice is building from their likeness, and nothing here states whose voice the recording is. Upload the reference recording against this character and declare whose voice it is before speaking in it.",
+    };
+  }
+
+  return null;
+}
+
+// ---- POST /api/internal/voice-declaration -----------------------------------
+//
+// 2026-09-11 (conduct-watch, resolution-manager). The same gate, asked by the
+// simulator before it speaks in a cloned voice on the encounter path.
+//
+// LAN-only and service-token only, never a user session: this is a
+// server-to-server question, the mirror of the X-Service-Token calls this host
+// already makes into the simulator. It carries no audio and grants access to
+// nothing -- it answers exactly one question, "may this voice be spoken in",
+// and returns a verdict.
+//
+// This ADDS authentication to a new surface; it relaxes none. An unset
+// PLATFORM_SERVICE_TOKEN refuses every request rather than accepting every
+// request, and because the simulator treats anything that is not an explicit
+// allow as a refusal, a broken token here makes the encounter voice path
+// silent rather than permissive.
+app.post("/api/internal/voice-declaration", (req, res) => {
+  if (!SERVICE_TOKEN || req.get("X-Service-Token") !== SERVICE_TOKEN) {
+    return res.status(401).json({ allowed: false, error: "service token required" });
+  }
+  const actor_id = req.body && req.body.actor_id;
+  if (!actor_id) return res.status(400).json({ allowed: false, error: "actor_id required" });
+
+  const refusal = voiceDeclarationRefusal(actor_id);
+  if (refusal) {
+    console.warn(`[tts] REFUSED (simulator encounter path) actor: ${actor_id}: ${refusal.log}`);
+    return res.status(403).json({ allowed: false, reason: refusal.reason, needs: refusal.needs, error: refusal.error });
+  }
+  return res.json({ allowed: true });
+});
+
+
 // ── POST /api/tts — proxy to XTTS, fallback gracefully if down ───────────────
 const XTTS_URL = "http://212.147.242.29:8005/tts";
+
+// 2026-09-11 (conduct-watch, resolution-manager) -- /api/tts ESTABLISHED THAT
+// SOMEBODY WAS LOGGED IN, AND NOTHING ELSE.
+//
+// Every other actor-scoped route on this host establishes a RELATIONSHIP to the
+// actor before it acts: requireWorld(..., 'owner'|'player') for the world
+// proxies, hasAccess(actor, user, 'read'|'use'|'copy') for the character
+// library, actorInWorld() for the media proxies. This one took a bare body
+// actor_id from any authenticated caller, so an account with no connection to
+// another account's character could speak new words in that character's voice
+// by knowing or guessing its id. The declaration gate below narrowed the blast
+// radius but answers a different question -- it asks whether the recording is
+// declared, not whether the CALLER is entitled to it -- so a correctly declared
+// and subject-authorised voice was synthesisable by any logged-in stranger.
+//
+// This is actorInWorld() with the world quantified out, because /api/tts has no
+// world in its path: the same two rungs, checked against every world the caller
+// actually belongs to.
+//
+//   1. direct character access -- owner of the actors row, or an actor_shares
+//      row at any level. 'read' is the floor deliberately: someone who may look
+//      at the character may hear it.
+//   2. world membership -- the actor is deployed into a world the caller is a
+//      member of, or the id IS the caller's own player actor in such a world.
+//      This is the voicemail case, and the reason the predicate is not
+//      owner-only: a player listening to a message from an NPC in their world
+//      has never owned that character and never will.
+//
+// Deployments are matched whether or not they are still live. A voicemail
+// outlives the deploy that produced it, and refusing to replay an old message
+// to a member of the world it was left in would be breaking playback for a
+// legitimate player to close a hole that is about strangers.
+//
+// The id may arrive as either a simulator actor id (VoicemailPage sends
+// msg.sender_id) or a platform actor id, so both spaces are tried, resolved
+// through actor_deployments exactly as the declaration gate below does.
+function ttsActorEntitlement(actorId, user) {
+  if (!user || !actorId) return null;
+  const id = String(actorId);
+
+  const platformIds = db.prepare(
+    `SELECT DISTINCT platform_actor_id FROM actor_deployments WHERE simulator_actor_id = ?`
+  ).all(id).map(r => r.platform_actor_id).filter(Boolean);
+
+  for (const cand of [id, ...platformIds]) {
+    const acc = hasAccess(cand, user, "read");
+    if (acc) return { via: acc.level === "owner" ? "owner" : `share:${acc.level}`, world_id: null };
+  }
+
+  const dep = db.prepare(
+    `SELECT d.world_id FROM actor_deployments d
+       JOIN world_memberships m ON m.world_id = d.world_id
+      WHERE m.user_id = ? AND (d.simulator_actor_id = ? OR d.platform_actor_id = ?)
+      LIMIT 1`
+  ).get(user.id, id, id);
+  if (dep) return { via: "world_membership", world_id: dep.world_id };
+
+  const own = db.prepare(
+    `SELECT world_id FROM world_memberships WHERE user_id = ? AND actor_id = ? LIMIT 1`
+  ).get(user.id, id);
+  if (own) return { via: "own_player_actor", world_id: own.world_id };
+
+  return null;
+}
+
 app.post("/api/tts", async (req, res) => {
   const user = authUser(req);
   if (!user) return res.status(401).json({ error: "not authenticated" });
   const { text, actor_id } = req.body;
   if (!text || !actor_id) return res.status(400).json({ error: "text and actor_id required" });
+
+  // Who is asking, before what is being asked for. This runs ahead of the
+  // declaration gate on purpose: a stranger should not learn from the reply
+  // whether an actor id exists, nor what state its reference recording is in.
+  // 404 rather than 403 for the same reason requireWorld() answers 404 to a
+  // non-member -- "forbidden" would confirm the character exists.
+  const entitlement = ttsActorEntitlement(actor_id, user);
+  if (!entitlement) {
+    console.warn(`[tts] REFUSED actor: ${actor_id} user: ${user.id}: caller has no established relationship to this actor (no ownership, no share, no world membership)`);
+    return res.status(404).json({ error: "actor not found" });
+  }
+
+  // An api key is minted for ONE world and is an installed app's credential,
+  // not a session. /api/tts sits in API_KEY_ACCOUNT_ALLOW because the phone app
+  // genuinely calls it with no world in the path, which means apiKeyDenial()
+  // never got to apply the binding -- so a key for world A could reach an actor
+  // its owner happens to have in world B. Ownership and shares still pass,
+  // because those are the key holder's own characters; reaching another world's
+  // cast with a key bound elsewhere does not.
+  const keyWorld = req._apiKeyRow?.world_id || null;
+  if (keyWorld && entitlement.via !== "owner" && !String(entitlement.via).startsWith("share")) {
+    const inKeyWorld = db.prepare(
+      `SELECT 1 FROM actor_deployments d
+         JOIN world_memberships m ON m.world_id = d.world_id AND m.user_id = ?
+        WHERE d.world_id = ? AND (d.simulator_actor_id = ? OR d.platform_actor_id = ?)
+        LIMIT 1`
+    ).get(user.id, keyWorld, String(actor_id), String(actor_id))
+      || db.prepare(
+        `SELECT 1 FROM world_memberships WHERE user_id = ? AND world_id = ? AND actor_id = ? LIMIT 1`
+      ).get(user.id, keyWorld, String(actor_id));
+    if (!inKeyWorld) {
+      console.warn(`[tts] REFUSED actor: ${actor_id} user: ${user.id}: api key is bound to world ${keyWorld} and this actor is not in it`);
+      return res.status(404).json({ error: "actor not found" });
+    }
+  }
+
+  // 2026-09-11 (conduct-watch, resolution-manager) -- A VOICE CLONE IS A BUILD
+  // FROM A LIKENESS, AND NOTHING WAS ASKING WHOSE.
+  //
+  // This is the act the reference recording exists for: XTTS is handed a
+  // reference voice and speaks arbitrary new words in it. Every comparable act
+  // on the photograph side -- solve, runtime-glb, save-morphed-glb, fork,
+  // deploy, share, link, publish -- refuses a reference set that carries no
+  // statement of whose likeness it is, or one declared 'other' whose subject has
+  // not agreed. This one asked nothing at all.
+  //
+  // Scoped to the actor's OWN reference recording rather than to
+  // unauthorisedSubjectInLineage: an undeclared photograph is an unanswered
+  // question about a FACE, and refusing to speak over it would be refusing the
+  // wrong thing. The face gates already cover that.
+  //
+  // 2026-09-11 (conduct-watch, resolution-manager) -- THE GATE ABOVE WAS
+  // QUERYING THE WRONG ID SPACE, AND THEN FAILING OPEN WHEN IT MISSED.
+  //
+  // VoicemailPage calls this endpoint with `msg.sender_id`, which is a
+  // SIMULATOR actor id. The declaration lives on actor_media, keyed by the
+  // PLATFORM actor id, and the two are different uuids: deploy mints a fresh
+  // one for the simulator actor (internal_world_controller.ex ~3017) and
+  // records the pair in actor_deployments. Measured against the live db before
+  // this change: the predicate below matched 0 rows for Lindsey Vaughn's two
+  // deployed simulator ids and 1 row for her platform id, whose voice sample is
+  // undeclared. So the gate was not merely holed for exotic ids -- it missed
+  // the only declared-reference case that exists on this host, every time, and
+  // the "cannot be checked here" branch then warned and synthesised anyway.
+  //
+  // Both halves are closed here. The id is resolved through actor_deployments
+  // before the declaration is read, and an id that still cannot be tied to a
+  // reference recording on this host is REFUSED rather than warned about: if
+  // nothing here says whose voice it is, this host cannot know whose voice
+  // comes out, which is the whole question the gate exists to ask.
+  //
+  // What goes to XTTS is still the bare id the caller sent, because that is
+  // what the reference file over there is named -- upload_voice_to_xtts/3 on
+  // the simulator uploads it under the SIMULATOR actor id.
+  const refusal = voiceDeclarationRefusal(actor_id);
+  if (refusal) {
+    console.warn(`[tts] REFUSED actor: ${actor_id} user: ${user.id}: ${refusal.log}`);
+    return res.status(403).json({ error: refusal.error, needs: refusal.needs });
+  }
+
   try {
     const response = await fetch(XTTS_URL, {
       method: "POST",
@@ -6651,7 +8103,7 @@ app.get("/api/actors/:actor_id/stream", async (req, res) => {
       res.end();
     };
     pump();
-    req.on("close", () => { try { reader.cancel(); } catch {} });
+    req.on("close", () => { cancelUpstreamReader(reader, "GET /api/actors/:actor_id/stream"); });
   } catch { res.status(502).end(); }
 });
 
@@ -6686,7 +8138,7 @@ app.get("/api/meeting/:session_id/stream", async (req, res) => {
       res.end();
     };
     pump();
-    req.on("close", () => { try { reader.cancel(); } catch {} });
+    req.on("close", () => { cancelUpstreamReader(reader, "GET /api/meeting/:session_id/stream"); });
   } catch { res.status(502).end(); }
 });
 
@@ -6785,15 +8237,21 @@ mountTestLabRoutes(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser });
 mountSignupLabRoutes(app, { db, authUser, PORT });
 mountAvatarLabRoutes(app, { db, authUser, SERVICE_TOKEN, SIMULATOR_URL });
 mountSignInLabRoutes(app, { db, authUser, PORT });
-mountWizardLabRoutes(app, { db, authUser, PORT });
+mountWizardLabRoutes(app, { db, authUser, PORT, recordActorDeletion });
 mountShareLabRoutes(app, { db, authUser, PORT });
 mountDeployLabRoutes(app, { db, authUser, PORT });
 mountRoutineLabRoutes(app, { authUser });
+// Session 157 — interaction scripts: the studio saves them here and an
+// encounter reads them back by slug. Creates its own table at mount.
+mountInteractionRoutes(app, { db, authUser });
 
 // Session 158 - cross-org character sharing by link. Its own file for the same
 // reason the lab routes are: a whole-file write to this 340KB index.js cannot
 // drop what is not in it.
-mountShareLinkRoutes(app, { db, authUser });
+// unauthorisedSubjectInLineage is injected (2026-09-11, conduct-watch) so the link
+// and publish gates share ONE definition of the subject-authorisation predicate with
+// fork/deploy/shares and the build gates, instead of a local copy that drifted.
+mountShareLinkRoutes(app, { db, authUser, unauthorisedSubjectInLineage });
 
 app.post("/api/worlds/:world_id/encounter/:encounter_id/typing", async (req, res) => {
   const ok = requireWorld(req, res, worldIdOf(req), "player");
@@ -6825,6 +8283,186 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/resume", async (req, res
     );
     res.status(r.status).json(await r.json().catch(() => ({})));
   } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── Media-repair proxies: browser → platform → simulator ─────────────────────
+//
+// Session 2026-09-05 (conduct-watch: "the browser calls the simulator internal
+// API directly over the public ngrok tunnel"). PresenceView's missing-media
+// modal used to call the simulator's /internal/* API straight from the browser,
+// against https://anima.simulator.ngrok.dev, carrying a shared service token in
+// the bundle. That broke two standing rules at once: personal media (reference
+// frames, actor video) must never transit the public tunnel, and the internal
+// API is never exposed to browser clients — the platform proxies all calls.
+//
+// These routes are that proxy. Each one authenticates the caller through the
+// same authUser()/requireWorld() chokepoint the rest of /api uses, then
+// forwards server-side over the LAN (SIMULATOR_URL is 192.168.1.58:4000) with
+// the service token, which never leaves this host.
+
+// A caller may touch an actor only through a world they belong to: the actor
+// must be deployed into that world, be their own player character there, or be
+// one they already hold direct access to. World membership is checked first by
+// requireWorld(), so this is the second half of the pair, never the whole gate.
+function actorInWorld(actorId, worldId, user) {
+  if (!actorId || !worldId) return false;
+  const dep = db.prepare(
+    `SELECT 1 FROM actor_deployments WHERE world_id = ? AND (simulator_actor_id = ? OR platform_actor_id = ?)`
+  ).get(String(worldId), String(actorId), String(actorId));
+  if (dep) return true;
+  const mem = db.prepare(
+    `SELECT 1 FROM world_memberships WHERE world_id = ? AND actor_id = ?`
+  ).get(String(worldId), String(actorId));
+  if (mem) return true;
+  return !!hasAccess(actorId, user, "read");
+}
+
+async function simMediaProxy(res, simPath, { method = "GET", body = null, headers = {} } = {}) {
+  try {
+    const r = await fetch(`${SIMULATOR_URL}${simPath}`, {
+      method,
+      headers: { "X-Service-Token": SERVICE_TOKEN, ...headers },
+      body,
+    });
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); }
+    catch { data = { error: text.slice(0, 500) || `simulator returned ${r.status}` }; }
+    return res.status(r.status).json(data);
+  } catch { return res.status(502).json({ error: "simulator unreachable" }); }
+}
+
+function simQuery(req, extra = {}) {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries({ ...req.query, ...extra })) {
+    if (v !== undefined && v !== null) q.append(k, String(v));
+  }
+  const s = q.toString();
+  return s ? `?${s}` : "";
+}
+
+// ── GET /api/worlds/:world_id/encounter/:encounter_id/media ──────────────────
+app.get("/api/worlds/:world_id/encounter/:encounter_id/media", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
+  if (!ok) return;
+  return simMediaProxy(res, `/internal/worlds/${encodeURIComponent(req.params.world_id)}/encounter/${encodeURIComponent(req.params.encounter_id)}/media`);
+});
+
+// ── POST /api/worlds/:world_id/encounter/:encounter_id/rescan_media ──────────
+app.post("/api/worlds/:world_id/encounter/:encounter_id/rescan_media", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
+  if (!ok) return;
+  return simMediaProxy(res, `/internal/worlds/${encodeURIComponent(req.params.world_id)}/encounter/${encodeURIComponent(req.params.encounter_id)}/rescan_media`, { method: "POST" });
+});
+
+// ── POST /api/worlds/:world_id/encounter/:encounter_id/generate_media ────────
+app.post("/api/worlds/:world_id/encounter/:encounter_id/generate_media", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
+  if (!ok) return;
+  const body = req.body || {};
+  if (!actorInWorld(body.actor_id, req.params.world_id, ok.user)) {
+    return res.status(403).json({ error: "no access to that actor in this world" });
+  }
+  return simMediaProxy(res, `/internal/worlds/${encodeURIComponent(req.params.world_id)}/encounter/${encodeURIComponent(req.params.encounter_id)}/generate_media`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+});
+
+// ── GET /api/actors/:actor_id/generate_prompt?world_id=… ─────────────────────
+app.get("/api/actors/:actor_id/generate_prompt", async (req, res) => {
+  const worldId = req.query.world_id;
+  const ok = requireWorld(req, res, worldId, "player");
+  if (!ok) return;
+  if (!actorInWorld(req.params.actor_id, worldId, ok.user)) {
+    return res.status(403).json({ error: "no access to that actor in this world" });
+  }
+  return simMediaProxy(res, `/internal/actors/${encodeURIComponent(req.params.actor_id)}/generate_prompt${simQuery(req)}`);
+});
+
+// ── GET /api/actors/:actor_id/suggest_frames?world_id=… ──────────────────────
+// The simulator answers with the frames inline as data: URLs, so nothing here
+// hands the browser a simulator address to go and fetch.
+app.get("/api/actors/:actor_id/suggest_frames", async (req, res) => {
+  const worldId = req.query.world_id;
+  const ok = requireWorld(req, res, worldId, "player");
+  if (!ok) return;
+  if (!actorInWorld(req.params.actor_id, worldId, ok.user)) {
+    return res.status(403).json({ error: "no access to that actor in this world" });
+  }
+  return simMediaProxy(res, `/internal/actors/${encodeURIComponent(req.params.actor_id)}/suggest_frames${simQuery(req)}`);
+});
+
+// ── POST /api/actors/:actor_id/upload_frame?world_id=… (multipart) ───────────
+app.post("/api/actors/:actor_id/upload_frame", upload.single("file"), async (req, res) => {
+  const worldId = req.query.world_id || (req.body && req.body.world_id);
+  const ok = requireWorld(req, res, worldId, "player");
+  if (!ok) return;
+  if (!actorInWorld(req.params.actor_id, worldId, ok.user)) {
+    return res.status(403).json({ error: "no access to that actor in this world" });
+  }
+  if (!req.file) return res.status(400).json({ error: "no file" });
+  try {
+    const form = new FormData();
+    form.append("file", new Blob([req.file.buffer], { type: req.file.mimetype || "image/jpeg" }), req.file.originalname || "frame.jpg");
+    const r = await fetch(`${SIMULATOR_URL}/internal/actors/${encodeURIComponent(req.params.actor_id)}/upload_frame`, {
+      method: "POST", headers: { "X-Service-Token": SERVICE_TOKEN }, body: form,
+    });
+    const data = await r.json().catch(() => ({}));
+    // The simulator answers with its own absolute /internal/frames/<name> URL.
+    // The browser must never fetch that address: repoint it at this host's
+    // authorised frame proxy below, so the image comes over the LAN.
+    if (data && typeof data.url === "string") {
+      data.url = `/api/actors/${encodeURIComponent(req.params.actor_id)}/frame/${encodeURIComponent(path.basename(data.url))}?world_id=${encodeURIComponent(worldId)}`;
+    }
+    return res.status(r.status).json(data);
+  } catch { return res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── GET /api/actors/:actor_id/frame/:filename?world_id=… ─────────────────────
+// Reference frames are personal media. They are fetched LAN-side and streamed
+// back through this authenticated route; the tunnel only ever carries them
+// between this host and the person who is already entitled to see them.
+app.get("/api/actors/:actor_id/frame/:filename", async (req, res) => {
+  const worldId = req.query.world_id;
+  const ok = requireWorld(req, res, worldId, "player");
+  if (!ok) return;
+  if (!actorInWorld(req.params.actor_id, worldId, ok.user)) {
+    return res.status(403).json({ error: "no access to that actor in this world" });
+  }
+  const name = path.basename(String(req.params.filename));
+  if (!/^[\w.-]+\.jpg$/.test(name)) return res.status(400).json({ error: "bad frame name" });
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/frames/${encodeURIComponent(name)}`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN },
+    });
+    if (!r.ok) return res.status(r.status).json({ error: `simulator returned ${r.status}` });
+    res.set("Content-Type", r.headers.get("content-type") || "image/jpeg");
+    res.set("Cache-Control", "private, no-store");
+    return res.send(Buffer.from(await r.arrayBuffer()));
+  } catch { return res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+// ── POST /api/worlds/:world_id/actors/:actor_id/upload_video (multipart) ─────
+app.post("/api/worlds/:world_id/actors/:actor_id/upload_video", upload.single("file"), async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
+  if (!ok) return;
+  if (!actorInWorld(req.params.actor_id, req.params.world_id, ok.user)) {
+    return res.status(403).json({ error: "no access to that actor in this world" });
+  }
+  if (!req.file) return res.status(400).json({ error: "no file" });
+  try {
+    const form = new FormData();
+    form.append("file", new Blob([req.file.buffer], { type: req.file.mimetype || "video/mp4" }), req.file.originalname || "upload.mp4");
+    form.append("world_id", String(req.params.world_id));
+    if (req.body && req.body.filename) form.append("filename", String(req.body.filename));
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${encodeURIComponent(req.params.world_id)}/actors/${encodeURIComponent(req.params.actor_id)}/upload_video`, {
+      method: "POST", headers: { "X-Service-Token": SERVICE_TOKEN }, body: form,
+    });
+    const data = await r.json().catch(() => ({}));
+    return res.status(r.status).json(data);
+  } catch { return res.status(502).json({ error: "simulator unreachable" }); }
 });
 
 // ── POST /api/worlds/:world_id/leave — clear player location ─────────────────
@@ -7148,7 +8786,12 @@ app.get("/api/actors/:id/assessments", (req, res) => {
 });
 
 
-registerGenerate3DRoutes(app, { db, __dirname, authUser });
+// Session 171 (conduct-watch, resolution-manager) — the build gates inside
+// generate3d.js get the SAME lineage-aware subject-authorisation predicate the
+// fork / shares / deploy gates above use. Injected rather than duplicated: a
+// fork copies no actor_media, so an own-actor predicate reads an empty set on
+// the copy and passes, which is exactly the gap this closes.
+registerGenerate3DRoutes(app, { db, __dirname, authUser, unauthorisedSubjectInLineage });
 
 // ── /media/* — pipe directly to simulator over LAN ──────────────────────────
 import http from "http";

@@ -245,7 +245,19 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
         world_id: b.world_id, actor_id: b.actor_id, scope_label: b.scope_label,
         severity: b.severity || "fail", detail: b.detail,
         source: b.source || `manual:${user.name || user.id}`,
+        distinct_from: b.distinct_from,
       });
+      // The store refuses a check_name that is a reworded or truncated twin of
+      // a row already on that bench, because filing it forks the board instead
+      // of recurring the original. Nothing was written, so `ok: true` would be
+      // a lie: 409 with the row it matched, and the exact wording to reuse.
+      if (r.outcome === "refused-near-duplicate") {
+        return res.status(409).json({
+          ok: false,
+          error: "that check_name is a reworded form of an incident already on this bench",
+          detail: r.hint, ...r,
+        });
+      }
       res.json({ ok: true, ...r });
     } catch (e) {
       res.status(500).json({ error: "could not file", detail: String(e.message || e).slice(0, 200) });

@@ -36,10 +36,23 @@
 //   { "bench": "suite", "check_name": "...", "detail": "...",
 //     "world_id": null, "actor_id": null, "severity": "fail" }
 //
+// The check_name IS the identity of a finding (the fingerprint is
+// bench|check_name|world|actor), so retyping it from memory forks a second row
+// at occurrence 1 instead of recurring the real one — twelve times on this
+// board by 2026-09-09, once forking four wordings of a single finding, and a
+// reworded refile of a `wontfix` row silently reopens a decision the owner
+// closed. `report` therefore REFUSES a check_name that is a reworded or
+// truncated twin of a row already on that bench: it prints the canonical row
+// and exits 1 without filing. Re-report under that row's exact check_name to
+// recur it, or add "distinct_from": "<its id>" if it genuinely is a different
+// finding. Copy check_names programmatically; never retype them.
+//
 // Exit codes: 0 = ran (see the JSON it prints), 1 = nothing filed / bad input,
 // 2 = the store or the sweep itself failed.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync, lstatSync, readdirSync, realpathSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import crypto from "node:crypto";
 import * as store from "./lab-incidents.js";
 import db from "./db.js";
@@ -140,6 +153,18 @@ async function main() {
         // `list` truncating mid-string with 30 real incidents on the board.
         db.prepare(`DELETE FROM auth_tokens WHERE token_hash = ?`).run(hash);
       }
+      // This `return` is load-bearing. Without it a SUCCESSFUL sweep fell
+      // through into `case "report"` below — the only `return`s above are on
+      // error paths, so the happy path hit JS switch fallthrough every time.
+      // `report` then read stdin, found it empty (cron pipes nothing), printed
+      // "nothing on stdin" and called process.exit(1): a clean nightly sweep
+      // reported failure to cron, and process.exit() truncated the sweep's own
+      // large stdout write mid-flush, which is the exact bug the comments above
+      // this line were written to prevent. A sweep invoked WITH JSON on stdin
+      // would additionally have filed it as findings. Found 2026-09-09 by the
+      // resolution manager while fixing report idempotency in this same pair
+      // of files.
+      return;
     }
 
     case "report": {
@@ -150,13 +175,47 @@ async function main() {
       catch (e) { console.error("stdin is not JSON: " + e.message); process.exit(1); }
       const items = Array.isArray(parsed) ? parsed : [parsed];
       const source = flag("source", "routine:cli");
+      // --run-id names THIS run, so the store can tell a re-submission from a
+      // recurrence. Optional: with no run id the store falls back to comparing
+      // the payload itself over a short window, which is what protects the
+      // callers that cannot be taught this flag (the watch procedures live in
+      // SKILL.md files on the Mac, outside both governed repos).
+      const runId = flag("run-id", null);
       const results = [];
       for (const it of items) {
         if (!it || !it.check_name) { results.push({ error: "each finding needs a check_name", item: it }); continue; }
-        results.push(store.report({ ...it, source: it.source || source }));
+        results.push(store.report({ ...it, source: it.source || source,
+          run_id: it.run_id || runId || undefined }));
       }
       console.log(JSON.stringify({ filed: results.length, results }, null, 2));
-      process.exitCode = results.some((r) => r.error) ? 1 : 0;
+      // A refusal must be LOUD. The store now declines to open a row whose
+      // check_name is a reworded or truncated twin of one already on that
+      // bench, because filing it forks the board instead of recurring the
+      // original — and the caller could not tell, since a fork returns
+      // "opened" exactly like a genuinely new finding does. stdout JSON alone
+      // is not enough: a routine that pipes it nowhere would read silence as
+      // success, which is the same failure this guards against.
+      // A suppressed duplicate must be visible on stderr for the same reason a
+      // refusal is: the caller cannot otherwise tell that its second identical
+      // call did nothing, and the whole point of this incident was a routine
+      // that believed it had filed once when it had filed twice.
+      const duped = results.filter((r) => r && r.outcome === "duplicate-ignored");
+      if (duped.length) {
+        console.error(`NOT COUNTED AGAIN: ${duped.length} finding(s) were an identical re-submission, ` +
+                      `so their occurrence counts were left where they were.`);
+        for (const r of duped) console.error(`  ${r.fingerprint} — ${r.why}`);
+      }
+
+      const refused = results.filter((r) => r && r.outcome === "refused-near-duplicate");
+      for (const r of refused) {
+        console.error(`REFUSED as a fork of an existing row: "${r.rejected_check_name}"`);
+        for (const m of r.matched) {
+          console.error(`  matches ${m.id} (${m.status}, occ ${m.occurrences}) — ${m.why}`);
+          console.error(`    "${m.check_name}"`);
+        }
+        console.error(`  ${r.hint}`);
+      }
+      process.exitCode = (results.some((r) => r.error) || refused.length) ? 1 : 0;
       return;
     }
 
@@ -222,7 +281,7 @@ async function main() {
         console.error(`not a known routine: ${raw} (known: ${Object.keys(store.ROUTINES).join(", ")})`);
         process.exit(1);
       }
-      console.log(JSON.stringify({ ok: true, ...r }, null, 2));
+      console.log(JSON.stringify({ ok: true, ...r, env: environmentFacts() }, null, 2));
       process.exitCode = 0;
       return;
     }
@@ -274,6 +333,79 @@ async function main() {
         `       status <open|acknowledged|known|resolved|wontfix> (--id X | --source X --check "name") [--by X] [--note X | --note-stdin]`);
       process.exit(1);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Environment facts, emitted by `ping` — which every watch procedure runs as
+// the FIRST command of every run, before it reads anything.
+//
+// Added 2026-09-09 by the resolution manager for the conduct-watch incident
+// "this routine's procedure names no on-disk media root, so a scan for a
+// minor's media against the wrong path returns empty and reads clean". The
+// watch procedures are SKILL.md files on the Mac, outside both governed repos,
+// so they cannot be corrected from here — but the reason they go wrong can be.
+// A routine is now TOLD where the data lives by the host that holds it, at run
+// start, instead of carrying transcribed paths that drift out of date silently.
+//
+// The distinction that makes this worth printing: an empty result is only
+// clean if it came from the right path. A scope query run as
+// `cd ~/platform; sqlite3 platform_dev.db` hit a 0-byte file (created by that
+// very command) and answered "no such table: world_memberships" for every
+// scope query on 2026-09-08/09 — which a run could have reported as zero
+// memberships, zero actors, clean sweep. Local paths below are stat'ed live at
+// ping time and are measurements; the simulator's are documented constants and
+// are labelled as unverified from here, so they cannot be mistaken for one.
+function statPath(p) {
+  try {
+    const st = statSync(p);
+    const out = { path: p, exists: true };
+    if (st.isFile()) out.bytes = st.size;
+    if (st.isDirectory()) out.entries = readdirSync(p).sort();
+    return out;
+  } catch (e) { return { path: p, exists: false, error: e.code || String(e) }; }
+}
+
+// The repo-relative twin of the platform DB. Reported every ping precisely
+// because its failure mode is silence: nothing in the codebase opens it (every
+// module resolves os.homedir()), so it only ever gets read by a person or a
+// routine typing a relative path, and reading it wrong looks like good news.
+function repoRelativeDb(home, dbOfRecord) {
+  const p = path.join(home, "platform/platform_dev.db");
+  try {
+    const st = lstatSync(p);
+    if (st.isSymbolicLink()) {
+      const target = realpathSync(p);
+      return { path: p, symlink_to: target, is_db_of_record: target === dbOfRecord };
+    }
+    return {
+      path: p, symlink_to: null, is_db_of_record: false, bytes: st.size,
+      warning: "NOT the database of record. `cd ~/platform; sqlite3 platform_dev.db` reads THIS file, and an empty one answers 'no such table' to every scope query — an absence of rows, not an absence of subjects.",
+    };
+  } catch (e) { return { path: p, exists: false, error: e.code || String(e) }; }
+}
+
+function environmentFacts() {
+  const home = os.homedir();
+  let dbOfRecord;
+  try { dbOfRecord = db.name; } catch { dbOfRecord = path.join(home, "platform_dev.db"); }
+  return {
+    note: "`local` is stat'ed on this host at ping time (measured). `simulator` is documented and NOT measured from here — check it over ssh before you read an empty result from it as clean.",
+    local: {
+      host: "mac-mini-ubuntu (192.168.1.59) — platform",
+      db: statPath(dbOfRecord),
+      media_root: statPath(path.join(home, "platform/public/media")),
+      repo_relative_db: repoRelativeDb(home, dbOfRecord),
+    },
+    simulator: {
+      host: "magnus@192.168.1.58",
+      db: "/mnt/anima-db/dev.db",
+      media_root: "/home/magnus/deliver_worlds/priv/static/media",
+    },
+    media_url_shapes: {
+      personal_actor_media: "/media/worlds/<world_id>/actors/<slug>/images/ — platform, nginx-authed (ANIMA-INVARIANT: never loosen)",
+      ambient_portrait: "/media/cities/<city_id>/ambient_actors/<actors.id>/images/profile.jpg — simulator",
+    },
+  };
 }
 
 main().catch((e) => { console.error(String(e.stack || e)); process.exit(2); });

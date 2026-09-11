@@ -123,8 +123,7 @@ export default function SignupLabPage() {
           <span style={{ ...label, color: GOLD + ".65)" }}>user · signup · creation</span>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={() => navigate("/lab/home")} style={chip(false)}>All tests</button>
-          <button onClick={() => navigate("/home")} style={chip(false)}>Close</button>
+          <button onClick={() => navigate("/lab/home")} style={chip(false)}>← All tests</button>
         </div>
       </div>
 

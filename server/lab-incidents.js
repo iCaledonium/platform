@@ -94,6 +94,9 @@ db.exec(`
 // last_pass_at later than last_seen_at means "green at the last look".
 // Nothing else about the row changes: only a person un-sticks it.
 try { db.exec(`ALTER TABLE lab_incidents ADD COLUMN last_pass_at TEXT`); } catch { /* already there */ }
+// Idempotency key of the LAST submission that actually moved this row's
+// occurrence count. See report() for why a repeat must not move it again.
+try { db.exec(`ALTER TABLE lab_incidents ADD COLUMN last_report_key TEXT`); } catch { /* already there */ }
 
 // Append-only transition log (2026-09-05). The row itself carries only the
 // LATEST of everything: `updated_at` is overwritten by the next write, and
@@ -301,7 +304,146 @@ function scopeLabel(bench, t) {
   return t.label || (BENCHES[bench].needsActor ? `world ${w} · actor ${a}` : `world ${w}`);
 }
 
+// ── What a check is ABOUT ─────────────────────────────────────────────
+//
+// An incident's identity is bench|check_name|world|actor, and until 2026-09-09
+// fileBoard stamped EVERY check on a board with the whole target it had been
+// run against. On an actor-scoped bench that is wrong for most of them: three
+// of encounter's thirteen cases read an actor_id and three of transport's
+// seven do. The rest are world-scoped, or read a global table and take no
+// arguments at all.
+//
+// Stamping those with the subject actor ORPHANS them the moment the suite's
+// subject changes. The row is pinned to an actor nothing will ever measure
+// again, so it can never recur, never reopen and never auto-resolve, while the
+// same finding re-files under a fresh fingerprint at occurrence 1 — one
+// condition, split into a frozen history and a new row that looks new.
+// Measured on this board: "a knock ends in a door or a refusal, never in
+// nothing" sat frozen at 24 occurrences against an actor deleted on
+// 2026-09-06, while the check itself was still being run every sweep.
+//
+// So a board DECLARES the subject of each case (`scope: "actor" | "world" |
+// "global"`) and the store keys on what it declared rather than on what the
+// runner happened to be pointed at. A board that declares nothing keeps
+// exactly the old behaviour — the bench's own scope — so a board that has not
+// been taught to say is never worse off than it is today.
+function checkSubject(target, scope) {
+  if (scope === "global") return { world_id: null, actor_id: null };
+  if (scope === "world") return { world_id: target.world_id || null, actor_id: null };
+  return { world_id: target.world_id || null, actor_id: target.actor_id || null };
+}
+
+// The label follows the subject, not the run: a world-scoped row must not read
+// "world a · actor b" when b is nothing to do with it. The target's own label
+// (e.g. a suite's name for its actor) is kept only for actor-scoped rows,
+// because that is the only scope it actually describes.
+function subjectScopeLabel(bench, target, scope) {
+  if (!BENCHES[bench]?.scoped || scope === "global") return "global";
+  if (scope === "world") return `world ${(target.world_id || "").slice(0, 8)}`;
+  return scopeLabel(bench, target);
+}
+
+// ── Near-duplicate check_names ───────────────────────────────────────────────
+//
+// The fingerprint is bench|check_name|world|actor, so the check_name is the
+// identity of a finding. A caller that RETYPES it — truncating the tail,
+// swapping "what age was declared for them" for "how old they were" — does not
+// recur the original row: it forks a second one at occurrence 1, and the real
+// row's count stops climbing while the board grows a twin nobody merges.
+//
+// This is not hypothetical and it is not rare. On the board as it stood
+// 2026-09-09 it had happened at least twelve times, including four separate
+// wordings of ONE portrait-deletion finding (128529a7 at occ 67, bda5661b at
+// occ 2, plus 715b6296 and 9c16eb1f). Worse, a reworded refile of a `wontfix`
+// row forks a fresh OPEN row, quietly undoing an owner's won't-fix decision.
+//
+// So the store, not the caller's discipline, decides. Two rules, both
+// calibrated against all 184 rows then on the board: every pair they flag is a
+// genuine fork, and no genuinely-distinct pair is flagged.
+//
+//   • shared wording   — Jaccard over content tokens >= 0.65, and only when
+//                        both names carry >= 4 content tokens, so a short name
+//                        cannot collide by accident.
+//   • shared opening   — >= 100 characters of identical normalised prefix,
+//                        which is what a truncation or a tail-reword leaves.
+//
+// 0.65 rather than 0.70 because the two error costs are not symmetric: a false
+// positive is a loud refusal the caller can step past in one flag, while a
+// false negative is a silent fork nobody notices for weeks. Measured, not
+// guessed — dropping the tail off 10129286 scores 0.69 against its own parent,
+// so 0.70 let a real truncation through. There is still clear air below: the
+// closest genuinely-distinct pair on the board scores 0.53 (two unguarded
+// GenServer.call findings in different controllers), and the closest distinct
+// pair that shares an opening clause reaches only 59 prefix characters.
+//
+// Deliberately compared against rows of EVERY status, wontfix and resolved
+// included: those are exactly the ones a fork does the most damage to.
+const DUP_JACCARD = 0.65;
+const DUP_PREFIX_CHARS = 100;
+const DUP_MIN_TOKENS = 4;
+const DUP_STOPWORDS = new Set(["the","a","an","and","or","of","to","in","on","for","is","are","it","its",
+  "that","this","so","as","at","by","with","from","was","were","be","been","has","have","had","not","no",
+  "but","than","then","which","who","what","when","never","every","any","all"]);
+
+const dupNormal = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+const dupTokens = (s) => new Set(dupNormal(s).split(" ").filter((w) => w.length >= 3 && !DUP_STOPWORDS.has(w)));
+function dupPrefixLen(a, b) {
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return i;
+}
+
+// Every row on the same bench and the same scope whose check_name is a
+// reworded or truncated form of `check_name`. Exact matches are excluded:
+// those are the fingerprint's own job and reach report()'s recur branch.
+export function nearDuplicatesOf({ bench, check_name, world_id, actor_id }) {
+  const rows = db.prepare(
+    `SELECT id, fingerprint, check_name, status, occurrences, first_seen_at
+       FROM lab_incidents
+      WHERE bench = ? AND IFNULL(world_id, '-') = ? AND IFNULL(actor_id, '-') = ?`
+  ).all(String(bench), world_id || "-", actor_id || "-");
+  const A = dupTokens(check_name);
+  const an = dupNormal(check_name);
+  const hits = [];
+  for (const r of rows) {
+    if (r.check_name === check_name) continue;
+    const B = dupTokens(r.check_name);
+    let inter = 0;
+    for (const w of A) if (B.has(w)) inter++;
+    const union = A.size + B.size - inter;
+    const jaccard = union > 0 ? inter / union : 0;
+    const pfx = dupPrefixLen(an, dupNormal(r.check_name));
+    const byWording = Math.min(A.size, B.size) >= DUP_MIN_TOKENS && jaccard >= DUP_JACCARD;
+    const byOpening = pfx >= DUP_PREFIX_CHARS;
+    if (!byWording && !byOpening) continue;
+    const pct = Math.round(jaccard * 100);
+    hits.push({
+      id: r.id, fingerprint: r.fingerprint, status: r.status,
+      occurrences: r.occurrences, check_name: r.check_name,
+      jaccard: Number(jaccard.toFixed(2)), shared_opening_chars: pfx,
+      why: byWording && byOpening ? `${pct}% shared wording and a ${pfx}-character shared opening`
+         : byWording ? `${pct}% shared wording`
+         : `a ${pfx}-character shared opening`,
+    });
+  }
+  // The canonical row first: the one that has actually been recurring, and
+  // among equals the one that has been on the board longest.
+  hits.sort((x, y) => (y.occurrences - x.occurrences) ||
+    String(x.first_seen_at || "").localeCompare(String(y.first_seen_at || "")));
+  return hits;
+}
+
 // ── Filing ───────────────────────────────────────────────────────────────────
+
+// How long after a row's last REAL occurrence an identical submission is read
+// as the same observation arriving twice rather than as new evidence. Chosen
+// against the actual cadences on this board: the only scheduled suite runs
+// daily, and the watch routines run hourly at most, so nothing legitimate can
+// re-report a byte-identical detail on the same fingerprint inside five
+// minutes. Anchored to last_seen_at and NOT refreshed by a suppressed
+// duplicate, so a stream of duplicates cannot roll the window forward
+// indefinitely and hide a genuine recurrence behind it.
+const DEDUP_WINDOW_MS = 300_000;
 
 // Report one finding. Returns what happened to it, which is what the sweep
 // counts and what the caller is told.
@@ -321,18 +463,111 @@ export function report(inc) {
   const detail = inc.detail == null ? null : String(inc.detail).slice(0, 4000);
   const severity = ["fail", "unknown", "error"].includes(inc.severity) ? inc.severity : "fail";
 
+  // ── One submission, one occurrence ────────────────────────────────────────
+  //
+  // Filed by conduct-watch against itself on 2026-09-09 and fixed here. A
+  // routine ran `report` with a 17-finding payload, then ran a second command
+  // that was MEANT to read the stored result back but re-executed the same
+  // `report` with the same payload on stdin. All 17 rows incremented by +2,
+  // measured by diffing the board before and after. Nothing in the store could
+  // tell the two calls apart, and there is no decrement anywhere in this
+  // module, so an inflated count could only ever be repaired by a person.
+  //
+  // The count is the board's whole value over an unread log: it is the number a
+  // person reads to judge "persistent, or a one-off, and how urgently". A
+  // repeat of an IDENTICAL payload is not new evidence about the world, so it
+  // must not move that number. (This is the exact mirror of the near-duplicate
+  // guard above: a fork splits one condition's history downward, a double-file
+  // inflates it upward, and both corrupt the same number.)
+  //
+  // Two keys, in this order:
+  //   run_id  — the caller states its own run identity. Deduplicates for as
+  //             long as that row's last report carried the same run id, with no
+  //             time window at all, because the caller has told us outright.
+  //             This is the shape the incident asked for.
+  //   payload — the fallback for callers that supply no run_id, which today is
+  //             all of them: the watch procedures are SKILL.md files on the Mac,
+  //             outside both governed repos, so they cannot be taught a new flag
+  //             from in here. A fix that only works once every caller is
+  //             re-educated is not a fix for the failure that was measured.
+  const submissionKey = inc.run_id
+    ? `run:${String(inc.run_id).slice(0, 120)}`
+    : `payload:${crypto.createHash("sha256").update(`${severity}\n${detail || ""}`).digest("hex").slice(0, 32)}`;
+
   const existing = db.prepare(`SELECT * FROM lab_incidents WHERE fingerprint = ?`).get(fp);
 
+  // Deliberately BEFORE the resolved-reopen branch is allowed to run: a repeat
+  // is only ever suppressed against a row this same submission has already
+  // moved, so it can never swallow the reopen of a resolved row (the first of
+  // the pair reopens it; only the second, redundant one is dropped).
+  if (existing && existing.last_report_key === submissionKey && existing.status !== "resolved") {
+    const withinWindow = inc.run_id
+      ? true
+      : (Date.parse(t) - Date.parse(existing.last_seen_at || 0)) < DEDUP_WINDOW_MS;
+    if (withinWindow) {
+      // The row is left completely untouched — not even last_seen_at, which is
+      // what anchors the window. Nothing is lost: the identical payload is
+      // already stored as this row's detail.
+      return {
+        outcome: "duplicate-ignored",
+        fingerprint: fp,
+        occurrences: existing.occurrences,
+        why: inc.run_id
+          ? `run_id "${inc.run_id}" has already reported this row; occurrence count left at ${existing.occurrences}`
+          : `an identical payload was reported for this row within the last ` +
+            `${Math.round(DEDUP_WINDOW_MS / 1000)}s; occurrence count left at ${existing.occurrences}`,
+      };
+    }
+  }
+
   if (!existing) {
+    // A finding whose check_name is a reworded or truncated twin of a row
+    // already on this bench is REFUSED, not filed: filing it is precisely the
+    // fork this guard exists to stop, and the caller cannot see the fork from
+    // its own side (report() returned "opened", which is what a genuinely new
+    // finding also returns). Refusing is loud — the CLI exits non-zero — and
+    // lossless: the rejected wording and its detail are written to the
+    // canonical row's event log, so nothing a caller said is thrown away.
+    //
+    // Two ways past it, both deliberate rather than accidental:
+    //   "distinct_from": "<id|fingerprint>"  — the caller has read the row it
+    //       was matched against and asserts this really is a different finding.
+    //   "guard_near_duplicates": false       — the internal sweep paths, whose
+    //       check_names are literals in code and cannot drift.
+    if (inc.guard_near_duplicates !== false) {
+      const cleared = new Set([].concat(inc.distinct_from || []).filter(Boolean).map(String));
+      const near = nearDuplicatesOf({ bench, check_name, world_id, actor_id })
+        .filter((n) => !cleared.has(n.id) && !cleared.has(n.fingerprint));
+      if (near.length) {
+        const canon = near[0];
+        recordEvent({
+          incident_id: canon.id, fingerprint: canon.fingerprint,
+          from_status: null, to_status: canon.status, at: t,
+          by: inc.source || "sweep", via: "near-duplicate-refused",
+          note: `Refused a fork of this row (${canon.why}). Rejected check_name: ` +
+                `"${check_name}". Detail it carried: ${detail || "(none)"}`,
+        });
+        return {
+          outcome: "refused-near-duplicate",
+          fingerprint: fp,
+          rejected_check_name: check_name,
+          matched: near,
+          hint: `This wording is a reworded or truncated form of an existing ${bench} row. ` +
+                `To RECUR that row, re-report it under its exact check_name: ` +
+                `"${canon.check_name}". If this really is a different finding, re-report with ` +
+                `"distinct_from": "${canon.id}" in the payload.`,
+        };
+      }
+    }
     db.prepare(`
       INSERT INTO lab_incidents
         (id, fingerprint, bench, bench_label, check_name, world_id, actor_id, scope_label,
          severity, status, source, detail, first_detail, occurrences,
-         first_seen_at, last_seen_at, updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,'open',?,?,?,1,?,?,?)
+         first_seen_at, last_seen_at, updated_at, last_report_key)
+      VALUES (?,?,?,?,?,?,?,?,?,'open',?,?,?,1,?,?,?,?)
     `).run(uid(), fp, bench, inc.bench_label || BENCHES[bench]?.label || bench, check_name,
       world_id, actor_id, inc.scope_label || "global", severity,
-      inc.source || "sweep", detail, detail, t, t, t);
+      inc.source || "sweep", detail, detail, t, t, t, submissionKey);
     const openedId = db.prepare(`SELECT id FROM lab_incidents WHERE fingerprint = ?`).get(fp)?.id;
     recordEvent({ incident_id: openedId, fingerprint: fp, from_status: null, to_status: "open",
       at: t, by: inc.source || "sweep", via: "report", note: detail });
@@ -342,8 +577,9 @@ export function report(inc) {
   if (existing.status === "resolved") {
     db.prepare(`
       UPDATE lab_incidents SET status='open', severity=?, detail=?, occurrences=occurrences+1,
-        last_seen_at=?, resolved_at=NULL, resolved_by=NULL, source=?, updated_at=? WHERE id=?
-    `).run(severity, detail, t, inc.source || "sweep", t, existing.id);
+        last_seen_at=?, resolved_at=NULL, resolved_by=NULL, source=?, updated_at=?,
+        last_report_key=? WHERE id=?
+    `).run(severity, detail, t, inc.source || "sweep", t, submissionKey, existing.id);
     recordEvent({ incident_id: existing.id, fingerprint: fp, from_status: "resolved",
       to_status: "open", at: t, by: inc.source || "sweep", via: "report", note: detail });
     return { outcome: "reopened", fingerprint: fp };
@@ -351,8 +587,8 @@ export function report(inc) {
 
   db.prepare(`
     UPDATE lab_incidents SET severity=?, detail=?, occurrences=occurrences+1,
-      last_seen_at=?, updated_at=? WHERE id=?
-  `).run(severity, detail, t, t, existing.id);
+      last_seen_at=?, updated_at=?, last_report_key=? WHERE id=?
+  `).run(severity, detail, t, t, submissionKey, existing.id);
 
   return {
     outcome: (existing.status === "known" || existing.status === "wontfix") ? "suppressed" : "recurred",
@@ -464,8 +700,9 @@ function fileBoard({ bench, target, checks, source }) {
   // nothing anywhere holds a hardcoded list of case names.
   try { cases.recordSeen(bench, checks); } catch { /* never fail a sweep over bookkeeping */ }
   const muted = cases.mutedSet();
-  const scope_label = scopeLabel(bench, target);
-  const passedNames = [];
+  // Passes, grouped by the subject each case declared — auto-resolve has to
+  // close a world-scoped row under its world key, not under the run's target.
+  const passedBySubject = new Map();
   // Every check this board ran, by name — what the manager shows when a board
   // row is expanded. Passes included: a board is its whole set of assertions,
   // and the incident page can only ever show the ones that failed.
@@ -474,15 +711,28 @@ function fileBoard({ bench, target, checks, source }) {
   for (const c of checks) {
     const name = c?.name || "unnamed check";
     const verdict = c?.verdict;
+    // Declared by the board; null when it says nothing, which keeps the old
+    // whole-target behaviour for that case.
+    const scope = ["actor", "world", "global"].includes(c?.scope) ? c.scope : null;
+    const subject = checkSubject(target, scope);
     const isMuted = muted.has(`${bench}|${name}`);
+    // `scope` rides along so a person reading a board can see WHICH subject each
+    // case was filed against, and so a board that has not been taught to
+    // declare one is visible as a null rather than looking like an actor case.
     roll.push({ name, verdict: isMuted ? "muted" : (verdict || "unknown"),
-                muted: isMuted, real_verdict: verdict || "unknown",
+                muted: isMuted, real_verdict: verdict || "unknown", scope,
                 detail: c?.detail == null ? "" : String(c.detail).slice(0, 600) });
     // A muted case files nothing and fails nothing. It is still COUNTED and
     // still shown, because a board that reads green only because somebody
     // turned three cases off is not a green board.
     if (isMuted) { tally.muted++; continue; }
-    if (verdict === "pass") { tally.passed++; passedNames.push(name); continue; }
+    if (verdict === "pass") {
+      tally.passed++;
+      const key = `${subject.world_id || "-"}|${subject.actor_id || "-"}`;
+      if (!passedBySubject.has(key)) passedBySubject.set(key, { ...subject, names: [] });
+      passedBySubject.get(key).names.push(name);
+      continue;
+    }
     if (verdict === "skip") { tally.skipped++; continue; }
 
     // A verdict that is neither pass, fail nor skip is not a pass. The lab's
@@ -491,9 +741,11 @@ function fileBoard({ bench, target, checks, source }) {
     tally.failed++;
     const sev = cases.severityMap().get(`${bench}|${name}`) || "blocking";
     const r = report({
+      guard_near_duplicates: false,
       bench, bench_label: BENCHES[bench]?.label, check_name: name,
       case_severity: sev,
-      world_id: target.world_id, actor_id: target.actor_id, scope_label,
+      world_id: subject.world_id, actor_id: subject.actor_id,
+      scope_label: subjectScopeLabel(bench, target, scope),
       severity, source,
       detail: verdict === "fail" ? (c?.detail || "") :
         `verdict "${verdict}" is not one this board is allowed to return — ${c?.detail || "no detail"}`,
@@ -506,14 +758,14 @@ function fileBoard({ bench, target, checks, source }) {
   // Auto-resolve, and ONLY on an explicit pass. A check that has vanished from
   // the board (renamed, removed) is deliberately left open: its absence is not
   // a fix, and silently closing it would lose the only record that it existed.
-  if (passedNames.length) {
-    const placeholders = passedNames.map(() => "?").join(",");
+  for (const group of passedBySubject.values()) {
+    const placeholders = group.names.map(() => "?").join(",");
     const open = db.prepare(`
       SELECT id, check_name FROM lab_incidents
        WHERE bench = ? AND world_id IS ? AND actor_id IS ?
          AND status IN ('open','acknowledged')
          AND check_name IN (${placeholders})
-    `).all(bench, target.world_id || null, target.actor_id || null, ...passedNames);
+    `).all(bench, group.world_id, group.actor_id, ...group.names);
     const t = now();
     for (const row of open) {
       db.prepare(`UPDATE lab_incidents SET status='resolved', resolved_at=?, resolved_by=?, updated_at=? WHERE id=?`)
@@ -530,7 +782,7 @@ function fileBoard({ bench, target, checks, source }) {
        WHERE bench = ? AND world_id IS ? AND actor_id IS ?
          AND status IN ('known','wontfix')
          AND check_name IN (${placeholders})
-    `).run(t, t, bench, target.world_id || null, target.actor_id || null, ...passedNames);
+    `).run(t, t, bench, group.world_id, group.actor_id, ...group.names);
   }
 
   // The bench answered, so its own unreachable incident (if any) is fixed.
@@ -609,6 +861,7 @@ export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN,
         if (res.error) {
           totals.boards_errored++;
           const r = report({
+      guard_near_duplicates: false,
             bench, bench_label: spec.label, check_name: UNREACHABLE,
             world_id: t.world_id, actor_id: t.actor_id, scope_label: scopeLabel(bench, t),
             severity: "error", source,
@@ -648,6 +901,7 @@ export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN,
       } catch (e) {
         totals.boards_errored++;
         const r = report({
+      guard_near_duplicates: false,
           bench, bench_label: spec.label, check_name: UNREACHABLE,
           scope_label: "global", severity: "error", source,
           detail: `the board could not be read, so nothing about this bench was measured this run: ${String(e.message || e).slice(0, 200)}`,
@@ -935,6 +1189,7 @@ export function checkRoutineLiveness() {
           `age as "nothing filed for that long" — a clean run and a dead one are currently ` +
           `indistinguishable to this detector.`;
       report({
+      guard_near_duplicates: false,
         bench: r.source, bench_label: r.label, check_name: LIVENESS_CHECK,
         severity: "error", source: "routine-liveness", scope_label: "global",
         detail: `${r.label} is scheduled every ${r.every_hours}h and has not been heard from since ` +

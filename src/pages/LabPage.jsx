@@ -301,8 +301,7 @@ export default function LabPage() {
           <span style={{ ...label, color: GOLD + ".65)" }}>owner's tool</span>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={() => navigate("/lab/home")} style={{ ...chip(false), flex: "none", padding: "8px 16px" }}>All tests</button>
-          <button onClick={() => navigate("/home")} style={{ ...chip(false), flex: "none", padding: "8px 16px" }}>Close</button>
+          <button onClick={() => navigate("/lab/home")} style={{ ...chip(false), flex: "none", padding: "8px 16px" }}>← All tests</button>
         </div>
       </div>
 

@@ -443,6 +443,14 @@ export default function HomePage() {
             <p className={homeStyles.toolName}>Test Lab</p>
             <p className={homeStyles.toolDesc}>Author a past, test a scene from any stage.</p>
           </div>
+          <div className={`${homeStyles.toolCard} ${homeStyles.toolCardLive}`} style={{cursor:"pointer"}} onClick={() => window.location.href="/lab/studio/interaction"}>
+            <span className={homeStyles.liveBadge}>live</span>
+            <div className={homeStyles.toolIcon} style={{background:"rgba(127,119,221,.07)",border:"1px solid rgba(127,119,221,.13)"}}>
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="5" cy="4.5" r="2" stroke="#7f77dd" strokeWidth="1.1"/><circle cx="11" cy="4.5" r="2" stroke="#7f77dd" strokeWidth="1.1"/><path d="M2 13c0-2 1.4-3.2 3-3.2S8 11 8 13M8 13c0-2 1.4-3.2 3-3.2S14 11 14 13" stroke="#7f77dd" strokeWidth="1.1" strokeLinecap="round"/></svg>
+            </div>
+            <p className={homeStyles.toolName}>Interaction studio</p>
+            <p className={homeStyles.toolDesc}>Script what two bodies do, and use it in encounters.</p>
+          </div>
         </div>
 
       </div>

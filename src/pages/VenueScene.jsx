@@ -3,6 +3,18 @@ import PresenceView from "./PresenceView.jsx";
 import VenueChatBubbles from "./VenueChatBubbles.jsx";
 
 const SIMULATOR_URL   = "https://anima.simulator.ngrok.dev";
+
+// Conduct watch 2026-09-09 (incident: "personal media is served unauthenticated
+// over the simulator's public tunnel"). Simulator-relative media paths are now
+// requested SAME-ORIGIN from the platform instead of straight off
+// https://anima.simulator.ngrok.dev. nginx here has an authenticated
+// `location /media/cities/` stanza (auth_request /api/auth/check) that proxies to
+// the simulator over the LAN, so ambient portraits still render for a signed-in
+// user -- exactly how /media/users/ photos have always been loaded -- while the
+// simulator's own public tunnel now refuses them (PersonalMediaGuard, 403).
+// Absolute URLs are passed through untouched.
+const simMedia = (u) => (!u ? null : u.startsWith("http") ? u : u.startsWith("/media/") ? u : SIMULATOR_URL + u);
+
 const ROTATION_MS     = 8000;
 const TRANSITION_MS   = 2000;
 
@@ -428,7 +440,7 @@ export default function VenueScene({ world, user, location, onLeave }) {
   const glassDark = { background: "rgba(20,18,16,0.62)",   backdropFilter: "blur(28px)", WebkitBackdropFilter: "blur(28px)", border: "1px solid rgba(255,255,255,0.1)" };
 
   if (encounter) {
-    const photoUrl = encounter.actor.photo_url ? (encounter.actor.photo_url.startsWith("http") ? encounter.actor.photo_url : `${SIMULATOR_URL}${encounter.actor.photo_url}`) : null;
+    const photoUrl = simMedia(encounter.actor.photo_url);
 
     if (encounterLoading) {
       return (
@@ -464,7 +476,7 @@ export default function VenueScene({ world, user, location, onLeave }) {
   }
 
   if (approaching) {
-    const photoUrl = approaching.photo_url ? (approaching.photo_url.startsWith("http") ? approaching.photo_url : `${SIMULATOR_URL}${approaching.photo_url}`) : null;
+    const photoUrl = simMedia(approaching.photo_url);
     return (
       <div style={{ fontFamily: "'DM Sans',system-ui,sans-serif", position: "fixed", inset: 0, zIndex: 1000, background: "#1a1814", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 32, gap: 24 }}>
         <style>{`@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap');`}</style>
@@ -593,7 +605,7 @@ export default function VenueScene({ world, user, location, onLeave }) {
         }}>
           <div style={{ width: 32, height: 32, borderRadius: "50%", background: "rgba(0,0,0,0.1)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, overflow: "hidden", border: "1.5px solid rgba(0,0,0,0.08)" }}>
             {toast.photo_url
-              ? <img src={SIMULATOR_URL + toast.photo_url} style={{ width: "100%", height: "100%", objectFit: "cover" }} alt="" />
+              ? <img src={simMedia(toast.photo_url)} style={{ width: "100%", height: "100%", objectFit: "cover" }} alt="" />
               : <span style={{ fontSize: 12, fontWeight: 500, color: "#1a1814" }}>{toast.name?.[0]}</span>
             }
           </div>
@@ -740,7 +752,7 @@ function ActorRow({ actor, onReachOut, onAmbientClick, playerActorId }) {
   const [hover, setHover] = useState(false);
   const photoUrl = actor.is_ambient
     ? (actor.generated_portrait_url || null)
-    : (actor.photo_url ? (actor.photo_url.startsWith("http") ? actor.photo_url : `${SIMULATOR_URL}${actor.photo_url}`) : null);
+    : simMedia(actor.photo_url);
   return (
     <div
       className="venue-actor-row"

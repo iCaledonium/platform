@@ -204,6 +204,48 @@ const setPoseStatus = (actorId, poseStage, extra = {}) => {
   jobStatus.set(actorId, { ...(jobStatus.get(actorId) || {}), poseStage, ...extra });
 };
 
+// Session 163 — generations must run ONE AT A TIME, because they share one
+// DAZ Studio.
+//
+// There is exactly one DAZ Studio, on one Mac (CFG.macMiniHost), holding one
+// scene. This whole file is written on that assumption: runPipeline() opens by
+// calling restartDazStudio(), which runs `killall DAZStudio` (Session 94's
+// "start every generation from a genuinely fresh process"), and the mid-run
+// recovery path does the same thing again. That is only sound while exactly one
+// pipeline is in flight.
+//
+// The route was fire-and-forget with no guard at all, so a second generation
+// started while a first was still running killed the first one's DAZ process out
+// from under it. The victim's figure vanished mid-pipeline and it then sat in
+// waitForNodeStable() until the timeout, dying with:
+//   waitForNodeStable: "Genesis 9" never stayed present for 12s within 420s
+// which reads like a Face Transfer problem and is not one — the scene was fine,
+// another job shot it.
+//
+// Observed directly on 2026-09-09, both halves in one journal:
+//   15:20:47  8452e5a9 queued        (still in its pose-clip loop at 15:23)
+//   15:23:32  f8ab5b37 queued -> starting_daz_studio -> "killing existing DAZ Studio process..."
+//   15:25:37  8452e5a9 -> ERROR: waitForNodeStable: "Genesis 9" never stayed present
+// 8452e5a9 had already reached "ready" once and was doing pose clips; nothing was
+// wrong with it.
+//
+// Serializing restores the exclusivity the rest of the file already depends on.
+// It also makes the route's own first status honest: it has always called
+// setStatus(actorId, "queued") before starting, and until now nothing was ever
+// actually queued.
+//
+// The .catch() is load-bearing: without it one rejected run would poison the
+// chain and silently strand every later generation. runPipeline() already
+// handles its own errors internally (its top-level try/catch calls setError),
+// so this is belt-and-braces rather than the primary error path.
+let dazPipelineChain = Promise.resolve();
+const enqueuePipeline = (args) => {
+  dazPipelineChain = dazPipelineChain
+    .catch(() => {})
+    .then(() => runPipeline(args));
+  return dazPipelineChain;
+};
+
 // Session 97: STUDIO_BUSY specifically retried, not thrown immediately —
 // DAZ's own error message says "please retry shortly", which is DAZ
 // itself documenting this as a transient condition, not a hard failure.
@@ -456,7 +498,14 @@ async function restartDazStudio() {
   // trust a fixed delay. Relies on "Start server when pane opens" already
   // being checked in the pane from earlier tonight; if it isn't, this
   // will time out here with a clear, honest error rather than hang.
-  const maxWaitMs = 60_000;
+  // Session 162 - was 60_000. DAZ Studio plus the Daz Script Server pane take
+  // ~50s to come up on this machine, measured three separate times, so a 60s
+  // ceiling left almost no margin and failed intermittently - reporting "did
+  // not come back online" and blaming the pane checkbox for what was simply a
+  // slow launch. The relaunch itself is fine: immediately after one such
+  // "failure" DAZ was up, the script server was listening on 18811, and the
+  // symlinked path resolved. Widened so a normal launch cannot lose the race.
+  const maxWaitMs = 180_000;
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
     await new Promise((r) => setTimeout(r, 3000));
@@ -474,7 +523,7 @@ async function restartDazStudio() {
       return;
     }
   }
-  throw new Error("DAZ Studio did not come back online after restart within 60s — check whether 'Start server when pane opens' is still enabled");
+  throw new Error(`DAZ Studio did not come back online after restart within ${Math.round(maxWaitMs / 1000)}s — DAZ may have failed to relaunch, or 'Start server when pane opens' may no longer be enabled in the Daz Script Server pane`);
 }
 
 async function dazScriptWithTimeout(script, timeoutMs) {
@@ -1069,7 +1118,134 @@ async function reloadDufFresh(dufPath) {
 // true) — recursive, called on the figure node itself (already the
 // primary selection from the preceding selectNodeForExport() call),
 // not Scene.findNodeByLabel() directly.
-async function removeDefaultClothing() {
+// Session 162 - wait for the FIGURE to exist, not for DAZ to say it is idle.
+//
+// Face Transfer finishes and immediately triggers a scene load. The pipeline
+// then ran the next script straight away, guarded only by dazScript()'s
+// STUDIO_BUSY retry - and DAZ clears that flag BEFORE the scene has finished
+// loading. So the script executed against a scene with no figure in it and
+// died on a missing node. Observed three times, at two different call sites,
+// with the same cause and two different-looking errors:
+//   "Line 4: Error: Node not found: Genesis 9"                        (bakeAllMorphsAtDefault)
+//   "Line 22: Error: removeDefaultClothing: node not found by label"  (removeDefaultClothing)
+// It is a race, so it fails intermittently - one run died here and the next
+// went straight through to ready, which is exactly what makes it worth fixing
+// rather than retrying by hand.
+//
+// removeDefaultClothing's own retry loop cannot help: when the node is absent
+// its script THROWS, so dazScript rejects and the pipeline aborts before the
+// loop's next iteration. The guard has to come before the call, not inside it.
+//
+// Probe errors are EXPECTED and swallowed on purpose - STUDIO_BUSY while a
+// scene loads is precisely the state being waited out.
+// Session 162, third pass - RETRY the operation, do not gate before it.
+//
+// waitForNode alone cannot fix this and the log shows why:
+//   23:04:08  [waitForNode] "Genesis 9" present after 1 probe(s), 0.0s
+//   23:04:08  selectNodeForExport -> STUDIO_BUSY "currently loading a scene" x3
+//   23:04:14  Line 5: Error: Node not found: Genesis 9
+// The node is present when checked and absent when used, because DAZ starts
+// loading a scene in between. That is check-then-use, and no pre-check closes
+// it - the only reliable answer is to re-run the operation once the figure is
+// back. dazScript's own STUDIO_BUSY retry does not help either: DAZ clears
+// "busy" while the scene is still loading, so the call proceeds and fails.
+async function withNodeRetry(label, nodeLabel, fn, attempts = 4) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const msg = String(e && e.message || e);
+      if (!/node not found/i.test(msg)) throw e;
+      lastErr = e;
+      console.log(`[withNodeRetry] ${label}: figure missing (attempt ${i}/${attempts}) - waiting for it and retrying`);
+      // Session 162, FIFTH pass - recover with the STABLE wait, not the bare one.
+      // withNodeRetry was written in the third pass and waitForNodeStable in the
+      // fourth, and nobody came back here: this recovery path still called
+      // waitForNode, the exact primitive the fourth pass proved unreliable
+      // ("present after 1 probe(s), 0.0s" = the PREVIOUS run's leftover figure,
+      // moments before the clear wiped it). A retry gated on that can be released
+      // straight back into the still-clearing scene and fail the same way, so all
+      // four attempts could burn out in a few seconds and rethrow the original
+      // "Node not found: Genesis 9". The ceiling is PER ATTEMPT, so keep it below
+      // waitForNode's old 180s: 4 x 120s exhausts FASTER than the 4 x 180s it
+      // replaces, while actually waiting for a scene that has stopped moving.
+      await waitForNodeStable(nodeLabel, { settleMs: 12000, timeoutMs: 120000 });
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+  throw lastErr;
+}
+
+// Session 162, fourth pass - wait for a figure that STAYS, not one that merely
+// exists right now.
+//
+// runDazGenerationSequence triggers Face Transfer and returns immediately:
+//   oActionMgr.findAction(...).trigger();
+//   return "reset pane and generated";
+// trigger() is asynchronous. Face Transfer then CLEARS THE SCENE, loads
+// _blank_template, and builds the new figure into it. Aligning the platform
+// journal with DAZ's own log made this unambiguous:
+//   00:00:39  "reset pane and generated"        <- script returns
+//   00:00:42  DAZ: *** Scene Cleared ***
+//   00:00:42  DAZ: asset load - _blank_template <- anything generated is wiped
+// And it explains the runs that "worked": waitForNode reported the node
+// "present after 1 probe(s), 1.2s", which no fresh Face Transfer can do - it
+// was finding the PREVIOUS run's figure, moments before the clear removed it.
+// Success and failure were the same bug, differing only in where the clear
+// happened to land.
+//
+// So presence alone is not evidence. The node must be present CONTINUOUSLY for
+// settleMs before we believe the figure is the new one and the scene has
+// stopped changing underneath us.
+async function waitForNodeStable(nodeLabel, { settleMs = 12000, timeoutMs = 420000 } = {}) {
+  const t0 = Date.now();
+  let presentSince = null;
+  let probes = 0;
+  while (Date.now() - t0 < timeoutMs) {
+    probes++;
+    let present = false;
+    try {
+      const res = await dazScript(`(function(){ return Scene.findNodeByLabel(${JSON.stringify(nodeLabel)}) ? "present" : "absent"; })()`);
+      present = String(res).indexOf("present") !== -1;
+    } catch (e) {
+      present = false; // busy/loading counts as not-yet-stable, deliberately
+    }
+    if (!present) {
+      if (presentSince) console.log(`[waitForNodeStable] "${nodeLabel}" disappeared again - the scene was still changing; restarting the settle window`);
+      presentSince = null;
+    } else {
+      if (!presentSince) presentSince = Date.now();
+      if (Date.now() - presentSince >= settleMs) {
+        console.log(`[waitForNodeStable] "${nodeLabel}" stable for ${Math.round((Date.now() - presentSince) / 1000)}s after ${probes} probe(s), ${((Date.now() - t0) / 1000).toFixed(1)}s total`);
+        return;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error(`waitForNodeStable: "${nodeLabel}" never stayed present for ${Math.round(settleMs / 1000)}s within ${Math.round(timeoutMs / 1000)}s`);
+}
+
+async function waitForNode(nodeLabel, timeoutMs = 180000) {
+  const t0 = Date.now();
+  let attempts = 0;
+  while (Date.now() - t0 < timeoutMs) {
+    attempts++;
+    try {
+      const res = await dazScript(`(function(){ return Scene.findNodeByLabel(${JSON.stringify(nodeLabel)}) ? "present" : "absent"; })()`);
+      if (String(res).indexOf("present") !== -1) {
+        console.log(`[waitForNode] "${nodeLabel}" present after ${attempts} probe(s), ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+        return;
+      }
+    } catch (e) {
+      console.log(`[waitForNode] probe ${attempts} not answerable yet (${e.message}) - scene still loading, continuing`);
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error(`waitForNode: "${nodeLabel}" never appeared in the scene within ${Math.round(timeoutMs / 1000)}s`);
+}
+
+async function removeDefaultClothing(nodeLabel) {
   // Fifth real finding on this feature: even with the confirmed-correct
   // labels and the null-child guard, a live run showed the master DUF
   // export (the one that actually becomes the final GLB's base mesh)
@@ -1088,9 +1264,22 @@ async function removeDefaultClothing() {
     var removed = [];
     var allLabelsFound = [];
 
-    var oFigure = Scene.getPrimarySelection();
+    // Sixth finding: selection does not survive BETWEEN separate dazScript()
+    // calls. selectNodeForExport() is called immediately before this at both
+    // call sites and was logged succeeding, yet getPrimarySelection() still
+    // came back null here — the identical symptom already documented on the
+    // shape function above, which was fixed the same way. So look the figure
+    // up by label with Scene.findNodeByLabel(), the method
+    // selectNodeForExport itself uses successfully, rather than trusting that
+    // a previous call's selection persisted into this one.
+    //
+    // No fallback to getPrimarySelection() on purpose: a silent fallback here
+    // would strip clothing off whatever happened to be selected instead, and
+    // this file's standing rule is to throw rather than quietly do the wrong
+    // thing.
+    var oFigure = Scene.findNodeByLabel(${JSON.stringify(nodeLabel)});
     if (!oFigure) {
-      throw new Error("removeDefaultClothing: no primary selection — selectNodeForExport() must run before this");
+      throw new Error("removeDefaultClothing: node not found by label: " + ${JSON.stringify(nodeLabel)});
     }
 
     // Fourth attempt on this feature — third convenience-method guess
@@ -1894,11 +2083,77 @@ async function runPipeline({ db, __dirname, actorId, localPhotoPath, mediaFolder
       console.log(`[runPipeline] ${actorId}: Advanced/body photos not provided — no reference images this run, client-side slider path unaffected`);
     }
     setStatus(actorId, "applying_body_shape");
-    morphValues = await bakeAllMorphsAtDefault(nodeLabel);
+    // Session 162 - gate every figure-dependent script behind the figure
+    // actually being in the scene. See waitForNode's note above.
+    // Face Transfer is still running when the script that started it returns,
+    // and it wipes the scene on its way. Wait for a figure that stays put.
+    // Session 163 (resolution manager, 2026-09-09) - RECOVER from a Face
+    // Transfer that clears the scene and never rebuilds, instead of waiting
+    // seven minutes and then killing the user's draft.
+    //
+    // The defect fixed here is on THIS side, not on the DAZ box.
+    // runDazGenerationSequence() already knows how to recover (restart DAZ
+    // Studio, re-run the whole sequence) but its retry loop sits on the WRONG
+    // SIDE OF THE ASYNC BOUNDARY: oActionMgr.findAction(...).trigger() returns
+    // immediately, so that loop can only ever catch a dazScript transport or
+    // script-level failure. The failure that actually happens - Face Transfer
+    // returns "reset pane and generated", clears the scene on its way, and
+    // then never builds the new figure - is invisible there, and only surfaces
+    // HERE, where until now there was no recovery at all: waitForNodeStable
+    // threw and the whole pipeline aborted. Measured occurrence: actor
+    // e3f62640, 2026-09-09 14:47:50, with no concurrent generate3d job
+    // anywhere in the journal; the user abandoned the draft at 14:50:11.
+    //
+    // The sizing is measured, not guessed. EVERY success in the journal reads
+    // "stable for 12s after 7 probe(s), ~13.0s total" - the figure is present
+    // at the first probe and stays there. No run has ever recovered by waiting
+    // longer, so the original single 420s wait was ~7 minutes of dead time in
+    // front of a hard failure. First attempt now gets 120s (9x the observed
+    // success time, ample margin for a loaded box - 192.168.1.60 also hosts
+    // the Ollama model behind the simulator's LLM warnings); if that fails we
+    // do the one thing already proven to clear a wedged DAZ - restartDazStudio,
+    // which this pipeline already runs unconditionally at its top - and
+    // re-trigger Face Transfer, keeping the original 420s ceiling on the final
+    // attempt so total patience is not reduced. If both attempts fail the
+    // original error is still thrown: nothing is suppressed.
+    //
+    // DELIBERATELY NOT CHANGED: waitForNodeStable's 2s poll interval. The
+    // "polling starves Face Transfer's own main-thread rebuild" theory would
+    // be addressed by delaying the first probe, and the evidence argues
+    // against that - every SUCCESS is a run where probing began while the
+    // figure was already present, so delaying the first probe would push every
+    // run into exactly the overlap state that only failures exhibit.
+    const figureWaitAttemptsMs = [120_000, 420_000];
+    let figureWaitErr = null;
+    for (let fa = 0; fa < figureWaitAttemptsMs.length; fa++) {
+      try {
+        await waitForNodeStable(nodeLabel, { settleMs: 12000, timeoutMs: figureWaitAttemptsMs[fa] });
+        figureWaitErr = null;
+        break;
+      } catch (e) {
+        figureWaitErr = e;
+        if (fa === figureWaitAttemptsMs.length - 1) break;
+        console.log(`[runPipeline] ${actorId}: ${e.message} - Face Transfer cleared the scene and never rebuilt the figure; restarting DAZ Studio and re-running the generation sequence (attempt ${fa + 2}/${figureWaitAttemptsMs.length})`);
+        setStatus(actorId, "recovering_daz_studio");
+        await restartDazStudio();
+        setStatus(actorId, "generating_face");
+        await runDazGenerationSequence(actorId, remotePhotoPath, gender);
+        setStatus(actorId, "applying_body_shape");
+      }
+    }
+    if (figureWaitErr) throw figureWaitErr;
+    morphValues = await withNodeRetry("bakeAllMorphsAtDefault", nodeLabel, () => bakeAllMorphsAtDefault(nodeLabel));
 
     setStatus(actorId, "selecting_node");
-    await selectNodeForExport(nodeLabel);
-    await removeDefaultClothing();
+    // Session 162, second pass - the gate above was necessary but NOT
+    // sufficient. Measured: waitForNode passed at 23:01:05, the morph bake
+    // succeeded at 23:01:06, and then DAZ began loading a scene AGAIN -
+    // "currently loading a scene" three times - and selectNodeForExport died
+    // on the same missing node at 23:01:12. The scene can reload BETWEEN
+    // stages, so one gate at the top of the stage guards only the first
+    // script. Every figure-dependent call needs it.
+    await withNodeRetry("selectNodeForExport", nodeLabel, () => selectNodeForExport(nodeLabel));
+    await withNodeRetry("removeDefaultClothing", nodeLabel, () => removeDefaultClothing(nodeLabel));
 
     setStatus(actorId, "saving_duf");
     const dufPath = await saveSceneAsDuf(actorId);
@@ -1943,8 +2198,13 @@ async function runPipeline({ db, __dirname, actorId, localPhotoPath, mediaFolder
       }
       console.log(`[runPipeline] "${clipName}": ${endFrame} frames (parsed from preset)${loop ? ", looping" : ""}`);
       setPoseStatus(actorId, `generating${variant}`);
-      await selectNodeForExport(nodeLabel);
-      await removeDefaultClothing();
+      // Session 162 rule applied to the clip loop: each iteration ends with
+      // reloadDufFresh() -> ContentMgr.openFile(), a scene load, so iteration
+      // 2+ starts in exactly the "the scene can reload BETWEEN stages"
+      // window that killed these same two calls at the top of the pipeline.
+      // Guarded the same way as lines ~2048-2049 rather than left bare.
+      await withNodeRetry("selectNodeForExport", nodeLabel, () => selectNodeForExport(nodeLabel));
+      await withNodeRetry("removeDefaultClothing", nodeLabel, () => removeDefaultClothing(nodeLabel));
       // Set the timeline BEFORE loading the preset, per real observed
       // behavior applying idle manually — the extend-timeline dialog
       // fires because the preset's own frame data exceeds whatever the
@@ -2097,7 +2357,84 @@ function currentAppearance(db, __dirname, actorId) {
   return { row, hash: appearanceHash({ glbUrl: row.glb_url, glbMtimeMs: mtime, draft }) };
 }
 
-export function registerGenerate3DRoutes(app, { db, __dirname, authUser }) {
+export function registerGenerate3DRoutes(app, { db, __dirname, authUser, unauthorisedSubjectInLineage }) {
+  // Session 158 (conduct-watch, resolution-manager) — one predicate, shared by
+  // every path in this file that BUILDS a likeness. Identical in shape to the
+  // subject-authorisation gates already on the shares, deploy and fork routes
+  // in index.js: scoped to the declared reference set (world_id IS NULL) and to
+  // declared-'other' rows only, so actors with no declaration — every actor
+  // predating the depicts column — behave exactly as before.
+  // Session 171 (conduct-watch, resolution-manager) — this predicate used to
+  // read the actor's OWN actor_media only. actor_media is deliberately absent
+  // from FORK_TABLES (index.js), so a fork holds ZERO reference rows while
+  // draft_state, glb_url, runtime_glb_url and runtime_glb_hash are copied over
+  // verbatim: the own-actor predicate read an empty set on the copy and passed,
+  // and every BUILD gate in this file was therefore blind to the one condition
+  // the lineage walk in index.js exists for. The egress gates (fork, shares,
+  // deploy) already walk the fork ancestry; the build gates now ask the same
+  // question, using the SAME function injected from index.js so there is one
+  // definition of it rather than two that can drift apart again.
+  //
+  // Shape: returns the offending row ({ actor_id, state_slug }) or null, so a
+  // refusal can tell an ancestor hit from a local one. The fallback below keeps
+  // the previous (own-actor) behaviour if nothing is injected — a registration
+  // that forgets the argument should degrade to the old gate, loudly, rather
+  // than throw at boot and take the API down.
+  const localSubjectHit = (actorId) => db.prepare(
+    `SELECT actor_id, state_slug, 'unauthorised' AS reason FROM actor_media WHERE actor_id = ? AND media_type = 'photo' AND world_id IS NULL
+       AND depicts = 'other' AND (subject_authorised IS NULL OR subject_authorised != 'yes') LIMIT 1`
+  ).get(actorId) || null;
+  if (typeof unauthorisedSubjectInLineage !== "function") {
+    console.log("[generate3d] WARNING: registerGenerate3DRoutes called without unauthorisedSubjectInLineage — build gates fall back to own-actor-only and will NOT see a fork ancestor");
+  }
+  const subjectHit = (actorId) => (
+    typeof unauthorisedSubjectInLineage === "function"
+      ? (unauthorisedSubjectInLineage(actorId) || null)
+      : localSubjectHit(actorId)
+  );
+  // An ancestor hit is not clearable by the caller — they do not own the
+  // source's actor_media and have no UI path to PATCH it — so the refusal says
+  // so instead of asking for an answer they cannot give. Same reasoning as
+  // subjectRefusalText() in index.js, worded for a build rather than an egress.
+  //
+  // 2026-09-11 (conduct-watch, resolution-manager) -- WIDENED, because the
+  // PREDICATE above was widened this morning and this wording was not. subjectHit
+  // delegates to unauthorisedSubjectInLineage (index.js), which now fires on a
+  // BLANK depicts as well as on an unauthorised declared-'other' one. Every gate
+  // in this file therefore began answering a blank with "These photographs are
+  // declared to be of somebody else" and `needs: "subject_authorised"`, and both
+  // halves are wrong in the worst available direction:
+  //   - the record is SILENT, and reading silence back as "declared to be of
+  //     somebody else" turns an absence of evidence into an assertion about a
+  //     person that nobody made;
+  //   - it points the owner at the subject-authorisation control, which cannot
+  //     be answered until the EARLIER question -- who is in these photographs? --
+  //     has been. A person sent to the wrong control answers neither.
+  // index.js already split these two questions for the egress side
+  // (subjectRefusalText / subjectRefusalNeeds). This is the same split on the
+  // build side, worded for a build.
+  const buildRefusalText = (hit, actorId) => {
+    const undeclared = hit && hit.reason === "undeclared";
+    if (hit && hit.actor_id !== actorId) {
+      return undeclared
+        ? "This character was copied from one built from reference photographs that carry no statement of whose likeness they are, and the original still does not say. The copy carries the same likeness, so it cannot be built. Ask the original's owner to say who is in those photographs, or rebuild this character from your own reference photographs."
+        : "This character was copied from one built from photographs of somebody else, and that person's authorisation is not recorded on the original. The copy carries the same likeness, so it cannot be built. Ask the original's owner to record authorisation, or rebuild this character from your own reference photographs.";
+    }
+    return undeclared
+      ? "Nobody has said who is in these reference photographs. A blank is not a declaration that they are of you, so this likeness cannot be built until the record says whose it is."
+      : "These photographs are declared to be of somebody else. Confirm that person authorised this likeness before building it.";
+  };
+  // Which control clears the refusal: 'depicts' for a blank (PATCH
+  // /api/actors/:id/media/depicts, which the editor's Declaration-needed notice
+  // and the wizard both call), 'subject_authorised' for a declared-'other' with
+  // no recorded 'yes'. Mirrors subjectRefusalNeeds() in index.js exactly.
+  const buildRefusalNeeds = (hit) => (hit && hit.reason === "undeclared" ? "depicts" : "subject_authorised");
+  // Same split for the log lines, which otherwise record an allegation about a
+  // record that says nothing at all.
+  const subjectHitLog = (hit) => (hit && hit.reason === "undeclared"
+    ? "carries no depicts declaration -- nobody has said whose likeness it is"
+    : "is declared to be of somebody else with no recorded subject authorisation");
+
   // What the worlds should be loading, and whether it is still true.
   //
   // `fresh` is the whole point of the naming scheme: the published file carries
@@ -2109,6 +2446,30 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser }) {
 
     const cur = currentAppearance(db, __dirname, req.params.id);
     if (!cur) return res.status(404).json({ error: "not found" });
+
+    // The RETROACTIVE arm of the subject-authorisation gate. Every other gate
+    // is prospective — it refuses the next build, the next share, the next
+    // deploy — and none of them says anything about a likeness that was
+    // already solved before they existed. This is that path: the runtime model
+    // is what every viewer and the bake actually read, so withholding it here
+    // makes the declaration bind on the likeness that is ALREADY on disk,
+    // without deleting or moving a byte of the owner's work. Answering the
+    // question 'yes' serves the same URL again, immediately.
+    //
+    // Shaped as "nothing built" rather than a 403 because that is the truthful
+    // answer to this caller — there is no runtime model it may use — and it is
+    // the one shape every existing caller already handles.
+    const runtimeBlock = subjectHit(req.params.id);
+    if (runtimeBlock) {
+      console.log(`[runtime] ${req.params.id}: withheld — reference photo '${runtimeBlock.state_slug}' on ${runtimeBlock.actor_id}${runtimeBlock.actor_id === req.params.id ? "" : " (an ancestor of this fork)"} ${subjectHitLog(runtimeBlock)}`);
+      return res.json({
+        url: null,
+        hash: cur.hash,
+        builtHash: cur.row.runtime_glb_hash || null,
+        fresh: false,
+        needs: buildRefusalNeeds(runtimeBlock),
+      });
+    }
 
     const built = cur.row.runtime_glb_url;
     // The stored URL carries ?v=, which is not part of the path on disk.
@@ -2135,6 +2496,19 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser }) {
 
       const owned = db.prepare(`SELECT id FROM actors WHERE id = ? AND owner_id = ?`).get(actorId, user.id);
       if (!owned) return res.status(404).json({ error: "not found" });
+      // The solve in POST /api/actors/:id/generate-3d is not the only way a
+      // likeness gets built. This route accepts the browser's own GLTFExporter
+      // output and writes it as the actor's runtime model — it is the wizard
+      // FINISHING her — so an undeclared 'other' likeness could be completed
+      // here with the solve gate never consulted.
+      const subjectBlock = subjectHit(actorId);
+      if (subjectBlock) {
+        console.log(`[runtime-glb] ${actorId}: refused — the reference set ${subjectHitLog(subjectBlock)} (offending row on ${subjectBlock.actor_id}${subjectBlock.actor_id === actorId ? "" : ", an ancestor of this fork"}, slug '${subjectBlock.state_slug}')`);
+        return res.status(403).json({
+          error: buildRefusalText(subjectBlock, actorId),
+          needs: buildRefusalNeeds(subjectBlock),
+        });
+      }
       if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
         return res.status(400).json({ error: "empty or missing glb body — ensure Content-Type: model/gltf-binary" });
       }
@@ -2211,7 +2585,7 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser }) {
     if (!actor) return res.status(404).json({ error: "not found" });
 
     const photo = db.prepare(
-      `SELECT url, depicts FROM actor_media WHERE actor_id = ? AND state_slug = 'profile' AND media_type = 'photo' AND world_id IS NULL`
+      `SELECT url, depicts, subject_authorised FROM actor_media WHERE actor_id = ? AND state_slug = 'profile' AND media_type = 'photo' AND world_id IS NULL`
     ).get(actorId);
     if (!photo) return res.status(400).json({ error: "No reference photo uploaded for this character yet." });
     // An undeclared reference photograph does not get solved into a likeness.
@@ -2226,6 +2600,51 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser }) {
         needs: "depicts",
       });
     }
+    // And a likeness of somebody else does not get solved on the uploader's
+    // say-so alone. Declaring the photographs are of another person answers
+    // WHOSE face this is; it does not answer whether that person agreed to it,
+    // and until 2026-09-09 nothing on this system could hold that answer, so a
+    // declared-'other' build and an authorised one were the same request.
+    // Deliberately narrow: this fires only on depicts === 'other'. 'self' and
+    // an undeclared row are untouched (the latter never gets here anyway), so
+    // no existing flow changes shape except the one this gate is about.
+    // 'no' blocks for the same reason a blank does -- neither is permission.
+    if (photo.depicts === "other" && photo.subject_authorised !== "yes") {
+      return res.status(400).json({
+        error: "These photographs are declared to be of somebody else. Confirm that person authorised this likeness before building it.",
+        needs: "subject_authorised",
+      });
+    }
+    // Session 169 (conduct-watch, resolution-manager) — both checks above read
+    // the PROFILE row only, and the solve below does not. actor_media carries a
+    // PER-ROW `depicts`: POST /api/actors/:id/media whitelists it per upload and
+    // DELETE+INSERTs one state_slug at a time, so a set assembled slot-by-slot
+    // against the API can hold profile='self' alongside body_*='other'. That set
+    // passed this gate, and the body photographs it let through are exactly the
+    // rows that produce the silhouette landmarks, measurements.json and the body
+    // morphs — i.e. the likeness. Same predicate as the shares gate (POST
+    // /api/actors/:id/shares) and the deploy gate, which already scope to the
+    // whole declared reference set (world_id IS NULL) instead of to one slug:
+    // declared-'other' ANYWHERE in the set needs a 'yes' before anything is
+    // solved. 2026-09-11: it catches an UNDECLARED row now too, because
+    // subjectHit was widened that morning. The sentence that used to stand here
+    // ("undeclared rows are not touched by this check") stopped being true then
+    // and is removed rather than left to mislead. The blank branch just above
+    // (the profile photo) still runs first and still answers first, so a blank
+    // profile is reported as a blank profile; this one catches a blank on any
+    // OTHER row of the set, and buildRefusalNeeds() now sends it to the depicts
+    // control rather than to the authorisation one.
+    // Session 171: this was the same own-actor query, inline. It is the SOLVE —
+    // the path that turns photographs into a face and a body — so it takes the
+    // lineage-aware form too, for the reason written on subjectHit above.
+    const unauthorisedRow = subjectHit(actorId);
+    if (unauthorisedRow) {
+      console.log(`[generate-3d] ${actorId}: refused — reference photo '${unauthorisedRow.state_slug}' on ${unauthorisedRow.actor_id}${unauthorisedRow.actor_id === actorId ? "" : " (an ancestor of this fork)"} ${subjectHitLog(unauthorisedRow)}`);
+      return res.status(400).json({
+        error: buildRefusalText(unauthorisedRow, actorId),
+        needs: buildRefusalNeeds(unauthorisedRow),
+      });
+    }
     const localPhotoPath = path.join(__dirname, "../public", photo.url);
 
     const { gender, torsoLength, armsLength, legsLength, bodyHeightCm } = req.body;
@@ -2238,13 +2657,32 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser }) {
     // failure on one of three, mid-flight) falls back to skipping the
     // photo-derived step entirely rather than running on incomplete data.
     const bodyPhotoRows = db.prepare(
-      `SELECT state_slug, url FROM actor_media WHERE actor_id = ? AND state_slug IN ('body_front','body_side','body_back') AND media_type = 'photo' AND world_id IS NULL`
+      `SELECT state_slug, url, depicts FROM actor_media WHERE actor_id = ? AND state_slug IN ('body_front','body_side','body_back') AND media_type = 'photo' AND world_id IS NULL`
     ).all(actorId);
     const bodyPhotoBySlug = Object.fromEntries(bodyPhotoRows.map(r => [r.state_slug, r.url]));
     const hasAllBodyPhotos = ["body_front", "body_side", "body_back"].every(slug => bodyPhotoBySlug[slug]);
     const localBodyFrontPath = hasAllBodyPhotos ? path.join(__dirname, "../public", bodyPhotoBySlug.body_front) : null;
     const localBodySidePath = hasAllBodyPhotos ? path.join(__dirname, "../public", bodyPhotoBySlug.body_side) : null;
     const localBodyBackPath = hasAllBodyPhotos ? path.join(__dirname, "../public", bodyPhotoBySlug.body_back) : null;
+    // The blank half of the same hole. A body photograph with no declaration on
+    // it is not "self" — it is a row that cannot say whose body is about to be
+    // solved, and the profile gate above already refuses precisely that for the
+    // face ("a blank must never read as a declaration nobody made"). Every
+    // legitimate path stamps these: CharacterWizard uploads all three body slots
+    // with the same `depicts` it sends for the profile, and PATCH
+    // /api/actors/:id/media/depicts rewrites the whole world_id IS NULL set, so
+    // this can only fire on a set built slot-by-slot against the API. Refuse the
+    // build rather than solve an undeclared body — and refuse rather than
+    // silently drop the body photos, because a caller who uploaded three
+    // photographs and got a generic body back would have no way to tell.
+    const undeclaredBody = hasAllBodyPhotos ? bodyPhotoRows.find(r => !r.depicts) : null;
+    if (undeclaredBody) {
+      console.log(`[generate-3d] ${actorId}: refused — body photo '${undeclaredBody.state_slug}' carries no depicts declaration`);
+      return res.status(400).json({
+        error: "Say who is in the body photographs before building a likeness from them.",
+        needs: "depicts",
+      });
+    }
     if (bodyPhotoRows.length > 0 && !hasAllBodyPhotos) {
       console.log(`[generate-3d] ${actorId}: partial body photo set (${bodyPhotoRows.length}/3) — skipping photo-derived body shape`);
     } else if (bodyPhotoRows.length === 0) {
@@ -2254,7 +2692,7 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser }) {
     setStatus(actorId, "queued");
     // Fire and forget — the wizard polls GET for progress instead of
     // blocking one long HTTP request for several minutes.
-    runPipeline({
+    enqueuePipeline({
       db, __dirname, actorId, localPhotoPath, mediaFolder: actor.media_folder, gender, torsoLength, armsLength, legsLength,
       localBodyFrontPath, localBodySidePath, localBodyBackPath, bodyHeightCm: hasAllBodyPhotos ? bodyHeightCm : null,
     });
@@ -2290,6 +2728,18 @@ export function registerGenerate3DRoutes(app, { db, __dirname, authUser }) {
 
     const actor = db.prepare(`SELECT id, media_folder FROM actors WHERE id = ? AND owner_id = ?`).get(actorId, user.id);
     if (!actor) return res.status(404).json({ error: "not found" });
+
+    // Same reasoning as the runtime-glb route above: this overwrites the
+    // actor's canonical .glb from a client-supplied body, so it is a build
+    // path and takes the build gate.
+    const subjectBlock = subjectHit(actorId);
+    if (subjectBlock) {
+      console.log(`[save-morphed-glb] ${actorId}: refused — the reference set ${subjectHitLog(subjectBlock)} (offending row on ${subjectBlock.actor_id}${subjectBlock.actor_id === actorId ? "" : ", an ancestor of this fork"}, slug '${subjectBlock.state_slug}')`);
+      return res.status(403).json({
+        error: buildRefusalText(subjectBlock, actorId),
+        needs: buildRefusalNeeds(subjectBlock),
+      });
+    }
 
     if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
       return res.status(400).json({ error: "empty or missing glb body — ensure Content-Type: model/gltf-binary" });

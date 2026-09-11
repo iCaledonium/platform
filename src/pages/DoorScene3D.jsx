@@ -2194,25 +2194,39 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       const b = new THREE.Box3().setFromObject(her);
       a.herEyeY = b.max.y - 0.11;          // crown to eye line on a Genesis head
     }
-    // THE SHOT. This was 0.62m from her face with the lens on her eye line —
-    // close enough that she filled the frame from chin to brow and nothing of
-    // her was in it. Reported 2026-09-05 as "too close".
+    // THE SHOT IS YOUR OWN EYES.
     //
-    // Standing distance now, with the lens centred below the eye line so the
-    // frame carries her head, shoulders and upper body rather than a face.
-    // The eye contact the mode exists for is untouched: she still looks down
-    // the lens, and the lens is still on her axis — only further back and
-    // aimed a little lower.
+    // This mode has been a floating camera: first 0.62m from her face (an
+    // extreme close-up), then 1.05m back on her sightline. Better framing, but
+    // still a camera parked in mid-air — which is why the player's body had to
+    // be hidden to keep it out of shot. If the mode is "she looks into your
+    // eyes", the lens belongs AT your eyes.
     //
-    // Three constants, all in metres: DIST out for a wider shot, DROP down to
-    // take in more of her, RISE for camera height relative to her eye line.
-    const DIST = 1.05;
-    const DROP = 0.26;              // lens centre below her eye line
-    const RISE = 0.06;                       // camera sits just under her eye line
-    const fx = Math.sin(her.rotation.y), fz = Math.cos(her.rotation.y);
+    // So: camera on the player's own eye bone, aimed at hers. The distance is
+    // then whatever it honestly is — stand across the room and she is across
+    // the room; walk up to her and it becomes intimate because you walked
+    // there. Eye contact is exact rather than approximated, because both ends
+    // are real bones rather than a bounding-box guess.
+    //
+    // Falls back to the body position plus EYE_HEIGHT if the rig has no eye
+    // bone, so a proxy capsule body still works.
+    const a2 = api.current;
+    let eyePos = null;
+    if (a2.me) {
+      let msk = null;
+      a2.me.traverse(o => { if (o.isSkinnedMesh && !msk && o.skeleton) msk = o; });
+      const eyeBone = msk && (msk.skeleton.bones.find(b => b.name === "l_eye")
+                           || msk.skeleton.bones.find(b => b.name === "head"));
+      if (eyeBone) eyePos = eyeBone.getWorldPosition(new THREE.Vector3());
+    }
+    if (!eyePos && a2.body) {
+      eyePos = new THREE.Vector3(a2.body.x, (a2.floorY ?? 0) + EYE_HEIGHT, a2.body.z);
+    }
+    if (!eyePos) return null;
+
     return {
-      pos:  new THREE.Vector3(her.position.x + fx * DIST, a.herEyeY - RISE, her.position.z + fz * DIST),
-      look: new THREE.Vector3(her.position.x, a.herEyeY - DROP, her.position.z),
+      pos:  eyePos,
+      look: new THREE.Vector3(her.position.x, a.herEyeY, her.position.z),
     };
   }
 
@@ -3512,7 +3526,21 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       if (e.button !== 0 && e.button !== 2) return;
       const el = canvas();
       if (!el) return;
-      if (e.target && e.target.closest && e.target.closest("input,textarea,button,select,a")) return;
+      // WHITELIST the canvas; do not blacklist controls.
+      //
+      // This used to exclude input/textarea/button/select/a, which meant a
+      // press anywhere ELSE on the watcher panel -- its header, its body, its
+      // scrollbar, the empty space between messages -- still grabbed the
+      // camera, so the panel could not be dragged or scrolled. Reported
+      // 2026-09-06: "if the mouse pointer is over the watcher i must be able to
+      // move it, now the hold camera movement jumps in".
+      //
+      // The camera belongs to the 3D view and nothing else. Anything overlaid
+      // on it -- this panel, the chat dock, the tabs, anything added later --
+      // then keeps its own mouse behaviour for free, without having to be
+      // listed here and without this list going stale the next time the UI
+      // grows a control.
+      if (e.target !== el && !el.contains(e.target)) return;
       e.preventDefault();
       if (isTyping()) document.activeElement.blur();
       a._mouseLook = true;
@@ -4263,7 +4291,6 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
           // when the landing was near-black; the lighting rework made it a
           // lit hallway, and the words drowned. The scrim guarantees them.
           background: "linear-gradient(to top, rgba(8,7,6,.78), rgba(8,7,6,.35) 55%, rgba(8,7,6,0))",
-          background: "linear-gradient(transparent, rgba(6,5,4,.92) 46%)", pointerEvents: "none",
           opacity: (inside || narrativeGone) ? 0 : 1, transition: "opacity 1.6s ease",
           pointerEvents: "none",
         }}>

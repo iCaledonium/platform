@@ -220,7 +220,15 @@ export function applySkinLayers(root, store) {
     const geo = mesh.geometry;
     // A fullIndex round-tripped through an export is a JSON-flattened object,
     // not a typed array — it crashed .slice() and hung Benny's load forever.
-    if (!ArrayBuffer.isView(geo.userData.fullIndex)) geo.userData.fullIndex = geo.index.array.slice();
+    // Session 162 - recover a round-tripped fullIndex rather than discarding it.
+    // Only fall back to the current index when there is genuinely nothing to
+    // recover, and never let a SMALLER stored index replace a larger live one.
+    if (!ArrayBuffer.isView(geo.userData.fullIndex)) {
+      const recovered = recoverFullIndex(geo.userData.fullIndex);
+      geo.userData.fullIndex = (recovered && recovered.length >= geo.index.count)
+        ? recovered
+        : geo.index.array.slice();
+    }
     const full = geo.userData.fullIndex;
 
     if (!groups.length) {
@@ -244,7 +252,19 @@ export function applySkinLayers(root, store) {
       nrm.fromBufferAttribute(nA, i).normalize();
       for (const g of candidate) {
         // Above me? (fabric covering intact skin)
-        ray.origin.copy(pos).addScaledVector(nrm, 0.003); // start just off the skin
+        // Session 162 - was 0.003. That offset was larger than the shrinkwrap's
+        // own clearanceMeters (0.0025), so for any garment the resolver had
+        // fitted properly the ray STARTED PAST THE FABRIC and flew away from
+        // it; the buried check then fired backwards and missed too. The better
+        // the fit, the more reliably the mask failed - which is why the tight
+        // shoulder ridge went uncovered while the looser chest passed.
+        // Measured live on the basic shirt: of 197 uncovered shoulder vertices,
+        // 172 had the fabric AHEAD along the normal and 77 had it within 5mm.
+        // The offset also guarded nothing: this ray is cast against the GARMENT
+        // bvh, never the body, so there is no self-hit to step over. Kept at a
+        // hair above zero purely for numerical safety, and it must stay well
+        // under clearanceMeters - if that constant ever shrinks, shrink this.
+        ray.origin.copy(pos).addScaledVector(nrm, 0.0001);
         ray.direction.copy(nrm);
         let hit = g.bvh.raycastFirst(ray, THREE.DoubleSide);
         if (hit && hit.distance <= NEAR_FABRIC) { covered[i] = 1; break; }
@@ -269,6 +289,12 @@ export function applySkinLayers(root, store) {
     let k = 0;
     for (let t = 0; t < full.length; t += 3) {
       const a = full[t], b = full[t + 1], c = full[t + 2];
+      // Session 162 - back to ALL THREE. Two-of-three was added when coverage
+      // was poor and the kept ring was wide; it cut into that ring unevenly and
+      // rendered as a SAWTOOTH fringe at the collar, because triangles then
+      // alternate culled/kept along the boundary. With the ray-offset bug fixed
+      // (shoulder cov 593 -> 703) the ring is thin on its own, so the smooth
+      // boundary is worth more than the extra row it culls.
       if (covered[a] && covered[b] && covered[c]) { culledTotal++; continue; }
       kept[k++] = a; kept[k++] = b; kept[k++] = c;
     }
@@ -289,11 +315,41 @@ export function applySkinLayers(root, store) {
 
 // Editable exports serialize the live geometry, and a working file must keep
 // every triangle. Returns the re-apply function for the finally-path.
+// Session 162 - recover a fullIndex that has been round-tripped through a GLB.
+//
+// GLTFExporter serialises userData, so a body exported once comes back with its
+// fullIndex as a PLAIN JSON OBJECT, not a typed array. Both call sites tested
+// ArrayBuffer.isView() and, finding false, treated it as absent: settleLayers
+// overwrote it with the CURRENT (already culled) index, and suspendSkinLayers
+// declined to restore. The true full mesh was therefore discarded on the first
+// reload after an export, and every later save rewrote the holes - measured
+// live as drawnTris === fullTris with culled:0 on a body visibly missing its
+// torso and upper arms, and as an editable export byte-identical in geometry
+// to the runtime bake that is SUPPOSED to keep culling.
+//
+// JSON gives back either {"0":n,"1":n,...} or a real array; both are recoverable.
+function recoverFullIndex(v) {
+  if (ArrayBuffer.isView(v)) return v;
+  if (Array.isArray(v)) return Uint32Array.from(v);
+  if (v && typeof v === "object") {
+    const keys = Object.keys(v);
+    if (!keys.length) return null;
+    const out = new Uint32Array(keys.length);
+    for (let i = 0; i < keys.length; i++) {
+      const n = v[i];
+      if (typeof n !== "number") return null;
+      out[i] = n;
+    }
+    return out;
+  }
+  return null;
+}
+
 export function suspendSkinLayers(root) {
   if (!root) return () => {};
   for (const mesh of bodyMeshes(root)) {
-    const full = mesh.geometry.userData.fullIndex;
-    if (ArrayBuffer.isView(full) && mesh.geometry.index.count !== full.length) {
+    const full = recoverFullIndex(mesh.geometry.userData.fullIndex);
+    if (full && mesh.geometry.index.count !== full.length) {
       mesh.geometry.setIndex(new THREE.BufferAttribute(full.slice(), 1));
     }
   }
