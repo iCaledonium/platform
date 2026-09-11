@@ -803,8 +803,9 @@ export function fitOuterLayers(root, store, body = null) {
 // Paused around exports (the file must carry the settled shape, not one
 // frame's correction) and invalidated by a manual-fit change until the
 // next settle rebuilds the anchors.
-const HAIR_RIDE_REACH = 0.10;   // anchor a hair vertex to fabric within 10cm of it at settle (6cm left 41 unanchored tips dipping at the head turn)
+const HAIR_RIDE_REACH = 0.06;   // anchor a hair vertex to fabric within 6cm of it at settle (10cm anchored 2000 more and read as melting on the shoulders in the desktop app; the 41 residual tips were anchored anyway)
 const HAIR_RIDE_GAP = 0.008;    // and never let it come closer than 8mm to that fabric in motion
+const HAIR_RIDE_SECOND_ANCHOR = false;   // see anchor 2 in prepareHairRide
 const rideState = new WeakMap();  // store -> { cloth, cvMesh, cvVi, posed, paused, frame }
 const _rq = new THREE.Vector3(), _racc = new THREE.Vector3(), _rt = new THREE.Vector3(), _rm = new THREE.Matrix4();
 const _rsum = new THREE.Matrix4(), _rM = new THREE.Matrix4();
@@ -889,10 +890,15 @@ export function prepareHairRide(store) {
       let first = -1;
       if (bvh.closestPointToPoint(p, hit, 0, HAIR_RIDE_REACH) && makeAnchor(hit.faceIndex, hit.point, corner, bary, sign, i)) { first = hit.faceIndex; anchored++; }
       // anchor 2: the fabric directly beneath, along the inward radial - the
-      // surface the parity verdict measures against; the nearest face alone
-      // left 41 anchored vertices dipping under a neighbouring fold
+      // surface the parity verdict measures against. DISABLED (Magnus, on the
+      // desktop app: "still melts on both shoulders, you had it right but
+      // changed something" - the build before this anchor was the one that
+      // was right). It took the idle residual from 41 to 33 in the numbers
+      // and pushed shoulder strands along a fold wall's normal on screen. A
+      // sideways ray from a strand on the shoulder does not find the fabric
+      // under that strand. Kept behind HAIR_RIDE_SECOND_ANCHOR for the record.
       _rd.set(-p.x, 0, -p.z);
-      if (_rd.lengthSq() > 1e-8) {
+      if (HAIR_RIDE_SECOND_ANCHOR && _rd.lengthSq() > 1e-8) {
         ray.origin.copy(p); ray.direction.copy(_rd.normalize());
         const hits = bvh.raycast(ray, THREE.DoubleSide);
         let near = null;
