@@ -249,6 +249,12 @@ export const BENCHES = {
     watcher: "Feature - Character Deploy",
     side: "platform", scoped: false, needsActor: false, local: "deployChecks",
   },
+  worldwizard: {
+    label: "World · Wizard",
+    page: "/lab/world/wizard",
+    watcher: "Feature - World Creation Wizard",
+    side: "platform", scoped: false, needsActor: false, local: "worldwizardChecks",
+  },
   // Cases written in the test manager rather than in code. A source like
   // any other downstream: same fingerprints, same incidents, same sweep.
   authored: {
@@ -803,7 +809,7 @@ function fileBoard({ bench, target, checks, source }) {
 // `signupChecks` is injected rather than fetched over HTTP: the signup board is
 // this same process, and making it a self-request would mean minting a session
 // for the server to show to itself.
-export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks, authoredChecks, signinChecks, only = null, suite_id = null, targets: suppliedTargets = null } = {}) {
+export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks, authoredChecks, signinChecks, worldwizardChecks, only = null, suite_id = null, targets: suppliedTargets = null } = {}) {
   // `only` limits the run to a set of categories — what a suite needs. null
   // means every category, which is the plain sweep.
   const wanted = only ? new Set(only) : null;
@@ -811,7 +817,7 @@ export async function runSweep({ source = "sweep", SIMULATOR_URL, SERVICE_TOKEN,
   // to authenticate to itself. The CLI cannot supply them — it runs outside
   // the process — so a CLI sweep reports them "not configured" rather than
   // green, which is the same rule as an unreachable simulator board.
-  const localBoards = { signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks, authoredChecks, signinChecks };
+  const localBoards = { signupChecks, wizardChecks, avatarChecks, shareChecks, deployChecks, authoredChecks, signinChecks, worldwizardChecks };
   const runId = uid();
   const startedAt = now();
   try { db.exec(`ALTER TABLE lab_sweep_runs ADD COLUMN suite_id TEXT`); } catch { /* already there */ }

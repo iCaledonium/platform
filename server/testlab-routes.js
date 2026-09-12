@@ -12,6 +12,7 @@ import { avatarChecks } from "./avatarlab-routes.js";
 import { shareChecks } from "./sharelab-routes.js";
 import { deployChecks } from "./deploylab-routes.js";
 import { signinChecks } from "./signinlab-routes.js";
+import { worldwizardChecks } from "./worldwizardlab-routes.js";
 import * as cases from "./lab-cases.js";
 import * as assistant from "./lab-assistant.js";
 import * as resolutionManager from "./resolution-manager-store.js";
@@ -144,7 +145,7 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
   // it can close over the dependencies the runs need.
   labIncidents.startScheduler({
     SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks,
-    shareChecks, deployChecks, signinChecks, authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
+    shareChecks, deployChecks, signinChecks, worldwizardChecks, authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
     // The routine benches measure liveness, computed in-process — no HTTP hop
     // to ourselves, same shape as the other platform-local boards. Supplied at
     // EVERY deps site: the scheduler, the manual sweep and RUN_DEPS each build
@@ -327,7 +328,7 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
     const source = (req.body || {}).source || `manual:${user.name || user.id}`;
     sweepInFlight = labIncidents.runSweep({
       source, SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks,
-      shareChecks, deployChecks, signinChecks,
+      shareChecks, deployChecks, signinChecks, worldwizardChecks,
       authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
       // The routine benches measure liveness, computed in-process — no HTTP hop
       // to ourselves, same shape as the other platform-local boards. Supplied at
@@ -435,7 +436,7 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
 
   const RUN_DEPS = () => ({
     SIMULATOR_URL, SERVICE_TOKEN, signupChecks, wizardChecks, avatarChecks,
-    shareChecks, deployChecks, signinChecks, authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
+    shareChecks, deployChecks, signinChecks, worldwizardChecks, authoredChecks: () => cases.runAuthored({ PORT: 4002 }),
     // The routine benches measure liveness, computed in-process — no HTTP hop
     // to ourselves, same shape as the other platform-local boards. Supplied at
     // EVERY deps site: the scheduler, the manual sweep and RUN_DEPS each build

@@ -22,6 +22,7 @@ import { mount as mountWizardLabRoutes } from "./wizardlab-routes.js";
 import { mount as mountShareLinkRoutes } from "./sharelinks-routes.js";
 import { mount as mountShareLabRoutes } from "./sharelab-routes.js";
 import { mount as mountDeployLabRoutes } from "./deploylab-routes.js";
+import { mount as mountWorldWizardLabRoutes } from "./worldwizardlab-routes.js";
 import { mount as mountRoutineLabRoutes } from "./routinelab-routes.js";
 import { mount as mountInteractionRoutes } from "./interaction-routes.js";
 
@@ -8430,6 +8431,7 @@ mountSignInLabRoutes(app, { db, authUser, PORT });
 mountWizardLabRoutes(app, { db, authUser, PORT, recordActorDeletion });
 mountShareLabRoutes(app, { db, authUser, PORT });
 mountDeployLabRoutes(app, { db, authUser, PORT });
+mountWorldWizardLabRoutes(app, { db, authUser, SERVICE_TOKEN, SIMULATOR_URL });
 mountRoutineLabRoutes(app, { authUser });
 // Session 157 — interaction scripts: the studio saves them here and an
 // encounter reads them back by slug. Creates its own table at mount.
