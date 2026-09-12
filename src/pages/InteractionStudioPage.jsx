@@ -142,13 +142,10 @@ export default function InteractionStudioPage() {
       .then(r => (r.ok ? r.json() : []))
       .then(list => {
         setCastList(list);
-        // Open with two bodies already standing there. An empty room with two
-        // empty dropdowns is a form; a room with people in it is a bench.
-        const ready = list.filter(p => !p.unavailable);
-        setCast(c => ({
-          a: c.a || ready.find(p => p.kind === "character") || ready[0] || null,
-          b: c.b || ready.find(p => p.kind === "you") || ready[1] || null,
-        }));
+        // No preloaded actors (Magnus, 2026-09-12): the studio opens as an
+        // untitled scene with an EMPTY room — nobody in either role until a
+        // script is loaded or a body is picked. (The earlier "a room with
+        // people in it is a bench" default kept surprising him instead.)
       })
       .catch(() => {});
     loadScripts();
@@ -669,13 +666,25 @@ export default function InteractionStudioPage() {
                     <option key={k} value={k}>{v.label}</option>
                   ))}
                 </select>
-                <button style={btn()} title="Remove every prop from the room"
+                <button style={btn()} title="Empty the room and start over: props, actors, timeline, script name"
                         onClick={() => {
+                          // Clear scene = back to the studio's default state
+                          // (Magnus, 2026-09-12): empty timeline, untitled
+                          // script, no props, both roles nobody — not just a
+                          // prop sweep.
                           rigRef.current?.clearProps?.();
                           setProps([]);
-                          setDirty(true);
                           setPlacing(null);
-                          say("scene cleared");
+                          setSelectedProp(null);
+                          setCast({ a: null, b: null });
+                          setSteps([]);
+                          setSelected(-1);
+                          setSelectedCam(-1);
+                          setScriptId(null);
+                          setName("Untitled interaction");
+                          setDescription("");
+                          setDirty(false);
+                          say("scene cleared — untitled, empty room");
                         }}>Clear scene</button>
               </div>
             </div>
