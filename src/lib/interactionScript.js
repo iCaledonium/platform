@@ -509,14 +509,20 @@ export function runScript(script, rig, { onEvent = () => {} } = {}) {
 //
 // Adding a behaviour means a row in ENGINE_ACTIONS and a row here. Adding an
 // AUTHORED action means neither: it is a library entry and arrives for free.
+// Each line mirrors a real signature on the rig, and they are NOT uniform:
+// walkToProp and pullProp take a distance as a positional NUMBER, walkTo and
+// clip take an options object. Passing an object where a number was expected
+// does not throw — it turns the arithmetic that consumes it into NaN, which is
+// how `sit test` sent the body to an undefined position and left it walking
+// there forever, invisible. Check against the scene before editing a line here.
 const ENGINE_CALL = {
   walkTo:     (who, p) => who.walkTo(p.x, p.z, { speed: p.speed }),
   approach:   (who, p, c) => who.approach(c.performer(p.target), p.distance, { speed: p.speed }),
   turnTo:     (who, p, c) => who.turnTo(c.performer(p.target)),
-  walkToProp: (who, p) => who.walkToProp(p.prop, { distance: p.distance, speed: p.speed }),
+  walkToProp: (who, p) => who.walkToProp(p.prop, p.distance, { speed: p.speed }),
   sitOn:      (who, p) => who.sitOn(p.prop),
   standUp:    (who) => who.standUp(),
-  pullProp:   (who, p) => who.pullProp(p.prop, { distance: p.distance }),
+  pullProp:   (who, p) => who.pullProp(p.prop, p.distance),
   clip:       (who, p) => who.clip(p.clip, { loop: p.loop, fade: p.fade }),
   // Rig-level, deliberately. A script raises a line; it never speaks it. The
   // studio captions it, an encounter hands it to her voice, and the simulator

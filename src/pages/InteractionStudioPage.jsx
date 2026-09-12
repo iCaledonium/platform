@@ -95,7 +95,7 @@ export default function InteractionStudioPage() {
 
   const [scripts, setScripts]   = useState([]);
   const [scriptId, setScriptId] = useState(null);   // null = unsaved draft
-  const [name, setName]         = useState("Untitled interaction");
+  const [name, setName]         = useState("Untitled composition");
   const [description, setDescription] = useState("");
   const [steps, setSteps]       = useState([]);
   const [dirty, setDirty]       = useState(false);
@@ -371,7 +371,7 @@ export default function InteractionStudioPage() {
 
   function newScript() {
     setScriptId(null);
-    setName("Untitled interaction");
+    setName("Untitled composition");
     setDescription("");
     setSteps([]);
     setDirty(false);
@@ -596,6 +596,16 @@ export default function InteractionStudioPage() {
     return () => cv.removeEventListener("pointerdown", onDown);
   }, [rigReady, placing]);
 
+  // Opening a composition pushes its furniture at the rig immediately, and the
+  // rig is usually not there yet — a 26 MB body is still arriving. The push
+  // silently did nothing, so the panel listed a chair that was not in the room
+  // and "sit on it" then reported the prop missing at run time. Sync whenever
+  // either side changes, which covers both orders.
+  useEffect(() => {
+    if (!rigReady) return;
+    rigRef.current?.setObstacles?.(props);
+  }, [rigReady, props]);
+
   const onRig = useCallback((rig) => {
     rigRef.current = rig;
     // Placement happens by pointing at the floor, inside the scene — so the
@@ -756,9 +766,8 @@ export default function InteractionStudioPage() {
               <InteractionStudioScene cast={cast} onRig={onRig} onStatus={onStatus} />
               <div style={{ position: "absolute", right: 12, top: 12, display: "flex", gap: 8, zIndex: 4 }}>
                 <button style={{ ...btn(running ? "plain" : "primary") }} onClick={running ? stop : run}>
-                  {running ? "Stop" : "▶ Run script"}
+                  {running ? "Stop" : "▶ Run composition"}
                 </button>
-                <button style={btn()} onClick={() => { rigRef.current?.reset?.(); rigRef.current?.setObstacles?.(props); }}>Reset marks</button>
                 {/* Adding a character is one picker and one button, the same
                     shape as adding a prop. Who is actually in the room is shown
                     in "The room" on the right — a row of selects on the toolbar
@@ -794,20 +803,20 @@ export default function InteractionStudioPage() {
                 <select
                   value=""
                   style={{ ...btn(placing ? "primary" : "plain"), width: 108 }}
-                  title="Pick a prop, then click the floor to place it. R turns it, Escape cancels."
+                  title="Pick a prop, then click the floor to place it. Right-click or R turns it, Escape cancels."
                   onChange={(e) => {
                     const type = e.target.value;
                     if (!type) return;
                     rigRef.current?.addProp?.(type);
                     setPlacing(type);
-                    say(`placing a ${type} — click the floor, R turns it, Esc cancels`);
+                    say(`placing a ${type} — click the floor, right-click turns it, Esc cancels`);
                   }}>
                   <option value="">+ Add prop</option>
                   {Object.entries(PROP_TYPES).map(([k, v]) => (
                     <option key={k} value={k}>{v.label}</option>
                   ))}
                 </select>
-                <button style={btn()} title="Empty the room and start over: props, actors, timeline, script name"
+                <button style={btn()} title="Empty the room and start over: props, actors, timeline, composition name"
                         onClick={() => {
                           // Clear scene = back to the studio's default state
                           // (Magnus, 2026-09-12): empty timeline, untitled
@@ -823,7 +832,7 @@ export default function InteractionStudioPage() {
                           setSelected(-1);
                           setSelectedCam(-1);
                           setScriptId(null);
-                          setName("Untitled interaction");
+                          setName("Untitled composition");
                           setDescription("");
                           setDirty(false);
                           say("scene cleared — untitled, empty room");
@@ -849,6 +858,7 @@ export default function InteractionStudioPage() {
                 liveStep={liveStep}
                 running={running}
                 onPlay={() => (running ? stop() : run())}
+                onReset={() => { rigRef.current?.reset?.(); rigRef.current?.setObstacles?.(props); }}
                 onAddStep={(type) => addStep(type)}
                 onAddTo={(ref, role) => addStep(ref, role)}
                 cameras={cameras}
@@ -985,10 +995,10 @@ export default function InteractionStudioPage() {
             </div>
           </div>
 
-          {/* ── right: the script ────────────────────────────────────────── */}
+          {/* ── right: the composition ───────────────────────────────────── */}
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
             <div style={cardStyle}>
-              <p style={labelStyle}>This script</p>
+              <p style={labelStyle}>The composition</p>
               <input value={name} onChange={e => { setName(e.target.value); setDirty(true); }}
                      style={{ width: "100%", fontSize: 14, padding: "6px 8px", marginBottom: 6,
                               border: "1px solid rgba(0,0,0,.12)", borderRadius: 6, color: "#2f2c28" }} />
@@ -998,7 +1008,7 @@ export default function InteractionStudioPage() {
                               border: "1px solid rgba(0,0,0,.12)", borderRadius: 6, color: "#55524e" }} />
               <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
                 <button style={btn("primary")} onClick={() => save()}>
-                  {scriptId ? "Save" : "Save script"}
+                  {scriptId ? "Save" : "Save composition"}
                 </button>
                 {scriptId && <button style={btn()} onClick={() => save({ asNew: true })}>Save as new</button>}
                 {dirty && <span style={{ fontSize: 10.5, color: "#a8a5a0", alignSelf: "center" }}>unsaved changes</span>}
@@ -1024,7 +1034,7 @@ export default function InteractionStudioPage() {
                   {studioOnly.length > 0 && (
                     <p style={{ margin: "3px 0 0", fontSize: 10.5, color: "#a8a5a0", lineHeight: 1.5 }}>
                       In an encounter that role is the player: first person, pointer-locked. Driving it would
-                      take their camera away, so the runner refuses the whole script rather than performing
+                      take their camera away, so the runner refuses the whole composition rather than performing
                       part of it. Rehearse it here; make it portable by acting only as a.
                     </p>
                   )}
@@ -1073,7 +1083,9 @@ export default function InteractionStudioPage() {
               )}
               {props.length === 0 && (
                 <p style={{ fontSize: 11.5, color: "#a8a5a0", margin: 0 }}>
-                  Bare. Add a prop above, then click the floor to put it down — R turns it, Esc cancels.
+                  Bare. Add a prop above, then click the floor to put it down — right-click or R turns it, Esc cancels.
+                  The square under it is the floor it takes away — amber where it shares that floor
+                  with something (a chair under a table is furniture, not a clash), red only outside the room.
                 </p>
               )}
               {props.map((pr) => (
@@ -1088,6 +1100,20 @@ export default function InteractionStudioPage() {
                       {pr.x.toFixed(1)}, {pr.z.toFixed(1)}
                     </span>
                   </span>
+                  {/* Before the turn handle, because moving is the commoner
+                      regret: you can see a chair is in the wrong place across
+                      the room, where the wrong angle only shows when somebody
+                      tries to sit in it. */}
+                  <a title="Pick it up and put it somewhere else"
+                     onClick={(e) => {
+                       e.stopPropagation();
+                       setSelectedProp(pr.id);
+                       if (rigRef.current?.moveProp?.(pr.id)) {
+                         setPlacing(pr.type);
+                         say(`moving the ${PROP_TYPES[pr.type]?.label || pr.type} — click the floor, right-click turns it, Esc puts it back`);
+                       }
+                     }}
+                     style={{ cursor: "pointer", color: "#c0bdb8", fontSize: 12 }}>&#10021;</a>
                   <a title="Turn it 15° (hold shift for a quarter)"
                      onClick={(e) => { e.stopPropagation(); turnProp(pr.id, e.shiftKey ? Math.PI / 2 : Math.PI / 12); }}
                      style={{ cursor: "pointer", color: "#c0bdb8", fontSize: 12 }}>&#8635;</a>
@@ -1109,8 +1135,8 @@ export default function InteractionStudioPage() {
                 </div>
               )}
               <p style={{ margin: "8px 0 0", fontSize: 10.5, color: "#a8a5a0", lineHeight: 1.5 }}>
-                Rehearsal furniture. Saved with the script as a stand-in — a real
-                room supplies the real pieces later, and what the script depends
+                Rehearsal furniture. Saved with the composition as a stand-in — a
+                real room supplies the real pieces later, and what it depends
                 on is that something was in the way, not where it stood.
               </p>
             </div>

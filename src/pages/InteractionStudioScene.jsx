@@ -443,6 +443,32 @@ export default function InteractionStudioScene({ cast, onRig, onStatus, still = 
       return hit ? { x: hit.point.x, z: hit.point.z } : null;
     };
 
+    // Where this footprint lands, and what that means.
+    //
+    // Overlapping another prop is ALLOWED. A chair tucked under a table is the
+    // commonest arrangement furniture has, and refusing it would contradict the
+    // rig, which already has a `direct` walk mode written for exactly this case:
+    // "sitting into a chair at a table means entering space the planner rightly
+    // calls illegal". The planner treats props as boxes, so an overlapping pair
+    // simply means that floor is not walkable — which is true, and is the
+    // author's business rather than this function's.
+    //
+    // Leaving the ROOM is refused, because a prop outside the walls is not a
+    // choice anybody is making on purpose.
+    const OUT = "out", OVER = "over", CLEAR = "clear";
+    const footprintState = (type, x, z, yaw, ignoreId) => {
+      const t = PROP_TYPES[type] || PROP_TYPES.table;
+      const c = Math.abs(Math.cos(yaw)), sn = Math.abs(Math.sin(yaw));
+      const hw = t.hw * c + t.hd * sn, hd = t.hw * sn + t.hd * c;
+      const limit = ROOM.size / 2;
+      if (Math.abs(x) + hw > limit || Math.abs(z) + hd > limit) return OUT;
+      for (const o of api.current.obstacles || []) {
+        if (!o.type || o.id === ignoreId) continue;
+        if (Math.abs(o.x - x) < o.hw + hw && Math.abs(o.z - z) < o.hd + hd) return OVER;
+      }
+      return CLEAR;
+    };
+
     const onPlaceMove = (ev) => {
       const a = api.current;
       if (!a.placing) return;
@@ -451,10 +477,28 @@ export default function InteractionStudioScene({ cast, onRig, onStatus, still = 
       a.placing.at = p;
       a.placing.ghost.position.set(p.x, 0, p.z);
       a.placing.ghost.rotation.y = a.placing.yaw;
+
+      // The square on the floor is the thing you are actually deciding about:
+      // not where the model's silhouette falls, but how much floor it takes
+      // away from everyone who has to walk past it.
+      const state = footprintState(a.placing.type, p.x, p.z, a.placing.yaw, a.placing.replaceId);
+      a.placing.fits = state !== OUT;
+      // Green clear, amber sharing the floor with something, red outside the
+      // room. Only the red one refuses — amber is information, not a veto.
+      const tint = state === OUT ? 0xd85a30 : state === OVER ? 0xc9973a : 0x1d9e75;
+      if (a.placing.pad) {
+        a.placing.pad.material.color.setHex(tint);
+        a.placing.pad.material.opacity = state === CLEAR ? 0.26 : 0.34;
+      }
+      if (a.placing.edge) a.placing.edge.material.color.setHex(tint);
     };
 
     const onPlaceClick = (ev) => {
       const a = api.current;
+      // Left button only. Every pointerdown used to drop the prop, so the
+      // right-click that now turns it would have put it down instead — and a
+      // middle-click always could.
+      if (ev.button !== undefined && ev.button !== 0) return;
       if (a.picking) {
         const p = floorPoint(ev);
         if (p) { ev.preventDefault(); ev.stopPropagation(); a.picking(p); }
@@ -465,25 +509,39 @@ export default function InteractionStudioScene({ cast, onRig, onStatus, still = 
       ev.stopPropagation();
       const p = a.placing.at;
       if (!p) return;
-      const prop = { id: Math.random().toString(36).slice(2, 9), type: a.placing.type,
+      // The only refusal is a prop outside the walls. The square has been red
+      // under the cursor the whole time, so this confirms what it already said.
+      if (a.placing.fits === false) return;
+      const keep = a.placing.replaceId;
+      const prop = { id: keep || Math.random().toString(36).slice(2, 9), type: a.placing.type,
                      x: +p.x.toFixed(3), z: +p.z.toFixed(3), yaw: +a.placing.yaw.toFixed(4) };
-      a.setObstacles([...(a.obstacles || []), prop]);
+      // Moving keeps the id, so every entry that names this prop still names it.
+      const rest = (a.obstacles || []).filter(o => o.id !== keep);
+      a.setObstacles([...rest, prop]);
       a.endPlacing?.();
       a.onProps?.(a.obstacles);
+    };
+
+    // Turning, wherever the instruction comes from. Fine by default, quarter
+    // turns with shift — you usually want a chair askew by a little, and square
+    // to the room occasionally.
+    const turnPlacing = (coarse) => {
+      const a = api.current;
+      if (!a.placing) return;
+      const step = coarse ? Math.PI / 2 : Math.PI / 12;
+      a.placing.yaw = (a.placing.yaw + step) % (Math.PI * 2);
+      a.placing.ghost.rotation.y = a.placing.yaw;
+      // Re-run the move so the footprint re-tests against the room: a chair
+      // that fits lengthwise in a gap does not fit across it, and the square
+      // has to say so as it turns.
+      onPlaceMove({ clientX: a.placing.lastX, clientY: a.placing.lastY });
     };
 
     const onPlaceKey = (ev) => {
       const a = api.current;
       if (!a.placing) return;
       if (ev.key === "Escape") a.endPlacing?.();
-      if (ev.key.toLowerCase() === "r") {
-        // Fine by default, quarter-turns with shift — you usually want a chair
-        // askew by a little, and square to the room occasionally.
-        const step = ev.shiftKey ? Math.PI / 2 : Math.PI / 12;
-        a.placing.yaw = (a.placing.yaw + step) % (Math.PI * 2);
-        a.placing.ghost.rotation.y = a.placing.yaw;
-        onPlaceMove({ clientX: a.placing.lastX, clientY: a.placing.lastY });
-      }
+      if (ev.key.toLowerCase() === "r") turnPlacing(ev.shiftKey);
     };
 
     renderer.domElement.addEventListener("pointermove", (e) => {
@@ -492,6 +550,15 @@ export default function InteractionStudioScene({ cast, onRig, onStatus, still = 
       onPlaceMove(e);
     });
     renderer.domElement.addEventListener("pointerdown", onPlaceClick, true);
+    // Right-click turns whatever you are holding, so a prop can be placed and
+    // squared up without the hand leaving the mouse. Only while placing: the
+    // rest of the time the browser's own menu is nobody's to take away.
+    renderer.domElement.addEventListener("contextmenu", (ev) => {
+      if (!api.current.placing) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      turnPlacing(ev.shiftKey);
+    }, true);
     window.addEventListener("keydown", onPlaceKey);
 
     const controls = new OrbitControls(camera, renderer.domElement);
@@ -524,7 +591,26 @@ export default function InteractionStudioScene({ cast, onRig, onStatus, still = 
                       controls.enabled = true;
                       return true;
                     },
-                    beginPlacing: (type) => {
+                    // Pick a placed prop back up. It leaves the room the moment you
+                    // lift it — a ghost AND the thing it stands for both drawn is
+                    // two chairs — and comes back with the same id when you put it
+                    // down, so nothing that referred to it has to be rewritten.
+                    moveProp: (id) => {
+                      const a = api.current;
+                      const it = (a.obstacles || []).find(o => o.id === id);
+                      if (!it) return false;
+                      // Out of the ROOM, so the ghost is not drawn on top of the
+                      // thing it stands for and the footprint does not collide
+                      // with itself — but NOT out of the composition. Telling the
+                      // page it had gone made "walk to a prop" unmeasurable, so
+                      // both entries started at zero, overlapped, and the
+                      // character's track split into two lanes for as long as the
+                      // chair was in your hand. It is being moved, not deleted.
+                      const original = { ...it };
+                      a.setObstacles((a.obstacles || []).filter(o => o.id !== id));
+                      return a.beginPlacing(it.type, { yaw: it.yaw ?? 0, replaceId: id, original });
+                    },
+                    beginPlacing: (type, opts = {}) => {
                       const a = api.current;
                       a.endPlacing?.();
                       const t = PROP_TYPES[type] || PROP_TYPES.table;
@@ -536,9 +622,32 @@ export default function InteractionStudioScene({ cast, onRig, onStatus, still = 
                         m.position.set(px, py, pz);
                         ghost.add(m);
                       }
+                      // The footprint. A filled square plus a bright edge, flat on
+                      // the floor, sized to the prop's own half-extents — the same
+                      // numbers the path planner will use once it is down.
+                      const pad = new THREE.Mesh(
+                        new THREE.PlaneGeometry(t.hw * 2, t.hd * 2),
+                        new THREE.MeshBasicMaterial({ color: 0x1d9e75, transparent: true,
+                                                      opacity: 0.26, depthWrite: false,
+                                                      side: THREE.DoubleSide }));
+                      pad.rotation.x = -Math.PI / 2;
+                      pad.position.y = 0.006;
+                      ghost.add(pad);
+
+                      const edge = new THREE.LineSegments(
+                        new THREE.EdgesGeometry(new THREE.PlaneGeometry(t.hw * 2, t.hd * 2)),
+                        new THREE.LineBasicMaterial({ color: 0x1d9e75 }));
+                      edge.rotation.x = -Math.PI / 2;
+                      edge.position.y = 0.008;
+                      ghost.add(edge);
+
                       ghost.position.set(0, 0, 0);
                       scene.add(ghost);
-                      a.placing = { type, yaw: 0, ghost, at: null, lastX: 0, lastY: 0 };
+                      a.placing = { type, yaw: opts.yaw || 0, ghost, pad, edge, fits: true,
+                                    replaceId: opts.replaceId || null,
+                                    original: opts.original || null,
+                                    at: null, lastX: 0, lastY: 0 };
+                      ghost.rotation.y = a.placing.yaw;
                       // Orbiting while placing fights the cursor for the same
                       // drag, so it waits its turn.
                       controls.enabled = false;
@@ -555,6 +664,14 @@ export default function InteractionStudioScene({ cast, onRig, onStatus, still = 
                         m.geometry?.dispose?.();
                         m.material?.dispose?.();
                       });
+                      // Cancelled mid-move: put it back where it was. Without
+                      // this, Escape while holding a prop is a delete that looks
+                      // like a cancel — and the page never heard it leave, so the
+                      // panel would go on listing furniture the room no longer had.
+                      const back = a.placing.original;
+                      if (back && !(a.obstacles || []).some(o => o.id === back.id)) {
+                        a.setObstacles([...(a.obstacles || []), back]);
+                      }
                       a.placing = null;
                       controls.enabled = true;
                       return true;
@@ -1001,11 +1118,15 @@ export default function InteractionStudioScene({ cast, onRig, onStatus, still = 
     // The settle writes the same bones; leaving it running would keep her
     // leaning on a chair she has stood up from.
     fig.settling = null;
-    if (!p?.tracks || !fig.rest) return;
+    if (!p?.tracks) return;
     for (const tr of p.tracks) {
       const bone = p.bones?.get(tr.rigBone);
-      const rest = fig.rest.get(tr.rigBone);
-      if (bone && rest) bone.quaternion.copy(rest);
+      if (!bone) continue;
+      // Back to the frozen idle where there is one — snapping to `rest` in the
+      // editor would leave the arms out at forty-five degrees, which is not
+      // where she was standing before the pose.
+      const back = fig.stillBase?.get(tr.rigBone) || fig.rest?.get(tr.rigBone);
+      if (back) bone.quaternion.copy(back);
     }
   }
 
@@ -1038,14 +1159,40 @@ export default function InteractionStudioScene({ cast, onRig, onStatus, still = 
       // idle never touches (the legs), where the mixer resets nothing and a
       // live base would compound frame over frame into a heap.
       p.mixerBones = new Set();
-      const idleClip = fig.actions?.idle?.getClip?.();
-      for (const t of idleClip?.tracks || []) {
-        const dot = t.name.lastIndexOf(".");
-        if (dot > 0) p.mixerBones.add(t.name.slice(0, dot));
+
+      // STILL MODE. The whole paragraph above turns on the mixer rewriting its
+      // bones every frame. Freeze the idle and it stops doing that, so
+      // `multiply` no longer applies the delta once — it applies it again on
+      // every frame, and the arms rotate away and never stop. Exactly the
+      // failure the leg bones already had, arriving at the arms by a different
+      // road (caught live, 2026-09-13).
+      //
+      // With nothing moving underneath, no bone is "owned" by the mixer, so
+      // every one composes onto a captured base. That base is the FROZEN IDLE
+      // itself, taken once per figure and reused — not `rest`, which is the
+      // A-pose and is what made her look like a bird flying.
+      const still = stillRef.current;
+      if (still && !fig.stillBase) fig.stillBase = new Map();
+      if (!still) {
+        const idleClip = fig.actions?.idle?.getClip?.();
+        for (const t of idleClip?.tracks || []) {
+          const dot = t.name.lastIndexOf(".");
+          if (dot > 0) p.mixerBones.add(t.name.slice(0, dot));
+        }
       }
       for (const tr of p.tracks) {
         const bone = p.bones.get(tr.rigBone);
         if (!bone) continue;
+        if (still) {
+          // Captured the first time this bone is ever posed, when it still
+          // holds the clean frozen idle. Never recaptured: poseAt replaces the
+          // pose object on every scrub tick, and re-reading the bone then would
+          // fold the last delta into the base — the compounding again, one
+          // scrub at a time.
+          if (!fig.stillBase.has(tr.rigBone)) fig.stillBase.set(tr.rigBone, bone.quaternion.clone());
+          p.base.set(tr.rigBone, fig.stillBase.get(tr.rigBone));
+          continue;
+        }
         const rest = fig.rest?.get(tr.rigBone);
         p.base.set(tr.rigBone, (rest || bone.quaternion).clone());
       }
@@ -3061,6 +3208,11 @@ export default function InteractionStudioScene({ cast, onRig, onStatus, still = 
 
       // Props: typed furniture, placed by pointing at the floor.
       addProp: (type) => a.beginPlacing?.(type),
+      // Same delegation as addProp. Defining it on the internal helper
+      // object only is how it came to be unreachable: the page holds the
+      // PUBLISHED rig, and an optional call to a method that is not on it
+      // fails by doing nothing at all.
+      moveProp: (id) => a.moveProp?.(id),
       cancelProp: () => a.endPlacing?.(),
       // What is waiting to be put down, so the UI can stop looking armed when
       // the scene has already ended placement (a drop, or Escape).

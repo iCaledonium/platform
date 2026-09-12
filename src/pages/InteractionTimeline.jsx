@@ -53,7 +53,7 @@ export default function InteractionTimeline({ steps, cameras, selected, selected
                                               liveStep, marks, running, onPlay, onAddStep, onAddCamera,
                                               onMoveCamera, onScrub, onRemoveStep, onRemoveCamera,
                                               propList, cast = ["a", "b"],
-                                              roster = null, onAddTo }) {
+                                              roster = null, onAddTo, onReset }) {
   const trackRef = useRef(null);
   const [head, setHead] = useState(0);
   const [dragging, setDragging] = useState(false);
@@ -251,6 +251,27 @@ export default function InteractionTimeline({ steps, cameras, selected, selected
                          background: running ? "#fff" : "#b45309", color: running ? "#b45309" : "#fff" }}>
           {running ? "\u25a0" : "\u25b6"}
         </button>
+        {/* Beside the transport, because that is what it is: the control that
+            puts the run back to its beginning. It sat among the room's own
+            buttons, next to Add prop and Clear scene, where it read as
+            furniture management and looked redundant with Run. */}
+        {onReset && (
+          <button onClick={() => {
+                    // The playhead goes home with the bodies. Leaving it where
+                    // the last run stopped meant the strip claimed to be two
+                    // seconds into a composition whose cast was standing on
+                    // their opening marks — the readout and the room
+                    // disagreeing about the same instant.
+                    setHead(0);
+                    onReset();
+                  }}
+                  title="Back to the opening marks: releases held poses, stands anyone seated, cancels a walk in flight, and clears personal space"
+                  style={{ fontSize: 11, lineHeight: "20px", height: 26, padding: "0 9px",
+                           borderRadius: 5, cursor: "pointer", border: "1px solid #ddd8d0",
+                           background: "#fff", color: "#55524e" }}>
+            Reset
+          </button>
+        )}
         <strong style={{ fontSize: 12.5 }}>Timeline</strong>
         <span style={{ fontSize: 10.5, color: "#a8a5a0" }}>
           {empty
