@@ -78,11 +78,24 @@ function hueFor(id) {
 
 const initials = name => (name || "?").split(" ").map(n => n[0]).join("").slice(0, 2).toUpperCase();
 
-function clock(iso) {
+// Message times carried no date, so anything sent before today read as if it
+// were sent today -- three messages at 04:32 PM, 06:30 PM and 08:32 PM look
+// like one evening even when they are days apart. Time alone while it is still
+// today, date in front once it is not, year too once that differs.
+function stamp(iso) {
   if (!iso) return "—";
   const d = new Date(iso.endsWith("Z") || iso.includes("+") ? iso : iso + "Z");
   if (isNaN(d)) return "—";
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const now  = new Date();
+  const sameDay = d.getFullYear() === now.getFullYear()
+    && d.getMonth() === now.getMonth()
+    && d.getDate() === now.getDate();
+  if (sameDay) return time;
+  const dateOpts = d.getFullYear() === now.getFullYear()
+    ? { month: "short", day: "numeric" }
+    : { year: "numeric", month: "short", day: "numeric" };
+  return `${d.toLocaleDateString([], dateOpts)}, ${time}`;
 }
 
 // ── one draggable panel ──────────────────────────────────────────────────────
@@ -556,7 +569,7 @@ export default function WorldInstruments({ world, playerActorId }) {
             {feed.length === 0 && <p className={styles.empty}>Nothing has happened yet today.</p>}
             {feed.map(e => (
               <div key={e.id} className={styles.ev}>
-                <time className={styles.evTime}>{clock(e.at)}</time>
+                <time className={styles.evTime}>{stamp(e.at)}</time>
                 <span className={styles.evDot} style={{ background: hueFor(e.actor_id) }} />
                 <p className={styles.evText}>
                   {/* Most entries are written as full sentences that already name
@@ -655,7 +668,16 @@ export default function WorldInstruments({ world, playerActorId }) {
                   {threadMsgs.map(m => (
                     <div key={m.id} style={{ display: "contents" }}>
                       <div className={`${styles.msg} ${m.from_me ? styles.msgOut : styles.msgIn}`}>{m.content}</div>
-                      <span className={styles.msgt}>{clock(m.sent_at)}</span>
+                      <span className={styles.msgt}>
+                        {stamp(m.sent_at)}
+                        {/* Only on outgoing: read_at on a message the ACTOR received is
+                            stamped when she processed it, a real read. On an incoming one
+                            it is set in bulk when the player opens the thread
+                            (sms_live.ex update_all), which says nothing about her. */}
+                        {m.from_me && m.read_at
+                          ? <span className={styles.msgread} title={`Read ${stamp(m.read_at)}`}> · Read</span>
+                          : null}
+                      </span>
                     </div>
                   ))}
                 </div>
@@ -693,7 +715,7 @@ export default function WorldInstruments({ world, playerActorId }) {
                       <div className={styles.tname}>{c.name}</div>
                       <div className={styles.tprev}>{c.last_message || c.occupation || "—"}</div>
                     </div>
-                    <span className={styles.twhen}>{c.last_sent_at ? clock(c.last_sent_at) : ""}</span>
+                    <span className={styles.twhen}>{c.last_sent_at ? stamp(c.last_sent_at) : ""}</span>
                   </div>
                 ))}
                 {sealedNote(comms.sealedContacts)}
@@ -716,7 +738,7 @@ export default function WorldInstruments({ world, playerActorId }) {
                 <div className={styles.agenda}>
                   {comms.calendar.map(m => (
                     <div key={m.id} className={styles.slot}>
-                      <span className={styles.slott}>{clock(m.scheduled_at)}</span>
+                      <span className={styles.slott}>{stamp(m.scheduled_at)}</span>
                       <div className={styles.slotc}>
                         <div className={`${styles.apt} ${m.with_private ? styles.aptPrivate : m.status === "confirmed" ? "" : styles.aptSoft}`}>
                           {m.with_private ? "Private appointment" : `With ${m.with_name}`}
@@ -754,7 +776,7 @@ export default function WorldInstruments({ world, playerActorId }) {
                       <div className={styles.tname}>
                         {v.sender_name}{!v.read_at && <span className={styles.unread} />}
                       </div>
-                      <div className={styles.tprev}>{clock(v.sent_at)}</div>
+                      <div className={styles.tprev}>{stamp(v.sent_at)}</div>
                       <div className={styles.vmt}>{v.content}</div>
                     </div>
                   </div>
@@ -805,7 +827,7 @@ export default function WorldInstruments({ world, playerActorId }) {
                 </div>
                 <div className={styles.kv}>
                   <span className={styles.kvKey}>Last tick</span>
-                  <span className={styles.kvVal}>{clock(selected.engine?.ticked_at)}</span>
+                  <span className={styles.kvVal}>{stamp(selected.engine?.ticked_at)}</span>
                 </div>
                 {selected.balance_minor != null && (
                   <div className={styles.kv}>
@@ -847,7 +869,7 @@ export default function WorldInstruments({ world, playerActorId }) {
               <div className={styles.tlab}>{runtime?.running ? "Running" : "Stopped"}</div>
               <div className={styles.tsub}>
                 {runtime?.running
-                  ? `${people.filter(p => p.awake).length} awake · last tick ${clock(lastTick)}`
+                  ? `${people.filter(p => p.awake).length} awake · last tick ${stamp(lastTick)}`
                   : "Nobody is ticking."}
               </div>
               <button className={styles.force} onClick={forceTick}

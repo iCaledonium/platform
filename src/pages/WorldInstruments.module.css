@@ -373,6 +373,7 @@
 .msg { max-width: 78%; padding: 8px 12px; border-radius: 14px; font-size: 12px; line-height: 1.55; }
 .msgIn  { align-self: flex-start; background: #e6e1da; color: #1a1a1a; border-bottom-left-radius: 5px; }
 .msgOut { align-self: flex-end;   background: #1a1814; color: #faf8f4; border-bottom-right-radius: 5px; }
+.msgread { color: var(--accent, #6b8f71); font-weight: 500; }
 .msgt { font-size: 10px; color: var(--text-3); align-self: center; font-variant-numeric: tabular-nums; }
 .composer { display: flex; gap: 8px; padding: 14px 18px; border-top: .5px solid var(--border); }
 .composer input {
