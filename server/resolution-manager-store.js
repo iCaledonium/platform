@@ -44,6 +44,16 @@ db.exec(`
 `);
 try { db.exec(`ALTER TABLE resolution_manager ADD COLUMN active_workers TEXT NOT NULL DEFAULT '[]'`); }
 catch { /* already there */ }
+// `pile` (2026-09-12): the uncommitted work sitting in the two governed
+// working trees, per host — dirty file count, insertions/deletions, and the
+// age of the oldest dirty file. Workers edit in place and leave the change
+// uncommitted BY DESIGN so a person reviews before anything lands, but
+// nothing surfaced how much had piled up: ~3,500 insertions of verified
+// repair were unlanded with no number rising anywhere, and a single
+// `git checkout` by anyone tidying up would discard it silently. Stored so
+// the board can show it climbing. Nothing here commits anything.
+try { db.exec(`ALTER TABLE resolution_manager ADD COLUMN pile TEXT NOT NULL DEFAULT '{}'`); }
+catch { /* already there */ }
 try { db.exec(`ALTER TABLE resolution_manager ADD COLUMN recent TEXT NOT NULL DEFAULT '[]'`); }
 catch { /* already there */ }
 try { db.exec(`ALTER TABLE resolution_manager ADD COLUMN paused INTEGER NOT NULL DEFAULT 0`); }
@@ -128,6 +138,7 @@ const DEFAULTS = {
   id: "singleton", state: "idle", bench: null, check_name: null, note: null,
   started_at: null, updated_at: null, resolved_count: 0, flagged_count: 0,
   last_result: null, last_run_at: null, active_workers: [], recent: [],
+  pile: {},
   paused: false, paused_by: null,
 };
 
@@ -137,7 +148,9 @@ function parseRow(row) {
   try { active_workers = JSON.parse(row.active_workers || "[]"); } catch { /* leave [] */ }
   let recent = [];
   try { recent = JSON.parse(row.recent || "[]"); } catch { /* leave [] */ }
-  return { ...row, active_workers, recent, paused: !!row.paused };
+  let pile = {};
+  try { pile = JSON.parse(row.pile || "{}"); } catch { /* leave {} */ }
+  return { ...row, active_workers, recent, pile, paused: !!row.paused };
 }
 
 export function getStatus() {
@@ -163,25 +176,28 @@ export function setStatus(patch) {
     check_name: redactSecrets(merged.check_name),
     active_workers: scrubDeep(merged.active_workers || []),
     recent: scrubDeep(merged.recent || []),
+    pile: scrubDeep(merged.pile || {}),
   };
   const activeWorkersJson = JSON.stringify(next.active_workers);
   const recentJson = JSON.stringify(next.recent);
+  const pileJson = JSON.stringify(next.pile);
   db.prepare(`
     INSERT INTO resolution_manager
       (id, state, bench, check_name, note, started_at, updated_at,
-       resolved_count, flagged_count, last_result, last_run_at, active_workers, recent,
+       resolved_count, flagged_count, last_result, last_run_at, active_workers, recent, pile,
        paused, paused_by)
-    VALUES ('singleton', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES ('singleton', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       state = excluded.state, bench = excluded.bench, check_name = excluded.check_name,
       note = excluded.note, started_at = excluded.started_at, updated_at = excluded.updated_at,
       resolved_count = excluded.resolved_count, flagged_count = excluded.flagged_count,
       last_result = excluded.last_result, last_run_at = excluded.last_run_at,
       active_workers = excluded.active_workers, recent = excluded.recent,
+      pile = excluded.pile,
       paused = excluded.paused, paused_by = excluded.paused_by
   `).run(next.state, next.bench, next.check_name, next.note, next.started_at,
          next.updated_at, next.resolved_count, next.flagged_count,
-         next.last_result, next.last_run_at, activeWorkersJson, recentJson,
+         next.last_result, next.last_run_at, activeWorkersJson, recentJson, pileJson,
          next.paused ? 1 : 0, next.paused_by);
   return next;
 }

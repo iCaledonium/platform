@@ -224,7 +224,7 @@ export default function ResolutionManagerPage() {
               <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                 <span style={{ fontSize: 20, color: "#7fc08a",
                   fontFamily: "'Cormorant Garamond',Georgia,serif" }}>{incidentCounts?.resolved ?? 0}</span>
-                <span style={{ ...label, fontSize: 9 }}>resolved</span>
+                <span style={{ ...label, fontSize: 9 }} title="Lifetime resolve EVENTS, not distinct incidents — a row that reopens and is resolved again counts twice.">resolved ·<span style={{ opacity: .6 }}> events</span></span>
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                 <span style={{ fontSize: 20, color: "#e0736b",
@@ -242,6 +242,48 @@ export default function ResolutionManagerPage() {
                 <span style={{ ...label, fontSize: 9 }}>last run</span>
               </div>
             </div>
+
+            {status.pile && Object.keys(status.pile).length > 0 && (() => {
+              const hosts = Object.entries(status.pile);
+              const total = hosts.reduce((n, [, v]) => n + (v.insertions || 0), 0);
+              const oldest = hosts
+                .map(([, v]) => v.oldest_dirty_at).filter(Boolean).sort()[0];
+              return (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  <span style={label}>Unlanded work</span>
+                  <span style={{ fontSize: 10.5, lineHeight: 1.6, color: "rgba(255,255,255,.4)", marginTop: -2 }}>
+                    Every fix is edited in place and left uncommitted on purpose — a person
+                    reviews and commits. This is how much is waiting. A{" "}
+                    <code style={{ color: "rgba(255,255,255,.55)" }}>git checkout</code> by
+                    anyone tidying up would discard it, and nothing else would report that.
+                  </span>
+                  {hosts.map(([host, v]) => (
+                    <div key={host} style={{ display: "flex", gap: 10, alignItems: "baseline",
+                      fontSize: 11.5, color: "rgba(255,255,255,.7)" }}>
+                      <span style={{ minWidth: 74, color: "rgba(255,255,255,.45)" }}>{host}</span>
+                      {v.error
+                        ? <span style={{ color: "#e0736b" }}>unreadable — {v.error}</span>
+                        : <>
+                            <span>{v.dirty_files} file{v.dirty_files === 1 ? "" : "s"}</span>
+                            <span style={{ color: "rgba(150,210,150,.8)" }}>+{v.insertions}</span>
+                            <span style={{ color: "rgba(224,115,107,.8)" }}>−{v.deletions}</span>
+                            <span style={{ color: "rgba(255,255,255,.35)" }}>
+                              oldest {ago(v.oldest_dirty_at)}
+                            </span>
+                          </>}
+                    </div>
+                  ))}
+                  {total > 0 && (
+                    <span style={{ fontSize: 10, color: quietFor(oldest) > 86400
+                      ? "rgba(224,115,107,.8)" : "rgba(255,255,255,.35)" }}>
+                      {total} insertion{total === 1 ? "" : "s"} unlanded
+                      {oldest ? `, oldest ${ago(oldest)}` : ""}
+                      {quietFor(oldest) > 86400 ? " — over a day without a landing pass" : ""}
+                    </span>
+                  )}
+                </div>
+              );
+            })()}
 
             {(status.recent || []).length > 0 && (
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
