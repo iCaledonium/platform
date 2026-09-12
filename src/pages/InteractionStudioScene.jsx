@@ -900,6 +900,7 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
     stepSitting(fig, delta);
     stepSettling(fig, delta);
     stepPulling(fig, delta);
+    stepScooting(fig, delta);
   }
 
   // ── body interactions ─────────────────────────────────────────────────────
@@ -913,6 +914,21 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
   // because `idle` does not animate the legs. So a released sit left her legs
   // folded forever: she stood up still bent, and the next sit measured from
   // there. Anything that drops a pose comes through here.
+  const _qIdent = new THREE.Quaternion();
+
+  // Standing up is the sit LEAVING the body, not being deleted from it.
+  // releasePose() snaps every tracked bone to rest in one frame — right for
+  // a reset, and exactly why he rose "faster than superman" (Magnus,
+  // 2026-09-12): legs teleported straight, then the root chased them. This
+  // marks the pose as RELEASING instead; applyPose fades its deltas toward
+  // identity over `dur`, so the knees unfold across the rise.
+  function releasePoseGently(fig, dur = 0.9) {
+    fig.settling = null;
+    const p = fig.pose;
+    if (!p) return;
+    if (!p.releasing) p.releasing = { t: 0, dur };
+  }
+
   function releasePose(fig) {
     const p = fig.pose;
     fig.pose = null;
@@ -946,14 +962,33 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
     // which never ends, made it visible.
     if (!p.base) {
       p.base = new Map();
+      // WHO owns each bone decides what a delta composes onto. Bones the idle
+      // clip animates are rewritten by the mixer every frame, so their honest
+      // base is the mixer's live value — that is what "composed on top of the
+      // idle" means, and it is why she keeps breathing through an action. But
+      // the REST pose is the A-POSE: using it as the base for the arms held
+      // them out at 45 degrees through every sit and stand — "he looks like a
+      // bird flying" (Magnus, 2026-09-12). Rest stays the base ONLY for bones
+      // idle never touches (the legs), where the mixer resets nothing and a
+      // live base would compound frame over frame into a heap.
+      p.mixerBones = new Set();
+      const idleClip = fig.actions?.idle?.getClip?.();
+      for (const t of idleClip?.tracks || []) {
+        const dot = t.name.lastIndexOf(".");
+        if (dot > 0) p.mixerBones.add(t.name.slice(0, dot));
+      }
       for (const tr of p.tracks) {
         const bone = p.bones.get(tr.rigBone);
         if (!bone) continue;
-        // Rest first; only fall back to the live rotation if this body somehow
-        // has no rest recorded, because that path bakes in a stride.
         const rest = fig.rest?.get(tr.rigBone);
         p.base.set(tr.rigBone, (rest || bone.quaternion).clone());
       }
+    }
+    let releaseK = 0;
+    if (p.releasing) {
+      p.releasing.t += delta;
+      const r = Math.min(1, p.releasing.t / p.releasing.dur);
+      releaseK = r * r * (3 - 2 * r);
     }
     for (const tr of p.tracks) {
       const bone = p.bones.get(tr.rigBone);
@@ -963,7 +998,68 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
       const [rx, ry, rz] = sampleTrack(tr, p.t);
       _e.set(rx * DEG, ry * DEG, rz * DEG);
       _q.setFromEuler(_e);
-      bone.quaternion.copy(base).multiply(_q);
+      if (releaseK > 0) _q.slerp(_qIdent, releaseK);
+      if (p.mixerBones?.has(bone.name)) bone.quaternion.multiply(_q);
+      else bone.quaternion.copy(base).multiply(_q);
+    }
+    // wrapTorso: the pose's arm angles are a shape; the BODY decides how far
+    // forward that shape must sit. Measured ONCE when the hold settles: the
+    // torso's real front reach (chest+belly region, arms and head excluded)
+    // versus where the hands actually are, converted to the extra forward
+    // swing that clears it. Applied every frame on top of the tracks — the
+    // arms are mixer-driven, so the multiply lands once per frame — and
+    // faded out with the release.
+    if (p.adapt === "wrapTorso" && p.t >= p.duration && p.wrapX == null) {
+      fig.group.updateMatrixWorld(true);
+      const chest = fig.group.getObjectByName("spine3");
+      if (chest) {
+        const facing = fig.group.rotation.y;
+        const fdir = new THREE.Vector3(Math.sin(facing), 0, Math.cos(facing));
+        const cp = chest.getWorldPosition(new THREE.Vector3());
+        // The SHIRT is the surface you see — clear that, not the flesh under
+        // it. And the clearance is judged for the WHOLE forearm, every
+        // vertex: checking only the hand bones let the forearm SHAFT lie
+        // buried in the belly with a clean wrist poking out, and the check
+        // passed (Magnus: "you are pulling the forearms thru the body").
+        const torso = limbSurface(fig,
+          limbRegion(fig, "spine1", ["l_upperarm", "r_upperarm", "neck1"]),
+          { dir: fdir, origin: cp });
+        const front = torso?.maxAlong ?? 0.12;
+        const back = fdir.clone().negate();
+        let limbFwd = Infinity;
+        for (const sd of ["r", "l"]) {
+          const span = limbSurface(fig, limbRegion(fig, sd + "_forearm"),
+            { dir: back, origin: cp });
+          if (span && span.maxAlong != null) limbFwd = Math.min(limbFwd, -span.maxAlong);
+        }
+        const need = front + 0.04 - (Number.isFinite(limbFwd) ? limbFwd : front);
+        p.wrapX = need > 0 ? Math.min(42, Math.asin(Math.min(0.95, need / 0.45)) / DEG) : 0;
+      } else p.wrapX = 0;
+    }
+    if (p.adapt === "wrapTorso" && p.wrapX > 0) {
+      const w = p.wrapX * (1 - releaseK);
+      for (const n of ["r_upperarm", "l_upperarm"]) {
+        const b = fig.group.getObjectByName(n);
+        if (!b) continue;
+        _e.set(w * DEG, 0, 0);
+        _q.setFromEuler(_e);
+        b.quaternion.multiply(_q);
+      }
+    }
+
+    if (p.releasing && releaseK >= 1) {
+      // Fully faded. Rest-restore only the bones the mixer will NOT rewrite
+      // next frame — snapping a mixer-driven arm to the A-pose rest, even for
+      // one frame, is a wing-flap.
+      for (const tr of p.tracks) {
+        if (p.mixerBones?.has(tr.rigBone)) continue;
+        const bone = p.bones.get(tr.rigBone);
+        const rest = fig.rest?.get(tr.rigBone);
+        if (bone && rest) bone.quaternion.copy(rest);
+      }
+      fig.pose = null;
+      p.resolve?.();
+      return;
     }
 
     // Contact is an authored instant, not a collision: see bodyActions.js for
@@ -1038,8 +1134,13 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
         tracks, bones: bonesOf(fig, tracks),
         t: 0, duration: def.duration || 1,
         contactAt: def.contactAt ?? null, fired: def.contactAt == null,
-        hold: def.kind === "pose" && def.hold !== false,
+        // A pose holds unless it says otherwise; anything ELSE holds only if
+        // it asks to. Crossed arms is a reaction (one body, no partner) that
+        // is also a STANCE — with hold gated on kind alone it played its 0.7s
+        // and quietly let the arms back down.
+        hold: def.kind === "pose" ? def.hold !== false : def.hold === true,
         aim: def.aim || null, otherFig: otherFig || null,
+        adapt: def.adapt || null,
         resolve,
         onContact: () => { try { onContact?.(); } catch {} },
       };
@@ -2020,6 +2121,63 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
     }
   }
 
+  // SEATED, YOU AND THE CHAIR ARE ONE OBJECT (Magnus, 2026-09-12: "people
+  // push themself and the chair backwards before raising... pull themself
+  // and the chair forward when seated"). Scooting is that object moving:
+  // the chair entry (planner), the chair mesh, the body root, and the
+  // hands resting on the lap all translate together. Runtime-only, like the
+  // pull — the authored room is not edited by someone shuffling a chair.
+  function startScoot(fig, prop, dir, dist, dur = 0.7) {
+    return new Promise((resolve) => {
+      fig.scooting = {
+        t: 0, dur, dist, dir, prop,
+        propGroup: (api.current.furniture?.children || []).find?.((g) => g.userData?.propId === prop.id) || null,
+        lastK: 0, done: resolve,
+      };
+    });
+  }
+
+  function stepScooting(fig, delta) {
+    const st = fig.scooting;
+    if (!st) return;
+    st.t += delta;
+    const e = Math.min(1, st.t / st.dur);
+    const m = e * e * (3 - 2 * e);
+    const dk = m - st.lastK;
+    st.lastK = m;
+    const dx = st.dir.x * st.dist * dk, dz = st.dir.z * st.dist * dk;
+    st.prop.x += dx; st.prop.z += dz;
+    if (st.propGroup) st.propGroup.position.set(st.prop.x, 0, st.prop.z);
+    fig.group.position.x += dx;
+    fig.group.position.z += dz;
+    // The lap-hand targets are WORLD points; left behind, the settle would
+    // drag his arms backward off his own knees as he slides.
+    const hands = fig.settling?.hands;
+    if (hands) for (const sd of ["l", "r"]) {
+      if (hands[sd]) { hands[sd].x += dx; hands[sd].z += dz; }
+    }
+    if (st.t >= st.dur) { fig.scooting = null; st.done?.(true); }
+  }
+
+  // The nearest piece of furniture in FRONT of a seat, and the gap from the
+  // seat's centre to its near edge — what both scoots decide against.
+  function frontObstacle(prop, facing) {
+    const fx = Math.sin(facing), fz = Math.cos(facing);
+    let best = null;
+    for (const o of api.current.obstacles || []) {
+      if (!o.type || o.id === prop.id) continue;
+      const dx = o.x - prop.x, dz = o.z - prop.z;
+      const fwd = dx * fx + dz * fz;
+      const lat = Math.abs(-dx * fz + dz * fx);
+      if (fwd <= 0 || fwd > 1.6) continue;
+      if (lat > (o.hw + o.hd) / 2 + 0.3) continue;
+      const halfAlong = Math.abs(fx) * o.hw + Math.abs(fz) * o.hd;
+      const gap = fwd - halfAlong;
+      if (!best || gap < best.gap) best = { o, gap };
+    }
+    return best;
+  }
+
   function stepSitting(fig, delta) {
     const st = fig.sitting;
     if (!st) return;
@@ -2029,6 +2187,29 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
 
     fig.group.position.x = st.from.x + (st.to.x - st.from.x) * e;
     fig.group.position.z = st.from.z + (st.to.z - st.from.z) * e;
+
+    // Standing only: the torso pitches forward through the middle of the
+    // rise and returns — a bell, zero at both ends, so it starts seated and
+    // ends upright with no residue. Multiplied onto the mixer's fresh value
+    // (idle animates the spine), so it applies once per frame by design.
+    if (st.standLean) {
+      const bell = Math.sin(Math.PI * Math.min(1, e));
+      for (const [name, deg] of [["spine1", 10], ["spine3", 8]]) {
+        const b = fig.group.getObjectByName(name);
+        if (!b) continue;
+        _e.set(deg * bell * DEG, 0, 0);
+        _q.setFromEuler(_e);
+        b.quaternion.multiply(_q);
+      }
+    }
+    // The chair gives way to the legs, smoothly, over the same rise.
+    if (st.push) {
+      const m = Math.min(1, e);
+      const k = m * m * (3 - 2 * m);
+      st.push.prop.x = st.push.from.x + st.push.dir.x * st.push.dist * k;
+      st.push.prop.z = st.push.from.z + st.push.dir.z * st.push.dist * k;
+      if (st.push.group) st.push.group.position.set(st.push.prop.x, 0, st.push.prop.z);
+    }
 
     // Two constraints, and which one rules changes as she lowers.
     //
@@ -2269,7 +2450,19 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
                   };
                 });
                 playMotion(fig, "sit");
-                return seated;
+                // Seated at a table means AT the table: once the settle has
+                // hold of him, he and the chair scoot forward until the seat
+                // sits a lap's depth from the table's edge.
+                return seated.then(async (r) => {
+                  const fb = frontObstacle(prop, facing);
+                  if (fb && fb.gap > 0.5) {
+                    const dist = Math.min(0.6, fb.gap - 0.42);
+                    if (dist > 0.05) {
+                      await startScoot(fig, prop, { x: Math.sin(facing), z: Math.cos(facing) }, dist);
+                    }
+                  }
+                  return r;
+                });
               });
           },
 
@@ -2314,21 +2507,69 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
               ;
           },
 
-          standUp: () => {
-            if (!fig.seatedOn) return Promise.resolve({ notSeated: true });
-            // Rising is the same movement backwards: the pose releases and the
-            // feet stay planted on the way up, so she pushes off the seat
-            // instead of popping back to standing height.
+          standUp: async () => {
+            if (!fig.seatedOn) return { notSeated: true };
+            // FIRST the chair goes back, WITH him on it — then he stands.
+            // Rising over the feet without this planted him inside the table
+            // he was sitting at: the feet were in the gap, and the gap was
+            // the table's.
+            {
+              const sp = findProp(a.obstacles, fig.seatedOn);
+              if (sp) {
+                const t0 = PROP_TYPES[sp.type];
+                const f0 = (sp.yaw ?? ((sp.rot || 0) * Math.PI) / 2) + (t0?.seatFacing ?? 0);
+                const fb = frontObstacle(sp, f0);
+                if (fb && fb.gap < 0.75) {
+                  const dist = Math.min(0.7, 0.75 - fb.gap);
+                  await startScoot(fig, sp, { x: -Math.sin(f0), z: -Math.cos(f0) }, dist);
+                }
+              }
+            }
+            // A person does not levitate off a chair — they stand OVER THEIR
+            // FEET. Rising in place ended him upright in the middle of the
+            // seat, legs through the wood (Magnus, 2026-09-12, with the whole
+            // recipe: feet down, torso forward, knees straighten, torso back
+            // — and if the legs hit the chair, the chair gives). The feet
+            // stayed planted in front of the seat all through the sit, so the
+            // rise carries the root forward to their midpoint while the pose
+            // fades and a bell-curve forward lean rides through the middle.
+            const seatProp = findProp(a.obstacles, fig.seatedOn);
             fig.seatedOn = null;
-            releasePose(fig);
+            releasePoseGently(fig, 0.9);
             const here = { x: fig.group.position.x, z: fig.group.position.z };
+            const v = new THREE.Vector3();
+            let fx = 0, fz = 0, n = 0;
+            for (const name of ["l_foot", "r_foot"]) {
+              const b = fig.group.getObjectByName(name);
+              if (b) { b.getWorldPosition(v); fx += v.x; fz += v.z; n++; }
+            }
+            const to = n ? { x: fx / n, z: fz / n } : here;
+            // Will his legs end up inside the chair? Measure the gap from
+            // where he will STAND to the chair's centre; a calf needs the
+            // seat's half-depth plus ~0.22 of body. Short of that, the chair
+            // is pushed back by the difference — runtime-only, like the pull:
+            // the authored room is not edited by a body standing up in it.
+            let push = null;
+            if (seatProp) {
+              const t = PROP_TYPES[seatProp.type];
+              const dx = seatProp.x - to.x, dz = seatProp.z - to.z;
+              const d = Math.hypot(dx, dz) || 1;
+              const need = (t?.hd ?? 0.24) + 0.22;
+              if (d < need) {
+                push = {
+                  prop: seatProp, dist: need - d,
+                  dir: { x: dx / d, z: dz / d },
+                  from: { x: seatProp.x, z: seatProp.z },
+                  group: a.furniture?.children?.find?.((g) => g.userData?.propId === seatProp.id) || null,
+                };
+              }
+            }
             return new Promise((resolve) => {
-              // Standing: no seat constraint any more, so the feet rule all
-              // the way up.
-              fig.sitting = { t: 0, dur: 0.4, propId: null, seat: null,
+              fig.sitting = { t: 0, dur: 0.9, propId: null, seat: null,
                               floorAnkle: fig.seatedFloorAnkle ?? null,
+                              standLean: true, push,
                               done: () => { fig.seatedY = 0; resolve(true); },
-                              from: here, to: here };
+                              from: here, to };
             });
           },
 

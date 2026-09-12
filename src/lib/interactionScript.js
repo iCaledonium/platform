@@ -847,13 +847,15 @@ export function estimateTimeline(script, { marks, actionDuration, contactAt, pro
         const seatFace = pr.seatFacing ?? 0;
         const f = (pr.yaw ?? 0) + seatFace;
         const tx = pr.x + Math.sin(f) * 0.55, tz = pr.z + Math.cos(f) * 0.55;
-        dur = Math.hypot(tx - who.x, tz - who.z) / 0.95 + TURN_SECONDS + 0.55;
+        // The sit itself plus the scoot-in toward whatever he sits at.
+        dur = Math.hypot(tx - who.x, tz - who.z) / 0.95 + TURN_SECONDS + 1.2;
         who.x = pr.x; who.z = pr.z; who.facing = f;
       } else {
         dur = 0.55;
       }
     } else if (step.type === "stand_up") {
-      dur = 0.4;
+      // Scoot back from the table, then the rise itself.
+      dur = 1.6;
     } else if (step.type === "approach" && who && other) {
       const d = Math.hypot(other.x - who.x, other.z - who.z);
       const travel = Math.max(0, d - step.distance);

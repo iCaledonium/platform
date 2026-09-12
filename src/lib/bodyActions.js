@@ -133,6 +133,94 @@ export const ACTIONS = {
     ],
   },
 
+  // A stance, not a gesture: crossed arms HOLD until something else moves
+  // the body — dialogue happens over it, which is the point of the pose.
+  // Registered as kind "reaction" because that is the studio's word for "one
+  // body performs this on its own"; the Reaction step plays it with no
+  // partner and no contact. Angles use the conventions measured for the
+  // slap: upper arm X = swing forward, Z+ = across the body (mirrored for
+  // the left), forearm X+ = bend the elbow. Right arm rides on top.
+  "cross-arms": {
+    slug: "cross-arms",
+    name: "Cross the arms",
+    kind: "reaction",
+    duration: 0.9,
+    hold: true,
+    // The angles are a SHAPE; they cannot know how deep this torso is. On a
+    // heavy body the same arc passes through the belly. wrapTorso makes the
+    // rig measure the torso's front surface at hold time and swing both
+    // upper arms forward until the forearms clear it — per body, measured.
+    adapt: "wrapTorso",
+    tracks: [
+      // v1 read as PRAYER, not a cross: elbow flex is one axis, and folding
+      // 104 degrees before the upper arm has come across the chest sends the
+      // forearms straight UP. The cross lives mostly in the UPPER arm — hard
+      // across the body with some internal twist — and the elbow only closes
+      // enough to lay the forearm flat against the chest.
+      // v2 held an invisible box: forearms horizontal but 33cm out in front.
+      // The last piece is the ELBOW closing to bring the forearms back
+      // against the chest — with a little more across so the wrists pass the
+      // midline and actually cross.
+      // Angles PROBED on the rig, not guessed (poseBone sweep, 2026-09-12):
+      // upper-arm Y is the flexion PLANE, and positive Y opens the arm
+      // outward — the cross needs NEGATIVE Y (internal rotation) on the
+      // right, mirrored on the left. With [20,-30,68]+86 the right hand
+      // lands exactly at the chest's front surface, 8cm past the midline,
+      // level. Two blind guesses before this read as prayer and as carrying
+      // an invisible box; one measured sweep ended it.
+      // Matched against a photo (Magnus, 2026-09-12): real crossed arms sit
+      // LOW — under the bust, not on the upper chest — and they WRAP: each
+      // wrist reaches past the opposite elbow to the far flank of the torso,
+      // forearms stacked tight. The probe sweep already contained the wrap:
+      // [10,-55,70] lands the hand 19cm across the midline at the flank.
+      // TWO BEATS, not one (Magnus: "first arms forward, you bend the arms
+      // into the torso"). A single blend from hanging to crossed drags the
+      // forearms diagonally through the body; the real motion reaches
+      // FORWARD first, then folds in. The 0.4s key is that reach.
+      // The ELBOWS stay wide; the FOREARMS do the crossing (Magnus: "you are
+      // pushing the elbows too close to each other"). Probed under the -52
+      // twist: Z does NOT sweep the arm across — it drags the ELBOW inboard
+      // (Z=70 elbow -12cm, Z=25 elbow AT the shoulder line) while the hand
+      // crosses 20cm either way, because the crossing comes from twist +
+      // elbow bend. Euler axes composed after a twist do not mean what
+      // their names say; measure, never reason, about the third axis.
+      { bone: "right_upper_arm", keys: [ [0,[0,0,0]], [0.4,[55,0,10]],  [0.9,[10,-52,25]] ] },
+      // Forearm Y is PRONATION (probed: +60 turns the palm to the ceiling,
+      // -60 turns it against the body). Without it the hands sat under the
+      // cross palms-up, offering a tray.
+      { bone: "right_forearm",   keys: [ [0,[0,0,0]], [0.4,[25,0,0]],   [0.9,[80,-60,0]] ] },
+      { bone: "right_hand",      keys: [ [0,[0,0,0]], [0.4,[0,-6,0]],   [0.9,[0,-14,0]] ] },
+      { bone: "left_upper_arm",  keys: [ [0,[0,0,0]], [0.4,[52,0,-10]], [0.9,[8,48,-22]] ] },
+      // Same sign as the right, NOT the anatomical mirror — this rig's
+      // twist axes do not flip across the body (the hand-basis lesson again:
+      // measure the sign, never derive it).
+      { bone: "left_forearm",    keys: [ [0,[0,0,0]], [0.4,[25,0,0]],   [0.9,[88,-60,0]] ] },
+      { bone: "left_hand",       keys: [ [0,[0,0,0]], [0.4,[0,6,0]],    [0.9,[0,16,0]] ] },
+      { bone: "chest",           keys: [ [0,[0,0,0]], [0.9,[2,0,0]] ] },
+    ],
+  },
+
+  // The way back down. Starts at exactly the crossed values, so playing it
+  // over the held cross is seamless — playMotion swaps the pose and the
+  // first frame matches the last one the hold was applying.
+  "uncross-arms": {
+    slug: "uncross-arms",
+    name: "Uncross the arms",
+    kind: "reaction",
+    duration: 0.8,
+    tracks: [
+      // The same two beats backwards: unfold FORWARD off the torso, then
+      // drop — never a diagonal sweep back through the body.
+      { bone: "right_upper_arm", keys: [ [0,[10,-52,25]], [0.4,[55,0,10]],  [0.8,[0,0,0]] ] },
+      { bone: "right_forearm",   keys: [ [0,[80,-60,0]],  [0.4,[25,0,0]],   [0.8,[0,0,0]] ] },
+      { bone: "right_hand",      keys: [ [0,[0,-14,0]],   [0.4,[0,-6,0]],   [0.8,[0,0,0]] ] },
+      { bone: "left_upper_arm",  keys: [ [0,[8,48,-22]],  [0.4,[52,0,-10]], [0.8,[0,0,0]] ] },
+      { bone: "left_forearm",    keys: [ [0,[88,-60,0]],  [0.4,[25,0,0]],   [0.8,[0,0,0]] ] },
+      { bone: "left_hand",       keys: [ [0,[0,16,0]],    [0.4,[0,6,0]],    [0.8,[0,0,0]] ] },
+      { bone: "chest",           keys: [ [0,[2,0,0]],     [0.8,[0,0,0]] ] },
+    ],
+  },
+
   "slap-recoil": {
     slug: "slap-recoil",
     name: "Recoil from a slap",
