@@ -37,6 +37,7 @@ import { textureCompress } from "@gltf-transform/functions";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
 
@@ -89,7 +90,10 @@ export async function compressRuntimeGlb(glbPath, { cap = DEFAULT_TEXTURE_CAP, l
 
     // Pass 2 — the CLI owns the ktx invocation; it is not exported from
     // @gltf-transform/functions in v4.
-    const bin = path.join(process.cwd(), "node_modules", ".bin", "gltf-transform");
+    // Resolved from this file, not process.cwd(): the service runs with
+    // WorkingDirectory=server/, and node_modules lives one level up. With cwd
+    // the spawn hit ENOENT and every real rebuild silently skipped compression.
+    const bin = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "node_modules", ".bin", "gltf-transform");
     await execFileAsync(bin, ["etc1s", tmpDecoded, tmpOut, "--quality", "200"], {
       env: {
         ...process.env,

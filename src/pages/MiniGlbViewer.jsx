@@ -2479,30 +2479,26 @@ function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loade
           }
           console.log(`[MiniGlbViewer] Stature scale (${accessoryUrl}): body ${(statureHeightM*100).toFixed(1)}cm vs 170 base -> uniform x${k.toFixed(3)} about garment center`);
         }
-        // GROUNDING COMPENSATION (Session 102/103, from the log's own
-        // numbers): the head-anchored height morph grows the body
-        // DOWNWARD in bind space (observed: minY=-0.189, maxY
-        // unchanged), and grounding lifts the ROOT so feet meet y=0.
-        // Accessories bound to the lifted skeleton land exactly
-        // groundOffset ABOVE their body region (bra at the neck, hair
-        // floating — both off by precisely 18.9cm on a 191cm body).
-        // Compensation: subtract the root's current groundOffset from
-        // the garment's bind Y. Self-scaling by construction: ~0 on
-        // 170-line bodies (which always fit), full correction on tall
-        // ones. Applied before prefit/wrap so all baselines agree.
-        {
-          const groundLift = loadedRoot?.userData?.groundOffset || 0;
-          if (Math.abs(groundLift) > 0.002) {
-            for (const m of accessoryMeshes) {
-              const p = m.geometry.attributes.position;
-              for (let i = 0; i < p.count; i++) p.setY(i, p.getY(i) - groundLift);
-              p.needsUpdate = true;
-              m.geometry.computeBoundingBox();
-              m.geometry.computeBoundingSphere();
-            }
-            console.log(`[MiniGlbViewer] Grounding compensation (${accessoryUrl}): garment bind shifted ${(-groundLift*100).toFixed(1)}cm in Y (root groundOffset ${(groundLift*100).toFixed(1)}cm)`);
-          }
-        }
+        // Session 175 - the GROUNDING COMPENSATION that used to sit here
+        // (Session 102/103: shift every garment vertex by -groundOffset) is
+        // gone, and the bind mode further down is what replaced it. It was
+        // cancelling a real bug at render time by corrupting bind space:
+        // grounding moves loadedRoot, and a garment bound DETACHED under that
+        // root received the offset twice (once through the bone matrices, once
+        // through its own model matrix) while the ATTACHED body received it
+        // once - so the garment rendered groundOffset off, and the vertex shift
+        // hid that. ActorModelPanel documents the same defect as its
+        // "landmine #1". But transfer, shrinkwrap, seam weld and the skin mask
+        // all work in bind space, where the shifted garment then sat
+        // groundOffset away from the body it was being fitted to. Measured live
+        // on Frida Svensson (groundOffset -5.65cm): her bra's cups reached
+        // y=140cm in bind space, the base of the neck (neck1 at 141.6), so the
+        // fit was resolving her bust against the wrong band of fabric - 27mm
+        // of "penetration" no fitter could resolve cleanly. Lindsey's garments
+        // (+4.6cm) were fitted the same distance too LOW; her moderate bust
+        // morphs just made it survivable. Exports carried the shifted vertices
+        // too, so every dressed/runtime GLB placed garments groundOffset off
+        // the body. Binding attached ends all of it at once.
 
         console.log(`[MiniGlbViewer] Accessory (${accessoryUrl}): ${accessoryMeshes.length} SkinnedMesh primitive(s) found [${accessoryMeshes.map((m) => `"${m.name}" ${m.geometry.attributes.position.count}v`).join(", ")}], ${accessoryBones.length} bones in its own skeleton.`);
 
@@ -2947,7 +2943,17 @@ function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loade
         // confirmed-good combination from the Session 100 investigation
         // (see SAD.md, Accessory Skinning Investigation) — do not change
         // without new evidence.
-        accessoryMesh.bindMode = "detached";
+        // Session 175 - this is the new evidence Session 100 asked for.
+        // Detached keeps bindMatrixInverse fixed, so a garment's world
+        // position is modelMatrix * skin(v), and modelMatrix carries the
+        // grounding offset the bone matrices already contain: the garment
+        // moved by groundOffset twice, the attached body once. Attached, with
+        // the body's own bindMatrix, gives skin(bindMatrix * v) - identical to
+        // the body in every pose and through every re-grounding - with v left
+        // in true bind space for everything that fits, masks or exports it.
+        // GLTFExporter bakes boneInverse * bindMatrix into the skin regardless
+        // of mode, so the exported skinning is the body's too.
+        accessoryMesh.bindMode = "attached";
         accessoryMesh.bind(mainSkeleton, mainSkinnedMesh.bindMatrix);
 
         loadedRoot.add(accessoryMesh);
