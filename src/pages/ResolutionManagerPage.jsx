@@ -10,7 +10,9 @@ import { useNavigate } from "react-router-dom";
 // exactly one of these, so there is exactly one status row.
 //
 // idle    — no incident currently being worked.
-// active  — up to MAX_CONCURRENT (6, 2026-09-04) incidents worked at once,
+// active  — up to MAX_CONCURRENT incidents worked at once, a number the
+//           DAEMON publishes in its status. It was hardcoded as 6 here while
+//           resolution-manager.mjs said 3, so the board read "2/6".
 //           full fault-triage authority (real code edits, service restarts
 //           under the broker protocol — never a git commit).
 // Six concurrent workers against two real repos means several can land on
@@ -167,7 +169,7 @@ export default function ResolutionManagerPage() {
                 <span style={{ fontSize: 22, fontFamily: "'Cormorant Garamond',Georgia,serif",
                   color: status.paused ? "rgba(255,255,255,.5)" : stale ? "#e0736b" : stateColor,
                   textTransform: "uppercase", letterSpacing: ".08em" }}>
-                  {status.paused ? "paused" : stale ? "not responding" : active ? `active · ${workers.length}/6` : "idle"}
+                  {status.paused ? "paused" : stale ? "not responding" : active ? `active · ${workers.length}/${status.max_concurrent || 3}` : "idle"}
                 </span>
                 <span style={{ ...label, fontSize: 9 }}>last update {ago(status.updated_at)}</span>
               </div>
