@@ -240,6 +240,17 @@ export default function WorldInstruments({ world, playerActorId }) {
   const [comms, setComms]         = useState(null);   // whoever is being read
   const [thread, setThread]       = useState(null);  // {id, name}
   const [threadMsgs, setThreadMsgs] = useState([]);
+  const convoRef = useRef(null);
+
+  // A scroll pane opens at the top, which in a conversation means it opens on
+  // the OLDEST message and hides the one you came to read. Pin to the bottom
+  // whenever the message list changes: that covers opening a thread and the
+  // refetch sendDraft does after posting, so the scrollbar follows your own
+  // message instead of leaving it below the fold.
+  useEffect(() => {
+    const el = convoRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [threadMsgs, thread]);
   const [draft, setDraft]         = useState("");
   const [sending, setSending]     = useState(false);
 
@@ -662,7 +673,7 @@ export default function WorldInstruments({ world, playerActorId }) {
           ) : thread ? (
             <>
               <button className={styles.back} onClick={() => setThread(null)}>← {thread.name}</button>
-              <div className={styles.wbd}>
+              <div className={styles.wbd} ref={convoRef}>
                 <div className={styles.convo}>
                   {threadMsgs.length === 0 && <p className={styles.empty}>No messages in this thread.</p>}
                   {threadMsgs.map(m => (
