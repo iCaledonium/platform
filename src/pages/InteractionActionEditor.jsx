@@ -16,7 +16,7 @@
 // registry the RUNNER reads, and Play dispatches a real step through the real
 // runner. There is no second code path that can disagree with the first.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   RIGS, getAction, listActions, registerActions, normalizeAction, slugify,
 } from "../lib/bodyActions.js";
@@ -60,9 +60,12 @@ const axesFor = (bone) =>
 const SCRATCH = "draft";
 const draftSlug = (d) => d?.slug || slugify(d?.name) || SCRATCH;
 
-const blank = (kind) => ({
+const blank = (kind, needsProp = false) => ({
   slug: "", name: "", kind, duration: kind === "reaction" ? 0.8 : 1.0,
   ...(kind === "action" ? { contactAt: 0.45, contactDistance: 0.5 } : {}),
+  // A room action happens AT something. `standAt` is how far in front of it the
+  // body stops; the room works out where that is from the prop's footprint.
+  ...(kind === "action" && needsProp ? { needsProp: true, standAt: 0.55 } : {}),
   tracks: [],
 });
 
@@ -82,12 +85,16 @@ function valueAt(track, t) {
   return k[k.length - 1][1];
 }
 
-export default function InteractionActionEditor({ rig, step, stepIndex, onStepChange, onPlay, onSay }) {
-  const kind = step?.type === "reaction" ? "reaction" : "action";
+export default function InteractionActionEditor({ rig, step, stepIndex, onStepChange, onPlay, onSay, onDirty, onSaveRef, needsProp = false }) {
+  // The kind comes from the ENTRY now. It used to be derived from the step
+  // type, which offered exactly two answers — and that is the whole reason a
+  // held shape like crossed arms was filed as a "reaction": there was no way to
+  // say "pose" anywhere in this editor.
+  const kind = ["reaction", "pose"].includes(step?.kind) ? step.kind : "action";
   const role = step?.role || "a";
 
   const [saved, setSaved] = useState([]);
-  const [draft, setDraft] = useState(() => blank(kind));
+  const [draft, setDraft] = useState(() => blank(kind, needsProp));
   const [bone, setBone] = useState(kind === "reaction" ? "head" : "right_upper_arm");
   const [t, setT] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -106,18 +113,32 @@ export default function InteractionActionEditor({ rig, step, stepIndex, onStepCh
     return () => { dead = true; };
   }, []);
 
-  const publish = useCallback((next) => {
+  // Held in a ref, and publish depends on NOTHING. This callback is the
+  // editor's spine: `open` depends on it, and an effect depends on `open`, so
+  // anything that changes its identity re-runs that effect and reloads the
+  // draft. Taking `onDirty` as a dependency did exactly that — the page passes
+  // an inline arrow, a fresh function every render, so every slider move
+  // published, re-rendered the page, changed the identity, and reset the draft
+  // it had just written. The slider moved and sprang back.
+  const dirtyRef = useRef(onDirty);
+  dirtyRef.current = onDirty;
+
+  const publish = useCallback((next, edited = false) => {
     setDraft(next);
     registerActions([{ ...next, slug: draftSlug(next) }]);
+    // Dirty means EDITED, not "has tracks". Opening a saved animation to look
+    // at it loads tracks and has changed nothing, and claiming otherwise would
+    // make Back interrogate you about work you never did.
+    if (edited) dirtyRef.current?.(true);
     return next;
   }, []);
 
   const open = useCallback((slug) => {
     const a = getAction(slug);
     setT(0);
-    if (!a) return publish(blank(kind));
-    publish(structuredClone({ ...blank(kind), ...a }));
-  }, [kind, publish]);
+    if (!a) return publish(blank(kind, needsProp));
+    publish(structuredClone({ ...blank(kind, needsProp), ...a }));
+  }, [kind, needsProp, publish]);
 
   // Follow the step: selecting a different one loads what THAT step names,
   // rather than leaving the last motion on screen looking as if it belonged to
@@ -148,7 +169,7 @@ export default function InteractionActionEditor({ rig, step, stepIndex, onStepCh
     // one is almost always an accident, so the rest key is added rather than
     // left to look wrong in playback.
     if (!tr.keys.some(k => k[0] === 0)) tr.keys.unshift([0, [0, 0, 0]]);
-    publish(next);
+    publish(next, true);
   };
 
   const removeKey = () => {
@@ -158,11 +179,21 @@ export default function InteractionActionEditor({ rig, step, stepIndex, onStepCh
     const at = +t.toFixed(3);
     tr.keys = tr.keys.filter(k => Math.abs(k[0] - at) >= 0.005);
     if (!tr.keys.length) next.tracks = next.tracks.filter(x => x.bone !== bone);
-    publish(next);
+    publish(next, true);
   };
 
   const save = async () => {
-    const payload = { ...draft, kind, slug: draft.slug || slugify(draft.name) };
+    // Asked for HERE rather than typed into a box that sits there empty while
+    // you work. Everything up to this point is a draft; naming it is the act
+    // that makes it a library entry.
+    let name = draft.name;
+    if (!String(name || "").trim()) {
+      name = window.prompt(`Name this ${kind}`, "");
+      if (name === null) return;                 // cancelled — not a failure
+      if (!String(name).trim()) return onSay?.("it needs a name", "warn");
+      publish({ ...draft, name });
+    }
+    const payload = { ...draft, name, kind, slug: draft.slug || slugify(name) };
     const { errors } = normalizeAction(payload);
     if (errors.length) return onSay?.(errors.join("; "), "warn");
     setBusy(true);
@@ -181,8 +212,14 @@ export default function InteractionActionEditor({ rig, step, stepIndex, onStepCh
       // had before the rename and plays the wrong motion.
       onStepChange?.({ action: body.slug });
       onSay?.(`saved “${body.name}”`);
+      dirtyRef.current?.(false);
     } finally { setBusy(false); }
   };
+
+  // The page owns Back and therefore owns "save before you go", but the draft
+  // lives here. Handing the function over is the smallest way to let the guard
+  // run the real Save rather than a second copy of it.
+  useEffect(() => { if (onSaveRef) onSaveRef.current = save; });
 
   const lbl = { fontSize: 11, color: "#8b8781", textTransform: "uppercase", letterSpacing: ".06em" };
   const cell = { fontSize: 12, padding: "4px 6px", border: "1px solid #ddd8d0", borderRadius: 4, background: "#fff" };
@@ -196,29 +233,47 @@ export default function InteractionActionEditor({ rig, step, stepIndex, onStepCh
   return (
     <div style={{ border: "1px solid #e6e1d9", borderRadius: 8, padding: 12, background: "#faf8f5" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
-        <strong style={{ fontSize: 13 }}>
-          Step {(stepIndex ?? 0) + 1} · {kind === "reaction" ? "reaction" : "action"}
-        </strong>
-        <span style={{ fontSize: 11.5, color: "#b05c08" }}>poses {nameOf(role)} · role {role}</span>
-        <select style={cell} value={draft.slug || ""}
-                onChange={e => { open(e.target.value); onStepChange?.({ action: e.target.value }); }}>
-          <option value="">— new —</option>
-          {listActions(kind).map(a => (
-            <option key={a.slug} value={a.slug}>{a.name}{a.builtin ? " (built-in)" : ""}</option>
-          ))}
-        </select>
-        <input style={{ ...cell, width: 150 }} placeholder="name"
-               value={draft.name} onChange={e => publish({ ...draft, name: e.target.value })} />
-        <label style={lbl}>length
-          <input type="number" step="0.05" style={{ ...cell, width: 66, marginLeft: 4 }}
-                 value={draft.duration}
-                 onChange={e => publish({ ...draft, duration: Number(e.target.value) })} />
-        </label>
-        {kind === "action" && ["contactAt", "contactDistance"].map(f => (
-          <label key={f} style={lbl}>{f}
-            <input type="number" step="0.05" style={{ ...cell, width: 66, marginLeft: 4 }}
-                   value={draft[f] ?? 0}
-                   onChange={e => publish({ ...draft, [f]: Number(e.target.value) })} />
+        {/* What this is and whose body it is posing are said by the PAGE, in
+            its heading. Repeating them here as "Step 1 · action" was both
+            redundant and, after the kind moved into the page, wrong. The name
+            is asked for at Save, because a thing has no name until it is one. */}
+        <span style={{ fontSize: 11.5, color: "#b05c08" }}>
+          {draft.name ? `“${draft.name}”` : "unsaved"} · poses {nameOf(role)}
+        </span>
+        {/* A pose is a shape, not a span — the only time in it is how long the
+            body takes to arrive, which nobody authors per pose. An action and a
+            reaction are motions over time, and their length is the thing you
+            tune against a contact. */}
+        {kind !== "pose" && (
+          <label style={lbl} title="How long the motion takes from start to rest.">length
+            <input type="number" step="0.05" min="0.05" max="10"
+                   style={{ ...cell, width: 62, marginLeft: 4 }}
+                   value={draft.duration}
+                   onChange={ev => publish({ ...draft, duration: Number(ev.target.value) }, true)} />
+            <span style={{ marginLeft: 3, textTransform: "none" }}>s</span>
+          </label>
+        )}
+        {kind === "action" && draft.needsProp && (
+          <label style={lbl} title="How far in front of the furniture the body stops. The room works out where that is from the prop's footprint.">
+            stand at
+            <input type="number" step="0.05" min="0.2" max="3"
+                   style={{ ...cell, width: 62, marginLeft: 4 }}
+                   value={draft.standAt ?? 0.55}
+                   onChange={ev => publish({ ...draft, standAt: Number(ev.target.value) }, true)} />
+            <span style={{ marginLeft: 3, textTransform: "none" }}>m</span>
+          </label>
+        )}
+        {kind === "action" && [
+          { key: "contactAt", label: "contact at", unit: "s",
+            hint: "When in this motion the blow lands. A reaction is timed against this instant, not against the step list." },
+          { key: "contactDistance", label: "contact from", unit: "m",
+            hint: "The separation this motion was authored at. There is no collision test — the distance is part of the action." },
+        ].map(f => (
+          <label key={f.key} style={lbl} title={f.hint}>{f.label}
+            <input type="number" step="0.05" style={{ ...cell, width: 62, marginLeft: 4 }}
+                   value={draft[f.key] ?? 0}
+                   onChange={e => publish({ ...draft, [f.key]: Number(e.target.value) }, true)} />
+            <span style={{ marginLeft: 3, textTransform: "none" }}>{f.unit}</span>
           </label>
         ))}
         <span style={{ flex: 1 }} />

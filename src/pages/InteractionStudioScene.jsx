@@ -146,6 +146,26 @@ export const MARKS = {
   b: { x: 0.75, z: 0 },
 };
 
+// Where an arbitrary cast stands before anything has moved them. Two face each
+// other across conversation distance, which is the pose every authoring session
+// starts from; three or more stand on an arc of the same radius so everyone is
+// in frame and nobody is behind anyone. Deterministic, so a composition reopens
+// with its bodies where it left them.
+export function marksFor(ids = []) {
+  const out = {};
+  const n = ids.length;
+  if (n <= 2) {
+    ids.forEach((id, i) => { out[id] = { ...(i === 0 ? MARKS.a : MARKS.b) }; });
+    return out;
+  }
+  const R = 0.75 + 0.18 * (n - 2);
+  ids.forEach((id, i) => {
+    const th = Math.PI * (0.5 + (i / (n - 1)) * 1.0);   // a half-circle facing the camera
+    out[id] = { x: Math.cos(th) * R, z: Math.sin(th) * R * 0.6 };
+  });
+  return out;
+}
+
 function gltfLoader() {
   const draco = new DRACOLoader();
   draco.setDecoderPath("https://www.gstatic.com/draco/versioned/decoders/1.5.6/");
@@ -244,10 +264,32 @@ function buildMark(color) {
   return ring;
 }
 
-export const ROLE_COLOR = { a: 0xc9973a, b: 0x378add };
+// The first two keep the colours the studio has always used; the rest come off
+// a palette. Looked up by slot id with an index fallback so an unfamiliar id
+// still gets a ring rather than an undefined one.
+const ROLE_PALETTE = [0xc9973a, 0x378add, 0x1d9e75, 0xb05c08, 0x7f77dd, 0xd85a30, 0x8b8781, 0x2f2c28];
+export const ROLE_COLOR = { a: ROLE_PALETTE[0], b: ROLE_PALETTE[1] };
+export function colorFor(id, index = 0) {
+  return ROLE_COLOR[id] ?? ROLE_PALETTE[index % ROLE_PALETTE.length];
+}
 
-export default function InteractionStudioScene({ cast, onRig, onStatus }) {
+// `still` — hold the idle on its first frame instead of playing it.
+//
+// The idle is COMPOSED UNDER an authored pose: applyPose multiplies its deltas
+// onto whatever the mixer left on each bone that frame. That is right in the
+// studio, where she should keep breathing through a slap. It is wrong in the
+// animation editor, where the body is the thing being authored — the chest
+// rises, the arms drift, and the shape you are setting is never quite the
+// shape you are looking at.
+//
+// Frozen rather than stopped. Stopping it entirely drops the body to the GLB's
+// bind pose, arms out at forty-five degrees, and every pose in the library was
+// authored as a delta from the idle's own stance. Holding frame zero keeps that
+// stance and takes away only the motion.
+export default function InteractionStudioScene({ cast, onRig, onStatus, still = false }) {
   const host = useRef(null);
+  const stillRef = useRef(still);
+  stillRef.current = still;
   const api  = useRef({});
   const [loading, setLoading] = useState({});   // role -> percent | null
   const [failed,  setFailed]  = useState({});
@@ -584,14 +626,22 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
   // seconds, and a studio that shows nothing until BOTH are in looks broken
   // for the whole of the first one.
   useEffect(() => {
-    for (const role of ["a", "b"]) {
+    const ids = Object.keys(cast || {});
+    // Anyone standing in the room who is no longer in the cast leaves it.
+    for (const role of Object.keys(api.current.figures || {})) {
+      if (!ids.includes(role)) removeFigure(role);
+    }
+    for (const role of ids) {
       const want = cast?.[role]?.glb_url || null;
       const have = api.current.figures?.[role];
       if (have?.url === want) continue;
       if (have) removeFigure(role);
-      if (want) loadFigure(role, cast[role]);
+      if (want) loadFigure(role, cast[role], ids.indexOf(role), ids);
     }
-  }, [cast?.a?.id, cast?.b?.id, cast?.a?.glb_url, cast?.b?.glb_url]);   // eslint-disable-line react-hooks/exhaustive-deps
+    // A signature over the whole cast, so adding a third body re-runs this the
+    // same way swapping the second one does. The old dependency list named
+    // a and b literally and could not see a change to anyone else.
+  }, [Object.entries(cast || {}).map(([k, v]) => `${k}:${v?.id || ""}:${v?.glb_url || ""}`).join("|")]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   function removeFigure(role) {
     const a = api.current;
@@ -611,7 +661,7 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
     publishRig();
   }
 
-  async function loadFigure(role, person) {
+  async function loadFigure(role, person, index = 0, ids = [role]) {
     const a = api.current;
     if (!a.scene) return;
     const url = person.glb_url;
@@ -671,13 +721,23 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
 
       const group = new THREE.Group();
       group.add(model);
-      group.add(buildMark(ROLE_COLOR[role]));
-      const mark = MARKS[role];
+      group.add(buildMark(colorFor(role, index)));
+      const marks = marksFor(ids);
+      const mark = marks[role] || MARKS.a;
       group.position.set(mark.x, 0, mark.z);
       // Facing the other mark to begin with: two people put in a room back to
       // back is a bug report waiting to happen.
-      group.rotation.y = Math.atan2(MARKS[role === "a" ? "b" : "a"].x - mark.x,
-                                    MARKS[role === "a" ? "b" : "a"].z - mark.z);
+      // Face the middle of everyone else. With two that is the other person,
+      // which is what it always did; with three or more it is the huddle,
+      // rather than whichever body happens to be called "b".
+      {
+        const others = ids.filter(r => r !== role).map(r => marks[r]).filter(Boolean);
+        const focus = others.length
+          ? { x: others.reduce((s, m) => s + m.x, 0) / others.length,
+              z: others.reduce((s, m) => s + m.z, 0) / others.length }
+          : { x: 0, z: 0 };
+        group.rotation.y = Math.atan2(focus.x - mark.x, focus.z - mark.z);
+      }
       a.scene.add(group);
 
       const mixer = new THREE.AnimationMixer(model);
@@ -712,7 +772,10 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
       // Standing still is a state, not the absence of one: without an idle
       // playing, a GLB renders in bind pose — arms out, a shop dummy.
       const idleName = clips.idle ? "idle" : Object.keys(clips)[0];
-      if (idleName) playClip(fig, idleName, { loop: true, fade: 0 });
+      if (idleName) {
+        playClip(fig, idleName, { loop: true, fade: 0 });
+        if (stillRef.current && fig.current) { fig.current.paused = true; fig.current.time = 0; }
+      }
 
       setLoading(l => ({ ...l, [role]: null }));
       publishRig();
@@ -866,7 +929,10 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
         // room, so a walk does not silently leave them in a walk cycle on the
         // spot — the single most obvious way a rehearsal looks broken.
         const idleName = fig.clips.idle ? "idle" : null;
-        if (idleName) playClip(fig, idleName, { loop: true, fade: 0.4 });
+        if (idleName) {
+          playClip(fig, idleName, { loop: true, fade: 0.4 });
+          if (stillRef.current && fig.current) { fig.current.paused = true; fig.current.time = 0; }
+        }
         else if (w.back) { w.back.reset().play(); fig.current?.crossFadeTo(w.back, 0.4, false); fig.current = w.back; }
         w.resolve?.();
       } else {
@@ -1277,8 +1343,18 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
         || null;
   }
 
+  // Every pair, not THE pair. This was O(1) maths on figures.a and figures.b,
+  // so a third body walked through everyone. n is a handful, so n squared is
+  // free and the ordering does not matter — each pair is resolved once.
   function keepApart(a, delta) {
-    const fa = a.figures?.a, fb = a.figures?.b;
+    const ids = Object.keys(a.figures || {});
+    for (let i = 0; i < ids.length; i++)
+      for (let j = i + 1; j < ids.length; j++)
+        keepPairApart(a, delta, ids[i], ids[j]);
+  }
+
+  function keepPairApart(a, delta, idA, idB) {
+    const fa = a.figures?.[idA], fb = a.figures?.[idB];
     if (!fa || !fb) return;
     const pa = fa.group.position, pb = fb.group.position;
     let dx = pb.x - pa.x, dz = pb.z - pa.z;
@@ -1309,8 +1385,8 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
       fig.group.position.z += uz * sign * step;
       clamp(fig.group.position);
     };
-    if ((space.a || 0) > d) give(fa, -1);
-    if ((space.b || 0) > d) give(fb, 1);
+    if ((space[idA] || 0) > d) give(fa, -1);
+    if ((space[idB] || 0) > d) give(fb, 1);
   }
 
   // ── landing the blow ──────────────────────────────────────────────────────
@@ -2938,8 +3014,10 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
       // How much room this role wants. 0 = they do not mind at all; the
       // collision floor still applies.
       setSpace(role, distance) {
-        if (!a.space) a.space = { a: 0, b: 0 };
-        if (role !== "a" && role !== "b") return false;
+        if (!a.space) a.space = {};
+        // Any cast slot, not the two letters. The guard used to refuse a third
+        // body's personal space outright, silently.
+        if (!a.figures?.[role]) return false;
         a.space[role] = Math.max(0, Math.min(3.6, Number(distance) || 0));
         return { ...a.space };
       },
@@ -3128,7 +3206,7 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
         // Personal space is script state, not room state: a run from the top
         // must not inherit what the last run's `space` steps set, or the second
         // playthrough of a scene quietly differs from the first.
-        a.space = { a: 0, b: 0 };
+        a.space = {};
         for (const role of Object.keys(a.figures || {})) {
           // ...and neither is a POSTURE. A held pose is meant to survive until
           // something moves her, and a re-run was not counted as something: the
@@ -3182,7 +3260,7 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
     onRig?.(rig);
   }
 
-  const busy = ["a", "b"].filter(r => typeof loading[r] === "number");
+  const busy = Object.keys(loading).filter(r => typeof loading[r] === "number");
 
   return (
     <div ref={host} style={{ position: "relative", width: "100%", height: "100%",
@@ -3197,7 +3275,7 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
           ))}
         </div>
       )}
-      {["a", "b"].filter(r => failed[r]).map(r => (
+      {Object.keys(failed).filter(r => failed[r]).map((r, i) => (
         <div key={r} style={{ position: "absolute", left: 14, top: 12 + (r === "b" ? 22 : 0), zIndex: 3,
                               fontSize: 10.5, color: "rgba(216,90,48,.9)" }}>
           {cast?.[r]?.name || r} did not load — {failed[r]}

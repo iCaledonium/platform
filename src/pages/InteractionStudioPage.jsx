@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import InteractionStudioScene, { MARKS, ROLE_COLOR, PROP_TYPES } from "./InteractionStudioScene.jsx";
+import InteractionStudioScene, { MARKS, marksFor, colorFor, PROP_TYPES } from "./InteractionStudioScene.jsx";
 import { listActions } from "../lib/bodyActions.js";
 import InteractionActionEditor from "./InteractionActionEditor.jsx";
 import InteractionTimeline from "./InteractionTimeline.jsx";
 import { estimateTimeline, positionsBefore } from "../lib/interactionScript.js";
-import { getAction, registerActions } from "../lib/bodyActions.js";
+import { getAction, registerActions, paramsFor } from "../lib/bodyActions.js";
 import {
-  STEP_TYPES, ROLES, defaultStep, describeScript, normalizeSteps, runScript, drivenRoles, timingWarnings,
-  SHOTS, describeCamera, cameraAt, normalizeCameras, hoistLegacyCameras,
+  ENTRY_KINDS, defaultEntry, describeEntry, describeScript, normalizeEntries, runScript,
+  drivenRoles, timingWarnings, castIds, entryId,
+  SHOTS, describeCamera, cameraAt, normalizeCameras,
 } from "../lib/interactionScript.js";
 
 // What an ENCOUNTER's rig will own. Role "b" there is the player: first person,
@@ -18,6 +19,20 @@ import {
 // AUTHOR time — the verdict is rendered next to the name, before it is saved,
 // rather than discovered as somebody's camera being taken away mid-scene.
 const ENCOUNTER_DRIVES = ["a"];
+
+// The four things the library holds. Three are movements a character performs;
+// the fourth is an arrangement of them. A drawn glyph per kind rather than a
+// rendered thumbnail — it is always available, costs no capture and no storage,
+// and the name carries the specifics.
+const KIND_GLYPH = {
+  action:   { mark: "▶", tint: "#b05c08", label: "Action" },
+  reaction: { mark: "↩", tint: "#7f77dd", label: "Reaction" },
+  pose:     { mark: "◆", tint: "#1d9e75", label: "Pose" },
+  composition: { mark: "❏", tint: "#378add", label: "Composition" },
+};
+
+// Slot ids, handed out in order as characters are added.
+const SLOT_IDS = ["a", "b", "c", "d", "e", "f", "g", "h"];
 
 // ── Interaction Studio ───────────────────────────────────────────────────────
 //
@@ -70,8 +85,13 @@ export default function InteractionStudioPage() {
   const navigate = useNavigate();
 
   const [castList, setCastList] = useState([]);
-  const [cast, setCast]         = useState({ a: null, b: null });
-  const [clips, setClips]       = useState({ a: [], b: [] });
+  // What the picker on the toolbar currently has selected, before Add.
+  const [toAdd, setToAdd]       = useState("");
+  // An ORDERED list of slots, and who stands in each. It used to be the literal
+  // pair {a, b}, which is the reason nothing could rehearse three people.
+  const [slots, setSlots]       = useState(["a", "b"]);
+  const [cast, setCast]         = useState({});
+  const [clips, setClips]       = useState({});
 
   const [scripts, setScripts]   = useState([]);
   const [scriptId, setScriptId] = useState(null);   // null = unsaved draft
@@ -133,7 +153,6 @@ export default function InteractionStudioPage() {
   // second scene would preview a different runtime than the one that plays
   // the script. null | { step } where step is a scratch reaction step never
   // added to the script.
-  const [poseLab, setPoseLab] = useState(null);
 
   const rigRef = useRef(null);
   const runRef = useRef(null);
@@ -172,7 +191,8 @@ export default function InteractionStudioPage() {
 
   const script = useMemo(
     () => ({ name, description, steps, cameras, props,
-              cast: ROLES.map(r => ({ role: r, actor_id: cast[r]?.id || null, label: cast[r]?.name || null })) }),
+              cast: slots.map(id => ({ id, role: id, actor_id: cast[id]?.id || null,
+                                       label: cast[id]?.name || null, driven: true })) }),
     [name, description, steps, cameras, props, cast]
   );
 
@@ -180,6 +200,25 @@ export default function InteractionStudioPage() {
   // verdict that arrives after the thinking is done.
   const drives = useMemo(() => drivenRoles({ steps }), [steps]);
   const studioOnly = drives.filter(r => !ENCOUNTER_DRIVES.includes(r));
+
+  // Click a library item to put it on the timeline. The entry arrives with the
+  // library's own declared parameters at their defaults — this function knows
+  // nothing about what any of them mean, which is what lets a new action be
+  // authored without touching the page.
+  function addEntry(ref) {
+    const def = getAction(ref);
+    if (!def) { say(`“${ref}” is not in the library`, "warn"); return; }
+    const role = slots.find(id => cast[id]) || slots[0] || "a";
+    const entry = defaultEntry(ref, role);
+    // An entry that aims needs somebody to aim at; default to the next slot
+    // that has a body in it rather than leaving it blank.
+    if (entry.params && "target" in entry.params) {
+      entry.params.target = slots.find(id => id !== role && cast[id]) || slots.find(id => id !== role) || role;
+    }
+    setSteps(s => [...s, entry]);
+    setDirty(true);
+    setSelected(steps.length);
+  }
 
   // ── the run ────────────────────────────────────────────────────────────────
   // `run()` plays THIS script. run(someScript) plays a throwaway one — used by
@@ -194,7 +233,7 @@ export default function InteractionStudioPage() {
     const scriptToRun = arg && Array.isArray(arg.steps) ? arg : script;
     const rig = rigRef.current;
     if (!rig) { say("no room yet — the models are still loading", "warn"); return; }
-    const { errors } = normalizeSteps(scriptToRun.steps);
+    const { errors } = normalizeEntries(scriptToRun.steps, { cast: slots });
     if (errors.length) { say(errors.join("; "), "warn"); return; }
 
     setLog([]);
@@ -215,7 +254,8 @@ export default function InteractionStudioPage() {
       // The studio owns both figures, and says so. An encounter's rig will
       // declare ["a"] and the runner will refuse anything that drives the
       // player rather than performing three quarters of it.
-      drives: ROLES,
+      // The studio owns every body in the room and says so explicitly.
+      drives: slots,
       performer: (role) => rig.performer(role),
       // The studio has no voice: a line becomes a caption in the log, and the
       // runner's own pacing (a beat per line) is what makes a rehearsal read
@@ -236,7 +276,7 @@ export default function InteractionStudioPage() {
       stopAll: () => rig.stopAll(),
     }, {
       onEvent: (e) => {
-        if (e.type === "step") { setLiveStep(e.index); say(`${e.index + 1}. ${STEP_TYPES[e.step.type].describe(e.step)}`); }
+        if (e.type === "step") { setLiveStep(e.index); say(`${e.index + 1}. ${describeEntry(e.step, id => cast[id]?.name || id)}`); }
         else if (e.type === "say") say(`${cast[e.role]?.name || e.role}: “${e.text}”`, "line");
         else if (e.type === "refused") say(e.text, "warn");
         else if (e.type === "warning") say(e.text, "warn");
@@ -258,7 +298,7 @@ export default function InteractionStudioPage() {
 
   // ── saving ─────────────────────────────────────────────────────────────────
   async function save({ asNew = false } = {}) {
-    const { errors } = normalizeSteps(steps);
+    const { errors } = normalizeEntries(steps, { cast: slots });
     if (errors.length) { setSaveNote({ bad: true, text: errors[0] }); return; }
     const body = JSON.stringify({ name, description, steps, cameras, props, cast: script.cast });
     const url = scriptId && !asNew ? `/api/interaction-scripts/${scriptId}` : "/api/interaction-scripts";
@@ -284,7 +324,7 @@ export default function InteractionStudioPage() {
     setSteps(row.steps || []);
     // Scripts written before cameras had a track of their own carry them on the
     // steps; hoist those rather than letting the framing vanish on load.
-    setCameras(hoistLegacyCameras(row.steps || [], row.cameras || []));
+    setCameras(row.cameras || []);
     setProps(row.props || []);
     rigRef.current?.setObstacles?.(row.props || []);
     setSelected(-1);
@@ -298,8 +338,11 @@ export default function InteractionStudioPage() {
     const byId = Object.fromEntries(castList.map(p => [p.id, p]));
     const next = {};
     const dropped = [];
-    ROLES.forEach(r => {
-      const c = (row.cast || []).find(x => x.role === r);
+    (row.cast || []).map(c => c.id || c.role).filter(Boolean).forEach(r => {
+      // A slot is identified by `id`. It was `role` before the cast became a
+      // list, and stored rows carry either — matching on only one of them
+      // silently emptied every slot on load.
+      const c = (row.cast || []).find(x => (x.id || x.role) === r);
       // A script can outlive its cast's eligibility: the body was castable when
       // the script was saved and is draft again now. Leaving the role empty is
       // right, but doing it silently would look like the script lost its cast,
@@ -309,6 +352,11 @@ export default function InteractionStudioPage() {
       next[r] = p && !p.unavailable ? p : null;
     });
     setCast(next);
+    // The composition carries its own slot list, so opening one with three
+    // characters puts three slots on the toolbar. Without this the cast map
+    // gained a third body that no control could reach.
+    const ids = (row.cast || []).map(c => c.id || c.role).filter(Boolean);
+    setSlots(ids.length ? ids : ["a", "b"]);
     dropped.forEach(d => say(`${d} — left out of the cast`, "warn"));
   }
 
@@ -331,8 +379,11 @@ export default function InteractionStudioPage() {
 
   // ── step editing ───────────────────────────────────────────────────────────
   const edit = (i, patch) => { setSteps(s => s.map((x, n) => (n === i ? { ...x, ...patch } : x))); setDirty(true); };
-  const addStep = (type) => {
-    const step = defaultStep(type, "a");
+  const addStep = (type, role) => {
+    // Which body performs it is decided by WHERE it was added — the + on a
+    // character's own row — rather than defaulting to the first slot and
+    // waiting to be corrected.
+    const step = defaultEntry(type, role || slots[0] || "a");
     // A step should be VALID the moment it is added. `interaction` is the one
     // verb whose parameter cannot have a sensible constant default in the lib —
     // the lib deliberately knows nothing about which actions exist — so the
@@ -379,7 +430,7 @@ export default function InteractionStudioPage() {
   function captureMark(role) {
     const p = rigRef.current?.performer(role)?.position?.();
     if (!p) { say(`nobody is cast as ${role}`, "warn"); return; }
-    setSteps(s => [...s, { ...defaultStep("walk_to", role), x: p.x, z: p.z }]);
+    setSteps(s => [...s, { ...defaultEntry("walk-to", role), params: { x: p.x, z: p.z, speed: 0.95 } }]);
     setDirty(true);
   }
 
@@ -474,7 +525,7 @@ export default function InteractionStudioPage() {
     // The cut in force at t. Its time is the anchor step's start plus its
     // offset — the same arithmetic the runner uses, so what you scrub to is
     // what will play.
-    const cuts = hoistLegacyCameras(steps, cameras)
+    const cuts = (cameras || [])
       .map(c => ({ ...c, at: (tl.blocks[c.step]?.start ?? 0) + (c.offset || 0) }))
       .filter(c => c.at <= t + 1e-6)
       .sort((x, y) => x.at - y.at);
@@ -567,85 +618,135 @@ export default function InteractionStudioPage() {
               Interaction studio
             </h1>
             <p style={{ fontSize: 12.5, color: "#8b8781", margin: "5px 0 0" }}>
-              Two bodies in an empty room, lit as the encounter lights them. Script what they do, save it, run it.
+              Bodies in an empty room, lit as the encounter lights them. Script what they do, save it, run it.
             </p>
           </div>
           <a onClick={() => navigate("/home")} style={{ fontSize: 12, color: "#b05c08", cursor: "pointer" }}>← Home</a>
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: poseLab ? "minmax(0,1fr)" : "220px minmax(0,1fr) 260px", gap: 14, alignItems: "start" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "220px minmax(0,1fr) 260px", gap: 14, alignItems: "start" }}>
 
-          {/* ── left: cast and shelf ─────────────────────────────────────── */}
-          <div style={{ display: poseLab ? "none" : "flex", flexDirection: "column", gap: 14 }}>
-            <div style={cardStyle}>
-              <p style={labelStyle}>The two of them</p>
-              {ROLES.map(role => (
-                <div key={role} style={{ marginBottom: 10 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
-                    <span style={{ width: 9, height: 9, borderRadius: 9,
-                                   background: `#${ROLE_COLOR[role].toString(16).padStart(6, "0")}` }} />
-                    <span style={{ fontSize: 11, color: "#55524e", textTransform: "uppercase", letterSpacing: ".1em" }}>
-                      role {role}
-                    </span>
-                  </div>
-                  <select
-                    value={cast[role]?.id || ""}
-                    onChange={e => {
-                      const p = castList.find(x => x.id === e.target.value) || null;
-                      setCast(c => ({ ...c, [role]: p }));
-                    }}
-                    style={{ width: "100%", fontSize: 12.5, padding: "6px 8px", borderRadius: 6,
-                             border: "1px solid rgba(0,0,0,.12)", background: "#fff", color: "#2f2c28" }}>
-                    <option value="">— nobody —</option>
-                    {castList.map(p => (
-                      <option key={p.id} value={p.id} disabled={!!p.unavailable}>
-                        {p.name}{p.kind === "you" ? " (you)" : ""}{p.unavailable ? ` — ${p.unavailable}` : ""}
-                      </option>
-                    ))}
-                  </select>
-                  {clips[role]?.length > 0 && (
-                    <p style={{ fontSize: 10.5, color: "#a8a5a0", margin: "5px 0 0" }}>
-                      clips: {clips[role].join(", ")}
-                    </p>
-                  )}
-                </div>
-              ))}
-              <p style={{ fontSize: 10.5, color: "#a8a5a0", margin: "8px 0 0", lineHeight: 1.5 }}>
-                A role is a slot, not a person. An encounter casts its own actor as A and the player as B —
-                the script does not care who stands in them.
-              </p>
-            </div>
-
+          {/* ── left: the library ────────────────────────────────────────── */}
+          {/*
+              Four kinds and nothing else. Actions, Reactions and Poses are
+              things ONE character does — click one to put it on the timeline.
+              Compositions are arrangements of those across the cast; click one
+              to open it. This replaces the old "Saved scripts" list, which was
+              the only library surface the studio had: authored motions were
+              reachable only as <option>s buried inside a step.
+          */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
             <div style={cardStyle}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-                <p style={labelStyle}>Saved scripts</p>
-                <a onClick={newScript} style={{ fontSize: 11, color: "#b05c08", cursor: "pointer" }}>+ new</a>
+                <p style={labelStyle}>Library</p>
               </div>
-              {scripts.length === 0 && (
-                <p style={{ fontSize: 11.5, color: "#a8a5a0", margin: 0 }}>Nothing saved yet.</p>
-              )}
-              {scripts.map(row => (
-                <div key={row.id}
-                     style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6,
-                              padding: "6px 0", borderTop: "1px solid rgba(0,0,0,.05)" }}>
-                  <div style={{ minWidth: 0, cursor: "pointer" }} onClick={() => open(row)}>
-                    <p style={{ margin: 0, fontSize: 12.5, color: scriptId === row.id ? "#b05c08" : "#2f2c28",
-                                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {row.name}
-                    </p>
-                    {/* The server computes `drives` from the stored steps, so
-                        the shelf can say which of these an encounter could
-                        actually play without opening each one. */}
-                    <p style={{ margin: 0, fontSize: 10, color: "#a8a5a0" }}>
-                      {row.steps?.length || 0} steps · {row.slug}
-                      {(row.drives || []).some(r => !ENCOUNTER_DRIVES.includes(r)) && (
-                        <span style={{ color: "#b05c08" }}> · studio only</span>
-                      )}
-                    </p>
+
+              {["action", "reaction", "pose"].map(kind => {
+                const items = listActions(kind);
+                return (
+                  <div key={kind} style={{ marginBottom: 12 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                      <p style={{ ...labelStyle, margin: "0 0 5px", color: KIND_GLYPH[kind].tint }}>
+                        {KIND_GLYPH[kind].label}{items.length ? ` · ${items.length}` : ""}
+                      </p>
+                      {/* Authoring one of these is the Animation Editor's whole
+                          job, so new hands over to it with the kind already
+                          chosen. Choosing it here rather than there is the
+                          point: a kind picked on purpose is how the Reaction
+                          library stops filling with things nobody reacts to. */}
+                      <a onClick={() => {
+                           // Only an action can be anchored to furniture. A pose
+                           // is a shape and a reaction happens to a body wherever
+                           // that body is standing, so neither is asked.
+                           if (kind !== "action") return navigate(`/lab/studio/animation?kind=${kind}`);
+                           const room = window.confirm(
+                             "Is this a ROOM action?\n\n" +
+                             "OK — it happens at a piece of furniture: leaning on a table, perching on a sofa arm. " +
+                             "The room puts them in front of it.\n\n" +
+                             "Cancel — it is a human action: body motion that happens wherever they stand.");
+                           navigate(`/lab/studio/animation?kind=action${room ? "&room=1" : ""}`);
+                         }}
+                         title={`Author a new ${KIND_GLYPH[kind].label.toLowerCase()}`}
+                         style={{ fontSize: 10.5, color: "#b05c08", cursor: "pointer" }}>+ new</a>
+                    </div>
+                    {items.length === 0 && (
+                      <p style={{ fontSize: 11, color: "#a8a5a0", margin: 0 }}>none yet</p>
+                    )}
+                    {items.map(it => (
+                      <div key={it.slug}
+                           title={it.source === "engine"
+                             ? "Built into the room — walking, sitting, speaking"
+                             : "Authored from bone tracks"}
+                           onClick={() => addEntry(it.slug)}
+                           style={{ display: "flex", alignItems: "center", gap: 7, padding: "3px 0",
+                                    cursor: "pointer" }}>
+                        <span style={{ color: KIND_GLYPH[kind].tint, fontSize: 11, width: 12 }}>
+                          {KIND_GLYPH[kind].mark}
+                        </span>
+                        <span style={{ fontSize: 12, color: "#2f2c28", overflow: "hidden",
+                                       textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {it.name}
+                        </span>
+                        {it.room && (
+                          <span style={{ fontSize: 9, color: "#c0bdb8" }}>room</span>
+                        )}
+                        {it.source === "engine" ? (
+                          <span style={{ fontSize: 9, color: "#c0bdb8", marginLeft: "auto" }} />
+                        ) : (
+                          // Engine entries have no pencil because there are no
+                          // bones to move: walking and sitting are room
+                          // geometry, not an authored motion.
+                          <a title={`Edit ${it.name} in the Animation editor`}
+                             onClick={(ev) => {
+                               ev.stopPropagation();
+                               navigate(`/lab/studio/animation?ref=${encodeURIComponent(it.slug)}&kind=${kind}`);
+                             }}
+                             style={{ fontSize: 10, color: "#c0bdb8", cursor: "pointer", marginLeft: "auto" }}>✎</a>
+                        )}
+                      </div>
+                    ))}
                   </div>
-                  <a onClick={() => remove(row)} style={{ fontSize: 11, color: "#c0bdb8", cursor: "pointer" }}>×</a>
+                );
+              })}
+
+              <div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                  <p style={{ ...labelStyle, margin: "0 0 5px", color: KIND_GLYPH.composition.tint }}>
+                    {KIND_GLYPH.composition.label}{scripts.length ? ` · ${scripts.length}` : ""}
+                  </p>
+                  {/* A composition is arranged HERE, so this one stays on the
+                      page: it clears the timeline rather than navigating. */}
+                  <a onClick={newScript} title="Start an empty composition"
+                     style={{ fontSize: 10.5, color: "#b05c08", cursor: "pointer" }}>+ new</a>
                 </div>
-              ))}
+                {scripts.length === 0 && (
+                  <p style={{ fontSize: 11, color: "#a8a5a0", margin: 0 }}>none yet</p>
+                )}
+                {scripts.map(row => (
+                  <div key={row.id}
+                       style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+                                gap: 6, padding: "3px 0" }}>
+                    <div style={{ minWidth: 0, cursor: "pointer", display: "flex", alignItems: "center", gap: 7 }}
+                         onClick={() => open(row)}>
+                      <span style={{ color: KIND_GLYPH.composition.tint, fontSize: 11, width: 12 }}>
+                        {KIND_GLYPH.composition.mark}
+                      </span>
+                      <span style={{ fontSize: 12, color: scriptId === row.id ? "#b05c08" : "#2f2c28",
+                                     overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {row.name}
+                      </span>
+                      {/* `drives` is computed server-side from the entries, so
+                          the shelf can say which of these an encounter could
+                          actually play without opening each one. */}
+                      {(row.drives || []).some(r => !ENCOUNTER_DRIVES.includes(r)) && (
+                        <span style={{ fontSize: 9, color: "#b05c08" }}>studio only</span>
+                      )}
+                    </div>
+                    <a onClick={() => remove(row)}
+                       style={{ fontSize: 11, color: "#c0bdb8", cursor: "pointer" }}>×</a>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
 
@@ -658,6 +759,38 @@ export default function InteractionStudioPage() {
                   {running ? "Stop" : "▶ Run script"}
                 </button>
                 <button style={btn()} onClick={() => { rigRef.current?.reset?.(); rigRef.current?.setObstacles?.(props); }}>Reset marks</button>
+                {/* Adding a character is one picker and one button, the same
+                    shape as adding a prop. Who is actually in the room is shown
+                    in "The room" on the right — a row of selects on the toolbar
+                    was the cast list and the cast control at once, and did
+                    neither job well. */}
+                <select value={toAdd} style={{ ...btn(), width: 150 }}
+                        title="Choose a character to put in the room"
+                        onChange={e => setToAdd(e.target.value)}>
+                  <option value="">— character —</option>
+                  {castList.map(x => (
+                    <option key={x.id} value={x.id} disabled={!!x.unavailable}>
+                      {x.name}{x.kind === "you" ? " (you)" : ""}{x.unavailable ? ` — ${x.unavailable}` : ""}
+                    </option>
+                  ))}
+                </select>
+                <button style={btn(toAdd ? "primary" : "plain")}
+                        disabled={!toAdd || slots.length >= SLOT_IDS.length}
+                        title="Put them in the room"
+                        onClick={() => {
+                          const who = castList.find(x => x.id === toAdd);
+                          if (!who) return;
+                          // Reuse an empty slot before opening a new one, so
+                          // adding after a removal does not walk the alphabet.
+                          const free = slots.find(id => !cast[id]) ||
+                                       SLOT_IDS.find(id => !slots.includes(id));
+                          if (!free) return;
+                          if (!slots.includes(free)) setSlots(s => [...s, free]);
+                          setCast(c => ({ ...c, [free]: who }));
+                          setToAdd("");
+                          setDirty(true);
+                          say(`${who.name} is in the room`);
+                        }}>+ Add</button>
                 <select
                   value=""
                   style={{ ...btn(placing ? "primary" : "plain"), width: 108 }}
@@ -684,7 +817,8 @@ export default function InteractionStudioPage() {
                           setProps([]);
                           setPlacing(null);
                           setSelectedProp(null);
-                          setCast({ a: null, b: null });
+                          setSlots(["a", "b"]);
+                          setCast({});
                           setSteps([]);
                           setSelected(-1);
                           setSelectedCam(-1);
@@ -697,47 +831,26 @@ export default function InteractionStudioPage() {
               </div>
             </div>
 
-            {poseLab && rigReady && (
-              <>
-                <div style={{ ...cardStyle, display: "flex", alignItems: "center", gap: 10 }}>
-                  <strong style={{ fontSize: 13 }}>Pose Animation Editor</strong>
-                  <span style={{ fontSize: 11.5, color: "#8b8781" }}>
-                    poses {cast[poseLab.step.role]?.name || "— cast a body on the left first"} · role {poseLab.step.role}
-                  </span>
-                  <select value={poseLab.step.role} style={inputStyle}
-                          onChange={e => setPoseLab(pl => ({ ...pl, step: { ...pl.step, role: e.target.value } }))}>
-                    {ROLES.map(r => <option key={r} value={r}>role {r}</option>)}
-                  </select>
-                  <div style={{ flex: 1 }} />
-                  <button style={btn()} onClick={() => setPoseLab(null)}>← Back to script</button>
-                </div>
-                <InteractionActionEditor
-                  key={"poselab-" + poseLab.step.id}
-                  rig={rigRef.current}
-                  stepIndex={0}
-                  step={poseLab.step}
-                  onStepChange={patch => setPoseLab(pl => ({ ...pl, step: { ...pl.step, ...patch } }))}
-                  onSay={say}
-                  onPlay={(slug, forStep) => {
-                    if (!slug) return say("give it a name first", "warn");
-                    const role = forStep?.role || poseLab.step.role || "a";
-                    run({ name: "preview", resetMarks: false,
-                          steps: [{ id: "preview", type: "reaction", role, action: slug, delay: 0, wait: true }] });
-                  }}
-                />
-              </>
-            )}
-
             {/* Always rendered. The add buttons are ON the tracks, so gating this
                 on steps.length meant an empty script had no way to gain one. */}
-            {!poseLab && (
-              <InteractionTimeline
+            {/* Who has a row, in cast order, with the colour their ring wears in
+                the room — so a bar on the timeline and a body on the floor are
+                recognisably the same person. An empty slot still gets a row:
+                that is where you put their first entry. */}
+            <InteractionTimeline
                 steps={steps}
+                cast={slots}
+                roster={slots.map((id, i) => ({
+                  id,
+                  name: cast[id]?.name || `slot ${id}`,
+                  color: `#${colorFor(id, i).toString(16).padStart(6, "0")}`,
+                }))}
                 selected={selected}
                 liveStep={liveStep}
                 running={running}
                 onPlay={() => (running ? stop() : run())}
                 onAddStep={(type) => addStep(type)}
+                onAddTo={(ref, role) => addStep(ref, role)}
                 cameras={cameras}
                 selectedCam={selectedCam}
                 onSelectCam={(i) => { setSelectedCam(i); setSelected(-1); }}
@@ -784,14 +897,13 @@ export default function InteractionStudioPage() {
                 }}
                 marks={{ a: { ...MARKS.a, facing: Math.PI / 2 }, b: { ...MARKS.b, facing: -Math.PI / 2 } }}
                 onSelect={setSelected}
-              />
-            )}
+            />
 
             {/* The selected block's settings, directly under the timeline —
                 clicking a bar is how you get here, so this is where the eye
                 already is. It renders the SAME row the steps list used to, so
                 there is one editor for a step, not two that can disagree. */}
-            {!poseLab && selectedCam >= 0 && cameras[selectedCam] && (
+            {selectedCam >= 0 && cameras[selectedCam] && (
               <div style={cardStyle}>
                 <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                   <strong style={{ fontSize: 12.5 }}>Camera</strong>
@@ -805,19 +917,19 @@ export default function InteractionStudioPage() {
                   {cameras[selectedCam].shot !== "wide" && (
                     <select value={cameras[selectedCam].of || "a"} style={inputStyle}
                             onChange={e => editCam(selectedCam, { of: e.target.value })}>
-                      {ROLES.map(r => <option key={r} value={r}>on {r}</option>)}
+                      {slots.map(r => <option key={r} value={r}>on {r}</option>)}
                     </select>
                   )}
                   {cameras[selectedCam].shot === "over_shoulder" && (
                     <select value={cameras[selectedCam].from || "b"} style={inputStyle}
                             onChange={e => editCam(selectedCam, { from: e.target.value })}>
-                      {ROLES.map(r => <option key={r} value={r}>over {r}</option>)}
+                      {slots.map(r => <option key={r} value={r}>over {r}</option>)}
                     </select>
                   )}
                   <label style={{ fontSize: 11, color: "#8b8781" }}>at step
                     <select value={cameras[selectedCam].step} style={{ ...inputStyle, marginLeft: 4 }}
                             onChange={e => editCam(selectedCam, { step: Number(e.target.value) })}>
-                      {steps.map((st, i) => <option key={i} value={i}>{i + 1}. {STEP_TYPES[st.type]?.label || st.type}</option>)}
+                      {steps.map((st, i) => <option key={i} value={i}>{i + 1}. {getAction(st.ref)?.name || st.ref}</option>)}
                     </select>
                   </label>
                   <label style={{ fontSize: 11, color: "#8b8781" }}>+ seconds
@@ -835,9 +947,9 @@ export default function InteractionStudioPage() {
               </div>
             )}
 
-            {!poseLab && steps[selected] && (
+            {steps[selected] && (
               <div style={cardStyle}>
-                <StepRow step={steps[selected]} index={selected} live={liveStep === selected}
+                <StepRow slots={slots} cast={cast} step={steps[selected]} index={selected} live={liveStep === selected}
                          selected
                          onSelect={() => {}}
                          warning={warnings.find(w => w.index === selected)}
@@ -854,45 +966,7 @@ export default function InteractionStudioPage() {
                          onEdit={patch => edit(selected, patch)}
                          onRemove={() => { removeStep(selected); setSelected(-1); }}
                          onMove={d => moveStep(selected, d)}
-                         onOpenPoseLab={(st) => setPoseLab({
-                           // Picking a reaction and pressing the button edits
-                           // THAT reaction (Magnus, 2026-09-12); with nothing
-                           // picked it starts a new one.
-                           step: { id: "poselab-" + Date.now(), type: "reaction",
-                                   role: st?.role || "a", action: st?.action || "",
-                                   on: "delay", delay: 0, wait: true } })} />
-              </div>
-            )}
-
-            {!poseLab && rigReady && ["interaction", "reaction"].includes(steps[selected]?.type) && (
-              <InteractionActionEditor
-                key={steps[selected].id}
-                rig={rigRef.current}
-                stepIndex={selected}
-                step={steps[selected]}
-                onStepChange={patch => edit(selected, patch)}
-                onSay={say}
-                onPlay={(slug, forStep) => {
-                  if (!slug) return say("give it a name first", "warn");
-                  // Played through the REAL runner on a real step of the SAME
-                  // TYPE as the one being edited — an editor whose play button
-                  // takes a different path to the runner is an editor that can
-                  // lie — but on a THROWAWAY script, so the sequence you are
-                  // composing is left exactly as it was, standing where it is.
-                  const role = forStep?.role || "a";
-                  const one = forStep?.type === "reaction"
-                    ? { id: "preview", type: "reaction", role, action: slug, delay: 0, wait: true }
-                    : { id: "preview", type: "interaction", role,
-                        target: forStep?.target || (role === "a" ? "b" : "a"), action: slug, wait: true };
-                  run({ name: "preview", resetMarks: false, steps: [one] });
-                }}
-              />
-            )}
-
-            {!poseLab && rigReady && !["interaction", "reaction"].includes(steps[selected]?.type)
-              && steps.some(x => ["interaction", "reaction"].includes(x.type)) && (
-              <div style={{ ...cardStyle, fontSize: 11.5, color: "#8b8781" }}>
-                Select a <strong>Body interaction</strong> or <strong>React</strong> step on the right to edit what it does.
+                         onOpenPoseLab={(st) => navigate(`/lab/studio/animation?ref=${encodeURIComponent(st?.ref || "")}&kind=${encodeURIComponent(st?.kind || "pose")}`)} />
               </div>
             )}
 
@@ -912,7 +986,7 @@ export default function InteractionStudioPage() {
           </div>
 
           {/* ── right: the script ────────────────────────────────────────── */}
-          <div style={{ display: poseLab ? "none" : "flex", flexDirection: "column", gap: 14 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
             <div style={cardStyle}>
               <p style={labelStyle}>This script</p>
               <input value={name} onChange={e => { setName(e.target.value); setDirty(true); }}
@@ -960,6 +1034,43 @@ export default function InteractionStudioPage() {
 
             <div style={cardStyle}>
               <p style={labelStyle}>The room</p>
+
+              {/* The cast, where you can see it while you author. Each one is a
+                  SLOT — the composition refers to "a", and an encounter casts
+                  whoever it likes into it. */}
+              {slots.filter(id => cast[id]).length === 0 && (
+                <p style={{ fontSize: 11.5, color: "#a8a5a0", margin: "0 0 9px" }}>
+                  Nobody in it yet. Pick a character above and press Add.
+                </p>
+              )}
+              {slots.filter(id => cast[id]).map((id, i) => (
+                <div key={id} style={{ display: "flex", alignItems: "center", gap: 7,
+                                       padding: "4px 0", borderBottom: "1px solid rgba(0,0,0,.05)" }}>
+                  <span style={{ width: 9, height: 9, borderRadius: 9, flex: "0 0 auto",
+                                 background: `#${colorFor(id, slots.indexOf(id)).toString(16).padStart(6, "0")}` }} />
+                  <span style={{ fontSize: 12.5, color: "#2f2c28", flex: 1, overflow: "hidden",
+                                 textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {cast[id].name}
+                  </span>
+                  <span style={{ fontSize: 10, color: "#a8a5a0", letterSpacing: ".1em" }}>slot {id}</span>
+                  <a title="Take them out of the room"
+                     onClick={() => {
+                       setSlots(s => s.filter(x => x !== id));
+                       setCast(c => { const n = { ...c }; delete n[id]; return n; });
+                       // Entries that acted as this slot have nobody to act them.
+                       setSteps(st => st.filter(e => e.role !== id && e.params?.target !== id));
+                       setDirty(true);
+                       say(`${cast[id].name} left the room`);
+                     }}
+                     style={{ fontSize: 11, color: "#c0bdb8", cursor: "pointer" }}>×</a>
+                </div>
+              ))}
+              {slots.filter(id => cast[id]).length > 0 && (
+                <p style={{ fontSize: 10.5, color: "#a8a5a0", margin: "8px 0 10px", lineHeight: 1.5 }}>
+                  A slot is a place someone stands, not a person. An encounter casts its own
+                  actor into one and the player into another.
+                </p>
+              )}
               {props.length === 0 && (
                 <p style={{ fontSize: 11.5, color: "#a8a5a0", margin: 0 }}>
                   Bare. Add a prop above, then click the floor to put it down — R turns it, Esc cancels.
@@ -1010,207 +1121,133 @@ export default function InteractionStudioPage() {
   );
 }
 
-// One step. Every type renders from the same row so the list reads as one
-// thing — the fields change, the shape does not.
-// Every field name the row below knows how to draw. Deliberately a LIST to
-// maintain rather than something inferred from the JSX: a list you must update
-// is a list that can be compared against, and the comparison is the point.
-//
-// STEP_TYPES promises that a verb cannot be half-added — the server validates
-// from it, the runner dispatches from it, the palette renders from it. The one
-// half that does NOT follow automatically is this row, because it is a
-// hand-written chain and not generated. `interaction` was added to the table,
-// got its palette button for free, and then could not be given an action at
-// all: it validated as "no body interaction chosen" forever with nothing in the
-// row to choose one. This catches that the moment a verb is added instead of
-// four error messages later.
-const RENDERABLE_FIELDS = new Set([
-  "on",
-  "role", "target", "clip", "loop", "action",
-  "x", "z", "distance", "speed", "fade", "seconds", "delay", "height", "text", "prop",
-]);
-
+// One entry on the timeline, edited. Every control here is generated from the
+// parameters the LIBRARY entry declares — there is no table of fields per verb
+// any more, because there are no verbs any more. Authoring a new action makes
+// its controls appear here without this file changing.
 function StepRow({ step, index, live, selected, onSelect, warning, onFix, clips, propList, onPickPoint,
-                   onEdit, onRemove, onMove, onOpenPoseLab }) {
-  const def = STEP_TYPES[step.type];
-  const fields = def?.fields || [];
-  const unrendered = fields.filter(f => !RENDERABLE_FIELDS.has(f));
+                   onEdit, onRemove, onMove, onOpenPoseLab, slots = ["a", "b"], cast = {} }) {
+  const def = getAction(step?.ref);
+  const params = paramsFor(def);
   const cell = { fontSize: 11.5, padding: "3px 6px", borderRadius: 5,
                  border: "1px solid rgba(0,0,0,.12)", color: "#2f2c28", background: "#fff" };
+  const who = (id) => cast[id]?.name || `slot ${id}`;
+  const setParam = (key, v) => onEdit({ params: { ...(step.params || {}), [key]: v } });
+
+  if (!def) {
+    return (
+      <div style={{ border: "1px solid rgba(216,90,48,.4)", background: "rgba(216,90,48,.06)",
+                    borderRadius: 8, padding: "8px 9px", marginBottom: 6, fontSize: 11.5, color: "#d85a30" }}>
+        {index + 1}. “{step?.ref}” is not in the library.
+      </div>
+    );
+  }
 
   return (
     <div onClick={onSelect}
-         style={{ border: `1px solid ${live ? "rgba(201,151,58,.55)" : selected ? "#b45309" : "rgba(0,0,0,.07)"}`,
-                  borderLeft: selected ? "3px solid #b45309" : undefined,
-                  background: live ? "rgba(201,151,58,.06)" : selected ? "#fff8f0" : "#fdfcfb",
-                  borderRadius: 8, padding: "8px 9px", marginBottom: 6, cursor: "pointer" }}>
+         style={{ border: `1px solid ${live ? "rgba(201,151,58,.55)" : selected ? "rgba(0,0,0,.22)" : "rgba(0,0,0,.07)"}`,
+                  background: live ? "rgba(201,151,58,.06)" : "#fdfcfb",
+                  borderRadius: 8, padding: "8px 9px", marginBottom: 6 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-        <span style={{ fontSize: 10.5, color: selected ? "#b05c08" : "#8b8781", fontWeight: selected ? 600 : 400 }}>
-          {index + 1}. {def?.label || step.type}{selected ? "  · editing" : ""}
+        <span style={{ fontSize: 10.5, color: "#8b8781" }}>
+          {index + 1}. {KIND_GLYPH[step.kind]?.mark} {def.name}
+          {def.source === "engine" && <span style={{ color: "#c0bdb8" }}> · room</span>}
         </span>
         <span style={{ display: "flex", gap: 6 }}>
-          <a onClick={() => onMove(-1)} style={{ cursor: "pointer", color: "#c0bdb8", fontSize: 11 }}>↑</a>
-          <a onClick={() => onMove(1)}  style={{ cursor: "pointer", color: "#c0bdb8", fontSize: 11 }}>↓</a>
-          <a onClick={onRemove}         style={{ cursor: "pointer", color: "#c0bdb8", fontSize: 11 }}>×</a>
+          {def.source !== "engine" && (
+            <a onClick={(e) => { e.stopPropagation(); onOpenPoseLab?.(step); }}
+               style={{ cursor: "pointer", color: "#b05c08", fontSize: 10.5 }}>edit</a>
+          )}
+          <a onClick={(e) => { e.stopPropagation(); onMove(-1); }} style={{ cursor: "pointer", color: "#c0bdb8", fontSize: 11 }}>↑</a>
+          <a onClick={(e) => { e.stopPropagation(); onMove(1); }}  style={{ cursor: "pointer", color: "#c0bdb8", fontSize: 11 }}>↓</a>
+          <a onClick={(e) => { e.stopPropagation(); onRemove(); }} style={{ cursor: "pointer", color: "#c0bdb8", fontSize: 11 }}>×</a>
         </span>
       </div>
 
       <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
-        {fields.includes("role") && (
-          <select value={step.role || "a"} onChange={e => onEdit({ role: e.target.value })} style={cell}>
-            {ROLES.map(r => <option key={r} value={r}>{r}</option>)}
-          </select>
-        )}
-        {fields.includes("target") && (
-          <select value={step.target || "b"} onChange={e => onEdit({ target: e.target.value })} style={cell}>
-            {ROLES.map(r => <option key={r} value={r}>→ {r}</option>)}
-          </select>
-        )}
-        {fields.includes("clip") && (
-          clips.length > 0 ? (
-            <select value={step.clip || ""} onChange={e => onEdit({ clip: e.target.value })} style={cell}>
-              {!clips.includes(step.clip) && <option value={step.clip || ""}>{step.clip || "—"}</option>}
-              {clips.map(c => <option key={c} value={c}>{c}</option>)}
+        {/* who performs it — always, for every kind */}
+        <select value={step.role || slots[0]} style={cell}
+                onChange={e => onEdit({ role: e.target.value })}>
+          {slots.map(r => <option key={r} value={r}>{who(r)}</option>)}
+        </select>
+
+        {params.map(prm => {
+          const v = step.params?.[prm.key];
+          if (prm.type === "role") return (
+            <select key={prm.key} value={v || ""} style={cell} title={prm.label}
+                    onChange={e => setParam(prm.key, e.target.value)}>
+              <option value="">— {prm.label} —</option>
+              {slots.filter(r => r !== step.role).map(r => <option key={r} value={r}>{who(r)}</option>)}
             </select>
-          ) : (
-            // No body cast in that role yet, so no clip list to offer. A free
-            // text box is right here rather than an empty dropdown: a script
-            // can be written before the models are in the room.
-            <input value={step.clip || ""} placeholder="clip"
-                   onChange={e => onEdit({ clip: e.target.value })} style={{ ...cell, width: 90 }} />
-          )
-        )}
-        {/* Framing, on every step. "keep previous" is the default because a
-            shot usually holds across several beats — forcing a choice on each
-            one produces six copies of the same answer and three that drifted. */}
-        <span style={{ display: "flex", width: "100%", gap: 5, alignItems: "center",
-                       marginTop: 6, paddingTop: 6, borderTop: "1px dashed rgba(0,0,0,.08)" }}>
-          <span style={{ fontSize: 10, color: "#a8a5a0", textTransform: "uppercase", letterSpacing: ".05em" }}>camera</span>
-          <select value={step.camera?.shot || ""} style={{ ...cell, fontSize: 11 }}
-                  onClick={e => e.stopPropagation()}
-                  onChange={e => {
-                    const v = e.target.value;
-                    if (!v) return onEdit({ camera: undefined });
-                    onEdit({ camera: { shot: v, of: step.camera?.of || "a",
-                                       from: step.camera?.from || "b",
-                                       distance: step.camera?.distance || 0,
-                                       height: step.camera?.height || 0 } });
-                  }}>
-            <option value="">keep previous</option>
-            <option value="two_shot">both of them</option>
-            <option value="over_shoulder">over the shoulder</option>
-            <option value="close">close on</option>
-            <option value="wide">wide</option>
-          </select>
-          {step.camera && step.camera.shot !== "wide" && (
-            <select value={step.camera.of || "a"} style={{ ...cell, fontSize: 11 }}
-                    onClick={e => e.stopPropagation()}
-                    onChange={e => onEdit({ camera: { ...step.camera, of: e.target.value } })}>
-              {ROLES.map(r => <option key={r} value={r}>on {r}</option>)}
+          );
+          if (prm.type === "prop") return (
+            <select key={prm.key} value={v || ""} style={cell} title={prm.label}
+                    onChange={e => setParam(prm.key, e.target.value)}>
+              <option value="">— prop —</option>
+              {(propList || []).map(pr => <option key={pr.id} value={pr.id}>{pr.label || pr.type}</option>)}
             </select>
-          )}
-          {step.camera?.shot === "over_shoulder" && (
-            <select value={step.camera.from || "b"} style={{ ...cell, fontSize: 11 }}
-                    onClick={e => e.stopPropagation()}
-                    onChange={e => onEdit({ camera: { ...step.camera, from: e.target.value } })}>
-              {ROLES.map(r => <option key={r} value={r}>over {r}</option>)}
+          );
+          if (prm.type === "clip") return (
+            <select key={prm.key} value={v || ""} style={cell} title={prm.label}
+                    onChange={e => setParam(prm.key, e.target.value)}>
+              {!(clips || []).includes(v) && <option value={v || ""}>{v || "—"}</option>}
+              {(clips || []).map(c => <option key={c} value={c}>{c}</option>)}
             </select>
-          )}
-        </span>
-        {warning && (
-          <span style={{ display: "block", width: "100%", fontSize: 10.5, color: "#b05c08",
-                         marginTop: 5, lineHeight: 1.45 }}>
-            ⚠ {warning.text}
-            {warning.fix && (
-              <a onClick={(e) => { e.stopPropagation(); onFix(); }}
-                 style={{ marginLeft: 6, cursor: "pointer", textDecoration: "underline" }}>fix it</a>
-            )}
-          </span>
+          );
+          if (prm.type === "bool") return (
+            <label key={prm.key} style={{ fontSize: 11, color: "#8b8781", display: "flex", gap: 4, alignItems: "center" }}>
+              <input type="checkbox" checked={!!v} onChange={e => setParam(prm.key, e.target.checked)} />
+              {prm.label}
+            </label>
+          );
+          if (prm.type === "text") return (
+            <input key={prm.key} value={v || ""} placeholder={prm.label} style={{ ...cell, flex: "1 1 160px", minWidth: 120 }}
+                   onChange={e => setParam(prm.key, e.target.value)} />
+          );
+          return (
+            <label key={prm.key} style={{ fontSize: 10.5, color: "#8b8781", display: "flex", gap: 3, alignItems: "center" }}>
+              {prm.label}
+              <input type="number" step={prm.step || 0.05} value={v ?? 0} style={{ ...cell, width: 62 }}
+                     onChange={e => setParam(prm.key, Number(e.target.value))} />
+            </label>
+          );
+        })}
+
+        {/* a reaction is timed against a contact, not a clock */}
+        {step.kind === "reaction" && (
+          <>
+            <select value={step.on || "contact"} style={cell}
+                    onChange={e => onEdit({ on: e.target.value })}>
+              <option value="contact">on contact</option>
+              <option value="delay">after a delay</option>
+            </select>
+            <label style={{ fontSize: 10.5, color: "#8b8781", display: "flex", gap: 3, alignItems: "center" }}>
+              {step.on === "delay" ? "seconds" : "+s"}
+              <input type="number" step="0.05" value={step.delay ?? 0} style={{ ...cell, width: 56 }}
+                     onChange={e => onEdit({ delay: Number(e.target.value) })} />
+            </label>
+          </>
         )}
-        {unrendered.length > 0 && (
-          <span title="This step type declares a field this editor cannot draw, so the step can never be completed here. Add it to StepRow and to RENDERABLE_FIELDS."
-                style={{ fontSize: 11, color: "#c2410c", background: "#fff3ed",
-                         border: "1px solid #fdba74", borderRadius: 4, padding: "2px 6px" }}>
-            ⚠ no editor for: {unrendered.join(", ")}
-          </span>
-        )}
-        {fields.includes("action") && (
-          // The palette button for this verb comes free from STEP_TYPES, so
-          // WITHOUT this field the step could be added and never made valid —
-          // it validated as "no body interaction chosen" forever with nothing
-          // in the row to choose one. Shipped exactly that way once.
-          <select value={step.action || ""} onChange={e => onEdit({ action: e.target.value })} style={cell}>
-            <option value="">— pick one —</option>
-            {/* Filtered by the step's own kind. An unfiltered list let a React
-                step name an ACTION — which validates, plays, and poses nothing,
-                because the tracks belong to a body that is not in this step. */}
-            {listActions(step.type === "reaction" ? "reaction" : "action")
-              .map(a => <option key={a.slug} value={a.slug}>{a.name}</option>)}
-          </select>
-        )}
-        {fields.includes("action") && step.type === "reaction" && onOpenPoseLab && (
-          <button style={{ fontSize: 11, padding: "3px 9px", borderRadius: 6, border: "1px solid #d8d3cb",
-                           background: "#fff", cursor: "pointer", color: "#2f2c28" }}
-                  title="Open the Pose Animation Editor — the sliders and the 3D view, nothing else. With a pose picked, it opens THAT pose for editing; empty, it starts a new one."
-                  onClick={(e) => { e.stopPropagation(); onOpenPoseLab(step); }}>
-            {step.action ? "Edit pose" : "New Reaction"}
-          </button>
-        )}
-        {fields.includes("on") && (
-          <select value={step.on || "contact"} onChange={e => onEdit({ on: e.target.value })} style={cell}>
-            <option value="contact">on contact</option>
-            <option value="delay">after a delay</option>
-          </select>
-        )}
-        {fields.includes("loop") && (
-          <label style={{ fontSize: 11, color: "#8b8781", display: "flex", gap: 4, alignItems: "center" }}>
-            <input type="checkbox" checked={!!step.loop} onChange={e => onEdit({ loop: e.target.checked })} />
-            loop
-          </label>
-        )}
-        {["x", "z", "distance", "speed", "fade", "seconds", "delay", "height"].filter(f => fields.includes(f)).map(f => (
-          <label key={f} style={{ fontSize: 10.5, color: "#8b8781", display: "flex", gap: 3, alignItems: "center" }}>
-            {f}
-            <input type="number" step="0.05" value={step[f] ?? 0}
-                   onChange={e => onEdit({ [f]: Number(e.target.value) })}
-                   style={{ ...cell, width: 62 }} />
-          </label>
-        ))}
-        {fields.includes("prop") && (
-          <select value={step.prop || ""} onChange={e => onEdit({ prop: e.target.value })} style={cell}>
-            <option value="">— which prop —</option>
-            {(propList || []).map(pr => (
-              <option key={pr.id} value={pr.id}>
-                {PROP_TYPES[pr.type]?.label || pr.type} ({pr.x.toFixed(1)}, {pr.z.toFixed(1)})
-              </option>
-            ))}
-            {/* By TYPE as well as by that particular one: "the table" survives a
-                room being rearranged, or being a different room entirely. */}
-            {Object.entries(PROP_TYPES).map(([k, v]) => (
-              <option key={"type-" + k} value={k}>any {v.label.toLowerCase()}</option>
-            ))}
-          </select>
-        )}
-        {step.type === "walk_to" && (
-          <a title="Point at the floor to set this"
-             onClick={(e) => { e.stopPropagation(); onPickPoint?.(); }}
-             style={{ fontSize: 10.5, color: "#b05c08", cursor: "pointer", textDecoration: "underline" }}>
-            pick in room
-          </a>
-        )}
-        {fields.includes("text") && (
-          <input value={step.text || ""} placeholder="what they say"
-                 onChange={e => onEdit({ text: e.target.value })}
-                 style={{ ...cell, flex: "1 1 160px", minWidth: 120 }} />
-        )}
-        {step.type !== "wait" && (
-          <label style={{ fontSize: 10.5, color: "#8b8781", display: "flex", gap: 4, alignItems: "center" }}
-                 title="Unticked, the next step starts on top of this one — that is how a walk and a line happen together.">
-            <input type="checkbox" checked={step.wait !== false} onChange={e => onEdit({ wait: e.target.checked })} />
-            finish before next
-          </label>
-        )}
+
+        <label style={{ fontSize: 10.5, color: "#8b8781", display: "flex", gap: 3, alignItems: "center" }}
+               title="Seconds of nothing before this entry begins — what a Wait step used to be.">
+          gap
+          <input type="number" step="0.1" value={step.gap ?? 0} style={{ ...cell, width: 52 }}
+                 onChange={e => onEdit({ gap: Number(e.target.value) })} />
+        </label>
+
+        <label style={{ fontSize: 10.5, color: "#8b8781", display: "flex", gap: 4, alignItems: "center" }}
+               title="Unticked, the next entry starts on top of this one — which is how a contact action and the reaction answering it are paired.">
+          <input type="checkbox" checked={step.wait !== false} onChange={e => onEdit({ wait: e.target.checked })} />
+          finish before next
+        </label>
       </div>
+
+      {warning && (
+        <p style={{ margin: "6px 0 0", fontSize: 10.5, color: "#d85a30" }}>
+          {warning}{onFix && <a onClick={onFix} style={{ marginLeft: 6, cursor: "pointer" }}>fix</a>}
+        </p>
+      )}
     </div>
   );
 }

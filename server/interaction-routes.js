@@ -32,7 +32,7 @@
 import { randomUUID } from "crypto";
 import express from "express";
 import { bootstrapSchema } from "./db.js";
-import { normalizeSteps, drivenRoles, normalizeCameras } from "../src/lib/interactionScript.js";
+import { normalizeEntries, drivenRoles, normalizeCameras, castIds } from "../src/lib/interactionScript.js";
 import { normalizeAction, slugify as actionSlug } from "../src/lib/bodyActions.js";
 
 // A slug is how an ENCOUNTER will ask for a script — by the name somebody gave
@@ -62,6 +62,9 @@ export function mount(app, { db, authUser }) {
       -- binding an encounter has to honour: role "a" is whoever the encounter
       -- casts as "a". Stored so re-opening a script in the studio puts the
       -- same two bodies back in the room.
+      -- The cast: an ordered list of SLOTS, each { id, label, driven }. It was
+      -- stored verbatim and never validated, which is how a wire shape nobody
+      -- checked became the thing entries resolve their roles against.
       cast_json   TEXT NOT NULL DEFAULT '[]',
       steps_json  TEXT NOT NULL DEFAULT '[]',
       inserted_at TEXT NOT NULL,
@@ -89,6 +92,27 @@ export function mount(app, { db, authUser }) {
       UNIQUE(owner_id, slug)
     );
   `);
+
+
+  // A slot is a place a character stands, not a character. `driven` is what
+  // survives into an encounter: a slot the rig does not drive is a living
+  // player, and an entry that moves them is refused before the first beat.
+  function normalizeCast(raw) {
+    const out = [];
+    const seen = new Set();
+    for (const c of Array.isArray(raw) ? raw.slice(0, 8) : []) {
+      const id = String(c?.id ?? c?.role ?? "").replace(/[^a-z0-9_-]/gi, "").slice(0, 16);
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      out.push({
+        id,
+        label: String(c?.label ?? c?.name ?? "").slice(0, 80) || null,
+        actor_id: c?.actor_id ? String(c.actor_id).slice(0, 64) : null,
+        driven: c?.driven === false ? false : true,
+      });
+    }
+    return out;
+  }
 
   const json = express.json({ limit: "512kb" });
 
@@ -135,14 +159,18 @@ export function mount(app, { db, authUser }) {
     }));
 
   const rowOut = (r) => {
-    const steps = safeParse(r.steps_json, []);
+    // `steps_json` keeps its column name; what it holds is the entry list.
+    // Renaming a column that five stored rows depend on buys nothing.
+    const entries = safeParse(r.steps_json, []);
+    const cast = safeParse(r.cast_json, []);
     return {
       id: r.id,
       name: r.name,
       slug: r.slug,
       description: r.description || "",
-      cast: safeParse(r.cast_json, []),
-      steps,
+      cast,
+      entries,
+      steps: entries,
       cameras: safeParse(r.cameras_json, []),
       // The furniture the rehearsal was staged with. A STAND-IN: what matters
       // is that a table was between them, not that it stood at x=0.4. When this
@@ -155,7 +183,11 @@ export function mount(app, { db, authUser }) {
       // it owns, and never play. Discovering it from runScript returning false
       // is correct but late — by then an encounter has already paused in front
       // of a player. (Chief Architect, 2026-09-06.)
-      drives: drivenRoles({ steps }),
+      // Which slots this composition takes hold of, computed from the entries
+      // by the same function the runner uses — so a host can compare it against
+      // the slots it owns BEFORE committing to a beat, rather than discovering
+      // the refusal mid-scene.
+      drives: drivenRoles({ entries, cast }),
       inserted_at: r.inserted_at,
       updated_at: r.updated_at,
     };
@@ -255,7 +287,9 @@ export function mount(app, { db, authUser }) {
     const name = String(req.body?.name || "").trim().slice(0, 80);
     if (!name) return res.status(400).json({ error: "a script needs a name" });
 
-    const { steps, errors } = normalizeSteps(req.body?.steps || []);
+    const cast = normalizeCast(req.body?.cast);
+    const { entries, errors } = normalizeEntries(req.body?.entries ?? req.body?.steps ?? [],
+                                                 { cast: castIds({ cast }) });
     if (errors.length) return res.status(400).json({ error: errors.join("; ") });
 
     // A name collision is a REPLACE offer, not an error the author has to
@@ -271,8 +305,8 @@ export function mount(app, { db, authUser }) {
       `INSERT INTO interaction_scripts (id, owner_id, name, slug, description, cast_json, steps_json, cameras_json, props_json, inserted_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(id, user.id, name, slug, String(req.body?.description || "").slice(0, 400),
-          JSON.stringify(req.body?.cast || []), JSON.stringify(steps),
-          JSON.stringify(normalizeCameras(req.body?.cameras, steps.length)),
+          JSON.stringify(req.body?.cast || []), JSON.stringify(entries),
+          JSON.stringify(normalizeCameras(req.body?.cameras, entries)),
           JSON.stringify(normalizeProps(req.body?.props)), now, now);
 
     res.json(rowOut(db.prepare(`SELECT * FROM interaction_scripts WHERE id = ?`).get(id)));
@@ -288,7 +322,10 @@ export function mount(app, { db, authUser }) {
 
     const name = String(req.body?.name ?? row.name).trim().slice(0, 80);
     if (!name) return res.status(400).json({ error: "a script needs a name" });
-    const { steps, errors } = normalizeSteps(req.body?.steps ?? safeParse(row.steps_json, []));
+    const cast = normalizeCast(req.body?.cast ?? safeParse(row.cast_json, []));
+    const { entries, errors } = normalizeEntries(
+      req.body?.entries ?? req.body?.steps ?? safeParse(row.steps_json, []),
+      { cast: castIds({ cast }) });
     if (errors.length) return res.status(400).json({ error: errors.join("; ") });
 
     const slug = slugify(name);
@@ -303,9 +340,9 @@ export function mount(app, { db, authUser }) {
         WHERE id = ?`
     ).run(name, slug,
           String(req.body?.description ?? row.description ?? "").slice(0, 400),
-          JSON.stringify(req.body?.cast ?? safeParse(row.cast_json, [])),
-          JSON.stringify(steps),
-          JSON.stringify(normalizeCameras(req.body?.cameras ?? safeParse(row.cameras_json, []), steps.length)),
+          JSON.stringify(cast),
+          JSON.stringify(entries),
+          JSON.stringify(normalizeCameras(req.body?.cameras ?? safeParse(row.cameras_json, []), entries)),
           JSON.stringify(normalizeProps(req.body?.props ?? safeParse(row.props_json, []))),
           new Date().toISOString(), row.id);
 

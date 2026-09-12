@@ -16,9 +16,9 @@
 // roughly right about proportion, and nothing should be measured off it.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { estimateTimeline, describeCamera, normalizeSteps, normalizeCameras, hoistLegacyCameras,
-         stepAt, STEP_TYPES } from "../lib/interactionScript.js";
-import { getAction } from "../lib/bodyActions.js";
+import { estimateTimeline, describeCamera, normalizeEntries, normalizeCameras,
+         stepAt, describeEntry, ENTRY_KINDS } from "../lib/interactionScript.js";
+import { getAction, listActions } from "../lib/bodyActions.js";
 import { PROP_TYPES } from "./InteractionStudioScene.jsx";
 
 // The same resolution order the rig uses — id, then slot, then type — so the
@@ -52,7 +52,8 @@ const COLOR = {
 export default function InteractionTimeline({ steps, cameras, selected, selectedCam, onSelect, onSelectCam,
                                               liveStep, marks, running, onPlay, onAddStep, onAddCamera,
                                               onMoveCamera, onScrub, onRemoveStep, onRemoveCamera,
-                                              propList }) {
+                                              propList, cast = ["a", "b"],
+                                              roster = null, onAddTo }) {
   const trackRef = useRef(null);
   const [head, setHead] = useState(0);
   const [dragging, setDragging] = useState(false);
@@ -61,7 +62,7 @@ export default function InteractionTimeline({ steps, cameras, selected, selected
   // BOUNDARY, which is the start of the cut on the right of it.
   const [camDrag, setCamDrag] = useState(-1);
   const { blocks, total, norm } = useMemo(() => {
-    const n = normalizeSteps(steps || []).steps;
+    const n = normalizeEntries(steps || [], { cast }).entries;
     const tl = estimateTimeline({ steps: n }, {
       marks,
       actionDuration: (slug) => getAction(slug)?.duration ?? 1,
@@ -81,10 +82,10 @@ export default function InteractionTimeline({ steps, cameras, selected, selected
   // Camera segments: from the step that sets a shot until the next one that
   // does. This is inheritance made visible.
   const shots = useMemo(() => {
-    const cams = hoistLegacyCameras(norm, normalizeCameras(cameras, norm.length));
+    const cams = normalizeCameras(cameras, norm);
     const out = [];
     cams.forEach((c, i) => {
-      const start = (blocks[c.step]?.start ?? 0) + (c.offset || 0);
+      const start = (blocks.find(b => b.id === c.entry)?.start ?? 0) + (c.offset || 0);
       const nxt = cams[i + 1];
       const end = nxt ? (blocks[nxt.step]?.start ?? total) + (nxt.offset || 0) : total;
       out.push({ index: i, start, end: Math.max(end, start + 0.05), camera: c });
@@ -152,21 +153,44 @@ export default function InteractionTimeline({ steps, cameras, selected, selected
   // which is how the readout came to say "4.64s of ~4.6s".
   const headAt = Math.max(0, Math.min(head, total));
 
-  // Lanes are assigned by ACTUAL OVERLAP, not by the blocking flag. Two steps
-  // that run at the same time — a non-blocking action and the reaction waiting
-  // on its contact — must never share a row, or one draws over the other and a
-  // whole step disappears from the strip. That is exactly what happened to the
-  // React step: zero width, hidden under the step after it.
-  const ends = [];
-  const lanes = blocks.map((b) => {
-    const start = b.start, end = b.start + Math.max(b.duration, 0.08);
-    let l = 0;
-    while (ends[l] !== undefined && ends[l] > start + 1e-6) l++;
-    ends[l] = end;
-    return l;
+  // ── a track per character ────────────────────────────────────────────────
+  //
+  // A composition is who does what when, so the person is the axis. Everything
+  // used to share one "action" track with lanes packed by overlap, which was
+  // fine while there were two roles and nearly every entry belonged to the
+  // first — and unreadable the moment three people were in the room, because
+  // nothing about a bar said whose body it moved.
+  //
+  // An entry sits on the track of the body it MOVES. A slap is the striker's;
+  // the person struck gets a tick at the contact instant on their own track,
+  // so the blow is visible on both sides without pretending one entry is two.
+  const who = roster && roster.length ? roster : cast.map(id => ({ id, name: id }));
+
+  // Overlap still decides lanes, but only against the same character's own
+  // entries: two things that genuinely run at once on one body must not draw
+  // over each other, and a reaction no longer has to dodge an unrelated walk.
+  const rows = who.map((slot) => {
+    const ends = [];
+    const items = [];
+    blocks.forEach((b, i) => {
+      if (norm[i].role !== slot.id) return;
+      const start = b.start, end = b.start + Math.max(b.duration, 0.08);
+      let l = 0;
+      while (ends[l] !== undefined && ends[l] > start + 1e-6) l++;
+      ends[l] = end;
+      items.push({ index: i, lane: l });
+    });
+    const laneCount = items.length ? Math.max(1, ...items.map(x => x.lane + 1)) : 1;
+    return { slot, items, laneCount, height: 6 + laneCount * 21 };
   });
-  const laneCount = lanes.length ? Math.max(1, ...lanes.map(l => l + 1)) : 1;
-  const ACTION_H = 6 + laneCount * 21;
+
+  // Where a contact lands on the body it happens TO.
+  const contactMarks = who.map(slot => blocks
+    .map((b, i) => ({ b, e: norm[i] }))
+    .filter(({ e }) => e.params?.target === slot.id && getAction(e.ref)?.aim)
+    .map(({ b, e }) => b.start + (getAction(e.ref)?.contactAt ?? 0)));
+
+  const ACTION_H = rows.reduce((h, r) => h + r.height + 2, 0);
 
   // Ticks every whole second, with halves when there is room. A ruler that
   // labelled every tick on a four-second script would be noise.
@@ -237,8 +261,18 @@ export default function InteractionTimeline({ steps, cameras, selected, selected
 
       <div style={{ display: "flex", gap: 6 }}>
         {/* labels */}
-        <div style={{ width: 54, flex: "0 0 54px", paddingTop: 18 }}>
-          <div style={{ ...label, height: ACTION_H, lineHeight: `${ACTION_H}px` }}>action</div>
+        <div style={{ width: 88, flex: "0 0 88px", paddingTop: 18 }}>
+          {rows.map((r, ri) => (
+            <div key={r.slot.id}
+                 style={{ ...label, height: r.height, lineHeight: `${r.height}px`, marginTop: ri ? 2 : 0,
+                          display: "flex", alignItems: "center", gap: 5, overflow: "hidden" }}>
+              <span style={{ width: 7, height: 7, borderRadius: 7, flex: "0 0 auto",
+                             background: r.slot.color || "#9c968d" }} />
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {r.slot.name}
+              </span>
+            </div>
+          ))}
           <div style={{ ...label, height: 30, lineHeight: "30px", marginTop: 4 }}>camera</div>
         </div>
 
@@ -262,37 +296,46 @@ export default function InteractionTimeline({ steps, cameras, selected, selected
             ))}
           </div>
 
-          <div style={{ ...trackStyle, height: ACTION_H, marginTop: 2 }}>
-            {blocks.map((b, i) => {
-              const st = norm[i];
-              const sel = selected === i;
-              return (
-                <div key={st.id || i}
-                     onMouseDown={(e) => { e.stopPropagation(); onSelect?.(i); }}
-                     title={STEP_TYPES[st.type]?.describe?.(st) || st.type}
-                     style={{
-                       position: "absolute", left: pct(b.start),
-                       width: `max(16px, ${pct(b.duration)})`,
-                       top: 3 + lanes[i] * 21, height: 19,
-                       background: COLOR[st.type] || "#9c968d",
-                       opacity: sel ? 1 : liveStep === i ? 0.95 : 0.78,
-                       border: sel ? "2px solid #2f2c28" : "1px solid rgba(0,0,0,.15)",
-                       borderRadius: 4, cursor: "pointer", overflow: "hidden",
-                       color: "#fff", fontSize: 10, lineHeight: "19px",
-                       padding: "0 5px", whiteSpace: "nowrap", textOverflow: "ellipsis",
-                     }}>
-                  {i + 1}. {STEP_TYPES[st.type]?.label || st.type}
-                  {sel && (
-                    <span onMouseDown={(e) => { e.stopPropagation(); onRemoveStep?.(i); }}
-                          title="Remove this step (or press Delete)"
-                          style={{ position: "absolute", right: 2, top: 0, padding: "0 4px",
-                                   cursor: "pointer", fontSize: 12, lineHeight: "19px",
-                                   color: "rgba(255,255,255,.85)" }}>×</span>
-                  )}
-                </div>
-              );
-            })}
-          </div>
+          {rows.map((r, ri) => (
+            <div key={r.slot.id} style={{ ...trackStyle, height: r.height, marginTop: ri ? 2 : 2 }}>
+              {/* A contact landing on this body, from someone else's action. */}
+              {contactMarks[ri].map((t, k) => (
+                <div key={"m" + k} title="a contact lands here"
+                     style={{ position: "absolute", left: pct(t), top: 0, bottom: 0, width: 2,
+                              marginLeft: -1, background: "rgba(216,90,48,.55)" }} />
+              ))}
+              {r.items.map(({ index: i, lane }) => {
+                const bl = blocks[i];
+                const st = norm[i];
+                const sel = selected === i;
+                return (
+                  <div key={st.id || i}
+                       onMouseDown={(e) => { e.stopPropagation(); onSelect?.(i); }}
+                       title={describeEntry(st)}
+                       style={{
+                         position: "absolute", left: pct(bl.start),
+                         width: `max(16px, ${pct(bl.duration)})`,
+                         top: 3 + lane * 21, height: 19,
+                         background: COLOR[st.kind] || "#9c968d",
+                         opacity: sel ? 1 : liveStep === i ? 0.95 : 0.78,
+                         border: sel ? "2px solid #2f2c28" : "1px solid rgba(0,0,0,.15)",
+                         borderRadius: 4, cursor: "pointer", overflow: "hidden",
+                         color: "#fff", fontSize: 10, lineHeight: "19px",
+                         padding: "0 5px", whiteSpace: "nowrap", textOverflow: "ellipsis",
+                       }}>
+                    {i + 1}. {getAction(st.ref)?.name || st.ref}
+                    {sel && (
+                      <span onMouseDown={(e) => { e.stopPropagation(); onRemoveStep?.(i); }}
+                            title="Remove this step (or press Delete)"
+                            style={{ position: "absolute", right: 2, top: 0, padding: "0 4px",
+                                     cursor: "pointer", fontSize: 12, lineHeight: "19px",
+                                     color: "rgba(255,255,255,.85)" }}>×</span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ))}
 
           {/* Cuts run edge to edge — each lasts until the next one — so there is
               no empty track to click. Cutting therefore has to work ON a bar,
@@ -354,11 +397,18 @@ export default function InteractionTimeline({ steps, cameras, selected, selected
           </div>
         </div>
 
-        {/* adding, at the end of each track where the sequence ends */}
+        {/* One + per character. Which body performs an entry was a field you
+            set afterwards on a row that always arrived saying "a"; now it is
+            decided by WHERE you add it, which is the question the timeline was
+            already asking. */}
         <div style={{ width: 30, flex: "0 0 30px", paddingTop: 18 }}>
-          <div style={{ height: ACTION_H, display: "flex", alignItems: "center" }}>
-            <AddMenu onPick={onAddStep} />
-          </div>
+          {rows.map((r, ri) => (
+            <div key={r.slot.id}
+                 style={{ height: r.height, marginTop: 2, display: "flex", alignItems: "center" }}>
+              <AddMenu who={r.slot}
+                       onPick={(ref) => (onAddTo ? onAddTo(ref, r.slot.id) : onAddStep?.(ref))} />
+            </div>
+          ))}
           <div style={{ height: 30, marginTop: 4, display: "flex", alignItems: "center" }}>
             {/* Cut at the head — the blade, for when you have scrubbed to the
                 exact moment and would rather not hit it with a mouse. */}
@@ -374,16 +424,25 @@ export default function InteractionTimeline({ steps, cameras, selected, selected
 // The action track's plus. A menu rather than a single button because there are
 // eight verbs and picking one IS the decision — a "+" that added a default step
 // would just make everybody delete it again.
-function AddMenu({ onPick }) {
+function AddMenu({ onPick, who }) {
   return (
     <select value="" onChange={(e) => { if (e.target.value) onPick?.(e.target.value); }}
-            title="Add a step"
+            title={who ? `Add something for ${who.name} to do` : "Add a step"}
             style={{ width: 30, height: 22, borderRadius: 4, border: "1px solid #ddd8d0",
                      background: "#fff", fontSize: 11, cursor: "pointer" }}>
       <option value="">+</option>
-      {Object.entries(STEP_TYPES).map(([type, def]) => (
-        <option key={type} value={type}>{def.label}</option>
-      ))}
+      {/* Grouped by kind, because that is what the library is. Picking one
+          here is the same act as clicking it in the library panel — the entry
+          arrives with that item's own declared parameters. */}
+      {["action", "reaction", "pose"].map(kind => {
+        const items = listActions(kind);
+        if (!items.length) return null;
+        return (
+          <optgroup key={kind} label={ENTRY_KINDS[kind]?.label || kind}>
+            {items.map(it => <option key={it.slug} value={it.slug}>{it.name}</option>)}
+          </optgroup>
+        );
+      })}
     </select>
   );
 }

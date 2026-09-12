@@ -427,10 +427,16 @@ export const ENGINE_ACTIONS = {
 export function paramsFor(entry) {
   if (!entry) return [];
   if (entry.source === "engine") return entry.params || [];
-  if (entry.kind === "action" && entry.aim) {
-    return [{ key: "target", type: "role", label: "at" }];
+  const out = [];
+  // Which piece of furniture, chosen per composition rather than baked into the
+  // motion — the same lean works on any table in any room.
+  if (entry.kind === "action" && entry.needsProp) {
+    out.push({ key: "prop", type: "prop", label: "on" });
   }
-  return [];
+  if (entry.kind === "action" && entry.aim) {
+    out.push({ key: "target", type: "role", label: "at" });
+  }
+  return out;
 }
 
 export function registerActions(list) {
@@ -456,10 +462,22 @@ export function listActions(kind) {
   const add = (a, builtin) => out.set(a.slug, {
     slug: a.slug, name: a.name, duration: a.duration, kind: a.kind || "action", builtin,
     source: a.source || "tracks", params: paramsFor(a),
+    // "Happens at a piece of furniture" — true of the built-in prop verbs and
+    // of an authored motion that declared it needs one. The library says room
+    // for both, because that is what the author called them; the pencil is
+    // what separates the ones you can open.
+    room: a.source === "engine" ? ["walk-to-prop", "sit-on", "stand-up", "pull-prop"].includes(a.slug)
+                                : !!a.needsProp,
   });
+  // The editor publishes on every slider move so the body in the room IS the
+  // thing being made ("the preview is not a preview"). An unnamed draft
+  // therefore lands in the registry too, under a scratch slug — and showed up
+  // in the library as a row with no name. A thing with no name is not a
+  // library entry; it is work in progress.
+  const named = (a) => !!String(a?.name || "").trim();
   for (const a of Object.values(ENGINE_ACTIONS)) add(a, true);
   for (const a of Object.values(ACTIONS)) add(a, true);
-  for (const a of SAVED.values()) add(a, false);
+  for (const a of SAVED.values()) if (named(a)) add(a, false);
   // An `interaction` step must not be offered a reaction, and vice versa —
   // choosing one would produce a step that validates and then poses nothing.
   return [...out.values()].filter(a => !kind || a.kind === kind);
@@ -610,6 +628,17 @@ export function normalizeAction(raw, { rig = "genesis9" } = {}) {
   }
 
   if (kind === "action") {
+    // A ROOM ACTION. The motion is authored here like any other, but it says it
+    // cannot happen in mid-air: leaning on a table, perching on the arm of a
+    // sofa, reaching into a cupboard. The composition binds which prop, and the
+    // ROOM supplies the geometry — where to stand and which way to face — the
+    // same footprint arithmetic `walk-to-prop` already does.
+    //
+    // This is as far as authoring reaches into the room, deliberately. An entry
+    // still cannot name a rig method: `source` is forced to "tracks" above, so
+    // a saved row can require furniture but can never choose what code runs.
+    action.needsProp = !!raw?.needsProp;
+    if (action.needsProp) action.standAt = clampNum(raw?.standAt, 0.55, 0.2, 3);
     action.contactAt = clampNum(raw?.contactAt, duration / 2, 0, duration);
     // What separation it was authored at. There is no IK and no contact test —
     // see the head of this file — so the distance is part of the action, not a

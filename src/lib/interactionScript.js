@@ -1,3 +1,5 @@
+import { getAction, paramsFor } from "./bodyActions.js";
+
 // ── The interaction script ───────────────────────────────────────────────────
 //
 // Session 157 — what two people DO to each other, written down.
@@ -81,11 +83,13 @@ function normalizeCamera(raw, errors, at) {
   const out = { shot: SHOTS.includes(String(raw.shot)) ? String(raw.shot) : "two_shot" };
   if (out.shot !== "wide") {
     const o = String(raw.of || "");
-    out.of = ROLES.includes(o) ? o : "a";
+    out.of = o || "a";
   }
   if (out.shot === "over_shoulder") {
     const f = String(raw.from || "");
-    out.from = ROLES.includes(f) ? f : (out.of === "a" ? "b" : "a");
+    // Explicit and required. With a cast of one or of five, "the other one"
+    // has no meaning — an over-the-shoulder has to name whose shoulder.
+    out.from = f || "";
     if (out.from === out.of) errors.push(`${at}: camera cannot shoot over their own shoulder`);
   }
   // 0 means "whatever suits this shot" — the sensible default per shot lives
@@ -106,349 +110,252 @@ function normalizeCamera(raw, errors, at) {
 // because every duration here is an estimate: a walk ends when the feet arrive.
 // An absolute time drifts out of sync the moment that walk gets longer;
 // "0.2s into step 3" stays true however long step 3 turns out to be.
-export function normalizeCameras(raw, stepCount, errors = []) {
+export function normalizeCameras(raw, entries = [], errors = []) {
+  // Anchored to the ID of the entry it belongs to. It used to be a positional
+  // index, and neither reordering nor deleting an entry ever touched the camera
+  // list — so moving one silently dragged every cut onto different content, and
+  // deleting one made this function re-clamp the out-of-range cuts onto the
+  // LAST entry rather than dropping them. A save/load round trip could relocate
+  // the framing of a whole composition with no warning anywhere.
+  const ids = new Set((entries || []).map(e => e?.id).filter(Boolean));
   const out = [];
-  const list = Array.isArray(raw) ? raw : [];
-  list.forEach((c, i) => {
-    if (!c || typeof c !== "object") return;
+  (Array.isArray(raw) ? raw : []).forEach((c, i) => {
     const at = `camera ${i + 1}`;
+    if (!c || typeof c !== "object") { errors.push(`${at}: not an object`); return; }
     const cam = normalizeCamera(c, errors, at);
     if (!cam) return;
-    const step = Math.max(0, Math.min(stepCount - 1, Math.round(Number(c.step) || 0)));
-    if (stepCount === 0) { errors.push(`${at}: nothing to anchor to`); return; }
-    out.push({ ...cam, id: safeId(c.id), step, offset: num(c.offset, 0, 0, 30) });
+    // Accept the old positional shape on the way in, once, so stored rows keep
+    // their framing: an integer `step` names the entry at that position.
+    const entry = ids.has(c.entry) ? c.entry
+                : (Number.isInteger(c.step) && entries[c.step]?.id) || null;
+    if (!entry) { errors.push(`${at}: nothing to anchor to`); return; }
+    out.push({ ...cam, id: safeId(c.id), entry, offset: num(c.offset, 0, 0, 30) });
   });
-  return out.sort((a, b) => (a.step - b.step) || (a.offset - b.offset));
+  // Ordered by where their entries actually fall, so inheritance reads left to
+  // right the way the timeline draws it.
+  const pos = new Map((entries || []).map((e, i) => [e.id, i]));
+  return out.sort((x, y) => (pos.get(x.entry) - pos.get(y.entry)) || (x.offset - y.offset));
 }
 
-// Which shot is in force when step `index` begins — the last cut anchored at or
-// before it. A step with no cut of its own keeps whatever is running.
-export function cameraAt(cameras, index) {
+export function cameraAt(cameras, entries, index) {
+  // Framing is inherited: a cut holds until the next one. Walk the cuts in
+  // entry order and keep the last one at or before this entry.
+  const pos = new Map((entries || []).map((e, i) => [e.id, i]));
   let found = null;
   for (const c of cameras || []) {
-    if (c.step <= index) found = c; else break;
+    if ((pos.get(c.entry) ?? Infinity) <= index) found = c; else break;
   }
   return found;
 }
 
-// Steps used to carry their own `camera`. Hoist those onto the track so scripts
-// saved under the old shape keep their framing instead of losing it silently —
-// the same mistake that emptied a saved slap earlier today.
-export function hoistLegacyCameras(steps, cameras) {
-  const out = [...(cameras || [])];
-  (steps || []).forEach((s, i) => {
-    if (!s?.camera) return;
-    if (out.some(c => c.step === i && c.offset === 0)) return;
-    out.push({ ...s.camera, step: i, offset: 0, id: `legacy-${i}` });
-  });
-  return out.sort((a, b) => (a.step - b.step) || (a.offset - b.offset));
-}
+// NOTE: `hoistLegacyCameras` used to live here, lifting a camera off a step
+// into the cut list. It was called from four places and StepRow kept WRITING
+// step.camera, so it never became a migration — it was a permanent second
+// write path for one concept. Cuts are their own objects now, anchored by
+// entry id, and the one-time acceptance of the old positional shape lives
+// inside normalizeCameras where nobody has to remember to call it.
 
-// Every step type, its parameters, and what it means to the rig. This table is
-// the contract: the server validates against it, the studio's editor renders
-// from it, and the runner dispatches on it. One place, so a new verb cannot be
-// half-added.
-export const STEP_TYPES = {
-  clip: {
-    label: "Play clip",
-    // Which body, which animation. `loop` holds it until something else takes
-    // over; a non-looping clip with wait:true blocks for its own duration.
-    fields: ["role", "clip", "loop", "fade"],
-    describe: (s) => `${s.role || "?"} plays “${s.clip || "…"}”${s.loop ? " (looping)" : ""}`,
-  },
-  walk_to: {
-    label: "Walk to point",
-    fields: ["role", "x", "z", "speed"],
-    describe: (s) => `${s.role || "?"} walks to ${fmt(s.x)}, ${fmt(s.z)}`,
-  },
-  walk_to_prop: {
-    label: "Walk to a prop",
-    // Named, not measured. "Go to the table" keeps meaning something when the
-    // table is somewhere else — in a real room, in a room rearranged since the
-    // rehearsal — where "walk to 1.2, -0.4" quietly becomes a walk to nowhere.
-    // The prop reference is the durable half of this step; the distance is just
-    // how close is close enough.
-    fields: ["role", "prop", "distance", "speed"],
-    describe: (s) => `${s.role || "?"} walks to the ${s.prop || "?"}`,
-  },
-  pull_prop: {
-    label: "Pull out a prop",
-    // Furniture has STATES. A chair tucked under a table offers no seat —
-    // sitting on it starts with pulling it out, the way it does in a kitchen.
-    // The step names the prop for the same reason walk_to_prop does, and the
-    // distance is how far out it comes.
-    fields: ["role", "prop", "distance"],
-    describe: (s) => `${s.role || "?"} pulls out the ${s.prop || "?"}`,
-  },
-  sit_on: {
-    label: "Sit on a prop",
-    // Named furniture again, for the same reason walk_to_prop names it: "sit on
-    // the chair" survives the chair being somewhere else, or being a different
-    // chair in a real room. Where she ends up is the room's business.
-    fields: ["role", "prop"],
-    describe: (s) => `${s.role || "?"} sits on the ${s.prop || "?"}`,
-  },
-  stand_up: {
-    label: "Stand up",
-    fields: ["role"],
-    describe: (s) => `${s.role || "?"} stands up`,
-  },
-  approach: {
-    label: "Approach the other",
-    // Stops at `distance` metres rather than walking into them. 0.7 is
-    // conversation distance; under about 0.45 two runtime models intersect.
-    fields: ["role", "target", "distance", "speed"],
-    describe: (s) => `${s.role || "?"} approaches ${s.target || "?"} to ${fmt(s.distance)}m`,
-  },
-  turn_to: {
-    label: "Turn to face",
-    fields: ["role", "target"],
-    describe: (s) => `${s.role || "?"} turns to ${s.target || "?"}`,
-  },
-  say: {
-    label: "Say a line",
-    // The runner does not synthesize anything. It raises the line as an event
-    // and the HOST decides what that means: a bubble in the studio, her real
-    // voice in an encounter. A script must never assume it owns the mouth.
-    fields: ["role", "text"],
-    describe: (s) => `${s.role || "?"}: “${(s.text || "").slice(0, 40)}”`,
-  },
-  interaction: {
-    label: "Body interaction",
-    // The one verb that is AUTHORED rather than coded. `action` names a saved
-    // body interaction — an action posed on the actor, a contact instant, and a
-    // reaction posed on the target — and the rig resolves it. Adding a slap, a
-    // shove or a hand on an arm after this touches no source at all, which is
-    // the entire point: STEP_TYPES stays closed while the vocabulary grows.
-    //
-    // Positioning and dialogue are deliberately NOT part of it. Where they
-    // stand is `approach`, what they say is `say`; both already work, and
-    // folding them in here would give two authorities over the same thing.
-    fields: ["role", "target", "action"],
-    describe: (s) => `${s.role || "?"} ${s.action || "…"} ${s.target || "?"}`,
+// ── what a composition is made of ────────────────────────────────────────────
+//
+// Three kinds, and nothing else. Each one is a REFERENCE to a library entry
+// plus the values that entry declared it needs — never a thing with its own
+// hardcoded verb. That is the whole point of the redesign: the vocabulary grows
+// by authoring a library entry, and this file never learns a fourteenth noun.
+//
+// The kind on an entry must match the kind of the library item it names. They
+// are stated twice on purpose: the timeline can draw and group entries without
+// resolving every reference, and a reference that has gone missing shows up as
+// a mismatch rather than as a silently skipped beat.
+export const ENTRY_KINDS = {
+  action: {
+    label: "Action",
+    // A movement performed by one character. May reach another — an action
+    // with `aim` takes a target — and publishes a contact instant that
+    // reactions can be timed against.
+    glyph: "action",
   },
   reaction: {
-    label: "React",
-    // The other half of a contact, as its OWN step — because the same slap can
-    // be met with a flinch, a laugh, or nothing at all, and binding one
-    // reaction permanently to one action makes that unsayable.
-    //
-    // It drives the body that REACTS, and nothing else. That is what makes a
-    // slap portable: the action alone touches only the actor, so an encounter
-    // (where the other role is a living player) can play the action and leave
-    // the reaction out, or answer it with a camera shake instead of a pose.
-    //
-    // `delay` is measured from when this step starts, and exists because a
-    // reaction lands on the beat of the contact, not on the beat of the step
-    // list. Compose it with the action step's "finish before next" unchecked,
-    // and set delay to the action's contact time.
-    // `on` is how it is TIMED, and it defaults to the only answer that stays
-    // true when anything is retimed: the contact the action itself raises.
-    // A hand-tuned delay is a guess about someone else's timing, and it goes
-    // stale the moment the action's windup is changed by a tenth of a second.
-    // `delay` survives as an offset FROM that instant — a beat before the head
-    // turns — not as a substitute for knowing when the blow lands.
-    fields: ["role", "action", "on", "delay"],
-    describe: (s) => `${s.role || "?"} reacts: ${s.action || "…"}` +
-      (s.on === "delay" ? ` after ${fmt(s.delay)}s`
-        : ` on contact${s.delay ? ` +${fmt(s.delay)}s` : ""}`),
+    label: "Reaction",
+    // A movement performed BECAUSE of someone else's contact. The distinction
+    // from an action is not the motion, it is the timing: a reaction waits for
+    // a contact rather than for a clock.
+    glyph: "reaction",
   },
-  space: {
-    label: "Personal space",
-    // Proxemics — Hall's zones. Intimate is under about 0.45m, personal runs to
-    // 1.2m, social to 3.6m. This is how close THIS role lets the other come
-    // before backing away, and it is a property of the person and the
-    // relationship rather than of the room: she lets him closer in the fourth
-    // scene than the first, and that change is the story.
-    //
-    // It is NOT collision. Bodies are kept from interpenetrating whatever this
-    // says — that floor is physics and is not authorable. This is the distance
-    // at which someone becomes uncomfortable, which is a different thing and
-    // can legitimately be set to zero.
-    fields: ["role", "distance"],
-    describe: (s) => `${s.role || "?"} keeps ${fmt(s.distance)}m of space`,
-  },
-  wait: {
-    label: "Wait",
-    fields: ["seconds"],
-    describe: (s) => `wait ${fmt(s.seconds)}s`,
+  pose: {
+    label: "Pose",
+    // A held configuration. It clamps at its last frame and keeps applying
+    // until something replaces it. This is the kind the old model could not
+    // say, which is why held shapes were filed as reactions.
+    glyph: "pose",
   },
 };
 
+export const ENTRY_KIND_LIST = Object.keys(ENTRY_KINDS);
+
 const fmt = (n) => (Number.isFinite(Number(n)) ? Number(n).toFixed(2).replace(/\.00$/, "") : "?");
 
-export const ROLES = ["a", "b"];
+// One line of English for an entry, used by the timeline, the run log and
+// anything handing a composition to Claude. Resolves the reference so it can
+// say "Slap the face" rather than "slap-face".
+export function describeEntry(entry, castOf = (r) => r) {
+  if (!entry) return "";
+  const def = getAction(entry.ref);
+  const name = def?.name || entry.ref || "…";
+  const who = castOf(entry.role) || entry.role || "?";
+  const p = entry.params || {};
+  if (def?.source === "engine") {
+    switch (def.slug) {
+      case "walk-to":      return `${who} walks to ${fmt(p.x)}, ${fmt(p.z)}`;
+      case "approach":     return `${who} approaches ${castOf(p.target) || p.target || "?"}`;
+      case "turn-to":      return `${who} turns to ${castOf(p.target) || p.target || "?"}`;
+      case "walk-to-prop": return `${who} walks to the ${p.prop || "prop"}`;
+      case "sit-on":       return `${who} sits on the ${p.prop || "prop"}`;
+      case "stand-up":     return `${who} stands up`;
+      case "pull-prop":    return `${who} pulls out the ${p.prop || "prop"}`;
+      case "play-clip":    return `${who} plays “${p.clip || "…"}”`;
+      case "say":          return `${who}: “${String(p.text || "").slice(0, 40)}”`;
+      default:             return `${who} ${name}`;
+    }
+  }
+  if (entry.kind === "pose")     return `${who} holds ${name.toLowerCase()}`;
+  if (entry.kind === "reaction") return `${who} reacts: ${name}` +
+    (entry.on === "delay" ? ` after ${fmt(entry.delay)}s`
+                          : ` on contact${entry.delay ? ` +${fmt(entry.delay)}s` : ""}`);
+  return `${who}: ${name}` + (p.target ? ` → ${castOf(p.target) || p.target}` : "");
+}
 
-// Which roles does this script actually take hold of? Not "which roles are
-// mentioned" — being approached or turned towards costs you nothing, and a
-// script where "a" walks over to "b" is perfectly playable with a live person
-// standing in "b". Only the roles that are ACTED AS count, because those are
-// the bodies the rig has to own.
+// ── the cast ─────────────────────────────────────────────────────────────────
 //
-// `say` counts. In an encounter the mouth on role "b" belongs to a human being,
-// and a script cannot put words in it.
+// A composition carries its own cast: an ordered list of slots, each a place a
+// character stands rather than a character. It used to be the literal pair
+// ["a","b"], which is why nothing could rehearse three people.
+//
+// `driven` is the guard that survives into an encounter: a slot the rig does
+// not drive is a living player, and an entry that moves them is refused.
+export const DEFAULT_SLOT_IDS = ["a", "b", "c", "d", "e", "f", "g", "h"];
+
+export function castIds(script) {
+  const cast = Array.isArray(script?.cast) ? script.cast : [];
+  const ids = cast.map(c => String(c?.id ?? c?.role ?? "")).filter(Boolean);
+  // A composition saved before the cast was a list still has entries naming
+  // "a" and "b". Falling back to those keeps every stored row readable.
+  return ids.length ? ids : ["a", "b"];
+}
+
+export function castLabel(script, id) {
+  const hit = (script?.cast || []).find(c => String(c?.id ?? c?.role) === String(id));
+  return hit?.label || hit?.name || null;
+}
+
+// Which slots does this composition take hold of? Being approached or turned
+// towards costs nothing — only the slots that ACT are counted, because those
+// are the bodies a rig has to own.
 export function drivenRoles(script) {
-  const { steps } = normalizeSteps(script?.steps || []);
+  const { entries } = normalizeEntries(script?.entries || script?.steps || [], { cast: castIds(script) });
   const out = new Set();
-  // Every verb now drives its OWN role and nothing else — including
-  // `interaction`, which swings the actor's arm and does not touch the body it
-  // is aimed at. Being approached, turned towards, or even struck costs the
-  // other role nothing HERE, because what it does to them is a separate
-  // `reaction` step naming them as its own role.
-  //
-  // This used to carry a special case adding an interaction's TARGET, back when
-  // one step owned both halves. Splitting the reaction out removed the need for
-  // it, and with it the reason a slap could never play in an encounter: the
-  // action drives only the actor, so her door can run it and answer the contact
-  // however it likes.
-  for (const s of steps) if (s.role) out.add(s.role);
+  for (const e of entries) if (e.role) out.add(e.role);
   return [...out].sort();
 }
 
-// Can this script play on a rig that only owns `available`? Returns the roles
-// it would need and cannot have — empty means it travels.
 export function rolesNotAvailable(script, available) {
   const own = new Set(available || []);
   return drivenRoles(script).filter(r => !own.has(r));
 }
 
-// A step that does not block is one the next step starts on top of — which is
-// how "start walking AND start talking" is expressed without a parallel
-// construct. Defaults per type, because the sensible answer differs: a looping
-// clip you want to continue under everything after it, a walk you almost
-// always want to finish.
-const DEFAULT_WAIT = { clip: false, walk_to: true, approach: true, turn_to: true, say: true, walk_to_prop: true, pull_prop: true, sit_on: true, stand_up: true, interaction: true, reaction: true, space: true, wait: true };
-
-export function defaultStep(type, role = "a") {
-  const base = { id: stepId(), type, wait: DEFAULT_WAIT[type] ?? true };
-  switch (type) {
-    case "clip":     return { ...base, role, clip: "idle", loop: true, fade: 0.35 };
-    case "walk_to":  return { ...base, role, x: 0, z: 0, speed: 0.95 };
-    case "walk_to_prop": return { ...base, role, prop: "", distance: 0.55, speed: 0.95 };
-    case "pull_prop": return { ...base, role, prop: "", distance: 0.6 };
-    case "sit_on":   return { ...base, role, prop: "" };
-    case "stand_up": return { ...base, role };
-    case "approach": return { ...base, role, target: role === "a" ? "b" : "a", distance: 0.7, speed: 0.95 };
-    case "turn_to":  return { ...base, role, target: role === "a" ? "b" : "a" };
-    case "say":      return { ...base, role, text: "" };
-    case "interaction": return { ...base, role, target: role === "a" ? "b" : "a", action: "" };
-    case "reaction": return { ...base, role, action: "", on: "contact", delay: 0 };
-    case "space":    return { ...base, role, distance: 0.6 };
-    case "wait":     return { ...base, seconds: 1 };
-    default:         return base;
-  }
+export function entryId() {
+  return Math.random().toString(36).slice(2, 10);
 }
 
-export function stepId() {
-  return Math.random().toString(36).slice(2, 10);
+// A new entry referencing a library item, with that item's declared parameters
+// at their defaults. Nothing here knows what the parameters MEAN.
+export function defaultEntry(ref, role = "a") {
+  const def = getAction(ref);
+  const params = {};
+  for (const p of paramsFor(def)) params[p.key] = p.default ?? (p.type === "number" ? 0 : "");
+  const entry = {
+    id: entryId(),
+    kind: def?.kind || "action",
+    ref: def?.slug || String(ref || ""),
+    role,
+    params,
+    // A pose holds and an action that is not a contact rarely needs the next
+    // beat to wait for it. A contact action must NOT block, or the reaction
+    // that answers it can never hear the contact.
+    wait: def?.kind === "pose" ? false : !(def?.kind === "action" && def?.aim),
+  };
+  if (entry.kind === "reaction") { entry.on = "contact"; entry.delay = 0; }
+  return entry;
 }
 
 // ── validation ───────────────────────────────────────────────────────────────
 //
-// Runs on the client for the editor's benefit and on the SERVER for real: a
-// stored script is executed later by code that will not re-check it, so the
-// row has to be trustworthy on its own. Returns { steps, errors } — the steps
-// coerced to their proper types, never the caller's object.
-export function normalizeSteps(raw) {
+// Runs in the editor for the author's benefit and on the SERVER for real: a
+// stored composition is played later by code that will not re-check it.
+// Everything is rebuilt from the library's own declaration — an entry cannot
+// carry a parameter the library never asked for.
+export function normalizeEntries(raw, { cast = ["a", "b"] } = {}) {
   const errors = [];
-  const steps = [];
-  if (!Array.isArray(raw)) return { steps, errors: ["steps must be a list"] };
-  if (raw.length > 200) return { steps, errors: ["a script is capped at 200 steps"] };
+  const entries = [];
+  if (!Array.isArray(raw)) return { entries, errors: ["entries must be a list"] };
+  if (raw.length > 200) return { entries, errors: ["a composition is capped at 200 entries"] };
 
-  raw.forEach((s, i) => {
-    const at = `step ${i + 1}`;
-    if (!s || typeof s !== "object") { errors.push(`${at}: not an object`); return; }
-    const type = String(s.type || "");
-    if (!STEP_TYPES[type]) { errors.push(`${at}: unknown type "${type}"`); return; }
+  const slots = new Set(cast);
 
-    const out = { id: safeId(s.id), type, wait: s.wait === undefined ? (DEFAULT_WAIT[type] ?? true) : !!s.wait };
-    const role = () => {
-      const r = String(s.role || "");
-      if (!ROLES.includes(r)) { errors.push(`${at}: role must be one of ${ROLES.join(", ")}`); return null; }
-      return r;
-    };
-    const target = () => {
-      const t = String(s.target || "");
-      if (!ROLES.includes(t)) { errors.push(`${at}: target must be one of ${ROLES.join(", ")}`); return null; }
-      return t;
-    };
+  raw.forEach((e, i) => {
+    const at = `entry ${i + 1}`;
+    if (!e || typeof e !== "object") { errors.push(`${at}: not an object`); return; }
 
-    if (type === "clip") {
-      out.role = role();
-      out.clip = String(s.clip || "").trim().slice(0, 64);
-      if (!out.clip) errors.push(`${at}: a clip name is required`);
-      out.loop = !!s.loop;
-      out.fade = num(s.fade, 0.35, 0, 4);
-    } else if (type === "walk_to") {
-      out.role = role();
-      // The room is 6m square; ±8 leaves room for a bigger one without letting
-      // a typo send somebody to the horizon.
-      out.x = num(s.x, 0, -8, 8);
-      out.z = num(s.z, 0, -8, 8);
-      out.speed = num(s.speed, 0.95, 0.1, 3);
-    } else if (type === "walk_to_prop") {
-      out.role = role();
-      out.prop = String(s.prop || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 40);
-      if (!out.prop) errors.push(`${at}: no prop chosen`);
-      // How close to stand to its EDGE, not its centre — a bed and a stool are
-      // not approached to the same coordinate.
-      out.distance = num(s.distance, 0.55, 0.1, 4);
-      out.speed = num(s.speed, 0.95, 0.1, 3);
-    } else if (type === "pull_prop") {
-      out.role = role();
-      out.prop = String(s.prop || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 40);
-      if (!out.prop) errors.push(`${at}: nothing to pull`);
-      out.distance = num(s.distance, 0.6, 0.2, 1.5);
-    } else if (type === "sit_on") {
-      out.role = role();
-      out.prop = String(s.prop || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 40);
-      if (!out.prop) errors.push(`${at}: nothing to sit on`);
-    } else if (type === "stand_up") {
-      out.role = role();
-    } else if (type === "approach") {
-      out.role = role();
-      out.target = target();
-      if (out.role && out.target && out.role === out.target) errors.push(`${at}: cannot approach themselves`);
-      out.distance = num(s.distance, 0.7, 0.4, 6);
-      out.speed = num(s.speed, 0.95, 0.1, 3);
-    } else if (type === "turn_to") {
-      out.role = role();
-      out.target = target();
-      if (out.role && out.target && out.role === out.target) errors.push(`${at}: cannot turn to themselves`);
-    } else if (type === "say") {
-      out.role = role();
-      out.text = String(s.text || "").slice(0, 600);
-      if (!out.text.trim()) errors.push(`${at}: a line with no words`);
-    } else if (type === "interaction") {
-      out.role = role();
-      out.target = target();
-      if (out.role && out.target && out.role === out.target) errors.push(`${at}: cannot do that to themselves`);
-      // A slug, not a payload. The tracks live in one row that the editor owns
-      // and the server validates on its own terms; a script that carried its
-      // own copy of the motion would fork the moment the action was edited.
-      out.action = String(s.action || "").trim().toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "").slice(0, 64);
-      if (!out.action) errors.push(`${at}: no body interaction chosen`);
-    } else if (type === "reaction") {
-      out.role = role();
-      out.action = String(s.action || "").trim().toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "").slice(0, 64);
-      if (!out.action) errors.push(`${at}: no reaction chosen`);
-      out.on = s.on === "delay" ? "delay" : "contact";
-      out.delay = num(s.delay, 0, 0, 10);
-    } else if (type === "space") {
-      out.role = role();
-      // 0 is allowed and means "no discomfort at any distance" — an embrace has
-      // to be sayable. The ceiling is the far edge of Hall's social zone.
-      out.distance = num(s.distance, 0.6, 0, 3.6);
-    } else if (type === "wait") {
-      // A 60s cap so a stray zero cannot hang a run for an hour.
-      out.seconds = num(s.seconds, 1, 0, 60);
+    const ref = String(e.ref || e.action || "").trim();
+    if (!ref) { errors.push(`${at}: names no library entry`); return; }
+    const def = getAction(ref);
+    if (!def) { errors.push(`${at}: “${ref}” is not in the library`); return; }
+
+    const kind = ENTRY_KINDS[e.kind] ? e.kind : (def.kind || "action");
+    if (def.kind && def.kind !== kind) {
+      errors.push(`${at}: “${ref}” is a ${def.kind}, filed here as a ${kind}`);
+      return;
     }
-    const cam = normalizeCamera(s.camera, errors, at);
-    if (cam) out.camera = cam;
-    steps.push(out);
+
+    const role = String(e.role || "");
+    if (!slots.has(role)) { errors.push(`${at}: “${role || "nobody"}” is not in the cast`); return; }
+
+    const out = { id: safeId(e.id), kind, ref: def.slug, role, params: {} };
+
+    // Parameters, one at a time, from the library's declaration. Anything the
+    // entry carries that the library did not declare is dropped rather than
+    // passed through — the values reach a rig method.
+    for (const p of paramsFor(def)) {
+      const v = e.params?.[p.key];
+      if (p.type === "number") out.params[p.key] = num(v, p.default ?? 0, p.min ?? -1e6, p.max ?? 1e6);
+      else if (p.type === "bool") out.params[p.key] = v === undefined ? !!p.default : !!v;
+      else if (p.type === "role") {
+        const t = String(v || "");
+        if (!slots.has(t)) errors.push(`${at}: “${ref}” needs someone to aim at`);
+        else if (t === role) errors.push(`${at}: cannot ${def.name.toLowerCase()} themselves`);
+        else out.params[p.key] = t;
+      }
+      else if (p.type === "text") out.params[p.key] = String(v ?? p.default ?? "").slice(0, 600);
+      else out.params[p.key] = String(v ?? p.default ?? "").slice(0, 120);
+    }
+
+    // A pause before this entry begins — what the `wait` step type used to be,
+    // expressed as a property rather than as a kind of its own so the timeline
+    // holds only Actions, Reactions and Poses.
+    out.gap = num(e.gap, 0, 0, 60);
+
+    out.wait = e.wait === undefined
+      ? (kind === "pose" ? false : !(kind === "action" && def.aim))
+      : !!e.wait;
+
+    if (kind === "reaction") {
+      out.on = e.on === "delay" ? "delay" : "contact";
+      out.delay = num(e.delay, 0, 0, 30);
+    }
+
+    entries.push(out);
   });
 
-  return { steps, errors };
+  return { entries, errors };
 }
 
 function num(v, fallback, lo, hi) {
@@ -459,7 +366,7 @@ function num(v, fallback, lo, hi) {
 
 function safeId(v) {
   const s = String(v || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 24);
-  return s || stepId();
+  return s || entryId();
 }
 
 // ── the runner ───────────────────────────────────────────────────────────────
@@ -520,11 +427,9 @@ export function runScript(script, rig, { onEvent = () => {} } = {}) {
   };
 
   const done = (async () => {
-    const { steps, errors } = normalizeSteps(script?.steps || []);
-    const cameras = hoistLegacyCameras(
-      script?.steps || [],
-      normalizeCameras(script?.cameras, steps.length, errors),
-    );
+    const cast = castIds(script);
+    const { entries, errors } = normalizeEntries(script?.entries || script?.steps || [], { cast });
+    const cameras = normalizeCameras(script?.cameras, entries, errors);
     if (errors.length) onEvent({ type: "warning", text: errors.join("; ") });
 
     // Refused BEFORE the first step, not discovered at step nine. A rig that
@@ -539,7 +444,7 @@ export function runScript(script, rig, { onEvent = () => {} } = {}) {
       onEvent({ type: "done", refused: true });
       return false;
     }
-    const missing = rolesNotAvailable({ steps }, rig.drives);
+    const missing = rolesNotAvailable({ entries, cast }, rig.drives);
     if (missing.length) {
       onEvent({ type: "refused", roles: missing,
                 text: `this script drives ${missing.join(" and ")}, which this rig does not own — ` +
@@ -548,7 +453,7 @@ export function runScript(script, rig, { onEvent = () => {} } = {}) {
       return false;
     }
 
-    onEvent({ type: "start", steps: steps.length });
+    onEvent({ type: "start", steps: entries.length });
 
     // What the steps know about each other while a run is in flight. Only one
     // thing lives here: when the most recent contact happens, so a reaction can
@@ -557,9 +462,18 @@ export function runScript(script, rig, { onEvent = () => {} } = {}) {
     // it is dispatched — for a contact-timed reaction those are half a second
     // apart, and cutting at dispatch shows the flinch before the blow lands.
     const ctx = {
-      contact: null,
-      cutsFor: (index) => cameras.filter(c => c.step === index),
+      // Keyed by the entry that raised it, so two overlapping contact actions
+      // no longer overwrite one another — which is what a single mutable slot
+      // did. `lastContact` is what an unqualified reaction answers.
+      contacts: new Map(),
+      lastContact: null,
+      // Cuts are anchored to an entry's ID, not to its position. A positional
+      // anchor silently relocated framing whenever a step was reordered or
+      // removed, because neither path ever touched the camera list.
+      cutsFor: (id) => cameras.filter(c => c.entry === id),
       cut: (cam) => { try { rig.camera?.(cam); } catch {} },
+      performer: (role) => rig.performer?.(role),
+      say: (role, text) => (rig.say ? rig.say(role, text) : null),
     };
 
     // Steps started with wait:false are still RUNNING when the next one
@@ -568,16 +482,14 @@ export function runScript(script, rig, { onEvent = () => {} } = {}) {
     // report about the interpreter, not about the scene.
     const background = [];
 
-    for (let i = 0; i < steps.length; i++) {
+    for (let i = 0; i < entries.length; i++) {
       if (cancelled) break;
-      const step = steps[i];
-      // The step needs to know its own index so its cuts can be found.
-      step._index = i;
-      onEvent({ type: "step", index: i, step });
-      const p = perform(step, rig, sleep, onEvent, ctx).catch((e) => {
+      const entry = entries[i];
+      onEvent({ type: "step", index: i, step: entry, entry });
+      const p = perform(entry, rig, sleep, onEvent, ctx).catch((e) => {
         onEvent({ type: "error", index: i, text: String(e?.message || e) });
       });
-      if (step.wait) await p; else background.push(p);
+      if (entry.wait) await p; else background.push(p);
     }
 
     if (!cancelled) await Promise.all(background);
@@ -588,142 +500,127 @@ export function runScript(script, rig, { onEvent = () => {} } = {}) {
   return { done, cancel };
 }
 
-async function perform(step, rig, sleep, onEvent, ctx = {}) {
-  // Framing applies when the step's motion actually BEGINS — which for most
-  // steps is now, and for a reaction waiting on contact is half a second from
-  // now. Applying it at dispatch time instead looked like the camera was
-  // ignoring shots entirely: an action must not block if a reaction is to hear
-  // its contact, so the reaction step starts IMMEDIATELY after it and its
-  // framing overwrote the action's within a frame. The shot was applied,
-  // correctly, and then replaced before anyone could see it.
+// ── how an engine action is called ───────────────────────────────────────────
+//
+// One line per engine behaviour, and the only place in this file that knows a
+// rig method's signature. The rig itself is untouched by the redesign: all the
+// room geometry — the seat search, the chair scoot, the footprint-aware stop
+// distance — stays exactly where it was and is reached through here.
+//
+// Adding a behaviour means a row in ENGINE_ACTIONS and a row here. Adding an
+// AUTHORED action means neither: it is a library entry and arrives for free.
+const ENGINE_CALL = {
+  walkTo:     (who, p) => who.walkTo(p.x, p.z, { speed: p.speed }),
+  approach:   (who, p, c) => who.approach(c.performer(p.target), p.distance, { speed: p.speed }),
+  turnTo:     (who, p, c) => who.turnTo(c.performer(p.target)),
+  walkToProp: (who, p) => who.walkToProp(p.prop, { distance: p.distance, speed: p.speed }),
+  sitOn:      (who, p) => who.sitOn(p.prop),
+  standUp:    (who) => who.standUp(),
+  pullProp:   (who, p) => who.pullProp(p.prop, { distance: p.distance }),
+  clip:       (who, p) => who.clip(p.clip, { loop: p.loop, fade: p.fade }),
+  // Rig-level, deliberately. A script raises a line; it never speaks it. The
+  // studio captions it, an encounter hands it to her voice, and the simulator
+  // stays the single authority on what reaches TTS.
+  say:        (who, p, c, entry) => c.say(entry.role, p.text),
+};
+
+async function perform(entry, rig, sleep, onEvent, ctx = {}) {
+  // Framing applies when the motion actually BEGINS — which for most entries is
+  // now, and for a contact-timed reaction is half a second from now. Applying
+  // it at dispatch instead looked like the camera was ignoring shots: a contact
+  // action must not block if the reaction is to hear it, so the reaction starts
+  // immediately after and its framing overwrote the action's within a frame.
   const frame = () => {
-    for (const cam of ctx.cutsFor?.(step._index ?? -1) || []) {
-      if (cam.offset > 0) sleep(cam.offset * 1000).then(() => ctx.cut(cam));
-      else ctx.cut(cam);
-    }
+    for (const cam of ctx.cutsFor?.(entry.id) || []) ctx.cut?.(cam);
   };
-  if (step.type !== "reaction") frame();
 
-  if (step.type === "wait") return sleep(step.seconds * 1000);
+  const def = getAction(entry.ref);
+  if (!def) { onEvent({ type: "warning", text: `“${entry.ref}” is not in the library — skipped` }); return; }
 
-  if (step.type === "say") {
-    onEvent({ type: "say", role: step.role, text: step.text });
-    if (rig.say) return rig.say(step.role, step.text);
-    // No mouth on this rig: hold for a readable beat so a rehearsal has the
-    // rhythm of a conversation rather than firing every line at once.
-    return sleep(Math.min(6000, 700 + step.text.length * 45));
-  }
+  const who = rig.performer?.(entry.role);
+  if (!who) { onEvent({ type: "warning", text: `nobody is cast as “${entry.role}” — skipped` }); return; }
 
-  // BEFORE the two-body lookups below, because a reaction has no target — it
-  // is one body answering something that already happened to it. Dispatching it
-  // after `step.target` was resolved meant every React step died on
-  // "no body cast as undefined" without ever reaching this branch.
-  if (step.type === "space") {
-    if (!rig.setSpace) { onEvent({ type: "warning", text: "this rig has no personal space — skipping" }); return; }
-    return rig.setSpace(step.role, step.distance);
-  }
-
-  if (step.type === "reaction") {
-    const me = rig.performer?.(step.role);
-    if (!me) { onEvent({ type: "warning", text: `no body cast as “${step.role}” — skipping` }); return; }
-    if (!me.react) {
-      onEvent({ type: "warning", text: `this rig cannot perform reactions — skipping “${step.action}”` });
-      return;
+  // ── a reaction waits for a contact, not for a clock ───────────────────────
+  //
+  // Which contact: the one it was told to answer, or failing that the most
+  // recent one started. `ctx.contacts` is keyed by the entry that raised it,
+  // so two overlapping contact actions no longer overwrite each other's
+  // promise — which they did when this was a single mutable slot.
+  if (entry.kind === "reaction") {
+    if (entry.on !== "delay") {
+      const waitFor = ctx.contacts?.get(entry.after) || ctx.lastContact;
+      // The 5s ceiling is a liveness guard, not a tunable: if the action it
+      // was meant to answer never fires, the reaction still happens rather
+      // than the run hanging on a promise nobody will resolve.
+      if (waitFor) await Promise.race([waitFor, sleep(5000)]);
     }
-    // Wait for the blow to actually land. The action raises contact from its
-    // own timeline, so this stays in step however the windup is retimed — and
-    // if the action was authored to strike at 0.45s and later moves to 0.6s,
-    // nothing here needs editing.
-    //
-    // The race is a guard, not a timeout worth tuning: if the action never
-    // raises contact (it was skipped, or the rig cannot perform it) the
-    // reaction still happens rather than hanging the run at step four.
-    if (step.on !== "delay" && ctx.contact) {
-      await Promise.race([ctx.contact, sleep(5000)]);
-    }
-    if (step.delay) await sleep(step.delay * 1000);
-    // NOW — the blow has landed and the flinch is about to start.
+    if (entry.delay) await sleep(entry.delay * 1000);
     frame();
-    return me.react(step.action);
+    return who.react(entry.ref);
   }
 
-  const who = rig.performer?.(step.role);
-  if (!who) { onEvent({ type: "warning", text: `no body cast as “${step.role}” — skipping` }); return; }
+  frame();
 
-  if (step.type === "pull_prop") {
-    if (!who.pullProp) { onEvent({ type: "warning", text: "this rig cannot move furniture — skipping" }); return; }
-    return who.pullProp(step.prop, step.distance);
+  // ── engine-backed ─────────────────────────────────────────────────────────
+  if (def.source === "engine") {
+    const call = ENGINE_CALL[def.handler];
+    if (!call) { onEvent({ type: "warning", text: `“${def.slug}” names no handler — skipped` }); return; }
+    return call(who, entry.params || {}, ctx, entry);
   }
 
-  if (step.type === "sit_on") {
-    if (!who.sitOn) { onEvent({ type: "warning", text: "this rig cannot sit anyone down — skipping" }); return; }
-    return who.sitOn(step.prop);
-  }
-
-  if (step.type === "stand_up") {
-    if (!who.standUp) { onEvent({ type: "warning", text: "this rig cannot stand anyone up — skipping" }); return; }
-    return who.standUp();
-  }
-
-  if (step.type === "walk_to_prop") {
-    if (!who.walkToProp) {
-      onEvent({ type: "warning", text: "this rig has no furniture — skipping" });
+  // ── a room action: the furniture decides where this happens ──────────────
+  //
+  // Authored as bone tracks like any other, but it declared it needs a prop, so
+  // the body is put in front of that prop first and the motion plays from
+  // there. The arithmetic is the rig's own — the same footprint-aware stop
+  // distance walk-to-prop uses — so a lean authored against one table works
+  // against a wider one without being re-authored.
+  if (def.source !== "engine" && def.needsProp && entry.params?.prop) {
+    const placed = await who.walkToProp(entry.params.prop, { distance: def.standAt ?? 0.55 });
+    // A prop that is not in this room is not a crash: the motion is skipped and
+    // says so, because playing a lean on nothing reads as a bug in the motion.
+    if (placed?.missing) {
+      onEvent({ type: "warning", text: `“${def.name}” needs a ${entry.params.prop} and there is none — skipped` });
       return;
     }
-    return who.walkToProp(step.prop, step.distance, { speed: step.speed });
   }
 
-  if (step.type === "clip")     return who.clip(step.clip, { loop: step.loop, fade: step.fade });
-  if (step.type === "walk_to")  return who.walkTo(step.x, step.z, { speed: step.speed });
+  // ── authored tracks ───────────────────────────────────────────────────────
+  //
+  // A pose and a non-contact action are the same call; the holding comes from
+  // the library entry's own kind, read inside the rig. An action that aims is
+  // the only one that needs the other body, and it publishes its contact.
+  const targetId = entry.params?.target;
+  if (entry.kind === "action" && def.aim && targetId) {
+    const other = rig.performer?.(targetId);
+    if (!other) { onEvent({ type: "warning", text: `nobody is cast as “${targetId}” — skipped` }); return; }
 
-  const other = rig.performer?.(step.target);
-  if (!other) { onEvent({ type: "warning", text: `no body cast as “${step.target}” — skipping` }); return; }
-  if (step.type === "approach") return who.approach(other, step.distance, { speed: step.speed });
-  if (step.type === "turn_to")  return who.turnTo(other);
+    let fire;
+    const contact = new Promise((r) => { fire = r; });
+    ctx.contacts?.set(entry.id, contact);
+    ctx.lastContact = contact;
 
-  if (step.type === "interaction") {
-    if (!who.interact) {
-      onEvent({ type: "warning", text: `this rig cannot perform body interactions — skipping “${step.action}”` });
-      return;
-    }
-    // The rig raises contact; the runner only forwards it. What contact MEANS
-    // — a sound, a camera shake, something told to the simulator — is the
-    // host's decision, exactly as `say` never owns the mouth.
-    // Published for any reaction step that follows. Set BEFORE the motion
-    // starts, because a non-blocking action means the next step begins while
-    // this one is still swinging — and that next step is usually the one
-    // waiting to hear about it.
-    let landed;
-    ctx.contact = new Promise((r) => { landed = r; });
-    return who.interact(other, step.action, {
-      onContact: () => {
-        onEvent({ type: "contact", role: step.role, target: step.target, action: step.action });
-        landed?.();
-      },
+    return who.interact(other, entry.ref, {
+      onContact: () => { onEvent({ type: "contact", id: entry.id, ref: entry.ref }); fire(); },
     });
   }
+
+  return who.react(entry.ref);
 }
 
-// ── timing problems a single step cannot see ─────────────────────────────────
-//
-// normalizeSteps validates each step ALONE, which is right — a step has to be
-// trustworthy on its own. But a reaction timed "on contact" depends on the step
-// BEFORE it still running when it starts, and nothing about either step in
-// isolation is wrong. The result is the worst kind of bug: everything valid,
-// nothing complained, and the flinch arrives after the arm is back at rest.
-//
-// So the pairing is checked at the script level and reported as a WARNING, not
-// an error. It is a legitimate thing to author — you may want a delayed,
-// deliberate reaction — and rewriting someone's script because it looked odd is
-// how an editor loses trust.
 export function timingWarnings(script) {
-  const { steps } = normalizeSteps(script?.steps || []);
+  const { entries } = normalizeEntries(script?.entries || script?.steps || [], { cast: castIds(script) });
   const out = [];
+  // The scan below walks backwards from each reaction looking for the action it
+  // answers, so it needs the list under the name its body uses.
+  const steps = entries;
   steps.forEach((step, i) => {
-    if (step.type !== "reaction" || step.on === "delay") return;
+    if (step.kind !== "reaction" || step.on === "delay") return;
     let prior = null;
     for (let j = i - 1; j >= 0; j--) {
-      if (steps[j].type === "interaction") { prior = { step: steps[j], index: j }; break; }
+      // The nearest preceding entry that actually publishes a contact — an
+      // action that aims. "interaction" was the old step type for this.
+      if (steps[j].kind === "action" && getAction(steps[j].ref)?.aim) { prior = { step: steps[j], index: j }; break; }
     }
     if (!prior) {
       out.push({ index: i, fix: null,
@@ -742,9 +639,10 @@ export function timingWarnings(script) {
 // A script's steps as one readable block — used by the studio's summary, and by
 // anything that wants to hand a script to Claude without inventing a format.
 export function describeScript(script) {
-  const { steps } = normalizeSteps(script?.steps || []);
-  return steps
-    .map((s, i) => `${String(i + 1).padStart(2, " ")}. ${STEP_TYPES[s.type].describe(s)}${s.wait ? "" : "  (does not block)"}`)
+  const { entries } = normalizeEntries(script?.entries || script?.steps || [], { cast: castIds(script) });
+  const label = (id) => castLabel(script, id) || id;
+  return entries
+    .map((e, i) => `${String(i + 1).padStart(2, " ")}. ${describeEntry(e, label)}${e.wait ? "" : "  (does not block)"}`)
     .join("\n");
 }
 
@@ -768,163 +666,130 @@ export function describeScript(script) {
 const TURN_SECONDS = 0.35;
 const CLIP_SECONDS = 1.0;   // a one-shot clip of unknown length
 
+// Where the bodies stand as a composition plays, entry by entry. This is what
+// makes the timeline more than a ruler: selecting entry 7 has to put the bodies
+// where entry 7 would find them. Editing a slap while they stand at their
+// opening marks is authoring against a lie — the pose looks wrong, you correct
+// it, and the correction is what is wrong.
+//
+// `marks` now carries one entry per cast slot rather than a hardcoded pair.
 export function estimateTimeline(script, { marks, actionDuration, contactAt, propAt } = {}) {
-  const { steps } = normalizeSteps(script?.steps || []);
-  // Position AND facing, carried forward step by step. This is the part that
-  // makes a timeline more than a ruler: selecting step 7 has to be able to put
-  // the bodies where step 7 would find them. Editing a slap while they stand at
-  // their opening marks, a metre and a half apart, is authoring against a lie —
-  // the pose looks wrong, you correct it, and the correction is what is wrong.
-  const at = {
-    a: { x: marks?.a?.x ?? -0.75, z: marks?.a?.z ?? 0, facing: marks?.a?.facing ?? Math.PI / 2 },
-    b: { x: marks?.b?.x ?? 0.75, z: marks?.b?.z ?? 0, facing: marks?.b?.facing ?? -Math.PI / 2 },
-  };
-  const snapshot = () => ({ a: { ...at.a }, b: { ...at.b } });
+  const cast = castIds(script);
+  const { entries } = normalizeEntries(script?.entries || script?.steps || [], { cast });
+
+  const at = {};
+  cast.forEach((id, i) => {
+    const m = marks?.[id];
+    at[id] = {
+      x: m?.x ?? (i % 2 === 0 ? -0.75 : 0.75),
+      z: m?.z ?? 0,
+      facing: m?.facing ?? (i % 2 === 0 ? Math.PI / 2 : -Math.PI / 2),
+    };
+  });
+  const snapshot = () => Object.fromEntries(Object.entries(at).map(([k, v]) => [k, { ...v }]));
   const face = (from, to) => Math.atan2(to.x - from.x, to.z - from.z);
 
   let clock = 0;
   const out = [];
   const unmeasured = [];
 
-  for (const step of steps) {
+  for (const entry of entries) {
     const before = snapshot();
+    const def = getAction(entry.ref);
+    const p = entry.params || {};
+    const who = entry.role && at[entry.role];
+    const other = p.target && at[p.target];
     let dur = 0;
-    const who = step.role && at[step.role];
-    const other = step.target && at[step.target];
 
-    if (step.type === "wait") {
-      dur = step.seconds;
-    } else if (step.type === "say") {
+    // A pause before this entry, which is what `wait` used to be. Expressed as
+    // a property of the entry rather than as a kind of its own, so the timeline
+    // holds only Actions, Reactions and Poses.
+    const gap = entry.gap || 0;
+    clock += gap;
+
+    const handler = def?.source === "engine" ? def.handler : null;
+
+    if (handler === "say") {
       // The runner's own beat when the host has no voice. Same formula, on
-      // purpose — see above.
-      dur = Math.min(6, 0.7 + (step.text?.length || 0) * 0.045);
-    } else if (step.type === "walk_to" && who) {
-      dur = Math.hypot(step.x - who.x, step.z - who.z) / (step.speed || 0.95);
-      who.facing = face(who, { x: step.x, z: step.z });
-      who.x = step.x; who.z = step.z;
-    } else if (step.type === "walk_to_prop" && who) {
+      // purpose — if either changes without the other the timeline lies.
+      dur = Math.min(6, 0.7 + (p.text?.length || 0) * 0.045);
+    } else if (handler === "walkTo" && who) {
+      dur = Math.hypot(p.x - who.x, p.z - who.z) / (p.speed || 0.95);
+      who.facing = face(who, { x: p.x, z: p.z });
+      who.x = p.x; who.z = p.z;
+    } else if (handler === "walkToProp" && who) {
       // Needs to know where the furniture is, which this module has no business
-      // knowing — so the caller resolves it, exactly as it does for action
-      // durations. Without this the step estimated at ZERO and drew as a sliver
-      // with no width, which is how a whole step vanishes from the strip.
-      const pr = propAt?.(step.prop);
+      // knowing — so the caller resolves it. Without this it estimated at ZERO
+      // and drew as a sliver, which is how a whole entry vanishes from the strip.
+      const pr = propAt?.(p.prop);
       if (pr) {
         const dx = who.x - pr.x, dz = who.z - pr.z;
         const d = Math.hypot(dx, dz) || 1;
         const ux = dx / d, uz = dz / d;
-        // The same arithmetic the rig walks: clear the footprint along the
-        // approach direction, then the body, then however close it asked.
-        const reach = Math.abs(ux) * (pr.hw || 0.4) + Math.abs(uz) * (pr.hd || 0.4)
-                    + 0.28 + (step.distance || 0.55);
+        const reach = Math.abs(ux) * (pr.hw || 0.3) + Math.abs(uz) * (pr.hd || 0.3) + 0.22 + (p.distance || 0.55);
         const tx = pr.x + ux * reach, tz = pr.z + uz * reach;
-        dur = Math.hypot(tx - who.x, tz - who.z) / (step.speed || 0.95) + TURN_SECONDS;
+        dur = Math.hypot(tx - who.x, tz - who.z) / (p.speed || 0.95);
         who.facing = face(who, { x: tx, z: tz });
         who.x = tx; who.z = tz;
-        who.facing = face(who, pr);
-      } else {
-        // Named a prop that is not in the room. It will warn and skip at run
-        // time; give it a visible sliver rather than nothing so the step can
-        // still be selected and corrected.
-        dur = 0.2;
       }
-    } else if (step.type === "pull_prop" && who) {
-      const pr = propAt?.(step.prop);
+    } else if (handler === "pullProp" && who) {
+      const pr = propAt?.(p.prop);
       if (pr) {
-        // Walk behind the backrest, take hold, step back with the chair.
-        const f = (pr.yaw ?? 0) + (pr.seatFacing ?? 0);
-        const gx = pr.x - Math.sin(f) * 0.75, gz = pr.z - Math.cos(f) * 0.75;
-        dur = Math.hypot(gx - who.x, gz - who.z) / 0.95 + TURN_SECONDS + 1.1;
-        who.x = gx - Math.sin(f) * (step.distance || 0.6);
-        who.z = gz - Math.cos(f) * (step.distance || 0.6);
-        who.facing = face(who, pr);
-      } else {
-        dur = 0.3;
+        dur = (Math.hypot(pr.x - who.x, pr.z - who.z) / 0.95) + 0.9;
+        who.x = pr.x; who.z = pr.z;
       }
-    } else if (step.type === "sit_on" && who) {
-      const pr = propAt?.(step.prop);
-      if (pr) {
-        // Walk to the front of the seat, turn around, then the sit itself.
-        const seatFace = pr.seatFacing ?? 0;
-        const f = (pr.yaw ?? 0) + seatFace;
-        const tx = pr.x + Math.sin(f) * 0.55, tz = pr.z + Math.cos(f) * 0.55;
-        // The sit itself plus the scoot-in toward whatever he sits at.
-        dur = Math.hypot(tx - who.x, tz - who.z) / 0.95 + TURN_SECONDS + 1.2;
-        who.x = pr.x; who.z = pr.z; who.facing = f;
-      } else {
-        dur = 0.55;
-      }
-    } else if (step.type === "stand_up") {
-      // Scoot back from the table, then the rise itself.
-      dur = 1.6;
-    } else if (step.type === "approach" && who && other) {
+    } else if (handler === "sitOn" && who) {
+      const pr = propAt?.(p.prop);
+      dur = 1.4;
+      if (pr) { who.x = pr.x; who.z = pr.z; }
+    } else if (handler === "standUp") {
+      dur = 1.2;
+    } else if (handler === "approach" && who && other) {
       const d = Math.hypot(other.x - who.x, other.z - who.z);
-      const travel = Math.max(0, d - step.distance);
-      dur = travel / (step.speed || 0.95) + TURN_SECONDS;
-      if (d > 0) { who.x += ((other.x - who.x) / d) * travel; who.z += ((other.z - who.z) / d) * travel; }
-      // approach ends by turning to them — the rig does it, so the estimate must
+      const stop = Math.max(0, d - (p.distance ?? 0.7));
+      dur = stop / (p.speed || 0.95) + TURN_SECONDS;
+      if (d > 0) { who.x += ((other.x - who.x) / d) * stop; who.z += ((other.z - who.z) / d) * stop; }
       who.facing = face(who, other);
-    } else if (step.type === "turn_to") {
+    } else if (handler === "turnTo") {
       dur = TURN_SECONDS;
       if (who && other) who.facing = face(who, other);
-    } else if (step.type === "clip") {
-      dur = step.loop ? 0 : CLIP_SECONDS;
-    } else if (step.type === "interaction") {
-      // The action's own length, which the caller supplies because this module
-      // deliberately knows nothing about the action library.
-      dur = actionDuration?.(step.action) ?? 1;
-    } else if (step.type === "reaction") {
-      // A reaction has a length like anything else. Leaving it at zero drew it
-      // as a sliver hidden behind the next step, which is how a whole step
-      // came to be invisible on the timeline.
-      dur = actionDuration?.(step.action) ?? 0.8;
+    } else if (handler === "clip") {
+      dur = p.loop ? 0 : CLIP_SECONDS;
+    } else if (def) {
+      // An authored entry knows its own length. The caller may override —
+      // a saved row wins over a built-in and only the caller has the registry.
+      dur = actionDuration?.(entry.ref) ?? def.duration ?? 0;
     }
 
-    // A step type this function has never heard of gets a visible sliver and
-    // SAYS SO. Four verbs have now been added to STEP_TYPES — which validates
-    // and dispatches them — while this switch silently gave them zero duration,
-    // so each drew as a hairline hidden under its neighbour and looked like a
-    // rendering bug. STEP_TYPES is the contract for what a step IS; nothing
-    // forced this to keep up, so it now complains instead of lying.
-    if (dur === 0 && !["clip", "wait", "space"].includes(step.type)) {
-      unmeasured.push(step.type);
-      dur = 0.25;
+    // An entry whose duration nobody can measure draws as a sliver and reads as
+    // missing. Say so rather than rendering a lie.
+    if (dur === 0 && !["clip"].includes(def?.slug) && entry.kind !== "pose") {
+      unmeasured.push(entry.ref);
     }
 
-    // A non-blocking step starts the next one immediately; it still OCCUPIES
-    // time on the strip, because you want to see that she is still walking
-    // while the next line is spoken.
-    // A contact-timed reaction does not begin when it is DISPATCHED — it waits
-    // for the blow. Drawing it at dispatch put it under the step before it and
-    // claimed things happened simultaneously that are half a second apart.
     let start = clock;
-    if (step.type === "reaction" && step.on !== "delay") {
-      for (let j = out.length - 1; j >= 0; j--) {
-        if (out[j].type === "interaction") {
-          start = out[j].start + (contactAt?.(out[j].step.action) ?? 0);
-          break;
-        }
-      }
+    // A reaction does not start when the list reaches it — it starts when the
+    // contact it answers lands.
+    if (entry.kind === "reaction" && entry.on !== "delay") {
+      const src = out.slice().reverse().find(b => b.entry.kind === "action" && getAction(b.entry.ref)?.aim);
+      // The caller may resolve a live contact instant; failing that the library
+      // entry knows its own. Falling through to zero drew the flinch as
+      // starting WITH the blow rather than on it.
+      if (src) start = src.start + (contactAt?.(src.entry.ref) ?? getAction(src.entry.ref)?.contactAt ?? 0);
     }
-    start += step.type === "reaction" ? (step.delay || 0) : 0;
+    start += entry.kind === "reaction" ? (entry.delay || 0) : 0;
 
-    out.push({ id: step.id, type: step.type, step, start, duration: dur,
-               blocking: step.wait, before, after: snapshot() });
-    if (step.wait) clock += dur;
+    out.push({ id: entry.id, entry, step: entry, start, duration: dur,
+               blocking: entry.wait, before, after: snapshot() });
+    if (entry.wait) clock = Math.max(clock, start + dur);
   }
 
   const total = out.reduce((m, b) => Math.max(m, b.start + b.duration), 0);
-  if (unmeasured.length && typeof console !== "undefined") {
-    console.warn("[estimateTimeline] no duration rule for:", [...new Set(unmeasured)].join(", "),
-                 "— drawn as a placeholder. Add a case, or the strip lies about when things happen.");
-  }
-  return { blocks: out, total, estimated: true, unmeasured: [...new Set(unmeasured)] };
+  return { blocks: out, total, estimated: true, unmeasured };
 }
 
-// Which step is live at time t, and how far into it. Returns null before the
-// first step and after the last — a scrubber past the end is not editing
-// anything, and pretending otherwise puts edits into the wrong step.
-// Where both bodies stand when step `index` BEGINS. Everything before it has
-// been played; nothing of it has. That is the state you want to author against.
+// Where both bodies stand when entry `index` BEGINS. Everything before it has
+// been played; nothing of it has. That is the state you author against.
 export function positionsBefore(timeline, index) {
   const b = timeline?.blocks?.[index];
   if (!b) return null;
@@ -934,7 +799,7 @@ export function positionsBefore(timeline, index) {
 export function stepAt(timeline, t) {
   const hit = (timeline?.blocks || []).filter(b => t >= b.start && t < b.start + b.duration);
   if (!hit.length) return null;
-  // The LAST match wins: with non-blocking steps several overlap, and the one
+  // The LAST match wins: with non-blocking entries several overlap, and the one
   // you mean is the one that started most recently.
   const b = hit[hit.length - 1];
   return { ...b, local: t - b.start };

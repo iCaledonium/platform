@@ -15,6 +15,7 @@ import SignInLabPage       from "./pages/SignInLabPage.jsx";
 import WizardLabPage       from "./pages/WizardLabPage.jsx";
 import TransportLabPage    from "./pages/TransportLabPage.jsx";
 import InteractionStudioPage from "./pages/InteractionStudioPage.jsx";
+import AnimationEditorPage from "./pages/AnimationEditorPage.jsx";
 import WatcherPanel, { watcherIsFollowing } from "./components/WatcherPanel.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
 import EnrollPage from "./pages/EnrollPage.jsx";
@@ -82,6 +83,9 @@ function LabWatcherOverlay() {
   // rule reaches it: scripting what two bodies do to each other is work
   // you narrate to the watcher while you do it.
   else if (location.pathname.startsWith("/lab/studio/interaction")) bound = "Feature - Interaction Studio";
+  // The animation editor authors what the studio arranges, so it is the
+  // same piece of work and binds the same conversation.
+  else if (location.pathname.startsWith("/lab/studio/animation")) bound = "Feature - Interaction Studio";
   else if (location.pathname.startsWith("/lab/transport") || location.pathname.startsWith("/lab/world/transport")) bound = "Runtime - Transport Engine";
   else if (location.pathname.startsWith("/lab/user/signup")) bound = "Feature - User Signup and Creation";
   else if (location.pathname.startsWith("/lab/user/signin")) bound = "Feature - User Sign In";
@@ -430,6 +434,9 @@ export default function App() {
         {/* Session 157 — the Interaction Studio. Reached from the Developer
             section on /home; lives here so the watcher rule above covers it. */}
         <Route path="/lab/studio/interaction" element={<InteractionStudioPage />} />
+        {/* Session 158 — the animation editor is its own page. It was a mode
+            of the studio that hid three of its four columns. */}
+        <Route path="/lab/studio/animation" element={<AnimationEditorPage />} />
         <Route path="/lab/world/transport/actor" element={<TransportLabPage />} />
         <Route path="/lab/transport/actor" element={<Navigate to="/lab/world/transport/actor" replace />} />
         <Route path="/lab/user/signup" element={<SignupLabPage />} />
