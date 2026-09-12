@@ -3001,6 +3001,35 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
       // it. Added because "are the palms ON the lap or IN it" had no oracle
       // outside this module — the seat surface is a constant anyone can read,
       // a thigh's top is not.
+      // Morph targets (hand grips etc. — exported in the runtime GLBs).
+      // morphs(role) lists every morph name with its current value; setMorph
+      // drives it on EVERY mesh that carries it (body + garments share
+      // names), so a grip closes the glove too.
+      morphs: (role) => {
+        const f = a.figures?.[role];
+        if (!f?.model) return null;
+        const out = {};
+        f.model.traverse((m) => {
+          const dict = m.morphTargetDictionary;
+          if (!dict || !m.morphTargetInfluences) return;
+          for (const [name, idx] of Object.entries(dict)) {
+            if (!(name in out)) out[name] = +m.morphTargetInfluences[idx].toFixed(3);
+          }
+        });
+        return out;
+      },
+      setMorph: (role, name, value) => {
+        const f = a.figures?.[role];
+        if (!f?.model) return false;
+        let hit = 0;
+        f.model.traverse((m) => {
+          const idx = m.morphTargetDictionary?.[name];
+          if (idx == null || !m.morphTargetInfluences) return;
+          m.morphTargetInfluences[idx] = value;
+          hit++;
+        });
+        return hit;
+      },
       skinInfo: (role) => {
         const f = a.figures?.[role];
         const sk = f?.pose?.skin;

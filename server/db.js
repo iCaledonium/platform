@@ -8,6 +8,73 @@ const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 
+// -- Trigger bootstrap is atomic (conduct-watch, 2026-09-11) -----------------
+//
+// Every trigger block below is DROP-then-CREATE, deliberately: see the comment
+// at each block -- CREATE TRIGGER IF NOT EXISTS would keep serving a stale body
+// forever on a database that already has the trigger. That ordering is right
+// and is unchanged here. What it was NOT is atomic.
+//
+// This file is imported at module load by platform-api at boot AND by
+// server/lab-incidents-cli.mjs, which is the door every routine files its
+// findings through. Two processes importing at the same moment could both run
+// the DROPs, and then the loser's CREATE hit a trigger the winner had already
+// recreated: SqliteError "trigger actor_deletions_no_delete already exists",
+// thrown during import, killing the CLI before it did any work. conduct-watch
+// reproduced it on 2026-09-11: 5 failures in 36 concurrent db.js imports, and
+// 2 of 24 concurrent CLI invocations exiting 1.
+//
+// bootstrapTriggers runs a whole DROP+CREATE block inside one IMMEDIATE
+// transaction. SQLite takes the write lock at BEGIN, so a second importer
+// blocks (busy_timeout) rather than interleaving, and when it proceeds it does
+// its own drop-and-recreate against a settled schema. Schema changes are
+// transactional in SQLite, so the triggers are never observably absent to any
+// other connection either -- which matters, because two of them are the
+// append-only guards on actor_deletions.
+db.pragma("busy_timeout = 15000");
+
+// Module load happens before anything is listening, so there is no event loop
+// to yield to and setTimeout cannot help; this is the synchronous wait.
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// The same helper guards the check-then-ALTER schema migrations further down
+// (conduct-watch, 2026-09-11): `PRAGMA table_info` followed by `ALTER TABLE ...
+// ADD COLUMN` is a read and a write that were neither atomic nor in a
+// transaction, so two importers could both see a column missing and both ALTER
+// it, and the loser threw SqliteError "duplicate column name: X" at import --
+// the identical uncaught-at-module-load failure as the trigger blocks, on a
+// window that opens the first boot after any new column is added to this file.
+// Doing the PRAGMA *inside* the IMMEDIATE transaction is what closes it: the
+// write lock is already held when the check is made, so the loser re-reads a
+// settled schema and correctly takes the else branch. Aliased rather than
+// renamed so the trigger call sites are untouched.
+function bootstrapTriggers(fn) {
+  const attempts = 5;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      db.exec("BEGIN IMMEDIATE");
+    } catch (err) {
+      // Write lock still held after busy_timeout: back off and try again.
+      if (attempt === attempts) throw err;
+      sleepSync(50 * attempt + Math.floor(Math.random() * 50));
+      continue;
+    }
+    try {
+      fn();
+      db.exec("COMMIT");
+      return;
+    } catch (err) {
+      try { db.exec("ROLLBACK"); } catch { /* already unwound */ }
+      if (attempt === attempts) throw err;
+      sleepSync(50 * attempt + Math.floor(Math.random() * 50));
+    }
+  }
+}
+
+export const bootstrapSchema = bootstrapTriggers;
+
 // ── Schema ───────────────────────────────────────────────────────────────────
 
 db.exec(`
@@ -417,6 +484,7 @@ try { db.exec(`ALTER TABLE actor_deletions ADD COLUMN media_manifest TEXT`); } c
 // gets edited from time to time (the likeness columns are the 2026-09-10 edit),
 // and IF NOT EXISTS would silently keep serving the OLD body forever on any
 // database that already has it. Both statements run on every boot.
+bootstrapTriggers(() => {
 db.exec(`DROP TRIGGER IF EXISTS actors_delete_audit_fallback`);
 db.exec(`
   CREATE TRIGGER actors_delete_audit_fallback
@@ -459,6 +527,7 @@ db.exec(`
     );
   END;
 `);
+});
 
 // ── The tombstones are APPEND-ONLY, enforced by the database (2026-09-10) ───
 //
@@ -523,6 +592,7 @@ db.prepare(`INSERT OR IGNORE INTO audit_ledger (table_name, rows_issued, last_is
 
 // DROP-then-CREATE for the same reason as the fallback trigger above: these
 // bodies get edited, and IF NOT EXISTS would keep serving a stale one forever.
+bootstrapTriggers(() => {
 db.exec(`DROP TRIGGER IF EXISTS actor_deletions_no_delete`);
 db.exec(`DROP TRIGGER IF EXISTS actor_deletions_no_update`);
 db.exec(`DROP TRIGGER IF EXISTS actor_deletions_ledger_bump`);
@@ -573,6 +643,7 @@ db.exec(`
     SELECT RAISE(ABORT, 'audit_ledger.rows_issued is monotonic: it may never be lowered (conduct-watch, 2026-09-10)');
   END;
 `);
+});
 
 // ── Tenancy migration ───────────────────────────────────────────────────────
 //
@@ -586,10 +657,12 @@ db.prepare(`INSERT OR IGNORE INTO orgs (id, name, kind, status, inserted_at, upd
             VALUES ('anima', 'Anima Systems AB', 'organization', 'active',
                     datetime('now'), datetime('now'))`).run();
 
-const userCols = db.prepare(`PRAGMA table_info(users)`).all().map(c => c.name);
-if (!userCols.includes("org_id")) {
-  db.prepare(`ALTER TABLE users ADD COLUMN org_id TEXT REFERENCES orgs(id)`).run();
-}
+bootstrapSchema(() => {
+  const userCols = db.prepare(`PRAGMA table_info(users)`).all().map(c => c.name);
+  if (!userCols.includes("org_id")) {
+    db.prepare(`ALTER TABLE users ADD COLUMN org_id TEXT REFERENCES orgs(id)`).run();
+  }
+});
 db.prepare(`CREATE INDEX IF NOT EXISTS users_org_id_idx ON users (org_id)`).run();
 
 // Everyone who predates orgs is Anima staff by definition — those four rows are
@@ -610,10 +683,12 @@ db.prepare(`UPDATE users SET org_id = 'anima', updated_at = datetime('now')
 // every restart and make a later demotion impossible to keep — precisely the
 // bug the removed world_membership seed below caused, where deleted rows came
 // back within two seconds of a restart. Bootstrap once, then never again.
-if (!db.prepare(`PRAGMA table_info(users)`).all().some(c => c.name === "org_role")) {
-  db.prepare(`ALTER TABLE users ADD COLUMN org_role TEXT`).run();
-  db.prepare(`UPDATE users SET org_role = 'admin' WHERE id = 'mk'`).run();
-}
+bootstrapSchema(() => {
+  if (!db.prepare(`PRAGMA table_info(users)`).all().some(c => c.name === "org_role")) {
+    db.prepare(`ALTER TABLE users ADD COLUMN org_role TEXT`).run();
+    db.prepare(`UPDATE users SET org_role = 'admin' WHERE id = 'mk'`).run();
+  }
+});
 db.prepare(`UPDATE users SET org_role = 'member' WHERE org_role IS NULL`).run();
 
 // ── 3D profile ──────────────────────────────────────────────────────────────
@@ -625,9 +700,11 @@ db.prepare(`UPDATE users SET org_role = 'member' WHERE org_role IS NULL`).run();
 //
 // Nullable on purpose — it is null for exactly as long as somebody has not
 // built one yet, which is the state the onboarding wizard exists to end.
-if (!db.prepare(`PRAGMA table_info(users)`).all().some(c => c.name === "avatar_actor_id")) {
-  db.prepare(`ALTER TABLE users ADD COLUMN avatar_actor_id TEXT REFERENCES actors(id)`).run();
-}
+bootstrapSchema(() => {
+  if (!db.prepare(`PRAGMA table_info(users)`).all().some(c => c.name === "avatar_actor_id")) {
+    db.prepare(`ALTER TABLE users ADD COLUMN avatar_actor_id TEXT REFERENCES actors(id)`).run();
+  }
+});
 
 // -- who a reference photograph depicts --------------------------------------
 //
@@ -643,9 +720,11 @@ if (!db.prepare(`PRAGMA table_info(users)`).all().some(c => c.name === "avatar_a
 // not say", which is deliberately a different state from a declaration; the
 // API refuses to invent one, because a guessed 'self' would read later as
 // evidence somebody gave that answer. Written values: 'self' or 'other'.
-if (!db.prepare(`PRAGMA table_info(actor_media)`).all().some(c => c.name === "depicts")) {
-  db.prepare(`ALTER TABLE actor_media ADD COLUMN depicts TEXT`).run();
-}
+bootstrapSchema(() => {
+  if (!db.prepare(`PRAGMA table_info(actor_media)`).all().some(c => c.name === "depicts")) {
+    db.prepare(`ALTER TABLE actor_media ADD COLUMN depicts TEXT`).run();
+  }
+});
 
 // -- whether the person depicted authorised the likeness ---------------------
 //
@@ -660,9 +739,11 @@ if (!db.prepare(`PRAGMA table_info(actor_media)`).all().some(c => c.name === "de
 // evidence somebody gave permission they were never asked for. Written values:
 // 'yes' or 'no'. Only meaningful where depicts = 'other'; a self-portrait needs
 // no third party's permission, and the gates below only consult it there.
-if (!db.prepare(`PRAGMA table_info(actor_media)`).all().some(c => c.name === "subject_authorised")) {
-  db.prepare(`ALTER TABLE actor_media ADD COLUMN subject_authorised TEXT`).run();
-}
+bootstrapSchema(() => {
+  if (!db.prepare(`PRAGMA table_info(actor_media)`).all().some(c => c.name === "subject_authorised")) {
+    db.prepare(`ALTER TABLE actor_media ADD COLUMN subject_authorised TEXT`).run();
+  }
+});
 
 // -- what a REPLACED photograph had declared ---------------------------------
 //
@@ -681,12 +762,15 @@ if (!db.prepare(`PRAGMA table_info(actor_media)`).all().some(c => c.name === "su
 // exist so the clearing can be explained to the owner in the editor, and so
 // conduct-watch signal 4 can tell a set that was never asked from a set whose
 // answer a file swap took away.
-if (!db.prepare(`PRAGMA table_info(actor_media)`).all().some(c => c.name === "depicts_cleared_from")) {
-  db.prepare(`ALTER TABLE actor_media ADD COLUMN depicts_cleared_from TEXT`).run();
-}
-if (!db.prepare(`PRAGMA table_info(actor_media)`).all().some(c => c.name === "depicts_cleared_at")) {
-  db.prepare(`ALTER TABLE actor_media ADD COLUMN depicts_cleared_at TEXT`).run();
-}
+bootstrapSchema(() => {
+  const mediaCols = db.prepare(`PRAGMA table_info(actor_media)`).all().map(c => c.name);
+  if (!mediaCols.includes("depicts_cleared_from")) {
+    db.prepare(`ALTER TABLE actor_media ADD COLUMN depicts_cleared_from TEXT`).run();
+  }
+  if (!mediaCols.includes("depicts_cleared_at")) {
+    db.prepare(`ALTER TABLE actor_media ADD COLUMN depicts_cleared_at TEXT`).run();
+  }
+});
 
 // ── actor_media IS the evidence, so it may not change silently (2026-09-11) ──
 //
@@ -764,6 +848,7 @@ db.prepare(`INSERT OR IGNORE INTO audit_ledger (table_name, rows_issued, last_is
 // DROP-then-CREATE for the same reason as every other trigger in this file:
 // CREATE TRIGGER IF NOT EXISTS would keep serving a stale body forever on any
 // database that already has it. Both statements run on every boot.
+bootstrapTriggers(() => {
 db.exec(`DROP TRIGGER IF EXISTS actor_media_delete_audit`);
 db.exec(`DROP TRIGGER IF EXISTS actor_media_depicts_audit`);
 db.exec(`DROP TRIGGER IF EXISTS actor_media_authorisation_audit`);
@@ -861,6 +946,7 @@ db.exec(`
           last_issued_at = excluded.last_issued_at;
   END;
 `);
+});
 
 // ── Seed Anima employees if not present ─────────────────────────────────────
 

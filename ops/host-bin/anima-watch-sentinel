@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""anima-watch-sentinel — detects that the fault watcher itself is not working.
+
+WHY THIS EXISTS (2026-09-11). /usr/local/bin/anima-watch was overwritten and
+then deleted on both hosts. On the simulator anima-watch.service crash-looped
+203/EXEC for ~1h45m (617 failed restarts) and NOTHING NOTICED: an empty fault
+table is exactly what a healthy host looks like, so the board and every routine
+that reads faults.db saw the host as clean for the whole window. On the platform
+the same deletion was quieter still — the running process kept executing the
+deleted inode from memory, so the host worked but was unrestartable, and nothing
+would have reported that either.
+
+WHY IT IS A SEPARATE PROGRAM. The obvious fix — point a second anima-watch
+instance at anima-watch.service — is useless in exactly the observed failure
+mode, because both instances exec the SAME binary: if that binary is missing the
+self-watcher is 203/EXEC too and reports nothing. Detection has to come from
+something that does not depend on the watcher's own executable. This file is
+that something. It is driven by a systemd timer, not by a daemon, so it also
+survives its own crashes.
+
+WHAT IT CHECKS, all four of the ways the watcher can be not-working:
+  1. the unit is not loaded           -> watcher-unit-missing
+  2. the unit is not active           -> watcher-down          (the .58 case)
+  3. its ExecStart binary is gone     -> watcher-binary-missing
+  4. its running process is executing a deleted inode
+                                      -> watcher-binary-deleted (the .59 case:
+                                         alive, working, unrestartable)
+  5. it is alive but its ingest watermark has fallen behind the watched unit's
+     journal tail                     -> watcher-wedged        (alive but stuck)
+
+Check 5 compares the watermark against the JOURNAL TAIL, not against wall clock,
+on purpose: a unit that is simply quiet has a watermark equal to its journal
+tail and must not be reported. Only a watcher that is falling behind live output
+is wedged.
+
+HOW A FINDING SURFACES. It is written into faults.db as an ordinary fault row,
+with the same fingerprint/dedup/reopen semantics anima-watch uses, so the
+existing hourly fault-triage sweep picks it up and files it on the board without
+anything else having to learn about this program.
+
+Exit status is 0 whether or not a fault was recorded — a recorded fault is a
+successful run. A non-zero exit means the sentinel itself failed, which is what
+the unit's fallback branch is for.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+DEFAULT_DB = "/var/lib/anima-watch/faults.db"
+DEFAULT_WATCHER = "anima-watch.service"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS faults (
+  fingerprint TEXT PRIMARY KEY,
+  host        TEXT NOT NULL,
+  unit        TEXT NOT NULL,
+  severity    TEXT NOT NULL,
+  category    TEXT NOT NULL,
+  note        TEXT,
+  sample      TEXT NOT NULL,
+  count       INTEGER NOT NULL DEFAULT 1,
+  first_seen  TEXT NOT NULL,
+  last_seen   TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'new'
+);
+"""
+
+FIX_NOTE = ("The fault watcher is not working, so faults are NOT being recorded "
+            "and an empty fault table no longer means a healthy host. Restore it "
+            "from the versioned copy: ops/host-bin/verify.sh to see the drift, "
+            "then ops/host-bin/install.sh --yes, then "
+            "`sudo systemctl restart anima-watch`.")
+
+
+def run(args, timeout=20):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except Exception as exc:  # noqa: BLE001 - any failure here is "unknown"
+        return 127, "", str(exc)
+
+
+def show(unit, keys):
+    cmd = ["systemctl", "show", unit]
+    for k in keys:
+        cmd += ["-p", k]
+    _, out, _ = run(cmd)
+    props = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            props[k] = v
+    return props
+
+
+def exec_path_and_unit(execstart):
+    """Pull the binary path and the --unit argument out of systemd's ExecStart.
+
+    systemd prints it as:
+      { path=/usr/local/bin/anima-watch ; argv[]=/usr/local/bin/anima-watch --unit x ; ... }
+    """
+    path = None
+    watched = None
+    m = re.search(r"path=(\S+)", execstart or "")
+    if m:
+        path = m.group(1)
+    m = re.search(r"argv\[\]=(.*?)\s+;", execstart or "")
+    if m:
+        argv = m.group(1).split()
+        for i, a in enumerate(argv):
+            if a == "--unit" and i + 1 < len(argv):
+                watched = argv[i + 1]
+            elif a.startswith("--unit="):
+                watched = a.split("=", 1)[1]
+    return path, watched
+
+
+def monotonic_now_usec():
+    with open("/proc/uptime", "r") as fh:
+        return int(float(fh.read().split()[0]) * 1_000_000)
+
+
+def journal_tail_usec(unit):
+    rc, out, _ = run(["journalctl", "-u", unit, "-o", "json", "-n", "1", "--no-pager"])
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        return int(json.loads(out.strip().splitlines()[-1]).get("__REALTIME_TIMESTAMP", 0))
+    except (ValueError, json.JSONDecodeError, AttributeError):
+        return None
+
+
+def record(db, host, unit, severity, category, sample, dry_run=False):
+    """Same fingerprint / dedup / reopen semantics as anima-watch's record().
+
+    The fingerprint deliberately carries no volatile numbers (PIDs, restart
+    counts), so a watcher that has been down for an hour is ONE row with a
+    climbing count, not sixty rows.
+    """
+    fp = hashlib.sha1(f"{host}|{unit}|{category}|sentinel".encode()).hexdigest()[:16]
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    if dry_run:
+        print(f"[sentinel] WOULD RECORD {severity}/{category} {fp}: {sample}")
+        return fp
+    cur = db.execute("SELECT status FROM faults WHERE fingerprint = ?", (fp,)).fetchone()
+    if cur:
+        # Same reasoning as anima-watch: a fault that fires again is not fixed,
+        # so reopen it out of 'fixed'/'ack' — otherwise a watcher that went down,
+        # got acked, and went down again would never be listed again. 'ignored'
+        # is the one status that means known-benign and is left alone.
+        if cur[0] in ("fixed", "ack"):
+            db.execute("UPDATE faults SET count = count + 1, last_seen = ?, sample = ?,"
+                       " severity = ?, status = 'new' WHERE fingerprint = ?",
+                       (now, sample[:2000], severity, fp))
+        else:
+            db.execute("UPDATE faults SET count = count + 1, last_seen = ?, sample = ?,"
+                       " severity = ? WHERE fingerprint = ?",
+                       (now, sample[:2000], severity, fp))
+    else:
+        db.execute(
+            "INSERT INTO faults (fingerprint, host, unit, severity, category, note, sample,"
+            " first_seen, last_seen) VALUES (?,?,?,?,?,?,?,?,?)",
+            (fp, host, unit, severity, category, FIX_NOTE, sample[:2000], now, now))
+    db.commit()
+    print(f"[sentinel] RECORDED {severity}/{category} {fp}: {sample}")
+    return fp
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--watcher-unit", default=DEFAULT_WATCHER)
+    ap.add_argument("--db", default=DEFAULT_DB)
+    ap.add_argument("--host", default=os.uname().nodename)
+    ap.add_argument("--lag-seconds", type=int, default=900,
+                    help="watermark may trail the watched unit's journal tail by this much")
+    ap.add_argument("--grace-seconds", type=int, default=300,
+                    help="ignore lag while the watcher has been up for less than this")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    props = show(args.watcher_unit, [
+        "LoadState", "ActiveState", "SubState", "Result", "NRestarts",
+        "MainPID", "ExecMainStatus", "ExecStart", "ActiveEnterTimestampMonotonic",
+    ])
+
+    if args.dry_run:
+        # Read-only so a dry run cannot create or alter anything — but it must
+        # still OPEN the db, because the wedged/not-ingesting checks below read
+        # ingest_state and would otherwise report a false positive on a
+        # perfectly healthy host.
+        db = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True, timeout=15)
+        db.execute("PRAGMA busy_timeout=15000")
+    else:
+        os.makedirs(os.path.dirname(args.db), exist_ok=True)
+        db = sqlite3.connect(args.db, timeout=15, isolation_level=None)
+        # WAL + busy_timeout for the same reason anima-watch sets them: the
+        # watcher daemon holds this file open for writing continuously, and
+        # without these a sentinel write dies with "database is locked" — which
+        # would make the detector silent in precisely the situation it exists for.
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA busy_timeout=15000")
+        db.executescript(SCHEMA)
+
+    def report(severity, category, sample):
+        record(db, args.host, args.watcher_unit, severity, category, sample, args.dry_run)
+
+    load = props.get("LoadState", "unknown")
+    active = props.get("ActiveState", "unknown")
+
+    if load != "loaded":
+        report("critical", "watcher-unit-missing",
+               f"{args.watcher_unit} is not installed on {args.host} "
+               f"(LoadState={load}). No faults are being recorded on this host at all.")
+        return 0
+
+    if active != "active":
+        report("critical", "watcher-down",
+               f"{args.watcher_unit} is {active}/{props.get('SubState','?')} on {args.host} "
+               f"(Result={props.get('Result','?')}, NRestarts={props.get('NRestarts','?')}, "
+               f"ExecMainStatus={props.get('ExecMainStatus','?')}). Faults are NOT being "
+               f"recorded, so an empty fault table for this host means nothing.")
+        return 0
+
+    exec_path, watched = exec_path_and_unit(props.get("ExecStart", ""))
+
+    if exec_path and not os.path.exists(exec_path):
+        report("critical", "watcher-binary-missing",
+               f"{args.watcher_unit} is active on {args.host} but its ExecStart binary "
+               f"{exec_path} does not exist. The running process is executing a deleted "
+               f"file from memory: it works now and dies permanently on the next restart "
+               f"or reboot.")
+        return 0
+
+    pid = props.get("MainPID", "0")
+    if pid and pid != "0":
+        try:
+            target = os.readlink(f"/proc/{pid}/exe")
+            if target.endswith(" (deleted)"):
+                report("critical", "watcher-binary-deleted",
+                       f"{args.watcher_unit} (PID {pid}) on {args.host} is running a deleted "
+                       f"inode ({target}). It works now and dies permanently on the next "
+                       f"restart or reboot.")
+                return 0
+        except OSError:
+            # Not readable (raced with a restart, or permissions). Not a finding:
+            # guessing here would file a fault every time the watcher restarts.
+            pass
+
+    # --- alive but wedged -----------------------------------------------------
+    if not watched:
+        return 0
+    try:
+        up_usec = monotonic_now_usec() - int(props.get("ActiveEnterTimestampMonotonic", "0"))
+    except ValueError:
+        up_usec = 0
+    if up_usec < args.grace_seconds * 1_000_000:
+        return 0  # just started, still catching up
+
+    tail = journal_tail_usec(watched)
+    if not tail:
+        return 0
+    row = None
+    if db is not None:
+        try:
+            row = db.execute("SELECT last_usec FROM ingest_state WHERE host = ? AND unit = ?",
+                             (args.host, watched)).fetchone()
+        except sqlite3.Error:
+            row = None
+    if row is None:
+        report("error", "watcher-not-ingesting",
+               f"{args.watcher_unit} has been active on {args.host} for "
+               f"{up_usec // 1_000_000}s but has no ingest watermark for {watched}, "
+               f"so it has never recorded a journal entry.")
+        return 0
+    lag = (tail - int(row[0])) / 1_000_000.0
+    if lag > args.lag_seconds:
+        report("error", "watcher-wedged",
+               f"{args.watcher_unit} is active on {args.host} but its ingest watermark for "
+               f"{watched} is {int(lag)}s behind that unit's journal tail (threshold "
+               f"{args.lag_seconds}s). The process is alive and not reading: faults "
+               f"happening now are not being recorded.")
+        return 0
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

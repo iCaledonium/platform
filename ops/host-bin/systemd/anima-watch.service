@@ -1,0 +1,14 @@
+[Unit]
+Description=anima-watch — fault detection for platform-api.service
+After=platform-api.service
+
+[Service]
+Type=simple
+User=magnus
+SupplementaryGroups=systemd-journal
+ExecStart=/usr/local/bin/anima-watch --unit platform-api.service --db /var/lib/anima-watch/faults.db
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

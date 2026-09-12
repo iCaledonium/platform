@@ -1,0 +1,11 @@
+[Unit]
+Description=anima-watch-sentinel — check that the fault watcher itself is working
+# Deliberately NOT a second anima-watch instance: if /usr/local/bin/anima-watch
+# is missing, an anima-watch-based self-watcher is 203/EXEC too and reports
+# nothing. That is the 2026-09-11 failure this unit exists to catch.
+
+[Service]
+Type=oneshot
+User=magnus
+SupplementaryGroups=systemd-journal
+ExecStart=/usr/local/bin/anima-watch-sentinel --db /var/lib/anima-watch/faults.db

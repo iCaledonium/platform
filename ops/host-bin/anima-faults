@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""anima-faults — read what the watcher caught, and triage it.
+
+  anima-faults                 open faults, worst first
+  anima-faults --all           include acknowledged / fixed / ignored
+  anima-faults --show <fp>     full sample for one fault
+  anima-faults --ack <fp>      defer: out of the default list for 7 days, then back
+  anima-faults --fixed <fp>    mark resolved
+  anima-faults --ignore <fp>   known-benign, stop surfacing it
+  anima-faults --since '2 days ago'
+"""
+
+import argparse, sqlite3, sys
+from datetime import datetime, timezone, timedelta
+
+DB = "/var/lib/anima-watch/faults.db"
+ORDER = {"critical": 0, "error": 1, "warn": 2, "info": 3}
+COL = {"critical": "\033[1;31m", "error": "\033[31m", "warn": "\033[33m", "info": "\033[2m"}
+RESET = "\033[0m"
+# An ack DEFERS a fault, it does not close it. After this many days the fault
+# comes back into the default listing so it is triaged again under whatever
+# policy is current, instead of sitting acked and unseen forever.
+ACK_TTL_DAYS = 7
+
+
+def ago(ts):
+    try:
+        dt = datetime.fromisoformat(ts)
+    except ValueError:
+        return ts
+    d = datetime.now(timezone.utc) - dt
+    s = int(d.total_seconds())
+    if s < 60:    return f"{s}s ago"
+    if s < 3600:  return f"{s//60}m ago"
+    if s < 86400: return f"{s//3600}h ago"
+    return f"{s//86400}d ago"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--db", default=DB)
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--show")
+    ap.add_argument("--ack"); ap.add_argument("--fixed")
+    ap.add_argument("--ignore"); ap.add_argument("--since")
+    a = ap.parse_args()
+
+    try:
+        db = sqlite3.connect(a.db, timeout=10)
+        # The watcher daemon holds this file continuously; without a busy
+        # timeout every write from here fails with "database is locked".
+        db.execute("PRAGMA busy_timeout=10000")
+        db.execute("SELECT 1 FROM faults LIMIT 1")
+    except sqlite3.Error as e:
+        print(f"no fault store at {a.db} ({e})"); sys.exit(1)
+
+    # A deferral has to know when it started, so carry acked_at next to
+    # status. Rows acked before this column existed have acked_at NULL and
+    # count as already expired - they are exactly the backlog that went
+    # invisible when an ack was still a permanent, unlogged close.
+    if "acked_at" not in [r[1] for r in db.execute("PRAGMA table_info(faults)")]:
+        db.execute("ALTER TABLE faults ADD COLUMN acked_at TEXT")
+        db.commit()
+
+    now = datetime.now(timezone.utc)
+
+    for flag, status in (("ack", "ack"), ("fixed", "fixed"), ("ignore", "ignored")):
+        fp = getattr(a, flag)
+        if fp:
+            stamp = now.isoformat(timespec="seconds") if status == "ack" else None
+            n = db.execute("UPDATE faults SET status = ?, acked_at = ? WHERE fingerprint LIKE ?",
+                           (status, stamp, fp + "%")).rowcount
+            db.commit()
+            tail = f" (deferred {ACK_TTL_DAYS}d, then back in the default list)" if status == "ack" else ""
+            print(f"{n} fault(s) -> {status}{tail}")
+            return
+
+    if a.show:
+        row = db.execute("SELECT * FROM faults WHERE fingerprint LIKE ?", (a.show + "%",)).fetchone()
+        if not row:
+            print("not found"); return
+        cols = [d[0] for d in db.execute("SELECT * FROM faults LIMIT 0").description]
+        r = dict(zip(cols, row))
+        print(f"\n  {r['severity'].upper()}  {r['category']}  [{r['fingerprint']}]  {r['status']}")
+        print(f"  {r['host']} / {r['unit']}")
+        print(f"  seen {r['count']}x   first {ago(r['first_seen'])}   last {ago(r['last_seen'])}")
+        if r["note"]:
+            print(f"\n  what it means:\n    {r['note']}")
+        print(f"\n  sample:\n    " + r["sample"].replace("\n", "\n    ") + "\n")
+        return
+
+    q = "SELECT fingerprint, host, unit, severity, category, count, first_seen, last_seen, status, sample FROM faults"
+    where = []
+    params = []
+    if not a.all:
+        # 'new', plus every ack whose deferral has run out. Filtering on
+        # status = 'new' alone made an ack a silent permanent close: the fault
+        # left this listing for good, and since nothing in the triage
+        # procedure ever passes --all, nothing ever looked at it again.
+        where.append("(status = 'new' OR (status = 'ack'"
+                     " AND (acked_at IS NULL OR acked_at < ?)))")
+        params.append((now - timedelta(days=ACK_TTL_DAYS)).isoformat(timespec="seconds"))
+    if a.since:
+        pass  # journalctl-style relative parsing is deliberately not reimplemented here
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    rows = db.execute(q, params).fetchall()
+    rows.sort(key=lambda r: (ORDER.get(r[3], 9), -r[5]))
+
+    if not rows:
+        print("\n  no open faults.\n")
+        return
+
+    counts = {}
+    for r in rows:
+        counts[r[3]] = counts.get(r[3], 0) + 1
+    summary = "  ".join(f"{COL.get(k,'')}{v} {k}{RESET}" for k, v in
+                        sorted(counts.items(), key=lambda kv: ORDER.get(kv[0], 9)))
+    label = "fault(s), all statuses" if a.all else "open fault(s)"
+    print(f"\n  {len(rows)} {label}:  {summary}\n")
+
+    for fp, host, unit, sev, cat, cnt, first, last, status, sample in rows:
+        c = COL.get(sev, "")
+        head = sample.split("\n")[0][:96]
+        if status == "new":
+            tag = ""
+        elif a.all:
+            tag = f"  [{status}]"
+        else:
+            tag = "  [ack expired - re-triage]"
+        print(f"  {c}{sev.upper():<8}{RESET} {cat:<20} {fp}  x{cnt:<5} last {ago(last):<10} {host.split('.')[0]}{tag}")
+        print(f"           {head}")
+    print(f"\n  anima-faults --show <fp>   for detail")
+    print(f"  anima-faults --ack|--fixed|--ignore <fp>\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""anima-watch — continuous fault detection for Deliver Worlds.
+
+Follows journald for one systemd unit, classifies anything that looks like a
+fault, and records it to a SQLite store with deduplication. It does NOT modify
+the application: systemd already handles process death via Restart=on-failure,
+and every fault this project has actually hit has been a code or schema defect
+that wants a person, not a retry.
+
+Why dedup matters: a broken SQL column fires on every tick. Without a
+fingerprint you get 40k identical lines and the ONE new fault underneath is
+invisible. Each distinct fault is one row with a count and a last-seen.
+
+Written Session 150, after a night in which four separate faults were found —
+each of which had been failing silently for some time:
+  - Repo.insert_all(..., on_conflict: :replace_all) on a schemaless table,
+    which broke EVERY deploy
+  - a renamed column referenced in raw SQL, invisible to the compiler
+  - a NOT NULL id omitted on two psych sub-tables
+  - a stale variable reference in a log line, thrown on every schedule build
+None of them announced themselves. That is what this is for.
+"""
+
+import argparse, hashlib, json, os, re, sqlite3, subprocess, sys, time
+from datetime import datetime, timezone
+
+# ── classification ───────────────────────────────────────────────────────────
+# (regex, severity, category, note). First match wins, so put benign patterns
+# ABOVE the general ones they would otherwise be caught by.
+SIGNATURES = [
+    # --- known-benign: real log lines that are not faults -------------------
+    # journald emits each line of a multi-line message separately, so
+    # "TypeError: terminated" arrives WITHOUT its "[cause]: SocketError" line and
+    # would otherwise be classified as a genuine type error. It is undici's
+    # wording for a connection cut mid-flight — which is what a service restart
+    # looks like from the other side.
+    (r"TypeError: terminated",                       "info",  "restart-artifact",
+     "undici's message for a request cut mid-flight, normally a restart of the "
+     "service being called. A burst with no restart nearby is real trouble."),
+    (r"SocketError: other side closed",              "info",  "restart-artifact",
+     "In-flight request cut by a service restart. Benign in isolation; a burst "
+     "with no restart nearby means real connectivity trouble."),
+
+    # --- schema / SQL: the class that fails at query time, not compile ------
+    (r"no such column",                              "critical", "schema-mismatch",
+     "SQL references a column that does not exist. Raw SQL is not compiler-"
+     "checked, so this ships clean and fails at runtime. Usually a rename that "
+     "missed a call site."),
+    (r"NOT NULL constraint failed",                  "critical", "schema-constraint",
+     "An insert omitted a required column. On a schemaless insert_all there is "
+     "no compile-time check."),
+    (r"UNIQUE constraint failed",                    "error",  "schema-constraint",
+     "Duplicate key. Often a missing on_conflict clause."),
+    (r"cannot use :replace_all on operations without a schema", "critical", "ecto-misuse",
+     "insert_all against a raw table name cannot take :replace_all. Needs an "
+     "explicit conflict_target plus a replace list."),
+    (r"\(Exqlite\.Error\)|\(Ecto\.\w+Error\)|\(Postgrex\.Error\)", "error", "db-error",
+     "Database error raised out of Ecto."),
+
+    # --- language-level faults ---------------------------------------------
+    (r"ReferenceError: (\w+) is not defined",        "critical", "js-reference",
+     "A JS identifier that does not exist at runtime. Typically a variable "
+     "moved into a narrower scope while a reference stayed behind."),
+    (r"TypeError|is not a function|is not a constructor", "error", "js-type",
+     "A JS type error — often a function that is not a function, i.e. an import "
+     "shape that changed under a version bump."),
+    (r"SyntaxError",                                 "critical", "syntax",
+     "Code failed to parse."),
+    (r"\*\* \((\w+Error|MatchError|FunctionClauseError|ArgumentError)\)", "error", "elixir-exception",
+     "Unhandled Elixir exception."),
+    (r"Compilation error|== Compilation error",      "critical", "compile",
+     "The project does not build."),
+
+    # --- domain faults specific to this system -----------------------------
+    (r"rolled back|deploy failed",                   "critical", "deploy",
+     "A deploy aborted and rolled back. The actor was not created."),
+    # Deploying into a world that is not started is a normal operation, not a
+    # fault: actors only boot once the world itself is running, so the
+    # supervisor genuinely is not there yet. Classified before the general
+    # boot-failure signature so it does not read as a defect.
+    (r"boot failed: :supervisor_not_running",        "info",   "world-not-started",
+     "The actor was created but not booted because its world is not started. "
+     "Expected — actors boot only once the world is running. Start the world "
+     "and the actor comes up with it. Note the deploy still reports success and "
+     "the wizard clears its draft, and there is no boot-retry endpoint."),
+    (r"actor created but boot failed|not booted",    "error",  "deploy-boot",
+     "The actor exists in the DB but its process did not start, for a reason "
+     "other than the world being stopped. There is no boot-retry endpoint, so "
+     "this needs manual attention."),
+    (r"XTTS upload (failed|error|exception)",        "warn",   "voice",
+     "A voice reference did not reach the TTS server. The file is saved "
+     "locally; the outcome is recorded on actors.voice_upload_error."),
+    (r"no SEK->\w+ rate|rates_too_old|no_rates",     "warn",   "fx",
+     "Currency conversion had no usable rate. Amounts fall back to SEK rather "
+     "than being converted wrongly."),
+    (r"overlapped another source",                   "info",   "schedule",
+     "Work blocks collided and were clipped. Expected when sources share hours."),
+    # ThoughtEngine words its synthesis failures differently from every other
+    # engine, and both shapes slipped through: "synthesis failed:
+    # %Req.TransportError{reason: :timeout}" carries no uppercase LLM token,
+    # and "SYNTHESIS failed: :llm_unavailable" puts the llm token AFTER
+    # "failed", which LLM.*(failed|timeout) cannot reach in either case. Both
+    # are logged at [warning], so the [error] catch-all did not rescue them:
+    # seven real synthesis failures in one afternoon produced zero rows while
+    # peer engines (MemoryEngine "LLM failed: ...") recorded normally — which
+    # is exactly why the gap read as health.
+    (r"Generation failed|LLM.*(failed|timeout)|(?i:synthesis failed)|:llm_unavailable", "warn", "llm",
+     "A model call failed. Usually transient."),
+
+    # A refused cross-origin websocket connect is the check_origin allowlist
+    # WORKING, but Phoenix logs it at [error], so it fell into the unclassified
+    # catch-all below and surfaced as an error-severity fault. Classified here
+    # at warn with its own category so a BURST is visible as a burst: as it
+    # stood, a genuine probe and a self-test were byte-identical rows. The
+    # second pattern catches the paired "Origin of the request:" line, which
+    # carries no [error] token and so matched nothing at all on its own.
+    (r"Could not check origin for|Origin of the request:", "warn", "socket-origin-rejected",
+     "A websocket connect was REFUSED by the endpoint's check_origin allowlist. "
+     "The guard worked and the application is not at fault -- do NOT 'fix' this "
+     "by loosening or removing the allowlist. Expect a pair per attempt: the "
+     "refusal itself, plus an 'Origin of the request:' row naming the origin. "
+     "One hit from an obviously synthetic origin is normally someone testing "
+     "the guard; a climbing count, or an origin you do not recognise, is a real "
+     "probe and wants a look at who is connecting."),
+
+    # --- catch-all: anything journald itself flagged as an error -----------
+    (r"\[error\]|\bERROR\b|\bCRITICAL\b|Traceback",  "error",  "unclassified",
+     "Matched no known signature. Read the sample and add a signature if it "
+     "recurs."),
+]
+
+COMPILED = [(re.compile(p), sev, cat, note) for p, sev, cat, note in SIGNATURES]
+
+# Strip the parts that vary between otherwise-identical faults, so they collapse
+# into one row rather than thousands.
+NOISE = [
+    (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), "<uuid>"),
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*"), "<ts>"),
+    (re.compile(r"\b\d{2}:\d{2}:\d{2}\.\d+\b"), "<time>"),
+    (re.compile(r"#PID<[\d.]+>"), "<pid>"),
+    (re.compile(r"\b\d{4,}\b"), "<n>"),
+]
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS faults (
+  fingerprint TEXT PRIMARY KEY,
+  host        TEXT NOT NULL,
+  unit        TEXT NOT NULL,
+  severity    TEXT NOT NULL,
+  category    TEXT NOT NULL,
+  note        TEXT,
+  sample      TEXT NOT NULL,
+  count       INTEGER NOT NULL DEFAULT 1,
+  first_seen  TEXT NOT NULL,
+  last_seen   TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'new'   -- new | ack | fixed | ignored
+);
+CREATE INDEX IF NOT EXISTS faults_status_idx   ON faults(status, severity);
+CREATE INDEX IF NOT EXISTS faults_lastseen_idx ON faults(last_seen);
+
+-- Highest journal timestamp already ingested, per (host, unit). Without this a
+-- second backfill over an overlapping window re-counts entries it has already
+-- seen, so a fault that happened once reports x2 and the counts stop meaning
+-- anything.
+CREATE TABLE IF NOT EXISTS ingest_state (
+  host       TEXT NOT NULL,
+  unit       TEXT NOT NULL,
+  last_usec  INTEGER NOT NULL,
+  PRIMARY KEY (host, unit)
+);
+"""
+
+
+def normalise(msg):
+    out = msg
+    for rx, rep in NOISE:
+        out = rx.sub(rep, out)
+    return out[:400]
+
+
+# Wrappers that carry a real error inside them. Node's unhandledRejection
+# handler prints "not crashing the process: <the actual error>", so matching the
+# wrapper first buries whatever it wrapped. During testing this downgraded a
+# genuine "ReferenceError: workBlocks is not defined" — a fault that broke every
+# schedule generation — to a generic warning. Strip the wrapper, classify the
+# contents, and only fall back to the wrapper itself if nothing inside matches.
+WRAPPERS = [
+    re.compile(r"\[unhandledRejection\][^:]*:\s*"),
+    re.compile(r"^\s*\[error\]\s*"),
+]
+
+
+def classify(msg):
+    inner = msg
+    for w in WRAPPERS:
+        inner = w.sub("", inner, count=1)
+
+    for target in ([inner, msg] if inner != msg else [msg]):
+        for rx, sev, cat, note in COMPILED:
+            if rx.search(target):
+                return sev, cat, note
+
+    if inner != msg:
+        return ("warn", "unhandled-rejection",
+                "A promise rejected with no handler and the inner error matched "
+                "no known signature. The process survives by design, so the "
+                "request failed silently.")
+    return None
+
+
+def record(db, host, unit, msg):
+    hit = classify(msg)
+    if not hit:
+        return None
+    sev, cat, note = hit
+    fp = hashlib.sha1(f"{host}|{unit}|{cat}|{normalise(msg)}".encode()).hexdigest()[:16]
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    cur = db.execute("SELECT status FROM faults WHERE fingerprint = ?", (fp,)).fetchone()
+    reopened = False
+    if cur:
+        # A fault that fires again is, by observation, not fixed - and "seen it"
+        # is not the same claim as "not happening any more". The default
+        # anima-faults listing filters on status = 'new', so leaving status
+        # untouched here made every recurrence of an already-triaged fault
+        # invisible however often it fired: an error-severity fault climbed past
+        # 100 while the listing showed nothing but warns, which reads as health.
+        # Reopen so the default listing keeps meaning "what is happening now".
+        # 'ignored' is the one status that means known-benign, never surface
+        # again (the restart-artifact line alone has 600+ hits), so it is left
+        # alone - otherwise suppression would not exist at all.
+        if cur[0] in ("fixed", "ack"):
+            db.execute("UPDATE faults SET count = count + 1, last_seen = ?, status = 'new'"
+                       " WHERE fingerprint = ?", (now, fp))
+            reopened = True
+        else:
+            db.execute("UPDATE faults SET count = count + 1, last_seen = ? WHERE fingerprint = ?", (now, fp))
+    else:
+        db.execute(
+            "INSERT INTO faults (fingerprint, host, unit, severity, category, note, sample, first_seen, last_seen)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (fp, host, unit, sev, cat, note, msg[:2000], now, now))
+    db.commit()
+    return fp, sev, cat, bool(cur), reopened
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--unit", required=True)
+    ap.add_argument("--db", default="/var/lib/anima-watch/faults.db")
+    ap.add_argument("--host", default=os.uname().nodename)
+    ap.add_argument("--since", default=None, help="backfill from, e.g. '1 hour ago'")
+    args = ap.parse_args()
+
+    os.makedirs(os.path.dirname(args.db), exist_ok=True)
+    # isolation_level=None puts sqlite3 in autocommit: every statement commits
+    # on its own. Without it, Python opens an implicit transaction on the first
+    # write and holds it until an explicit commit — and the watermark UPDATE in
+    # the loop below writes on EVERY journal line, including the vast majority
+    # that never reach record()'s commit because they classify as nothing. The
+    # daemon then sat on an open write transaction indefinitely while blocked on
+    # journalctl, and every anima-faults write died with "database is locked".
+    # WAL alone does not help: it allows a reader alongside a writer, not a
+    # second writer.
+    db = sqlite3.connect(args.db, timeout=10, isolation_level=None)
+    # WAL so anima-faults can read AND write while this daemon holds the file.
+    # Without it the triage tool cannot mark anything: the writer blocks every
+    # other writer, and "database is locked" is what the operator sees instead
+    # of a working --fixed. busy_timeout covers the brief overlap when both
+    # processes write at once.
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=10000")
+    db.executescript(SCHEMA)
+
+    cmd = ["journalctl", "-u", args.unit, "-o", "json", "--no-pager", "-f", "-n", "0"]
+    if args.since:
+        cmd = ["journalctl", "-u", args.unit, "-o", "json", "--no-pager", "--since", args.since]
+
+    row = db.execute("SELECT last_usec FROM ingest_state WHERE host = ? AND unit = ?",
+                     (args.host, args.unit)).fetchone()
+    watermark = row[0] if row else 0
+
+    print(f"[anima-watch] following {args.unit} -> {args.db} (watermark {watermark})", flush=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = entry.get("MESSAGE")
+            if not isinstance(msg, str) or not msg.strip():
+                continue
+
+            # Skip anything already ingested, so re-running a backfill is a
+            # no-op rather than inflating every count it touches.
+            try:
+                usec = int(entry.get("__REALTIME_TIMESTAMP", 0))
+            except (TypeError, ValueError):
+                usec = 0
+            if usec and usec <= watermark:
+                continue
+            if usec > watermark:
+                watermark = usec
+                db.execute(
+                    "INSERT INTO ingest_state (host, unit, last_usec) VALUES (?,?,?)"
+                    " ON CONFLICT(host, unit) DO UPDATE SET last_usec = excluded.last_usec",
+                    (args.host, args.unit, watermark))
+
+            res = record(db, args.host, args.unit, msg)
+            if res:
+                fp, sev, cat, seen_before, reopened = res
+                if not seen_before:
+                    print(f"[anima-watch] NEW {sev}/{cat} {fp}: {msg[:160]}", flush=True)
+                elif reopened:
+                    print(f"[anima-watch] REOPENED {sev}/{cat} {fp}: {msg[:160]}", flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        proc.terminate()
+
+
+if __name__ == "__main__":
+    main()

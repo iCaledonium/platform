@@ -255,37 +255,175 @@ app.use((req, res, next) => {
 // carry no subject at all.
 const SUBJ_BY_FOLDER = db.prepare(`SELECT id, age FROM actors WHERE media_folder = ?`);
 const SUBJ_BY_ID = db.prepare(`SELECT id, age FROM actors WHERE id = ?`);
+// Third key for the /media/worlds shape. A platform actor that has been DEPLOYED
+// is addressed in world media by its SIMULATOR actor id (see the deployed-portrait
+// writer, which builds /media/worlds/<world_id>/actors/<actor_id>/images/ from the
+// simulator id), and that id matches no row in `actors` on this host. Without this
+// the subject of a deployed person's own photographs resolved remote: and emitted
+// minor=unknown even though this host holds their declared age one join away.
+// Undeployed rows are deliberately INCLUDED: the bytes still depict that person
+// after the deployment ends, and the audit question is who is in the picture, not
+// whether the deployment is current. Newest deployment wins if an id was reused.
+const SUBJ_BY_DEPLOYMENT = db.prepare(`SELECT a.id AS id, a.age AS age FROM actor_deployments d JOIN actors a ON a.id = d.platform_actor_id WHERE d.simulator_actor_id = ? ORDER BY d.deployed_at DESC LIMIT 1`);
+// ── Fourth key: a declared age the SIMULATOR owns, cached locally ────────
+// Conduct watch, 2026-09-11. nginx's /media/worlds/ stanza is
+// `try_files $uri @simulator_media`, so when the file EXISTS on this host's
+// disk this host serves it and the simulator never witnesses the fetch at
+// all. For a simulator-NATIVE actor (no `actors` row here, no
+// actor_deployments row) the three keys above all miss, the line fell back to
+// subject=remote:<id> minor=unknown subject_age=-, and that was the ONLY
+// journal line the fetch would ever produce ON EITHER HOST -- while the
+// declared age sat in the simulator's dev.db, one LAN call away. Measured:
+// /media/worlds/87c91ce8-.../actors/mk-87c91ce8/images/profile.jpg logged
+// minor=unknown here; `select age from actors where id='mk-87c91ce8'` on
+// 192.168.1.58 returns 49. The remote: label then sent an auditor to look for
+// a simulator line that was never written -- each journal pointing at the
+// other, which is the failure this bench exists to catch.
+//
+// The fix is a small LOCAL READ-MODEL, refreshed OUT OF BAND. Attribution
+// must never be able to block or fail a request it is only observing, so the
+// logger itself makes NO cross-host call: it reads this table synchronously,
+// exactly like the three keys above. It is filled by refreshRemoteActorAges()
+// below (20s after boot, then every 15 min) and opportunistically by the
+// world-portrait writer the moment it puts such a file on our disk.
+//
+// Rows are deliberately NEVER deleted when an actor is destroyed: the bytes
+// stay on disk and keep depicting that person, so the declared age has to
+// outlive the row (same principle as the simulator's non-deletable
+// content_deletion_log). This is a COPY of another host's declaration, so the
+// line says so: age_src= carries which host corroborated it and when.
+db.exec(`CREATE TABLE IF NOT EXISTS remote_actor_ages (
+  actor_id   TEXT PRIMARY KEY,
+  world_id   TEXT,
+  age        INTEGER,
+  updated_at TEXT NOT NULL
+)`);
+const SUBJ_BY_REMOTE_CACHE = db.prepare(`SELECT actor_id AS id, age AS age, updated_at AS updated_at FROM remote_actor_ages WHERE actor_id = ?`);
+const UPSERT_REMOTE_AGE = db.prepare(`INSERT INTO remote_actor_ages (actor_id, world_id, age, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(actor_id) DO UPDATE SET world_id = excluded.world_id, age = excluded.age, updated_at = excluded.updated_at`);
 function mediaSubject(p) {
-  const none = { subject: "-", minor: "-", age: "-" };
+  const none = { subject: "-", minor: "-", age: "-", src: "-" };
   try {
     const seg = String(p || "").split("/").filter(Boolean).map(decodeURIComponent);
     if (seg[0] !== "media") return none;
     let a = null;
     let fallback = null;
+    // Filled only when no row on THIS host answers -- see remote_actor_ages.
+    let cached = null;
     if (seg[1] === "actors" && seg[2]) {
       a = SUBJ_BY_FOLDER.get(seg[2]) || SUBJ_BY_ID.get(seg[2]);
       fallback = `orphan:${seg[2]}`;
     } else if (seg[1] === "worlds" && seg[3] === "actors" && seg[4]) {
-      a = SUBJ_BY_ID.get(seg[4]);
+      // Conduct watch, 2026-09-11: this branch resolved by id ONLY, but seg[4]
+      // on this path is written as the actor MEDIA_FOLDER SLUG by this host own
+      // writers -- the world-video upload urlBase `/media/worlds/${world_id}/actors/${actorSlug}`
+      // and the deployed-portrait copy -- so every platform-local actor on this
+      // shape missed its row, fell through to remote: and emitted minor=unknown,
+      // subject_age=-. Measured: id lookup for frida-svensson-c2653aac returns 0
+      // rows, media_folder lookup returns 1. That made minor=yes UNREACHABLE on
+      // the one path the ping env block names personal_actor_media, i.e. the
+      // canonical shape for real photographs of real people: a clean read by
+      // construction rather than by measurement, which is the exact failure mode
+      // this bench exists to catch, surviving one branch over from where it was
+      // fixed on 2026-09-09. Resolve by slug OR id, same order as /media/actors.
+      // The remote: fallback STAYS and the /media/cities branch below is left
+      // alone: both shapes also carry simulator-owned actors whose rows really do
+      // live on the other host, so absence there is normal topology and must not
+      // be reported as an orphan.
+      a = SUBJ_BY_FOLDER.get(seg[4]) || SUBJ_BY_ID.get(seg[4]) || SUBJ_BY_DEPLOYMENT.get(seg[4]);
+      if (!a) cached = SUBJ_BY_REMOTE_CACHE.get(seg[4]);
       fallback = `remote:${seg[4]}`;
     } else if (seg[1] === "cities" && seg[3] === "ambient_actors" && seg[4]) {
       a = SUBJ_BY_ID.get(seg[4]);
+      if (!a) cached = SUBJ_BY_REMOTE_CACHE.get(seg[4]);
       fallback = `remote:${seg[4]}`;
     } else if (seg[1] === "users" && seg[2]) {
       // A user's own media folder. `users` carries no declared age on this
       // host, so the honest answer is "unknown" -- never "no".
-      return { subject: `user:${seg[2]}`, minor: "unknown", age: "-" };
+      return { subject: `user:${seg[2]}`, minor: "unknown", age: "-", src: "-" };
     } else {
       return none;
     }
-    if (!a) return { subject: fallback, minor: "unknown", age: "-" };
-    if (a.age === null || a.age === undefined) return { subject: `actor:${a.id}`, minor: "unknown", age: "-" };
-    return { subject: `actor:${a.id}`, minor: a.age < 18 ? "yes" : "no", age: String(a.age) };
+    if (!a && cached && cached.age !== null && cached.age !== undefined) {
+      // Declared on the other host, copied here out of band. The subject token
+      // stays `remote:` -- the row really does live over there and an audit
+      // greps for it -- but minor=/subject_age= are now ANSWERED rather than
+      // unknown, and age_src= says the answer is a cached copy and how old it
+      // is, so nobody mistakes it for a row this host owns.
+      return { subject: fallback, minor: cached.age < 18 ? "yes" : "no", age: String(cached.age), src: `sim-cache@${cached.updated_at}` };
+    }
+    if (!a) return { subject: fallback, minor: "unknown", age: "-", src: "-" };
+    if (a.age === null || a.age === undefined) return { subject: `actor:${a.id}`, minor: "unknown", age: "-", src: "local" };
+    return { subject: `actor:${a.id}`, minor: a.age < 18 ? "yes" : "no", age: String(a.age), src: "local" };
   } catch (_e) {
     // Attribution must never be able to break a request it is only observing.
-    return { subject: "unresolved", minor: "unknown", age: "-" };
+    return { subject: "unresolved", minor: "unknown", age: "-", src: "-" };
   }
 }
+// ── Keeping the fourth key current, off the request path ─────────────────
+// Everything here runs on a TIMER or from a write handler, never from the
+// attribution logger: a per-request cross-host lookup in something that only
+// observes a request is the wrong shape, because it could delay or fail the
+// request it is watching. SIMULATOR_URL/SERVICE_TOKEN are module consts
+// declared further down this file; these functions only ever run after module
+// init (20s after boot at the earliest), so that is safe.
+async function fetchDeclaredAge(worldId, actorId) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 6000);
+  try {
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${encodeURIComponent(worldId)}/actors/${encodeURIComponent(actorId)}/profile`, {
+      headers: { "X-Service-Token": SERVICE_TOKEN },
+      signal: ctl.signal,
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const age = j && j.identity ? j.identity.age : null;
+    return (typeof age === "number" && Number.isFinite(age)) ? age : null;
+  } catch (_e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function localSubjectRow(id) {
+  try {
+    return SUBJ_BY_FOLDER.get(id) || SUBJ_BY_ID.get(id) || SUBJ_BY_DEPLOYMENT.get(id) || null;
+  } catch (_e) { return null; }
+}
+async function cacheRemoteActorAge(worldId, actorId) {
+  try {
+    if (!worldId || !actorId || !SERVICE_TOKEN) return false;
+    // A row on this host always wins: the read-model exists only for subjects
+    // this host holds no declaration for.
+    if (localSubjectRow(actorId)) return false;
+    const age = await fetchDeclaredAge(worldId, actorId);
+    if (age === null) return false;
+    UPSERT_REMOTE_AGE.run(String(actorId), String(worldId), age, new Date().toISOString());
+    return true;
+  } catch (_e) { return false; }
+}
+async function refreshRemoteActorAges() {
+  try {
+    const root = path.join(__dirname, "../public/media/worlds");
+    if (!fs.existsSync(root)) return;
+    let filled = 0, unknown = 0;
+    for (const worldId of await fs.promises.readdir(root)) {
+      const actorsDir = path.join(root, worldId, "actors");
+      if (!fs.existsSync(actorsDir)) continue;
+      for (const actorId of await fs.promises.readdir(actorsDir)) {
+        if (localSubjectRow(actorId)) continue;
+        if (await cacheRemoteActorAge(worldId, actorId)) filled++; else unknown++;
+      }
+    }
+    if (filled || unknown) console.log(`[media-attrib] remote_actor_ages refresh: ${filled} declared, ${unknown} still unknown`);
+  } catch (e) {
+    // Never fatal: a stale read-model degrades to the old minor=unknown, it
+    // does not break serving or logging.
+    console.log(`[media-attrib] remote_actor_ages refresh failed: ${e && e.message}`);
+  }
+}
+setTimeout(() => { refreshRemoteActorAges(); }, 20 * 1000).unref();
+setInterval(refreshRemoteActorAges, 15 * 60 * 1000).unref();
+
 const ATTRIB_SKIP = /^\/(assets|js|favicon|static|phoenix|live)\b/;
 app.use((req, res, next) => {
   if (ATTRIB_SKIP.test(req.path)) return next();
@@ -380,6 +518,7 @@ app.use((req, res, next) => {
       `${Date.now() - started}ms account=${safe(account)} auth=${safe(how)} ` +
       `ip=${safe(peer)} xff=${safe(xffRaw)} ` +
       `subject=${safe(subj.subject)} minor=${safe(subj.minor)} subject_age=${safe(subj.age)} ` +
+      `age_src=${safe(subj.src)} ` +
       `probe=${probe} ua=${ua} for=${safe(origUri || "-")}`
     );
     // The one line a child-safety audit can grep for WITHOUT knowing the media
@@ -390,6 +529,7 @@ app.use((req, res, next) => {
       console.log(
         `[minor-media] ${req.method} ${safe(attribPath)} ${res.statusCode} ` +
         `${Date.now() - started}ms subject=${safe(subj.subject)} subject_age=${safe(subj.age)} ` +
+        `age_src=${safe(subj.src)} ` +
         `auth=${safe(how)} ip=${safe(peer)} xff=${safe(xffRaw)} ` +
         `probe=${probe} ua=${ua} via=${origUri ? "auth_request" : "direct"}`
       );
@@ -1923,6 +2063,12 @@ app.post("/api/worlds/:world_id/actors/:actor_id/portrait", upload.single("photo
     const relativePath = `/media/worlds/${world_id}/actors/${actor_id}/images/${filename}`;
     const baseUrl = process.env.PLATFORM_PUBLIC_URL || `https://${req.headers["x-forwarded-host"] || req.headers.host}`;
     const mediaPath = `${baseUrl}${relativePath}`;
+
+    // This host has just put media for an actor on ITS OWN disk, which means
+    // nginx will serve those bytes and the simulator will never witness the
+    // fetch. If the subject is simulator-native, fill the read-model now so the
+    // very first fetch is attributed instead of waiting for the 15-min sweep.
+    cacheRemoteActorAge(world_id, actor_id).catch(() => {});
 
     // Tell simulator to write actor_media row
     await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/actors/${actor_id}/portrait`, {
@@ -5120,12 +5266,41 @@ app.post("/api/actors/:id/deploy", async (req, res) => {
   } catch {}
 
   try {
-    const simRes = await fetch(`${SIMULATOR_URL}/internal/actors/deploy`, {
+    const simHttp = await fetch(`${SIMULATOR_URL}/internal/actors/deploy`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Service-Token": SERVICE_TOKEN },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(180_000) // 3 min — Dolphin can be slow under load
-    }).then(r => r.json());
+    });
+
+    // 2026-09-12 (fault-triage, fault 2901eb23874758a8) — this was
+    // `.then(r => r.json())`: no status check, and the body never read on
+    // failure. So a simulator 500 never surfaced AS a simulator 500. undici
+    // fed the Phoenix error body to JSON.parse, that threw
+    //   SyntaxError: Unexpected non-whitespace character after JSON at position 4
+    // and THAT is what reached the user, the 500 below, and the fault watcher —
+    // which filed it CRITICAL/`syntax`, "code failed to parse", against the
+    // platform. Nothing in it named the simulator, the route, or the real
+    // error. Seen 2026-09-12T00:03:40Z, where the actual cause was a
+    // BadBooleanError in the simulator's do_deploy_actor/2 (since fixed):
+    // recoverable only by hand-correlating the simulator's own journal by
+    // wall-clock. Two occurrences 19 days apart, each opaque the same way.
+    //
+    // Read the body once and report what the simulator actually said. The
+    // success path is byte-for-byte what it was; only the failure path gained
+    // a message. Same shape as the /undeploy route further down, which has
+    // checked `simRes.ok` and echoed the status since Session 156.
+    const simRaw = await simHttp.text();
+    let simRes = null;
+    try { simRes = JSON.parse(simRaw); } catch { /* not JSON — reported below */ }
+
+    const simSnippet = (t) => String(t ?? "").replace(/\s+/g, " ").trim().slice(0, 300);
+    if (!simHttp.ok) {
+      throw new Error(`simulator refused the deploy — HTTP ${simHttp.status}: ${simSnippet(simRes?.error ?? simRaw) || "(empty body)"}`);
+    }
+    if (simRes === null) {
+      throw new Error(`simulator returned non-JSON on HTTP ${simHttp.status}: ${simSnippet(simRaw) || "(empty body)"}`);
+    }
     if (!simRes?.simulator_actor_id) throw new Error("no simulator_actor_id returned");
 
     const now = new Date().toISOString();
@@ -7496,6 +7671,21 @@ function apiKeyDenial(req, keyRow) {
   }
   if (keyRow.world_id && world[1] !== keyRow.world_id) {
     return `key is bound to world ${keyRow.world_id}, request is for ${world[1]}`;
+  }
+  // Conduct watch, 2026-09-12: the binding is not the grant. The check above
+  // only asks whether the key names this world; it never asked whether the
+  // key's owner is still entitled to it. Membership can be revoked, and it
+  // vanishes outright when a world is deleted -- the api_keys row does not.
+  // Five of seven live keys were found addressing worlds their owner holds no
+  // membership on, two of them belonging to accounts with no membership
+  // anywhere at all, so a credential outlived the grant it was issued under by
+  // months. Checked at the same point the key becomes a principal, so a
+  // withdrawn grant takes its credentials with it on the next request.
+  const granted = db.prepare(
+    `SELECT 1 FROM world_memberships WHERE user_id = ? AND world_id = ? LIMIT 1`
+  ).get(keyRow.user_id, world[1]);
+  if (!granted) {
+    return `key owner ${keyRow.user_id} holds no membership on world ${world[1]}`;
   }
   const tail = path.slice(world[0].length);
   if (/^\/issue-key(\/|$)/.test(tail)) return "a key may not mint another key";

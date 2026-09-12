@@ -43,6 +43,13 @@ export const RIGS = {
     left_thigh: "l_thigh", right_thigh: "r_thigh",
     left_shin: "l_shin", right_shin: "r_shin",
     left_foot: "l_foot", right_foot: "r_foot",
+    // Pseudo-bones: one "fingers" handle per hand, three axes read as
+    // [grip, spread, thumb] instead of euler degrees. Expanded onto the real
+    // finger joints in resolveTracks - the marker value never reaches the
+    // rig. Hand poses are BONES here, not morphs: verified 2026-09-12, the
+    // runtime GLBs carry zero morph targets (the bake strips them) and the
+    // source GLBs' 113 morphs are body-shape dials, no grips among them.
+    right_fingers: "@fingers", left_fingers: "@fingers",
   },
 };
 
@@ -135,15 +142,17 @@ export const ACTIONS = {
 
   // A stance, not a gesture: crossed arms HOLD until something else moves
   // the body — dialogue happens over it, which is the point of the pose.
-  // Registered as kind "reaction" because that is the studio's word for "one
-  // body performs this on its own"; the Reaction step plays it with no
-  // partner and no contact. Angles use the conventions measured for the
+  // A POSE: a held shape, not an answer to anything. It was filed as a
+  // "reaction" while that was the studio's only word for "one body performs
+  // this on its own" — which is exactly how the Reaction library filled up
+  // with things nobody reacts to. A reaction answers someone else's contact;
+  // this does not. Angles use the conventions measured for the
   // slap: upper arm X = swing forward, Z+ = across the body (mirrored for
   // the left), forearm X+ = bend the elbow. Right arm rides on top.
   "cross-arms": {
     slug: "cross-arms",
     name: "Cross the arms",
-    kind: "reaction",
+    kind: "pose",
     duration: 0.9,
     hold: true,
     // The angles are a SHAPE; they cannot know how deep this torso is. On a
@@ -209,7 +218,10 @@ export const ACTIONS = {
   "uncross-arms": {
     slug: "uncross-arms",
     name: "Uncross the arms",
-    kind: "reaction",
+    // An ACTION, not a pose: it does not hold. It ends at rest, which is the
+    // difference — a pose clamps at its last frame and keeps applying, an
+    // action releases. This one is the way back down out of `cross-arms`.
+    kind: "action",
     duration: 0.8,
     tracks: [
       // The same two beats backwards: unfold FORWARD off the torso, then
@@ -220,6 +232,42 @@ export const ACTIONS = {
       { bone: "left_upper_arm",  keys: [ [0,[65,36,10]],   [0.4,[52,0,-10]], [0.8,[0,0,0]] ] },
       { bone: "left_forearm",    keys: [ [0,[100,-11,-42]],[0.4,[25,0,0]],   [0.8,[0,0,0]] ] },
                 ],
+  },
+
+  "hands-on-hips": {
+    slug: "hands-on-hips",
+    name: "Hands on the hips",
+    kind: "pose",
+    duration: 0.8,
+    hold: true,
+    tracks: [
+      // Akimbo, from the reference photo (2026-09-12): elbows OUT in the
+      // torso plane (raise/Z carries them, per the probed convention:
+      // right raise is negative), forearms angling down-inward to the
+      // waist, palms pronated onto the hip crest, thumbs behind. One small
+      // out-and-up beat at 0.4 so the hands travel around the body, not
+      // through it.
+      // Twist PROBED on Lindsey (2026-09-12): -25 left the flexion plane
+      // pointing forward - sleepwalker arms. Sweeping Y with the wrist
+      // measured against the hip bone: -85 lands the wrist 0.18 out,
+      // 0.10 up, just behind the hip point - on the crest, thumb back.
+      // Probed on Lindsey against the reference photo (2026-09-12), 9
+      // rounds. What the numbers hide: with the upper arm out to the side a
+      // bent elbow can NEVER fold the hand "down" - the flexion plane only
+      // points forward/inward/outward - so the hand reaches the hip via
+      // slight arm EXTENSION (X -25), deep raise, moderate twist, and the
+      // WRIST does the final work: yaw (Y -/+35) swings the fingers from
+      // across-the-belly to down-the-thigh, and negative X breaks the palm
+      // onto the crest. First attempt measured "0.18 out" on the WRONG
+      // AXIS - she faces +x, so dx was FORWARD - and parked both hands at
+      // the belly like a shelf.
+      { bone: "right_upper_arm", keys: [ [0,[0,0,0]], [0.4,[-8,-15,-55]], [0.8,[-25,-35,-50]] ] },
+      { bone: "right_forearm",   keys: [ [0,[0,0,0]], [0.4,[40,-30,0]],   [0.8,[88,-55,0]] ] },
+      { bone: "right_hand",      keys: [ [0,[0,0,0]], [0.4,[0,0,0]],      [0.8,[-30,-35,0]] ] },
+      { bone: "left_upper_arm",  keys: [ [0,[0,0,0]], [0.4,[-8,15,55]],   [0.8,[-25,35,50]] ] },
+      { bone: "left_forearm",    keys: [ [0,[0,0,0]], [0.4,[40,-30,0]],   [0.8,[88,-55,0]] ] },
+      { bone: "left_hand",       keys: [ [0,[0,0,0]], [0.4,[0,0,0]],      [0.8,[-30,35,0]] ] },
+    ],
   },
 
   "slap-recoil": {
@@ -279,25 +327,115 @@ function upgradeLegacy(a) {
   return { ...a, kind: a.kind || "action", tracks: actorTracks || reactionTracks || [] };
 }
 
-// The reaction half of a legacy row, as its own entry, so work authored before
-// the split is not lost — only re-filed.
-function legacyReaction(a) {
-  const tracks = a?.reaction?.tracks;
-  if (!tracks?.length || Array.isArray(a.tracks)) return null;
-  return {
-    slug: `${a.slug}-reaction`,
-    name: `${a.name || a.slug} (reaction)`,
-    kind: "reaction",
-    duration: a.reaction?.duration || 0.8,
-    tracks,
-  };
+// NOTE: a `legacyReaction()` used to live here, splitting the reaction half
+// out of any pre-split row as "<slug>-reaction". It was a migration shim that
+// never stopped running, so the Reaction library kept growing entries nobody
+// authored. Neither stored row is in the legacy shape, so nothing is lost by
+// removing it; a row that genuinely predates the split now fails visibly
+// rather than quietly spawning a phantom.
+
+// ── engine actions ───────────────────────────────────────────────────────────
+//
+// The studio used to have two unrelated-looking groups: things authored as bone
+// tracks (a slap, a pose) and things implemented in engine code (walking,
+// sitting, speaking). The first were library entries played by name; the second
+// were step types, one branch of a thirteen-way switch each.
+//
+// They are the same thing from the author's side — things a character does — so
+// they are the same thing here. An entry declares where its motion comes from:
+//
+//   source: "tracks"  play the authored rotation tracks   (playMotion)
+//   source: "engine"  call the rig method named by handler
+//
+// That is the whole difference. "Approach" and "Slap the face" sit side by side
+// in the Action library and nothing downstream needs to know which is which,
+// which is what lets the timeline hold only Actions, Reactions and Poses.
+//
+// These are built-ins and can never be authored: normalizeAction forces
+// source "tracks" on anything arriving from the wire, so a POST cannot name a
+// handler and get it called.
+
+// What a parameter can be. `role` and `prop` resolve against the composition
+// (which character, which piece of furniture); the rest are plain values.
+export const PARAM_TYPES = ["number", "role", "prop", "text", "clip", "bool"];
+
+const N = (key, label, def, min, max, step = 0.05) =>
+  ({ key, type: "number", label, default: def, min, max, step });
+
+export const ENGINE_ACTIONS = {
+  "walk-to": {
+    slug: "walk-to", name: "Walk to a point", kind: "action",
+    source: "engine", handler: "walkTo",
+    params: [N("x", "x", 0, -8, 8), N("z", "z", 0, -8, 8), N("speed", "speed", 0.95, 0.1, 3)],
+  },
+  "approach": {
+    slug: "approach", name: "Approach", kind: "action",
+    source: "engine", handler: "approach",
+    // Stops SHORT by `distance` rather than walking into them — the ugliest
+    // thing this room can render is two runtime bodies intersecting.
+    params: [{ key: "target", type: "role", label: "toward" },
+             N("distance", "stop at", 0.7, 0.4, 6), N("speed", "speed", 0.95, 0.1, 3)],
+  },
+  "turn-to": {
+    slug: "turn-to", name: "Turn to face", kind: "action",
+    source: "engine", handler: "turnTo",
+    params: [{ key: "target", type: "role", label: "toward" }],
+  },
+  "walk-to-prop": {
+    slug: "walk-to-prop", name: "Walk to a prop", kind: "action",
+    source: "engine", handler: "walkToProp",
+    params: [{ key: "prop", type: "prop", label: "prop" },
+             N("distance", "stop at", 0.55, 0.2, 4), N("speed", "speed", 0.95, 0.1, 3)],
+  },
+  "sit-on": {
+    slug: "sit-on", name: "Sit on a prop", kind: "action",
+    source: "engine", handler: "sitOn",
+    // The shape of sitting is the library pose "sit"; the DROP is geometry the
+    // rig reads off the furniture. Style from the library, height from the room.
+    params: [{ key: "prop", type: "prop", label: "prop" }],
+  },
+  "stand-up": {
+    slug: "stand-up", name: "Stand up", kind: "action",
+    source: "engine", handler: "standUp", params: [],
+  },
+  "pull-prop": {
+    slug: "pull-prop", name: "Pull out a prop", kind: "action",
+    source: "engine", handler: "pullProp",
+    params: [{ key: "prop", type: "prop", label: "prop" }, N("distance", "from", 0.6, 0.2, 3)],
+  },
+  "play-clip": {
+    slug: "play-clip", name: "Play a clip", kind: "action",
+    source: "engine", handler: "clip",
+    params: [{ key: "clip", type: "clip", label: "clip", default: "idle" },
+             { key: "loop", type: "bool", label: "loop", default: false },
+             N("fade", "fade", 0.35, 0, 4)],
+  },
+  "say": {
+    slug: "say", name: "Say a line", kind: "action",
+    // Rig-level, not per-performer: the rig decides what a line MEANS. The
+    // studio captions it; an encounter hands it to her voice. A script never
+    // owns the mouth — see the note in interactionScript.js.
+    source: "engine", handler: "say",
+    params: [{ key: "text", type: "text", label: "line", default: "" }],
+  },
+};
+
+// The parameters an entry takes, whoever authored it. Engine entries carry
+// their own; a track entry derives one — an action that aims needs to know
+// whose chin it is aiming at. Derived rather than stored so an authored row
+// cannot declare parameters that nothing reads.
+export function paramsFor(entry) {
+  if (!entry) return [];
+  if (entry.source === "engine") return entry.params || [];
+  if (entry.kind === "action" && entry.aim) {
+    return [{ key: "target", type: "role", label: "at" }];
+  }
+  return [];
 }
 
 export function registerActions(list) {
   for (const raw of Array.isArray(list) ? list : []) {
     if (!raw?.slug) continue;
-    const half = legacyReaction(raw);
-    if (half) SAVED.set(half.slug.toLowerCase(), half);
     const a = upgradeLegacy(raw);
     SAVED.set(String(a.slug).toLowerCase(), a);
   }
@@ -310,14 +448,16 @@ export function forgetAction(slug) {
 
 export function getAction(slug) {
   const key = String(slug || "").toLowerCase();
-  return SAVED.get(key) || ACTIONS[key] || null;
+  return SAVED.get(key) || ACTIONS[key] || ENGINE_ACTIONS[key] || null;
 }
 
 export function listActions(kind) {
   const out = new Map();
   const add = (a, builtin) => out.set(a.slug, {
     slug: a.slug, name: a.name, duration: a.duration, kind: a.kind || "action", builtin,
+    source: a.source || "tracks", params: paramsFor(a),
   });
+  for (const a of Object.values(ENGINE_ACTIONS)) add(a, true);
   for (const a of Object.values(ACTIONS)) add(a, true);
   for (const a of SAVED.values()) add(a, false);
   // An `interaction` step must not be offered a reaction, and vice versa —
@@ -347,10 +487,43 @@ export function sampleTrack(track, t) {
 
 // Every bone this side of an action touches, already resolved to rig names, so
 // a caller can look them up once instead of per frame.
+// One slider-triple per hand becomes fifteen joint tracks. Weights: the
+// proximal joint carries slightly less curl than the middle, the tip less
+// again; spread lives only on the proximal joint and fans outward from the
+// middle finger; the thumb is its own axis because a thumb is not a finger.
+// Signs are the AUTHOR'S to find on the sliders - both directions work.
+const FINGER_SET = [
+  ["index", 0.85, 1.0], ["mid", 1.0, 0.35], ["ring", 0.9, -0.4], ["pinky", 0.8, -1.0],
+];
+function expandFingerTrack(t) {
+  const p = t.bone.startsWith("right") ? "r" : "l";
+  const out = [];
+  const mk = (rigBone, fn) =>
+    out.push({ bone: t.bone, rigBone, keys: (t.keys || []).map(([tt, v]) => [tt, fn(v || [0, 0, 0])]) });
+  for (const [f, cw, sw] of FINGER_SET) {
+    for (let k = 1; k <= 3; k++) {
+      const w = cw * [0.85, 1.0, 0.75][k - 1];
+      const sp = k === 1 ? sw : 0;
+      mk(p + "_" + f + k, ([g, s]) => [(+g || 0) * w, 0, (+s || 0) * sp]);
+    }
+  }
+  mk(p + "_thumb1", ([, , th]) => [(+th || 0) * 0.3, 0, (+th || 0) * 0.3]);
+  mk(p + "_thumb2", ([, , th]) => [(+th || 0) * 0.7, 0, 0]);
+  mk(p + "_thumb3", ([, , th]) => [(+th || 0) * 0.8, 0, 0]);
+  return out;
+}
+
 export function resolveTracks(entry, rig = "genesis9") {
-  return (entry?.tracks || [])
-    .map(t => ({ ...t, rigBone: boneFor(t.bone, rig) }))
-    .filter(t => t.rigBone);
+  const out = [];
+  for (const t of (entry?.tracks || [])) {
+    if (t.bone === "right_fingers" || t.bone === "left_fingers") {
+      out.push(...expandFingerTrack(t));
+      continue;
+    }
+    const rigBone = boneFor(t.bone, rig);
+    if (rigBone) out.push({ ...t, rigBone });
+  }
+  return out;
 }
 
 
@@ -423,6 +596,11 @@ export function normalizeAction(raw, { rig = "genesis9" } = {}) {
     kind,
     duration,
     rig: RIGS[rig] ? rig : "genesis9",
+    // Authored content is ALWAYS tracks. `source` and `handler` are read off
+    // the wire nowhere: an entry that arrives claiming source "engine" would
+    // otherwise name a rig method and have it called, which is a POST that
+    // executes code. Engine entries are built-ins and are not authorable.
+    source: "tracks",
   };
   if (!action.slug) errors.push("it needs a slug");
 

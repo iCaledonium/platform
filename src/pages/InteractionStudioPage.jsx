@@ -128,6 +128,12 @@ export default function InteractionStudioPage() {
   // partway through a step instead of only at its edges.
   const [cameras, setCameras] = useState([]);
   const [selectedCam, setSelectedCam] = useState(-1);
+  // POSE ANIMATION EDITOR mode (Magnus, 2026-09-12: "too confusing to have
+  // all on the same page"). Full-screen over the SAME canvas and rig - a
+  // second scene would preview a different runtime than the one that plays
+  // the script. null | { step } where step is a scratch reaction step never
+  // added to the script.
+  const [poseLab, setPoseLab] = useState(null);
 
   const rigRef = useRef(null);
   const runRef = useRef(null);
@@ -409,6 +415,8 @@ export default function InteractionStudioPage() {
       footInfo: (role) => rigRef.current?.footInfo?.(role),
       sitRest: (role) => rigRef.current?.sitRest?.(role),
       skinInfo: (role) => rigRef.current?.skinInfo?.(role),
+      morphs: (role) => rigRef.current?.morphs?.(role),
+      setMorph: (role, name, v) => rigRef.current?.setMorph?.(role, name, v),
       rayTest: (role) => rigRef.current?.rayTest?.(role),
       limbTest: (role, bone) => rigRef.current?.limbTest?.(role, bone),
       // Proxemics, on the debug handle as well as in the runner. Two
@@ -565,10 +573,10 @@ export default function InteractionStudioPage() {
           <a onClick={() => navigate("/home")} style={{ fontSize: 12, color: "#b05c08", cursor: "pointer" }}>← Home</a>
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "220px minmax(0,1fr) 260px", gap: 14, alignItems: "start" }}>
+        <div style={{ display: "grid", gridTemplateColumns: poseLab ? "minmax(0,1fr)" : "220px minmax(0,1fr) 260px", gap: 14, alignItems: "start" }}>
 
           {/* ── left: cast and shelf ─────────────────────────────────────── */}
-          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={{ display: poseLab ? "none" : "flex", flexDirection: "column", gap: 14 }}>
             <div style={cardStyle}>
               <p style={labelStyle}>The two of them</p>
               {ROLES.map(role => (
@@ -689,9 +697,40 @@ export default function InteractionStudioPage() {
               </div>
             </div>
 
+            {poseLab && rigReady && (
+              <>
+                <div style={{ ...cardStyle, display: "flex", alignItems: "center", gap: 10 }}>
+                  <strong style={{ fontSize: 13 }}>Pose Animation Editor</strong>
+                  <span style={{ fontSize: 11.5, color: "#8b8781" }}>
+                    poses {cast[poseLab.step.role]?.name || "— cast a body on the left first"} · role {poseLab.step.role}
+                  </span>
+                  <select value={poseLab.step.role} style={inputStyle}
+                          onChange={e => setPoseLab(pl => ({ ...pl, step: { ...pl.step, role: e.target.value } }))}>
+                    {ROLES.map(r => <option key={r} value={r}>role {r}</option>)}
+                  </select>
+                  <div style={{ flex: 1 }} />
+                  <button style={btn()} onClick={() => setPoseLab(null)}>← Back to script</button>
+                </div>
+                <InteractionActionEditor
+                  key={"poselab-" + poseLab.step.id}
+                  rig={rigRef.current}
+                  stepIndex={0}
+                  step={poseLab.step}
+                  onStepChange={patch => setPoseLab(pl => ({ ...pl, step: { ...pl.step, ...patch } }))}
+                  onSay={say}
+                  onPlay={(slug, forStep) => {
+                    if (!slug) return say("give it a name first", "warn");
+                    const role = forStep?.role || poseLab.step.role || "a";
+                    run({ name: "preview", resetMarks: false,
+                          steps: [{ id: "preview", type: "reaction", role, action: slug, delay: 0, wait: true }] });
+                  }}
+                />
+              </>
+            )}
+
             {/* Always rendered. The add buttons are ON the tracks, so gating this
                 on steps.length meant an empty script had no way to gain one. */}
-            {true && (
+            {!poseLab && (
               <InteractionTimeline
                 steps={steps}
                 selected={selected}
@@ -752,7 +791,7 @@ export default function InteractionStudioPage() {
                 clicking a bar is how you get here, so this is where the eye
                 already is. It renders the SAME row the steps list used to, so
                 there is one editor for a step, not two that can disagree. */}
-            {selectedCam >= 0 && cameras[selectedCam] && (
+            {!poseLab && selectedCam >= 0 && cameras[selectedCam] && (
               <div style={cardStyle}>
                 <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                   <strong style={{ fontSize: 12.5 }}>Camera</strong>
@@ -796,7 +835,7 @@ export default function InteractionStudioPage() {
               </div>
             )}
 
-            {steps[selected] && (
+            {!poseLab && steps[selected] && (
               <div style={cardStyle}>
                 <StepRow step={steps[selected]} index={selected} live={liveStep === selected}
                          selected
@@ -814,11 +853,18 @@ export default function InteractionStudioPage() {
                          }}
                          onEdit={patch => edit(selected, patch)}
                          onRemove={() => { removeStep(selected); setSelected(-1); }}
-                         onMove={d => moveStep(selected, d)} />
+                         onMove={d => moveStep(selected, d)}
+                         onOpenPoseLab={(st) => setPoseLab({
+                           // Picking a reaction and pressing the button edits
+                           // THAT reaction (Magnus, 2026-09-12); with nothing
+                           // picked it starts a new one.
+                           step: { id: "poselab-" + Date.now(), type: "reaction",
+                                   role: st?.role || "a", action: st?.action || "",
+                                   on: "delay", delay: 0, wait: true } })} />
               </div>
             )}
 
-            {rigReady && ["interaction", "reaction"].includes(steps[selected]?.type) && (
+            {!poseLab && rigReady && ["interaction", "reaction"].includes(steps[selected]?.type) && (
               <InteractionActionEditor
                 key={steps[selected].id}
                 rig={rigRef.current}
@@ -843,7 +889,7 @@ export default function InteractionStudioPage() {
               />
             )}
 
-            {rigReady && !["interaction", "reaction"].includes(steps[selected]?.type)
+            {!poseLab && rigReady && !["interaction", "reaction"].includes(steps[selected]?.type)
               && steps.some(x => ["interaction", "reaction"].includes(x.type)) && (
               <div style={{ ...cardStyle, fontSize: 11.5, color: "#8b8781" }}>
                 Select a <strong>Body interaction</strong> or <strong>React</strong> step on the right to edit what it does.
@@ -866,7 +912,7 @@ export default function InteractionStudioPage() {
           </div>
 
           {/* ── right: the script ────────────────────────────────────────── */}
-          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={{ display: poseLab ? "none" : "flex", flexDirection: "column", gap: 14 }}>
             <div style={cardStyle}>
               <p style={labelStyle}>This script</p>
               <input value={name} onChange={e => { setName(e.target.value); setDirty(true); }}
@@ -985,7 +1031,7 @@ const RENDERABLE_FIELDS = new Set([
 ]);
 
 function StepRow({ step, index, live, selected, onSelect, warning, onFix, clips, propList, onPickPoint,
-                   onEdit, onRemove, onMove }) {
+                   onEdit, onRemove, onMove, onOpenPoseLab }) {
   const def = STEP_TYPES[step.type];
   const fields = def?.fields || [];
   const unrendered = fields.filter(f => !RENDERABLE_FIELDS.has(f));
@@ -1101,6 +1147,14 @@ function StepRow({ step, index, live, selected, onSelect, warning, onFix, clips,
             {listActions(step.type === "reaction" ? "reaction" : "action")
               .map(a => <option key={a.slug} value={a.slug}>{a.name}</option>)}
           </select>
+        )}
+        {fields.includes("action") && step.type === "reaction" && onOpenPoseLab && (
+          <button style={{ fontSize: 11, padding: "3px 9px", borderRadius: 6, border: "1px solid #d8d3cb",
+                           background: "#fff", cursor: "pointer", color: "#2f2c28" }}
+                  title="Open the Pose Animation Editor — the sliders and the 3D view, nothing else. With a pose picked, it opens THAT pose for editing; empty, it starts a new one."
+                  onClick={(e) => { e.stopPropagation(); onOpenPoseLab(step); }}>
+            {step.action ? "Edit pose" : "New Reaction"}
+          </button>
         )}
         {fields.includes("on") && (
           <select value={step.on || "contact"} onChange={e => onEdit({ on: e.target.value })} style={cell}>

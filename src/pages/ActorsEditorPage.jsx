@@ -944,7 +944,7 @@ function ReferenceDeclarationNotice({ actorId, mediaPhotos, canEdit, hasSolve })
     : "";
   const body = hasSolve
     ? `A 3D likeness has already been built from this character's reference photographs, and ${n === 1 ? "one item of reference material carries" : `${n} items of reference material carry`} no statement of whose likeness it is. The build gates only ask before a solve, so they never asked about this one. Nothing here is an accusation — the record is simply silent, and a blank does not mean "me". Say who is in the ${material} so it says something.${voiceLine}`
-    : `${n} item${n === 1 ? "" : "s"} of reference material on this character (${material}) ${n === 1 ? "carries" : "carry"} no statement of whose likeness ${n === 1 ? "it is" : "they are"}. A blank is not a declaration that they are of you — building the 3D likeness, sharing, publishing and deploying stay refused until it is answered.${voiceLine}`;
+    : `${n} item${n === 1 ? "" : "s"} of reference material on this character (${material}) ${n === 1 ? "carries" : "carry"} no statement of whose likeness ${n === 1 ? "it is" : "they are"}. A blank is not a declaration that they are of you — sharing, publishing, linking, forking and deploying stay refused until it is answered.${voiceLine}`;
 
   function declare(v) {
     if (!v || saving) return;

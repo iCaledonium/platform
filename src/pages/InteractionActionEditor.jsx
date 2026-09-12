@@ -24,8 +24,8 @@ import {
 // The bones worth offering, in the order a person thinks about them. The rig
 // has 254 joints; a list that long is not a tool, it is a haystack.
 const BONE_GROUPS = [
-  { label: "right arm", bones: ["right_shoulder", "right_upper_arm", "right_forearm", "right_hand"] },
-  { label: "left arm",  bones: ["left_shoulder", "left_upper_arm", "left_forearm", "left_hand"] },
+  { label: "right arm", bones: ["right_shoulder", "right_upper_arm", "right_forearm", "right_hand", "right_fingers"] },
+  { label: "left arm",  bones: ["left_shoulder", "left_upper_arm", "left_forearm", "left_hand", "left_fingers"] },
   { label: "head",      bones: ["head", "neck_upper", "neck_lower"] },
   { label: "torso",     bones: ["chest", "upper_chest", "spine"] },
 ];
@@ -37,6 +37,9 @@ const AXIS_SETS = {
   arm:   [{ i: 0, label: "swing", hint: "+ forward, − back" },
           { i: 1, label: "twist", hint: "along the limb" },
           { i: 2, label: "raise", hint: "− out to the side, + across the body" }],
+  fingers: [{ i: 0, label: "grip",   hint: "curl all four fingers - drag either way, one closes" },
+            { i: 1, label: "spread", hint: "fan the fingers apart" },
+            { i: 2, label: "thumb",  hint: "curl the thumb in" }],
   head:  [{ i: 0, label: "nod",   hint: "+ down, − up" },
           { i: 1, label: "turn",  hint: "− away, + toward" },
           { i: 2, label: "tilt",  hint: "ear toward shoulder" }],
@@ -48,7 +51,8 @@ const AXIS_SETS = {
           { i: 2, label: "splay", hint: "wrist side to side" }],
 };
 const axesFor = (bone) =>
-  /hand$/.test(bone) ? AXIS_SETS.hand
+  /fingers$/.test(bone) ? AXIS_SETS.fingers
+  : /hand$/.test(bone) ? AXIS_SETS.hand
   : /head|neck/.test(bone) ? AXIS_SETS.head
   : /chest|spine/.test(bone) ? AXIS_SETS.torso
   : AXIS_SETS.arm;
