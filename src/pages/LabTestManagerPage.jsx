@@ -34,7 +34,6 @@ export default function LabTestManagerPage() {
   const [error, setError] = useState("");
   const [authed, setAuthed] = useState(true);
 
-  const [worldId, setWorldId] = useState("");
   const [actorId, setActorId] = useState("");
 
   const label = { fontSize: 10, letterSpacing: ".16em", textTransform: "uppercase",
@@ -66,18 +65,6 @@ export default function LabTestManagerPage() {
       .then(r => { if (r.status === 401) setAuthed(false); return r.json(); })
       .then(j => { setBenches(Array.isArray(j.benches) ? j.benches : []); setCoverage(j.coverage || null); })
       .catch(e => setError(String(e.message || e)));
-    (async () => {
-      try {
-        const r = await fetch("/api/worlds", { credentials: "include" });
-        if (r.status === 401) { setAuthed(false); return; }
-        const ws = await r.json();
-        // Anything that is not an array is not a world list. Storing one
-        // costs the whole app: there is no error boundary above this page.
-        if (!Array.isArray(ws)) { setError("the world list came back in a shape this page cannot read"); return; }
-        const running = ws.find(w => w.status === "running") || ws[0];
-        if (running) setWorldId(running.id);
-      } catch (e) { setError(String(e.message || e)); }
-    })();
     loadRuns();
   }, [loadRuns]);
 
