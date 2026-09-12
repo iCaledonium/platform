@@ -314,7 +314,7 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
     try {
       const results = await sweepInFlight;
       const known = Object.keys(labIncidents.BENCHES);
-      res.json({ ok: true, results, uncovered: cases.uncoveredCategories(known) });
+      res.json({ ok: true, results, uncovered: cases.uncoveredCategories() });
     } catch (e) {
       res.status(500).json({ error: String(e.message || e).slice(0, 300) });
     } finally { sweepInFlight = null; }
@@ -480,6 +480,13 @@ export function mount(app, { SERVICE_TOKEN, SIMULATOR_URL, authUser }) {
       cases.assignCategory((req.body || {}).cases, req.params.id);
       res.json({ ok: true, cases: cases.catalogue(), categories: cases.listCategories() });
     } catch (e) { res.status(400).json({ error: String(e.message || e).slice(0, 250) }); }
+  });
+
+  app.get("/api/test/categories/uncovered", (req, res) => {
+    if (!admin(req, res)) return;
+    try {
+      res.json({ ok: true, uncovered: cases.uncoveredCategories() });
+    } catch (e) { res.status(500).json({ error: String(e.message || e).slice(0, 250) }); }
   });
 
   app.get("/api/test/suites", (req, res) => {

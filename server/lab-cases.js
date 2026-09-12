@@ -469,13 +469,26 @@ export function setSuiteTargets(suite_id, targets) {
 // Categories that no suite covers. The analogue of the unwired-source check:
 // a category nothing runs is not a passing category, and the only thing worse
 // than an untested area is an untested area nobody mentions.
+// Which managed CATEGORIES no enabled suite reaches, by name. Resolved
+// through suiteCategories() — the same translation the runner uses to decide
+// which boards to sweep for a suite — so this can never disagree with what
+// actually runs. `allCategories` (board keys) is accepted and ignored for
+// callers still passing the old shape; every managed category is checked.
 export function uncoveredCategories(allCategories) {
-  const covered = new Set();
+  const coveredSources = new Set();
   for (const s of listSuites()) {
     if (!s.enabled) continue;
-    for (const m of s.members) covered.add(m.source);
+    for (const src of suiteCategories(s)) coveredSources.add(src);
   }
-  return (allCategories || []).filter((c) => !covered.has(c)).sort();
+  return listCategories()
+    .filter((cat) => {
+      const srcs = sourcesForCategory(cat.id);
+      // No source at all (nothing has ever run to populate the catalogue, and
+      // it is not a board's own seeded category either) cannot be covered.
+      return srcs.length === 0 || !srcs.some((s) => coveredSources.has(s));
+    })
+    .map((cat) => cat.name)
+    .sort();
 }
 
 export function saveSuite({ id, name, description, schedule_kind, schedule_value, enabled }) {

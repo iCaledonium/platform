@@ -93,11 +93,14 @@ export default function LabCaseAdmin() {
       const cc = await fetch("/api/test/categories", { credentials: "include" })
         .then(x => x.json()).catch(() => null);
       setCats(cc?.categories || []);
-      // Derived here rather than waiting for a run: a category in no suite is
-      // a gap whether or not anybody has pressed anything today.
-      const covered = new Set((s.suites || []).filter(x => x.enabled)
-        .flatMap(x => (x.members || []).map(m => m.source)));
-      setUncovered((b?.benches || []).map(x => x.key).filter(k => !covered.has(k)));
+      // The server resolves category membership (a category can be reached
+      // through several boards), so ask it rather than re-deriving this in
+      // JS — that reimplementation was the bug: it compared a suite member's
+      // source to a board key, which broke the moment a category member's
+      // source became a category id instead of one.
+      const u = await fetch("/api/test/categories/uncovered", { credentials: "include" })
+        .then(x => x.json()).catch(() => null);
+      setUncovered(u?.uncovered || []);
       setErr("");
     } catch (e) { setCases(null); setErr(String(e.message || e)); }
   }, []);
@@ -267,7 +270,7 @@ export default function LabCaseAdmin() {
           )}
           {uncovered.length > 0 && (
             <div style={{ fontSize: 11, lineHeight: 1.7, color: "#d9a441" }}>
-              In no suite, so nothing runs them: {uncovered.map(catName).join(", ")}.
+              In no suite, so nothing runs them: {uncovered.join(", ")}.
               A category no suite covers is not a passing category.
             </div>
           )}
