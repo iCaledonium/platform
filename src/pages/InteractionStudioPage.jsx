@@ -411,6 +411,7 @@ export default function InteractionStudioPage() {
       pickPoint: (fn) => rigRef.current?.pickPoint?.(fn),
       footInfo: (role) => rigRef.current?.footInfo?.(role),
       sitRest: (role) => rigRef.current?.sitRest?.(role),
+      skinInfo: (role) => rigRef.current?.skinInfo?.(role),
       rayTest: (role) => rigRef.current?.rayTest?.(role),
       limbTest: (role, bone) => rigRef.current?.limbTest?.(role, bone),
       // Proxemics, on the debug handle as well as in the runner. Two

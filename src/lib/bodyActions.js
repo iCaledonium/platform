@@ -184,20 +184,23 @@ export const ACTIONS = {
       // crosses 20cm either way, because the crossing comes from twist +
       // elbow bend. Euler axes composed after a twist do not mean what
       // their names say; measure, never reason, about the third axis.
-      { bone: "right_upper_arm", keys: [ [0,[0,0,0]], [0.4,[55,0,10]],  [0.9,[10,-52,25]] ] },
+      // END STATE AUTHORED BY MAGNUS ON THE SLIDERS (2026-09-12): read verbatim
+      // off his editing panel and baked as the 0.9 keys. Asymmetric on purpose
+      // — a real cross is. The 0.4 keys keep the two-beat approach (reach
+      // forward, then fold in) so playback LANDS here instead of sweeping
+      // through the torso.
+      { bone: "right_upper_arm", keys: [ [0,[0,0,0]], [0.4,[55,0,10]],  [0.9,[34,-61,-10]] ] },
       // Forearm Y is PRONATION (probed: +60 turns the palm to the ceiling,
       // -60 turns it against the body). Without it the hands sat under the
       // cross palms-up, offering a tray.
-      { bone: "right_forearm",   keys: [ [0,[0,0,0]], [0.4,[25,0,0]],   [0.9,[80,-60,0]] ] },
-      { bone: "right_hand",      keys: [ [0,[0,0,0]], [0.4,[0,-6,0]],   [0.9,[0,-14,0]] ] },
-      { bone: "left_upper_arm",  keys: [ [0,[0,0,0]], [0.4,[52,0,-10]], [0.9,[8,48,-22]] ] },
+      { bone: "right_forearm",   keys: [ [0,[0,0,0]], [0.4,[25,0,0]],   [0.9,[85,4,1]] ] },
+            { bone: "left_shoulder",   keys: [ [0,[0,0,0]], [0.4,[-8,0,0]],   [0.9,[-15,0,0]] ] },
+      { bone: "left_upper_arm",  keys: [ [0,[0,0,0]], [0.4,[52,0,-10]], [0.9,[65,36,10]] ] },
       // Same sign as the right, NOT the anatomical mirror — this rig's
       // twist axes do not flip across the body (the hand-basis lesson again:
       // measure the sign, never derive it).
-      { bone: "left_forearm",    keys: [ [0,[0,0,0]], [0.4,[25,0,0]],   [0.9,[88,-60,0]] ] },
-      { bone: "left_hand",       keys: [ [0,[0,0,0]], [0.4,[0,6,0]],    [0.9,[0,16,0]] ] },
-      { bone: "chest",           keys: [ [0,[0,0,0]], [0.9,[2,0,0]] ] },
-    ],
+      { bone: "left_forearm",    keys: [ [0,[0,0,0]], [0.4,[25,0,0]],   [0.9,[100,-11,-42]] ] },
+                ],
   },
 
   // The way back down. Starts at exactly the crossed values, so playing it
@@ -211,14 +214,12 @@ export const ACTIONS = {
     tracks: [
       // The same two beats backwards: unfold FORWARD off the torso, then
       // drop — never a diagonal sweep back through the body.
-      { bone: "right_upper_arm", keys: [ [0,[10,-52,25]], [0.4,[55,0,10]],  [0.8,[0,0,0]] ] },
-      { bone: "right_forearm",   keys: [ [0,[80,-60,0]],  [0.4,[25,0,0]],   [0.8,[0,0,0]] ] },
-      { bone: "right_hand",      keys: [ [0,[0,-14,0]],   [0.4,[0,-6,0]],   [0.8,[0,0,0]] ] },
-      { bone: "left_upper_arm",  keys: [ [0,[8,48,-22]],  [0.4,[52,0,-10]], [0.8,[0,0,0]] ] },
-      { bone: "left_forearm",    keys: [ [0,[88,-60,0]],  [0.4,[25,0,0]],   [0.8,[0,0,0]] ] },
-      { bone: "left_hand",       keys: [ [0,[0,16,0]],    [0.4,[0,6,0]],    [0.8,[0,0,0]] ] },
-      { bone: "chest",           keys: [ [0,[2,0,0]],     [0.8,[0,0,0]] ] },
-    ],
+      { bone: "right_upper_arm", keys: [ [0,[34,-61,-10]], [0.4,[55,0,10]],  [0.8,[0,0,0]] ] },
+      { bone: "right_forearm",   keys: [ [0,[85,4,1]],     [0.4,[25,0,0]],   [0.8,[0,0,0]] ] },
+            { bone: "left_shoulder",   keys: [ [0,[-15,0,0]],    [0.4,[-8,0,0]],   [0.8,[0,0,0]] ] },
+      { bone: "left_upper_arm",  keys: [ [0,[65,36,10]],   [0.4,[52,0,-10]], [0.8,[0,0,0]] ] },
+      { bone: "left_forearm",    keys: [ [0,[100,-11,-42]],[0.4,[25,0,0]],   [0.8,[0,0,0]] ] },
+                ],
   },
 
   "slap-recoil": {

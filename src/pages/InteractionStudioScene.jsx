@@ -999,49 +999,155 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
       _e.set(rx * DEG, ry * DEG, rz * DEG);
       _q.setFromEuler(_e);
       if (releaseK > 0) _q.slerp(_qIdent, releaseK);
-      if (p.mixerBones?.has(bone.name)) bone.quaternion.multiply(_q);
+      if (p.mixerBones?.has(bone.name)) {
+        // Dampen the idle sway on ARM bones while a pose drives them
+        // (Magnus 2026-09-12): the mixer keeps writing the full idle swing
+        // under the pose, so held arms breathed and wandered. Blend the
+        // mixer's live value 80% back toward what it was when the pose
+        // began — a fifth of the sway survives, so the body still breathes,
+        // but the arms hold their line. Ramps in with the pose, out with
+        // the release; spine and head keep their full idle.
+        if (/upperarm|forearm|hand|shldr|shoulder/.test(bone.name)) {
+          if (!p.idleBase) p.idleBase = new Map();
+          let ib = p.idleBase.get(bone.name);
+          if (!ib) { ib = bone.quaternion.clone(); p.idleBase.set(bone.name, ib); }
+          const damp = 0.8 * Math.min(1, p.t / Math.max(0.001, p.duration)) * (1 - releaseK);
+          if (damp > 0) bone.quaternion.slerp(ib, damp);
+        }
+        bone.quaternion.multiply(_q);
+      }
       else bone.quaternion.copy(base).multiply(_q);
     }
-    // wrapTorso: the pose's arm angles are a shape; the BODY decides how far
-    // forward that shape must sit. Measured ONCE when the hold settles: the
-    // torso's real front reach (chest+belly region, arms and head excluded)
-    // versus where the hands actually are, converted to the extra forward
-    // swing that clears it. Applied every frame on top of the tracks — the
-    // arms are mixer-driven, so the multiply lands once per frame — and
-    // faded out with the release.
-    if (p.adapt === "wrapTorso" && p.t >= p.duration && p.wrapX == null) {
-      fig.group.updateMatrixWorld(true);
-      const chest = fig.group.getObjectByName("spine3");
-      if (chest) {
-        const facing = fig.group.rotation.y;
-        const fdir = new THREE.Vector3(Math.sin(facing), 0, Math.cos(facing));
-        const cp = chest.getWorldPosition(new THREE.Vector3());
-        // The SHIRT is the surface you see — clear that, not the flesh under
-        // it. And the clearance is judged for the WHOLE forearm, every
-        // vertex: checking only the hand bones let the forearm SHAFT lie
-        // buried in the belly with a clean wrist poking out, and the check
-        // passed (Magnus: "you are pulling the forearms thru the body").
-        const torso = limbSurface(fig,
-          limbRegion(fig, "spine1", ["l_upperarm", "r_upperarm", "neck1"]),
-          { dir: fdir, origin: cp });
-        const front = torso?.maxAlong ?? 0.12;
-        const back = fdir.clone().negate();
-        let limbFwd = Infinity;
-        for (const sd of ["r", "l"]) {
-          const span = limbSurface(fig, limbRegion(fig, sd + "_forearm"),
-            { dir: back, origin: cp });
-          if (span && span.maxAlong != null) limbFwd = Math.min(limbFwd, -span.maxAlong);
+    // SKIN CLEARANCE (2026-09-12, Magnus: "we need some kind of skin
+    // collision control"). The pose's arm angles are a shape; the BODY
+    // decides how far forward that shape must sit. Was a one-shot measure at
+    // hold-settle applied equally to both arms; now a PER-ARM controller
+    // that re-measures every 120ms THROUGHOUT the motion:
+    //   - torso front reach and half-width measured once per pose (shirt
+    //     included — the garment is the surface you see);
+    //   - a forearm vertex counts only while it is over the torso
+    //     (armTorsoDeficit), so an arm hanging at the side is left alone;
+    //   - residual deficit converts to EXTRA forward swing on that side's
+    //     upper arm, approached exponentially, never snapped. Measuring
+    //     after the wrap is applied makes the loop incremental: the target
+    //     grows by what is still buried and decays only on clear surplus
+    //     (3cm hysteresis), so it cannot oscillate.
+    if (p.adapt === "wrapTorso") {
+      if (!p.skin) p.skin = { r: 0, l: 0, tr: 0, tl: 0, nextAt: 0.2, prof: null, halfW: null };
+      const sk = p.skin;
+      // Clock, not pose time: p.t CLAMPS at the hold, so scheduling the
+      // next measurement at p.t+0.12 stopped all measurement the moment the
+      // pose settled — the last mid-fold reading (elbows legitimately close
+      // to the chest = huge deficit) froze the wrap at its 42-degree cap and
+      // Benny held a zombie reach forever (caught live, 2026-09-12).
+      sk.clock = (sk.clock || 0) + delta;
+      if (!p.releasing && sk.clock >= sk.nextAt) {
+        sk.nextAt = sk.clock + 0.12;
+        fig.group.updateMatrixWorld(true);
+        const chest = fig.group.getObjectByName("spine3");
+        if (chest) {
+          const facing = fig.group.rotation.y;
+          const fdir = new THREE.Vector3(Math.sin(facing), 0, Math.cos(facing));
+          const sdir = new THREE.Vector3(Math.cos(facing), 0, -Math.sin(facing));
+          const cp = chest.getWorldPosition(new THREE.Vector3());
+          if (!sk.prof) {
+            // HEIGHT-RESOLVED torso front (2026-09-12). One global "front"
+            // was Benny's belly maximum, 0.283m — arms resting properly ON
+            // his chest still measured buried against the BELLY's reach, and
+            // the lift pinned at its cap. The threshold must be the torso's
+            // reach AT THE FOREARM'S OWN HEIGHT: 5cm bands over the torso,
+            // garments included, measured once per pose.
+            const region = limbRegion(fig, "spine1", ["l_upperarm", "r_upperarm", "neck1"]);
+            const vv = new THREE.Vector3();
+            let yMin = Infinity, yMax = -Infinity, hw = 0;
+            const pts = [];
+            fig.model.traverse((mesh) => {
+              if (!mesh.isSkinnedMesh || typeof mesh.applyBoneTransform !== "function") return;
+              const ids = limbVertexIds(fig, mesh, region);
+              if (!ids) return;
+              const pos = mesh.geometry.attributes.position;
+              for (const i of ids) {
+                vv.fromBufferAttribute(pos, i);
+                mesh.applyBoneTransform(i, vv);
+                vv.applyMatrix4(mesh.matrixWorld);
+                const fwd = (vv.x - cp.x) * fdir.x + (vv.z - cp.z) * fdir.z;
+                const lat = (vv.x - cp.x) * sdir.x + (vv.z - cp.z) * sdir.z;
+                if (Math.abs(lat) > hw) hw = Math.abs(lat);
+                if (vv.y < yMin) yMin = vv.y;
+                if (vv.y > yMax) yMax = vv.y;
+                pts.push(vv.y, lat, fwd);
+              }
+            });
+            // 2D: height bands ALONE still pinned the lift at its cap —
+            // the band front is the torso's reach at its CENTRE, while a
+            // crossed forearm's elbow end wraps the torso's SIDE, where the
+            // skin is far less forward. Those wrapped vertices read "buried
+            // 20cm" forever. The threshold is the local skin surface at the
+            // vertex's own (height, lateral) cell.
+            const bandH = 0.05, nB = Math.max(1, Math.ceil((yMax - yMin) / bandH));
+            const latB = 0.05, nL = Math.max(1, Math.ceil((2 * hw) / latB));
+            const grid = new Array(nB * nL).fill(-Infinity);
+            for (let k = 0; k < pts.length; k += 3) {
+              const bi = Math.min(nB - 1, Math.floor((pts[k] - yMin) / bandH));
+              const li = Math.min(nL - 1, Math.max(0, Math.floor((pts[k + 1] + hw) / latB)));
+              const gi = bi * nL + li;
+              if (pts[k + 2] > grid[gi]) grid[gi] = pts[k + 2];
+            }
+            sk.prof = { yMin, bandH, nB, latB, nL, halfW: hw, grid };
+            sk.halfW = hw;
+          }
+          for (const sd of ["r", "l"]) {
+            const d = armTorsoDeficit(fig, sd, fdir, sdir, cp, sk.prof, 0.01, sk.halfW);
+            const tKey = "t" + sd;
+            // Rate-limited: at most 8 degrees per measurement in either
+            // direction. A transient mid-fold deficit nudges, it does not
+            // slam the cap; equilibrium is reached over a few ticks.
+            // Deadband [-0.02, 0.02]: a forearm RESTING ON the skin reads
+            // a deficit of about the margin — that is the goal state, not a
+            // reason to keep climbing.
+            // STALL DETECTION: on a deep torso a tucked hand nests BESIDE
+            // the pec bulge and always reads "behind" its cell's maximum —
+            // a phantom deficit no amount of lifting clears (Benny pinned
+            // the cap at deficit 0.13 with the arms at his chin). Lift only
+            // while lifting BUYS clearance; when an increment returns less
+            // than 5mm, hold there. The stall is sticky until the deficit
+            // resolves or jumps (pose moved on).
+            sk.prevD = sk.prevD || {}; sk.grew = sk.grew || {}; sk.stall = sk.stall || {};
+            let step = 0;
+            if (d == null) { step = -4; sk.stall[sd] = false; }
+            else if (d > 0.02) {
+              const prev = sk.prevD[sd];
+              if (sk.grew[sd] && prev != null && prev - d < 0.005) sk.stall[sd] = true;
+              if (prev != null && d - prev > 0.05) sk.stall[sd] = false;
+              if (!sk.stall[sd]) step = Math.min(8, Math.asin(Math.min(0.95, d / 0.45)) / DEG);
+            } else {
+              sk.stall[sd] = false;
+              if (d < -0.02) step = -Math.min(8, Math.asin(Math.min(0.95, (-d - 0.02) / 0.45)) / DEG);
+            }
+            sk.grew[sd] = step > 0;
+            sk.prevD[sd] = d;
+            sk[tKey] = Math.max(0, Math.min(30, sk[tKey] + step));
+            sk.lastD = sk.lastD || {};
+            sk.lastD[sd] = d == null ? null : +d.toFixed(3);
+          }
         }
-        const need = front + 0.04 - (Number.isFinite(limbFwd) ? limbFwd : front);
-        p.wrapX = need > 0 ? Math.min(42, Math.asin(Math.min(0.95, need / 0.45)) / DEG) : 0;
-      } else p.wrapX = 0;
-    }
-    if (p.adapt === "wrapTorso" && p.wrapX > 0) {
-      const w = p.wrapX * (1 - releaseK);
-      for (const n of ["r_upperarm", "l_upperarm"]) {
-        const b = fig.group.getObjectByName(n);
+      }
+      const ka = 1 - Math.exp(-8 * delta);
+      sk.r += (sk.tr - sk.r) * ka;
+      sk.l += (sk.tl - sk.l) * ka;
+      // Actuate on RAISE (local Z), never on X (Magnus, 2026-09-12: "you can
+      // only move the arms up and down, NOT X"). This delta multiplies in
+      // AFTER the pose's twist is already on the bone, and Euler axes
+      // composed after a twist do not mean what their names say — the X
+      // "forward swing" swept the forearms INTO the midline on Benny. Raising
+      // instead slides the crossed forearms up the torso until they sit
+      // above the bulge, which is what a big-bellied cross really does.
+      for (const sd of ["r", "l"]) {
+        const w = (sd === "r" ? sk.r : sk.l) * (1 - releaseK);
+        if (w <= 0.01) continue;
+        const b = fig.group.getObjectByName(sd + "_upperarm");
         if (!b) continue;
-        _e.set(w * DEG, 0, 0);
+        _e.set(0, 0, (sd === "r" ? -w : w) * DEG);
         _q.setFromEuler(_e);
         b.quaternion.multiply(_q);
       }
@@ -1925,6 +2031,54 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
     // thigh gives to a chair.
     const yAt = (q) => ys[Math.min(ys.length - 1, Math.max(0, Math.floor(q * ys.length)))];
     return { minY, maxY, count, maxAlong: dir ? maxAlong : null, yAt };
+  }
+
+  // How deep is this arm still inside the torso's visible front? The whole
+  // forearm+hand region, every vertex — but only vertices currently OVER the
+  // torso: laterally inside the chest's measured half-width and no more than
+  // 10cm behind its front line. An arm hanging at the side is BESIDE the
+  // body, not buried in it — without this filter the controller would shove
+  // idle arms forward. Returns metres of deficit (positive = buried behind
+  // the shirt front), or null when the arm is not over the torso at all.
+  function armTorsoDeficit(fig, sd, fdir, sdir, cp, prof, margin, halfW) {
+    const region = limbRegion(fig, sd + "_forearm");
+    if (!region || !prof) return null;
+    const v = new THREE.Vector3();
+    const dvs = [];
+    fig.model.traverse((mesh) => {
+      if (!mesh.isSkinnedMesh || typeof mesh.applyBoneTransform !== "function") return;
+      const ids = limbVertexIds(fig, mesh, region);
+      if (!ids) return;
+      const pos = mesh.geometry.attributes.position;
+      for (const i of ids) {
+        v.fromBufferAttribute(pos, i);
+        mesh.applyBoneTransform(i, v);
+        v.applyMatrix4(mesh.matrixWorld);
+        const lat = (v.x - cp.x) * sdir.x + (v.z - cp.z) * sdir.z;
+        if (Math.abs(lat) > halfW) continue;
+        const fwd = (v.x - cp.x) * fdir.x + (v.z - cp.z) * fdir.z;
+        if (fwd < -0.10) continue;
+        // Compare against the LOCAL skin surface at this vertex's own
+        // (height, lateral) cell. Empty cell = no torso there = nothing to
+        // clear. Deficit is PENETRATION: how far behind the local skin the
+        // vertex sits, plus a 1cm visual margin.
+        const bi = Math.floor((v.y - prof.yMin) / prof.bandH);
+        if (bi < 0 || bi >= prof.nB) continue;
+        const li = Math.floor((lat + prof.halfW) / prof.latB);
+        if (li < 0 || li >= prof.nL) continue;
+        const bf = prof.grid[bi * prof.nL + li];
+        if (bf === -Infinity) continue;
+        dvs.push(bf + margin - fwd);
+      }
+    });
+    if (dvs.length < 12) return null;
+    // 80th percentile, not max. The MAX is a phantom: a hand TUCKED beside
+    // the pec bulge always reads "behind" its cell's maximum without being
+    // inside anything (Benny read 0.13 buried while visually resting
+    // naturally on his belly). A truly buried forearm SHAFT is hundreds of
+    // vertices deep; a tucked hand is a few dozen shallow ones.
+    dvs.sort((a, b) => a - b);
+    return dvs[Math.min(dvs.length - 1, Math.floor(0.8 * dvs.length))];
   }
 
   // Slide her forward until the back of her CLEARS the backrest.
@@ -2847,6 +3001,12 @@ export default function InteractionStudioScene({ cast, onRig, onStatus }) {
       // it. Added because "are the palms ON the lap or IN it" had no oracle
       // outside this module — the seat surface is a constant anyone can read,
       // a thigh's top is not.
+      skinInfo: (role) => {
+        const f = a.figures?.[role];
+        const sk = f?.pose?.skin;
+        if (!sk) return null;
+        return { r: +sk.r.toFixed(2), l: +sk.l.toFixed(2), tr: +sk.tr.toFixed(2), tl: +sk.tl.toFixed(2), halfW: sk.halfW, clock: +(sk.clock || 0).toFixed(2), deficits: sk.lastD || null, stall: sk.stall || null };
+      },
       sitRest: (role) => {
         const f = a.figures?.[role];
         const st = f?.settling;
