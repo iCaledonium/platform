@@ -4815,6 +4815,42 @@ function rebindGarmentsForExport(root, bodySkinMesh) {
         }
       } catch (e) { /* body not found — nothing cached to strip */ }
 
+      // Session 152 — the skin culling is a RENDER state, and this function
+      // serializes live geometry. An editable export (wizard Save GLB, the
+      // dressed editor snapshot) saved with the culled index would permanently
+      // lose every hidden triangle — real data loss, compounding on each save.
+      // Suspend for those; the runtime file KEEPS the culling, deliberately:
+      // a world loads a body that cannot poke through its clothes.
+      //
+      // Session 176 - and it must run BEFORE the cache lift below. Since the
+      // lift landed (2026-08-25) this suspend came after it, so
+      // suspendSkinLayers looked for geometry.userData.fullIndex, found the
+      // lift had just removed it, and restored nothing: every editable export
+      // since — every wizard Next, every Save GLB — serialised the culled
+      // body, and the next load captured those holes as "full". Found live on
+      // Lindsey with her top set to None: the blouse-shaped hole was in the
+      // file (Body 1066 of 3861 vertices referenced), not in the mask (140
+      // triangles). Three of four canonical bodies had it; Benny's file
+      // predates the lift by two hours. Repaired from an intact donor's index
+      // via the shared Genesis 9 UV layout (scratchpad glb_repair_body.mjs).
+      // The exportSkinSnap lines below are how it was caught: before-suspend
+      // must show drawn < full and after-suspend drawn == full on a dressed
+      // body — keep them.
+      const _skinSnap = (tag) => {
+        const rows = [];
+        (loadedRootRef.current || { traverse: () => {} }).traverse((m) => {
+          if (!m.isSkinnedMesh || (m.userData && m.userData.isAccessoryMesh)) return;
+          const g = m.geometry;
+          const fi = g.userData && g.userData.fullIndex;
+          const fullLen = fi ? (fi.length !== undefined ? fi.length : Object.keys(fi).length) : null;
+          rows.push(`${(m.name || "?").slice(0, 14)} drawn=${g.index ? g.index.count / 3 : 0} full=${fullLen ? fullLen / 3 : "none"} isView=${ArrayBuffer.isView(fi)}`);
+        });
+        console.log(`[exportSkinSnap:${tag}] runtime=${runtime} | ${rows.slice(0, 8).join(" | ")}`);
+      };
+      _skinSnap("before-suspend");
+      pauseHairRide(accessoryMeshesRef.current, true);   // Session 173 - the file carries the settled shape, not one frame's correction
+      const reapplySkinLayers = runtime ? () => {} : suspendSkinLayers(loadedRootRef.current);
+      _skinSnap("after-suspend");
       // Session 152 — the SAME law bit again, through the layer system: its
       // fullIndex / bodyZones caches live on geometry.userData, the wizard's
       // per-Next export flattened them into Benny's editable GLB (tens of MB
@@ -4840,28 +4876,6 @@ function rebindGarmentsForExport(root, bodySkinMesh) {
       };
 
       const exporter = new GLTFExporter();
-      // Session 152 — the skin culling is a RENDER state, and this function
-      // serializes live geometry. An editable export (wizard Save GLB, the
-      // dressed editor snapshot) saved with the culled index would permanently
-      // lose every hidden triangle — real data loss, compounding on each save.
-      // Suspend for those; the runtime file KEEPS the culling, deliberately:
-      // a world loads a body that cannot poke through its clothes.
-      // Session 162 TEMP DIAGNOSTIC - remove once the culling-on-export bug is closed.
-      const _skinSnap = (tag) => {
-        const rows = [];
-        (loadedRootRef.current || { traverse: () => {} }).traverse((m) => {
-          if (!m.isSkinnedMesh || (m.userData && m.userData.isAccessoryMesh)) return;
-          const g = m.geometry;
-          const fi = g.userData && g.userData.fullIndex;
-          const fullLen = fi ? (fi.length !== undefined ? fi.length : Object.keys(fi).length) : null;
-          rows.push(`${(m.name || "?").slice(0, 14)} drawn=${g.index ? g.index.count / 3 : 0} full=${fullLen ? fullLen / 3 : "none"} isView=${ArrayBuffer.isView(fi)}`);
-        });
-        console.log(`[exportSkinSnap:${tag}] runtime=${runtime} | ${rows.slice(0, 8).join(" | ")}`);
-      };
-      _skinSnap("before-suspend");
-      pauseHairRide(accessoryMeshesRef.current, true);   // Session 173 - the file carries the settled shape, not one frame's correction
-      const reapplySkinLayers = runtime ? () => {} : suspendSkinLayers(loadedRootRef.current);
-      _skinSnap("after-suspend");
       const allAnimations = Object.values(animationsRef.current || {});
 
       // Session 152 — a clip cannot animate targets the file no longer has.
