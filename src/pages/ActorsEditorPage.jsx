@@ -1042,6 +1042,7 @@ function SubjectAuthorisationNotice({ actorId, mediaPhotos, canEdit, stillDeploy
   const [override, setOverride] = useState(null);
   const [saving, setSaving]     = useState(false);
   const [err, setErr]           = useState(null);
+  const [expanded, setExpanded] = useState(false);
   // Session 152 -- answering "No" is RETROACTIVE, one-way, and reaches copies
   // other accounts forked. PATCH .../media/authorisation unlists the actor,
   // revokes every live share link, deletes every claim and undeploys her from
@@ -1135,10 +1136,52 @@ function SubjectAuthorisationNotice({ actorId, mediaPhotos, canEdit, stillDeploy
       });
   }
 
+  // Magnus: once the answer is "yes" the panel has said everything it has to
+  // say, and it was holding the top of the page for the life of the character.
+  // Collapsed to one line -- but deliberately NOT removed. This component is
+  // the documented route back to the authorisation question for a finished
+  // character (the wizard's copy belongs to the creation flow and is gone once
+  // she is saved), and the answer it holds is withdrawable: "no" is
+  // retroactive and one-way, unlisting her, revoking every live share link,
+  // deleting every claim and undeploying her from every world including copies
+  // other accounts forked. A consent declaration with no route back to it is
+  // not a consent declaration, so the line stays and reopens the panel.
+  //
+  // Never collapsed while a withdrawal is still outstanding: that case renders
+  // a red "still in N worlds" banner below, which is the one thing here that
+  // must not be a click away. (It cannot arise while the answer reads "yes",
+  // but this does not depend on that staying true.)
+  if (ok && !outstanding.length && !expanded) {
+    return (
+      <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap", marginBottom:16 }}>
+        <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".16em", textTransform:"uppercase", color:"#a8a5a0" }}>
+          Subject authorisation
+        </span>
+        <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11.5, color:tone.text }}>
+          authorised
+        </span>
+        {canEdit && (
+          <button type="button" onClick={() => setExpanded(true)}
+            style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".08em", textTransform:"uppercase", padding:"3px 8px", borderRadius:6, background:"transparent", border:"1px solid rgba(0,0,0,.12)", color:"#6b6760", cursor:"pointer" }}>
+            Review
+          </button>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div style={{ marginBottom:20, padding:"14px 16px", borderRadius:12, background:tone.bg, border:`1px solid ${tone.border}` }}>
-      <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".16em", textTransform:"uppercase", color:tone.text, marginBottom:6 }}>
-        Subject authorisation
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:10, marginBottom:6 }}>
+        <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".16em", textTransform:"uppercase", color:tone.text }}>
+          Subject authorisation
+        </div>
+        {ok && !outstanding.length && (
+          <button type="button" onClick={() => setExpanded(false)}
+            style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".08em", textTransform:"uppercase", padding:"3px 8px", borderRadius:6, background:"transparent", border:`1px solid ${tone.border}`, color:tone.text, cursor:"pointer" }}>
+            Hide
+          </button>
+        )}
       </div>
       <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:12.5, color:"#4a4740", lineHeight:1.6, maxWidth:720 }}>
         {body}
