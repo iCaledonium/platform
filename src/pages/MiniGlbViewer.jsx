@@ -2029,6 +2029,17 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
   // last time. Populated once at load time, read (not reloaded) by the
   // separate live-update effect on every slider drag.
   const accessoryMeshesRef = useRef({});
+  // Session 176 - the loading overlay waits for the first dressed settle
+  // when a wardrobe is expected (see the body load callback).
+  const wardrobeGateRef = useRef(false);
+  const loadingGateTimerRef = useRef(null);
+  const releaseLoading = () => {
+    if (!wardrobeGateRef.current) return;
+    wardrobeGateRef.current = false;
+    if (loadingGateTimerRef.current) { clearTimeout(loadingGateTimerRef.current); loadingGateTimerRef.current = null; }
+    setModelLoading(false);
+    if (onLoadingChange) onLoadingChange(false);
+  };
   // Session 176 - this viewer's fit worker (see fitClient.js); created by the
   // accessory manager on the first body, disposed with the component.
   const fitClientRef = useRef(null);
@@ -2676,7 +2687,19 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
         // lived here (load+bind+wrap inside the body effect) moved to
         // its own manager effect below. This effect now owns the BODY
         // ONLY; the spinner ends here, when the body is visible.
-        if (mounted) { setModelLoading(false); if (onLoadingChange) onLoadingChange(false); }
+        // Session 176 - with the fit in the worker the body renders before its
+        // garments are back, and the character showed NUDE for the seconds the
+        // first fits took (seen live on Lindsey). When a wardrobe is expected,
+        // the loading overlay stays up until the accessory manager's first
+        // settle has landed (releaseLoading below), with a safety release.
+        if (mounted) {
+          if ((accessoriesLatestRef.current || []).length) {
+            wardrobeGateRef.current = true;
+            loadingGateTimerRef.current = setTimeout(() => { console.warn("[MiniGlbViewer] wardrobe took over 90s to dress - showing the character anyway."); releaseLoading(); }, 90000);
+          } else {
+            setModelLoading(false); if (onLoadingChange) onLoadingChange(false);
+          }
+        }
       },
       undefined,
       (err) => { console.error("[MiniGlbViewer] GLTF load failed:", err); if (mounted) { setModelLoading(false); if (onLoadingChange) onLoadingChange(false); } }
@@ -3023,7 +3046,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
       // end of the additions path below. Whether this run loaded anything or
       // found it all done, the wardrobe is now settled, and settled is exactly
       // when the mask must be true.
-      settleLayers(loadedRoot, store, accessories, mixerRef.current);
+      Promise.resolve(settleLayers(loadedRoot, store, accessories, mixerRef.current)).then(releaseLoading, releaseLoading);
       return () => { cancelled = true; };
     }
     // Session 103 — CANCELLATION MUST CLEAN ITS HALF-WORK: during a
@@ -3084,7 +3107,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
       // After every garment in this batch has loaded AND shrunk-wrapped
       // (shrinkwrap must see the full body surface, so culling comes last),
       // hide the skin the active wardrobe covers.
-      if (!cancelled) settleLayers(loadedRoot, store, accessories, mixerRef.current);
+      if (!cancelled) Promise.resolve(settleLayers(loadedRoot, store, accessories, mixerRef.current)).then(releaseLoading, releaseLoading);
     });
     return () => {
       cancelled = true;
@@ -3951,22 +3974,6 @@ function rebindGarmentsForExport(root, bodySkinMesh) {
     });
   }
 
-  async function handleDownloadGlbClick() {
-    try {
-      const blob = await exportMorphedGlbBlob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `morphed_${Date.now()}.glb`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } catch (err) {
-      console.error("[MiniGlbViewer] handleDownloadGlbClick failed:", err);
-    }
-  }
-
   // Real feature — hands the raw export function up to CharacterWizard
   // via a ref (see onExportReady prop), so step navigation can await a
   // freshly-morphed blob: URL and feed it directly into the next
@@ -4033,24 +4040,10 @@ function rebindGarmentsForExport(root, bodySkinMesh) {
         </div>,
         document.body
       )}
-      {/* Real feature — downloads the currently-loaded character as a
-          .glb, with current morph slider values baked in as starting
-          weights (not an irreversible bake — every morph target stays
-          adjustable in the downloaded file too). Top-left, since
-          top-right is already the view combo + reference toggle +
-          offset sliders stack. */}
-      <button
-        onClick={handleDownloadGlbClick}
-        style={{
-          position: "absolute", top: 14, left: 14,
-          fontFamily: "'DM Mono',monospace", fontSize: 13, color: "#c7b48c",
-          background: "rgba(0,0,0,0.5)", padding: "8px 12px", borderRadius: 12,
-          border: "1px solid rgba(199,180,140,0.2)",
-          cursor: "pointer", outline: "none",
-        }}
-      >
-        ↓ Save GLB
-      </button>
+      {/* Session 176 - the "Save GLB" download button that sat here is gone
+          (Magnus: legacy). The canonical file is written by the wizard's
+          own step exports (save-morphed-glb) and the runtime by the 3D
+          panel's build; exportMorphedGlbBlob stays, for those. */}
       {/* View mode switcher — perspective/front/right. Front/right use
           an orthographic camera with rotation disabled (pan + zoom
           only), matching standard CAD/3D-tool convention for a fixed
