@@ -1088,6 +1088,12 @@ const _rq = new THREE.Vector3(), _racc = new THREE.Vector3(), _rt = new THREE.Ve
 const _rsum = new THREE.Matrix4(), _rM = new THREE.Matrix4();
 const _rP = new THREE.Vector3(), _rA = new THREE.Vector3(), _rn = new THREE.Vector3(), _re1 = new THREE.Vector3(), _re2 = new THREE.Vector3();
 const _rc0 = new THREE.Vector3(), _rc1 = new THREE.Vector3(), _rc2 = new THREE.Vector3(), _rd = new THREE.Vector3();
+const _rv = new THREE.Vector3();   // (P - c0), for the triangle-extent test in rideHairOnCloth
+// How far outside its anchor triangle a strand may still be pushed by that
+// triangle, in barycentric units (0 = strictly inside, 1 = a whole triangle
+// width beyond an edge). Hair rests BETWEEN triangles as often as over one,
+// so a strictly-inside test would drop legitimate corrections at every seam.
+const HAIR_RIDE_BARY_MARGIN = 0.25;
 
 // posed position of (x,y,z) skinned with vertex i's bones of mesh
 function ridePose(mesh, i, x, y, z, out) {
@@ -1353,6 +1359,32 @@ export function rideHairOnCloth(store) {
         _rn.crossVectors(_re1.subVectors(_rc1, _rc0), _re2.subVectors(_rc2, _rc0));
         if (_rn.lengthSq() === 0) continue;
         _rn.normalize().multiplyScalar(sign[i]);
+        // Push out of the TRIANGLE, not out of its infinite plane.
+        //
+        // `d` below is the distance to the plane, and the plane of a small,
+        // steeply curved triangle sweeps far beyond the fabric it belongs to.
+        // At the nape the shirt collar's triangles have planes that run back
+        // through the empty space behind the neck, so strands hanging there
+        // measured centimetres "behind" fabric they were nowhere near and were
+        // shoved that far out: measured on Frida, the nape band's median push
+        // was 19.3mm against an 8mm gap (max 49.8mm), while the hair as a whole
+        // sat at a legitimate 7.1mm. That is the gap Magnus marked.
+        //
+        // So require the strand to actually be over the triangle. Barycentric
+        // coordinates cost four dot products on edges already computed above,
+        // and the out-of-plane part of (P - c0) is orthogonal to both edges, so
+        // P can be used directly without projecting it first. Same formulation
+        // as the settle-side test further up this file.
+        _rv.subVectors(_rP, _rc0);
+        const b00 = _re1.dot(_re1), b01 = _re1.dot(_re2), b11 = _re2.dot(_re2);
+        const bden = b00 * b11 - b01 * b01;
+        if (bden !== 0) {
+          const b20 = _rv.dot(_re1), b21 = _rv.dot(_re2);
+          const bv = (b11 * b20 - b01 * b21) / bden;
+          const bw = (b00 * b21 - b01 * b20) / bden;
+          if (bv < -HAIR_RIDE_BARY_MARGIN || bw < -HAIR_RIDE_BARY_MARGIN ||
+              bv + bw > 1 + HAIR_RIDE_BARY_MARGIN) continue;
+        }
         const d = _rA.subVectors(_rP, _rA).dot(_rn);   // _rA now holds P - A
         if (d >= HAIR_RIDE_GAP) continue;
         const push = HAIR_RIDE_GAP - d;
