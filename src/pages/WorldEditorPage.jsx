@@ -628,6 +628,55 @@ function DangerPanel({ world, onDeleted }) {
   );
 }
 
+// Cast list row: name + avatar (click → actor page) plus a pause/resume
+// toggle for the character's own ActorEngine decision loop, independent of
+// the world start/stop above it. `paused` is in-memory-only on the
+// simulator (no DB column), so it starts unknown and is only known once
+// fetched or toggled — render nothing for the toggle until then rather than
+// guessing a state.
+function CastRow({ actor, worldId, onOpen }) {
+  const [paused, setPaused] = useState(null); // null = unknown, true/false = known
+  const [busy,   setBusy]   = useState(false);
+
+  useEffect(() => {
+    fetch(`/api/worlds/${worldId}/actors/${actor.id}/ticking-status`)
+      .then(r => r.ok ? r.json() : {})
+      .then(d => setPaused(typeof d.paused === "boolean" ? d.paused : null))
+      .catch(() => {});
+  }, [worldId, actor.id]);
+
+  async function toggle(e) {
+    e.stopPropagation();
+    setBusy(true);
+    try {
+      const action = paused ? "resume" : "pause";
+      const r = await fetch(`/api/worlds/${worldId}/actors/${actor.id}/${action}`, { method:"POST" });
+      if (r.ok) setPaused(!paused);
+    } catch {}
+    setBusy(false);
+  }
+
+  return (
+    <div onClick={onOpen}
+      style={{ display:"flex", alignItems:"center", gap:8, padding:"7px 20px", cursor:"pointer", ...F, fontSize:12, color:"#6b6760" }}>
+      {actor.photo_url
+        ? <img src={actor.photo_url} alt="" style={{ width:22, height:22, borderRadius:"50%", objectFit:"cover", flexShrink:0 }} />
+        : <div style={{ width:22, height:22, borderRadius:"50%", background:"rgba(0,0,0,.07)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:9, color:"#6b6760", flexShrink:0 }}>{ini(actor.name)}</div>}
+      <span style={{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", flex:1 }}>{actor.name}</span>
+      {paused !== null && (
+        <button onClick={toggle} disabled={busy} title={paused ? "Resume this character's decision loop" : "Pause this character's decision loop"}
+          style={{ ...F, fontSize:9, letterSpacing:".05em", textTransform:"uppercase", flexShrink:0,
+            padding:"3px 8px", borderRadius:6, cursor: busy ? "default" : "pointer",
+            background: paused ? "rgba(176,92,8,.12)" : "none",
+            color: paused ? "#b05c08" : "#a8a5a0",
+            border: paused ? "none" : "1px solid rgba(0,0,0,.12)", opacity: busy ? .6 : 1 }}>
+          {busy ? "…" : paused ? "Paused" : "Pause"}
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────────
 export default function WorldEditorPage() {
   const { worldId } = useParams();
@@ -735,13 +784,8 @@ export default function WorldEditorPage() {
               <div style={{ ...F, fontSize:11, color:"#a8a5a0", padding:"4px 20px 8px" }}>Nobody deployed yet.</div>
             )}
             {cast.map(a => (
-              <div key={a.id} onClick={() => navigate(`/my-worlds/${worldId}/actors/${a.id}`)}
-                style={{ display:"flex", alignItems:"center", gap:8, padding:"7px 20px", cursor:"pointer", ...F, fontSize:12, color:"#6b6760" }}>
-                {a.photo_url
-                  ? <img src={a.photo_url} alt="" style={{ width:22, height:22, borderRadius:"50%", objectFit:"cover", flexShrink:0 }} />
-                  : <div style={{ width:22, height:22, borderRadius:"50%", background:"rgba(0,0,0,.07)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:9, color:"#6b6760", flexShrink:0 }}>{ini(a.name)}</div>}
-                <span style={{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{a.name}</span>
-              </div>
+              <CastRow key={a.id} actor={a} worldId={worldId}
+                onOpen={() => navigate(`/my-worlds/${worldId}/actors/${a.id}`)} />
             ))}
             <div onClick={() => navigate("/actors")}
               style={{ ...F, fontSize:12, color:"#b05c08", padding:"7px 20px", cursor:"pointer" }}>+ Deploy character</div>
