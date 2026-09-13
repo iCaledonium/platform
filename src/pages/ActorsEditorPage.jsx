@@ -1028,7 +1028,7 @@ function ReferenceDeclarationNotice({ actorId, mediaPhotos, canEdit, hasSolve })
 // Clearing back to "not stated" is deliberately not offered, matching
 // PATCH /api/actors/:id/media/authorisation, which refuses to write NULL: a
 // silent clear would read later as "never asked" rather than as "withdrawn".
-function SubjectAuthorisationNotice({ actorId, mediaPhotos, canEdit, stillDeployed }) {
+function SubjectAuthorisationNotice({ actorId, mediaPhotos, canEdit, stillDeployed, variant = "panel", open = false, onOpen, onClose }) {
   const others = useMemo(
     () => (mediaPhotos || []).filter(m => m.depicts === "other"),
     [mediaPhotos]
@@ -1042,7 +1042,6 @@ function SubjectAuthorisationNotice({ actorId, mediaPhotos, canEdit, stillDeploy
   const [override, setOverride] = useState(null);
   const [saving, setSaving]     = useState(false);
   const [err, setErr]           = useState(null);
-  const [expanded, setExpanded] = useState(false);
   // Session 152 -- answering "No" is RETROACTIVE, one-way, and reaches copies
   // other accounts forked. PATCH .../media/authorisation unlists the actor,
   // revokes every live share link, deletes every claim and undeploys her from
@@ -1136,39 +1135,41 @@ function SubjectAuthorisationNotice({ actorId, mediaPhotos, canEdit, stillDeploy
       });
   }
 
-  // Magnus: once the answer is "yes" the panel has said everything it has to
-  // say, and it was holding the top of the page for the life of the character.
-  // Collapsed to one line -- but deliberately NOT removed. This component is
-  // the documented route back to the authorisation question for a finished
-  // character (the wizard's copy belongs to the creation flow and is gone once
-  // she is saved), and the answer it holds is withdrawable: "no" is
-  // retroactive and one-way, unlisting her, revoking every live share link,
-  // deleting every claim and undeploying her from every world including copies
-  // other accounts forked. A consent declaration with no route back to it is
-  // not a consent declaration, so the line stays and reopens the panel.
+  // Settled, and therefore a status rather than a question: it rides under her
+  // age / gender / occupation line in the sidebar, in the same chip language as
+  // the attachment-style badge beside it. Only the SETTLED case goes there --
+  // the sidebar is 240px wide and the unsettled cases are a paragraph of
+  // consequences plus a select, and the withdrawal case a red banner naming
+  // every world she is still running in. Those keep the content column.
   //
-  // Never collapsed while a withdrawal is still outstanding: that case renders
-  // a red "still in N worlds" banner below, which is the one thing here that
-  // must not be a click away. (It cannot arise while the answer reads "yes",
-  // but this does not depend on that staying true.)
-  if (ok && !outstanding.length && !expanded) {
+  // Deliberately a chip and not nothing at all. The comment above this
+  // component calls it the route back to the authorisation question, and for a
+  // finished character it is the only one (the wizard's copy belongs to the
+  // creation flow). The answer is withdrawable, and withdrawal is the
+  // consequential direction: "no" is retroactive and one-way, unlisting her,
+  // revoking every live share link, deleting every claim and undeploying her
+  // from every world including copies other accounts forked. A consent
+  // declaration with no route back to it is not a consent declaration.
+  //
+  // `open` is the PAGE's state, because the chip and the panel it opens are in
+  // two different columns.
+  const settled = ok && !outstanding.length;
+
+  if (variant === "chip") {
+    if (!settled) return null;   // unsettled speaks in the content column
     return (
-      <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap", marginBottom:16 }}>
-        <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".16em", textTransform:"uppercase", color:"#a8a5a0" }}>
-          Subject authorisation
-        </span>
-        <span style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11.5, color:tone.text }}>
-          authorised
-        </span>
-        {canEdit && (
-          <button type="button" onClick={() => setExpanded(true)}
-            style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".08em", textTransform:"uppercase", padding:"3px 8px", borderRadius:6, background:"transparent", border:"1px solid rgba(0,0,0,.12)", color:"#6b6760", cursor:"pointer" }}>
-            Review
-          </button>
-        )}
-      </div>
+      <span
+        onClick={canEdit && onOpen ? onOpen : undefined}
+        title={canEdit ? "Review the subject authorisation" : undefined}
+        style={{ display:"inline-block", fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:9, letterSpacing:".08em", padding:"3px 8px", borderRadius:5, background:"rgba(29,158,117,.10)", color:"#0f6e56", border:"1px solid rgba(29,158,117,.25)", marginTop:8, marginRight:6, cursor: canEdit && onOpen ? "pointer" : "default" }}>
+        likeness authorised
+      </span>
     );
   }
+
+  // The panel. Silent while the answer is settled and nobody asked to see it --
+  // the chip is carrying that case in the sidebar.
+  if (settled && !open) return null;
 
   return (
     <div style={{ marginBottom:20, padding:"14px 16px", borderRadius:12, background:tone.bg, border:`1px solid ${tone.border}` }}>
@@ -1176,8 +1177,8 @@ function SubjectAuthorisationNotice({ actorId, mediaPhotos, canEdit, stillDeploy
         <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".16em", textTransform:"uppercase", color:tone.text }}>
           Subject authorisation
         </div>
-        {ok && !outstanding.length && (
-          <button type="button" onClick={() => setExpanded(false)}
+        {settled && onClose && (
+          <button type="button" onClick={onClose}
             style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:10, letterSpacing:".08em", textTransform:"uppercase", padding:"3px 8px", borderRadius:6, background:"transparent", border:`1px solid ${tone.border}`, color:tone.text, cursor:"pointer" }}>
             Hide
           </button>
@@ -1324,6 +1325,9 @@ export default function ActorsEditorPage() {
   const [saveError, setSaveError]   = useState(null);
   const [editData, setEditData] = useState(null);
   const [showDeploy, setShowDeploy] = useState(false);
+  // Opened from the sidebar chip, rendered in the content column — see
+  // SubjectAuthorisationNotice.
+  const [authOpen, setAuthOpen] = useState(false);
 
   useEffect(() => {
     if (!id) return;
@@ -1494,6 +1498,9 @@ export default function ActorsEditorPage() {
             <div style={{ fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:11, color:"#a8a5a0", marginTop:3 }}>
               {[a?.age, a?.gender, a?.occupation].filter(Boolean).join(" · ")}
             </div>
+            <SubjectAuthorisationNotice variant="chip" actorId={id} mediaPhotos={data?.mediaPhotos}
+              canEdit={isOwner} stillDeployed={data?.withdrawal_still_deployed}
+              onOpen={() => setAuthOpen(true)} />
             {a?.attachment_style && (
               <span style={{ display:"inline-block", fontFamily:"'DM Sans',system-ui,sans-serif", fontSize:9, letterSpacing:".08em", padding:"3px 8px", borderRadius:5, background:c.bg, color:c.text, border:`1px solid ${c.border}`, marginTop:8 }}>
                 {a.attachment_style.replace(/_/g," ")}
@@ -1550,7 +1557,9 @@ export default function ActorsEditorPage() {
           <div style={{ flex:1, overflowY:"auto", padding:"24px 28px" }}
             onBlur={() => { if (Object.keys(pending.current).length) commitNow(); }}>
             <ReferenceDeclarationNotice actorId={id} mediaPhotos={data?.mediaPhotos} canEdit={isOwner} hasSolve={!!(data?.measurements || data?.actor?.glb_url)} />
-            <SubjectAuthorisationNotice actorId={id} mediaPhotos={data?.mediaPhotos} canEdit={isOwner} stillDeployed={data?.withdrawal_still_deployed} />
+            <SubjectAuthorisationNotice actorId={id} mediaPhotos={data?.mediaPhotos} canEdit={isOwner}
+              stillDeployed={data?.withdrawal_still_deployed}
+              open={authOpen} onClose={() => setAuthOpen(false)} />
             {panels[tab] || null}
           </div>
         </div>
