@@ -420,6 +420,7 @@ const HAIR_BODY_SEARCH = 0.05;  // no skin within 5cm means the vertex cannot be
 // position fingerprint catches). Both keyed on the geometry object.
 const _hairAdjCache = new WeakMap();
 const _hairScalpCache = new WeakMap();
+const _hairSkinCache = new WeakMap();   // first-pass skin verdict + lift per vertex, same key as the scalp mask
 const _scalpFingerprint = (pos, bbvh) => {
   const N = pos.count, step = Math.max(1, Math.floor(N / 97));
   let h = N * 7919;
@@ -453,7 +454,11 @@ export function fitOuterLayers(root, store, body = null) {
     if (geo.index) for (let i = 0; i < geo.index.count; i++) push(geo.index.getX(i));
     else for (let i = 0; i < pos.count; i++) push(i);
   }
-  let cbvh = null, cbox = null;
+  let cbvh = null, cbox = null, cboxPad = 0;
+  // Session 175 - distance bounds left behind by the last evaluation of a
+  // vertex (see computeField): how far the skin / the cloth was, so a vertex
+  // that has since moved less than that cannot have crossed either surface.
+  let _ds = -1, _dc = -1;
   if (tri.length) {
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3));
@@ -462,7 +467,8 @@ export function fitOuterLayers(root, store, body = null) {
     // reaches. Most of a long hairdo (scalp, crown, bangs) sits above every
     // garment and never needed the raycasts it was paying for.
     g.computeBoundingBox();
-    cbox = g.boundingBox.clone().expandByScalar(Math.max(HAIR_SEARCH, HAIR_CLEARANCE) + 0.01);
+    cboxPad = Math.max(HAIR_SEARCH, HAIR_CLEARANCE) + 0.01;
+    cbox = g.boundingBox.clone().expandByScalar(cboxPad);
   }
 
   // The intact body surface (getBodySurfaceBVH's cache: bvh + merged geom +
@@ -545,17 +551,29 @@ export function fitOuterLayers(root, store, body = null) {
   // oscillate there; the exit lift always converges. clearScale ramps the
   // float down next to the scalp so a root-pinned card cannot pivot out
   // like a flag (seen live at 2cm).
+  const evaluateSkin = (p, clear) => {
+    _ds = -1;
+    if (!bbvh) { _ds = 1e9; return false; }
+    if (!bbvh.closestPointToPoint(p, bt, 0, HAIR_BODY_SEARCH)) { _ds = HAIR_BODY_SEARCH; return false; }
+    if (!insideBody(p)) { _ds = bt.distance; return false; }
+    const fn = bodyNormal(bt.faceIndex);
+    if (fn) {
+      lift.copy(bt.point).addScaledVector(fn, clear).sub(p);
+      if (lift.length() > HAIR_MAX_LIFT) lift.setLength(HAIR_MAX_LIFT);
+      return true;
+    }
+    return false;
+  };
   const evaluate = (p, mode, clearScale) => {
     const clear = HAIR_CLEARANCE * clearScale;
-    if (bbvh && bbvh.closestPointToPoint(p, bt, 0, HAIR_BODY_SEARCH) && insideBody(p)) {
-      const fn = bodyNormal(bt.faceIndex);
-      if (fn) {
-        lift.copy(bt.point).addScaledVector(fn, clear).sub(p);
-        if (lift.length() > HAIR_MAX_LIFT) lift.setLength(HAIR_MAX_LIFT);
-        return 1;
-      }
-    }
-    if (cbvh && cbox.containsPoint(p)) {
+    if (evaluateSkin(p, clear)) return 1;
+    return evaluateCloth(p, mode, clear);
+  };
+  const evaluateCloth = (p, mode, clear) => {
+    _dc = -1;
+    if (!cbvh) { _dc = 1e9; return 0; }
+    if (!cbox.containsPoint(p)) { _dc = cbox.distanceToPoint(p) + cboxPad; return 0; }
+    {
       // Beneath or outside is decided by PARITY along the outward radial from
       // the torso axis, not by the sign of the closest face: on a pleated
       // blouse the closest face is often the far wall of a fold, whose normal
@@ -588,7 +606,7 @@ export function fitOuterLayers(root, store, body = null) {
           if (lift.length() > HAIR_MAX_LIFT) lift.setLength(HAIR_MAX_LIFT);
           return 2;
         }
-        if ((crossings & 1) === 1) return 0;   // deeper than the search: left alone, as before
+        if ((crossings & 1) === 1) { _dc = -1; return 0; }   // deeper than the search: left alone, as before
       }
       // Outside but closer than the clearance: a soft NUDGE along the face
       // normal, applied in the convergence passes but never counted, pinned
@@ -597,12 +615,17 @@ export function fitOuterLayers(root, store, body = null) {
       // clearance from each oscillates forever (measured live: 1616 of 1623
       // "still beneath" after the raw snap were exactly these). Hair resting
       // on cloth is not hair melting into it.
-      if (cbvh.closestPointToPoint(p, hit, 0, clear)) {
-        const fn = clothNormal(hit.faceIndex);
-        if (fn.dot(tmp.subVectors(p, hit.point)) < 0) fn.negate();
-        lift.copy(fn).multiplyScalar(clear - hit.distance);
-        return 3;
+      if (cbvh.closestPointToPoint(p, hit, 0, HAIR_SEARCH)) {
+        if (hit.distance < clear) {
+          const fn = clothNormal(hit.faceIndex);
+          if (fn.dot(tmp.subVectors(p, hit.point)) < 0) fn.negate();
+          lift.copy(fn).multiplyScalar(clear - hit.distance);
+          return 3;
+        }
+        _dc = hit.distance;
+        return 0;
       }
+      _dc = HAIR_SEARCH;
     }
     return 0;
   };
@@ -618,8 +641,9 @@ export function fitOuterLayers(root, store, body = null) {
 
     // Scalp mask, taken BEFORE anything moves: inside the body, head nearest.
     let scalp;
+    const layerKey = `${_bvhId(bbvh)}|${_scalpFingerprint(pos, bbvh)}`;
     {
-      const key = `${_bvhId(bbvh)}|${_scalpFingerprint(pos, bbvh)}`;
+      const key = layerKey;
       const cached = _hairScalpCache.get(geo);
       if (cached && cached.key === key) scalp = cached.scalp;
       else {
@@ -662,14 +686,61 @@ export function fitOuterLayers(root, store, body = null) {
     const moved = new Uint8Array(N);
     const cand = new Uint8Array(N);
     const markCand = () => { for (let i = 0; i < N; i++) cand[i] = (kindOf[i] !== 0 || moved[i]) ? 1 : 0; };
+    // Session 175 - the first full pass asks the body the same question about
+    // the same 66k starting positions on every settle a garment slider causes
+    // (the hair is restored to its raw shape and re-transformed identically,
+    // and the body has not moved). Its skin verdict and lift are cached under
+    // the same fingerprint as the scalp mask; a hit skips every body query of
+    // the first pass and leaves only the cloth tests inside the cloth box.
+    const skinCached = (() => { const c = _hairSkinCache.get(geo); return c && c.key === layerKey && c.inside.length === N ? c : null; })();
+    let skinRecord = skinCached ? null : { inside: new Uint8Array(N), lift: new Float32Array(N * 3), ds: new Float32Array(N) };
+    // Per-vertex memory of the last evaluation: where it was, and how far the
+    // skin (ds) and the cloth (dc) were at that point (-1 = unknown / was
+    // violating). Both surfaces are static during a settle, and distance to a
+    // surface is 1-Lipschitz, so a vertex that has moved less than its last
+    // distance cannot have crossed it - it is still outside, and the query
+    // that would say so is skipped. Smoothing moves ~50k neighbours by a
+    // fraction of a millimetre per pass; nearly all of them take this exit.
+    const lastP = new Float32Array(N * 3), dsArr = new Float32Array(N).fill(-1), dcArr = new Float32Array(N).fill(-1);
+    const EPS = 0.0005;
     const computeField = (mode = "exit", only = null) => {
       disp.fill(0); kindOf.fill(0);
       let skin = 0, cloth = 0, near = 0;
+      const firstPass = !only;
       for (let i = 0; i < N; i++) {
         if (scalp[i]) continue;
         if (only && !only[i]) continue;
         v.set(pos.getX(i), pos.getY(i), pos.getZ(i));
-        const kind = evaluate(v, mode, clearScaleAt(v.y));
+        const clear = HAIR_CLEARANCE * clearScaleAt(v.y);
+        let kind;
+        if (firstPass) {
+          lastP[i * 3] = v.x; lastP[i * 3 + 1] = v.y; lastP[i * 3 + 2] = v.z;
+          if (skinCached) {
+            if (skinCached.inside[i]) { kind = 1; lift.set(skinCached.lift[i * 3], skinCached.lift[i * 3 + 1], skinCached.lift[i * 3 + 2]); dsArr[i] = -1; dcArr[i] = -1; }
+            else { dsArr[i] = skinCached.ds[i]; kind = evaluateCloth(v, mode, clear); dcArr[i] = _dc; }
+          } else {
+            const inside = evaluateSkin(v, clear);
+            dsArr[i] = inside ? -1 : _ds;
+            if (skinRecord) { if (inside) { skinRecord.inside[i] = 1; skinRecord.lift[i * 3] = lift.x; skinRecord.lift[i * 3 + 1] = lift.y; skinRecord.lift[i * 3 + 2] = lift.z; } else skinRecord.ds[i] = _ds; }
+            if (inside) { kind = 1; dcArr[i] = -1; } else { kind = evaluateCloth(v, mode, clear); dcArr[i] = _dc; }
+          }
+        } else {
+          const m = Math.hypot(v.x - lastP[i * 3], v.y - lastP[i * 3 + 1], v.z - lastP[i * 3 + 2]);
+          const skipSkin = dsArr[i] >= 0 && m < dsArr[i] - EPS;
+          const skipCloth = dcArr[i] >= 0 && m < dcArr[i] - clear - EPS;
+          if (skipSkin && skipCloth) continue;   // still clear of both surfaces
+          lastP[i * 3] = v.x; lastP[i * 3 + 1] = v.y; lastP[i * 3 + 2] = v.z;
+          if (skipSkin) {
+            dsArr[i] -= m;
+            kind = evaluateCloth(v, mode, clear); dcArr[i] = _dc;
+          } else {
+            const inside = evaluateSkin(v, clear);
+            dsArr[i] = inside ? -1 : _ds;
+            if (inside) { kind = 1; dcArr[i] = -1; }
+            else if (skipCloth) { dcArr[i] -= m; kind = 0; }
+            else { kind = evaluateCloth(v, mode, clear); dcArr[i] = _dc; }
+          }
+        }
         if (!kind) continue;
         disp[i * 3] = lift.x; disp[i * 3 + 1] = lift.y; disp[i * 3 + 2] = lift.z;
         kindOf[i] = kind;
@@ -747,6 +818,7 @@ export function fitOuterLayers(root, store, body = null) {
     };
 
     let counts = computeField("normal");
+    if (skinRecord) { _hairSkinCache.set(geo, { key: layerKey, inside: skinRecord.inside, lift: skinRecord.lift, ds: skinRecord.ds }); skinRecord = null; }
     const initial = counts;
     if (!initial.total) continue;
     const trace = [`${initial.cloth}c/${initial.skin}s (+${initial.near} within clearance, nudged only)`];
