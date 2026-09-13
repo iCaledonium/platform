@@ -6,7 +6,7 @@ import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
 import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { MeshBVH } from "three-mesh-bvh";
-import { applySkinLayers, suspendSkinLayers, fitOuterLayers, prepareHairRide, rideHairOnCloth, pauseHairRide } from "./bodyLayers.js";
+import { applySkinLayers, suspendSkinLayers, fitOuterLayers, prepareHairRide, rideHairOnCloth, pauseHairRide, fitTopsOverBottoms } from "./bodyLayers.js";
 import { attachKtx2 } from "../lib/gltfKtx2.js";
 
 // Session 96: the three real, confirmed body-shape morphs (see
@@ -2415,6 +2415,10 @@ function settleLayers(loadedRoot, store, accessories, mixer = null, { verify = t
   let bodySurface = null;
   try { const m = findBodySkinMesh(loadedRoot); if (m) bodySurface = getBodySurfaceBVH(m); }
   catch (e) { console.warn("[MiniGlbViewer] settleLayers: no body surface for the hair skin rule:", e); }
+  // 3a. Session 175 - tops over bottoms first, so the hair layers over the
+  //     shirt as it finally sits (see bodyLayers.fitTopsOverBottoms).
+  try { fitTopsOverBottoms(store, bodySurface); }
+  catch (e) { console.warn("[MiniGlbViewer] tops-over-bottoms layering failed:", e); }
   fitOuterLayers(loadedRoot, store, bodySurface);
 
   // 4. Session 172 - the hair's RIG follows the surface it now rests on

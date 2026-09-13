@@ -430,6 +430,131 @@ const _scalpFingerprint = (pos, bbvh) => {
 const _bvhTag = new WeakMap(); let _bvhSeq = 0;
 const _bvhId = (bvh) => { if (!bvh) return "none"; if (!_bvhTag.has(bvh)) _bvhTag.set(bvh, ++_bvhSeq); return String(_bvhTag.get(bvh)); };
 
+
+// ── Tops over bottoms ─────────────────────────────────────────────────────────
+//
+// Session 175 (Magnus: "the jeans start to bleed through the shirt"). Every
+// garment is shrinkwrapped to the SKIN, and the geometric mask only hides
+// skin - nothing ever layered one garment over another. A tee's hem fitted to
+// skin clearance therefore sits INSIDE a waistband fitted to its own
+// clearance, and the jeans win wherever the two overlap. This is the hair
+// layering's radial-parity rule applied to tops: a ray outward from the
+// torso axis that crosses the bottoms an odd number of times starts beneath
+// them, and its last crossing is the surface the top must rest on (any
+// crossing at all, in fact - see the field loop for why not parity). Only
+// above the fork (one tube around the torso; between the thighs the radial
+// legitimately points into the other leg - the same guard the shrinkwrap
+// keeps), so a shirt reaching below the crotch is left alone there.
+const TOP_OVER_BOTTOM_CLEARANCE = 0.004;   // fabric over fabric: 4mm, a seam's worth
+const TOP_OVER_BOTTOM_SEARCH = 0.12;
+const TOP_OVER_BOTTOM_PASSES = 3;
+export function fitTopsOverBottoms(store, body = null) {
+  const tops = [], bottoms = [];
+  for (const [url, entries] of Object.entries(store || {})) {
+    const ms = (entries || []).filter((e) => e.mesh && e.mesh.visible !== false);
+    if (url.includes("/torso/")) tops.push(...ms);
+    else if (url.includes("/legs/")) bottoms.push(...ms);
+  }
+  if (!tops.length || !bottoms.length) return null;
+  const tri = [];
+  for (const e of bottoms) {
+    const geo = e.mesh.geometry, pos = geo.attributes.position; if (!pos) continue;
+    const push = (i) => tri.push(pos.getX(i), pos.getY(i), pos.getZ(i));
+    if (geo.index) for (let i = 0; i < geo.index.count; i++) push(geo.index.getX(i)); else for (let i = 0; i < pos.count; i++) push(i);
+  }
+  if (!tri.length) return null;
+  const bg = new THREE.BufferGeometry(); bg.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3));
+  const bbvh = new MeshBVH(bg); bg.computeBoundingBox();
+  const bbox = bg.boundingBox.clone().expandByScalar(TOP_OVER_BOTTOM_SEARCH);
+  // the fork: the lowest height at which the body's central axis is still
+  // inside one volume, from the intact body surface when given
+  let forkY = -Infinity;
+  if (body && body.bvh) {
+    const ray = new THREE.Ray(new THREE.Vector3(), new THREE.Vector3());
+    const dirs = [new THREE.Vector3(0.093, 0.031, 0.995).normalize(), new THREE.Vector3(0.719, 0.024, -0.694).normalize(), new THREE.Vector3(-0.757, 0.041, -0.652).normalize()];
+    const inside = (y) => { let votes = 0; for (const d of dirs) { ray.origin.set(0, y, 0); ray.direction.copy(d); let c = 0; for (const h of body.bvh.raycast(ray, THREE.DoubleSide)) if (h.distance > 1e-6) c++; if (c & 1) votes++; } return votes >= 2; };
+    for (let y = bbox.min.y; y <= bbox.max.y; y += 0.01) { if (inside(y)) { forkY = y; break; } }
+  }
+  const ray = new THREE.Ray(new THREE.Vector3(), new THREE.Vector3());
+  const p = new THREE.Vector3(), h = new THREE.Vector3(), lift = new THREE.Vector3();
+  const _tobHit = { point: new THREE.Vector3(), distance: 0, faceIndex: 0 };
+  const t0 = performance.now();
+  let totalBeneath = 0, totalLifted = 0, maxLift = 0, passesUsed = 0, near = 0, totalNear = 0;
+  for (const e of tops) {
+    const geo = e.mesh.geometry, pos = geo.attributes.position; if (!pos) continue;
+    const N = pos.count;
+    let adj = _hairAdjCache.get(geo) || null;
+    if (geo.index && (!adj || adj.length !== N)) {
+      adj = Array.from({ length: N }, () => new Set());
+      for (let i = 0; i < geo.index.count; i += 3) { const x = geo.index.getX(i), y = geo.index.getX(i + 1), z = geo.index.getX(i + 2); adj[x].add(y); adj[x].add(z); adj[y].add(x); adj[y].add(z); adj[z].add(x); adj[z].add(y); }
+      _hairAdjCache.set(geo, adj);
+    }
+    const disp = new Float32Array(N * 3);
+    const field = () => {
+      disp.fill(0); let n = 0; near = 0;
+      for (let i = 0; i < N; i++) {
+        p.set(pos.getX(i), pos.getY(i), pos.getZ(i));
+        if (p.y < forkY || !bbox.containsPoint(p)) continue;
+        h.set(p.x, 0, p.z); if (h.lengthSq() < 1e-8) continue;
+        ray.origin.copy(p); ray.direction.copy(h.normalize());
+        let crossings = 0, far = null;
+        for (const x of bbvh.raycast(ray, THREE.DoubleSide)) { if (x.distance <= 1e-6) continue; crossings++; if (!far || x.distance > far.distance) far = x; }
+        // ANY crossing, not parity: bottoms are layered primitives (waistband,
+        // yoke, pockets over the jeans body), so a hem tucked under the
+        // waistband sees two sheets outward and reads as outside by parity -
+        // measured live: 9 vertices caught of a hand-sized bleed. Outward from
+        // the axis a vertex outside the bottoms crosses nothing (belt loops
+        // and rivets aside, and a shirt should clear those too); anything
+        // crossed is fabric it must sit over, and the farthest is the surface.
+        if (crossings === 0) {
+          // Outside, but coincident: both garments were fitted to the same
+          // skin clearance, so a hem and a waistband can share a depth to the
+          // millimetre and the depth buffer alternates between them - the
+          // blotchy bleed seen live on Frida's lower back. Within the
+          // clearance, nudge out along the radial to the clearance.
+          if (!bbvh.closestPointToPoint(p, _tobHit, 0, TOP_OVER_BOTTOM_CLEARANCE)) continue;
+          lift.copy(ray.direction).multiplyScalar(TOP_OVER_BOTTOM_CLEARANCE - _tobHit.distance);
+          disp[i * 3] = lift.x; disp[i * 3 + 1] = lift.y; disp[i * 3 + 2] = lift.z;
+          near++;
+          continue;
+        }
+        if (!far || far.distance > TOP_OVER_BOTTOM_SEARCH) continue;
+        lift.copy(far.point).addScaledVector(ray.direction, TOP_OVER_BOTTOM_CLEARANCE).sub(p);
+        disp[i * 3] = lift.x; disp[i * 3 + 1] = lift.y; disp[i * 3 + 2] = lift.z;
+        const L = lift.length(); if (L > maxLift) maxLift = L;
+        n++;
+      }
+      return n;
+    };
+    let beneath = field();
+    totalNear += near;
+    if (!beneath && !near) continue;
+    totalBeneath += beneath;
+    beneath += near;
+    let passes = 0;
+    while (beneath > 0 && passes < TOP_OVER_BOTTOM_PASSES) {
+      // half-strength neighbour blend, twice, so the hem carries its
+      // neighbours instead of kinking (the hair layering's smoothing)
+      let f = disp;
+      if (adj) for (let s = 0; s < 2; s++) {
+        const next = f.slice();
+        for (let i = 0; i < N; i++) { const ns = adj[i]; if (!ns.size) continue; let sx = 0, sy = 0, sz = 0; for (const j of ns) { sx += f[j * 3]; sy += f[j * 3 + 1]; sz += f[j * 3 + 2]; } const k = ns.size; next[i * 3] = 0.5 * f[i * 3] + 0.5 * sx / k; next[i * 3 + 1] = 0.5 * f[i * 3 + 1] + 0.5 * sy / k; next[i * 3 + 2] = 0.5 * f[i * 3 + 2] + 0.5 * sz / k; }
+        f = next;
+      }
+      for (let i = 0; i < N; i++) { const dx = f[i * 3], dy = f[i * 3 + 1], dz = f[i * 3 + 2]; if (dx || dy || dz) { pos.setXYZ(i, pos.getX(i) + dx, pos.getY(i) + dy, pos.getZ(i) + dz); totalLifted++; } }
+      passes++;
+      beneath = field() + near;
+    }
+    // whatever smoothing left beneath is pinned to its exact lift
+    if (beneath > 0) for (let i = 0; i < N; i++) { const dx = disp[i * 3], dy = disp[i * 3 + 1], dz = disp[i * 3 + 2]; if (dx || dy || dz) pos.setXYZ(i, pos.getX(i) + dx, pos.getY(i) + dy, pos.getZ(i) + dz); }
+    passesUsed = Math.max(passesUsed, passes);
+    pos.needsUpdate = true;
+    geo.computeVertexNormals?.();
+  }
+  if (totalBeneath || totalNear) console.log(`[bodyLayers] tops over bottoms: ${totalBeneath} top vertex(es) started beneath the bottoms and ${totalNear} within clearance of them, lifted to ${(TOP_OVER_BOTTOM_CLEARANCE * 1000).toFixed(0)}mm over them (max ${(maxLift * 1000).toFixed(1)}mm, ${passesUsed} pass(es), fork at ${forkY === -Infinity ? "n/a" : (forkY * 100).toFixed(1) + "cm"}) in ${(performance.now() - t0).toFixed(0)}ms.`);
+  return { beneath: totalBeneath, maxLift };
+}
+
 export function fitOuterLayers(root, store, body = null) {
   const clothing = [];
   const hair = [];
