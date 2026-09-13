@@ -102,7 +102,7 @@ function zoneOfBone(name) {
   return "other";
 }
 
-function ensureZones(mesh) {
+export function ensureZones(mesh) {
   const geo = mesh.geometry;
   // Session 106's law, learned again the hard way: userData is not private.
   // GLTFExporter serializes it, so a body exported by the wizard WHILE these
@@ -353,8 +353,37 @@ export function suspendSkinLayers(root) {
       mesh.geometry.setIndex(new THREE.BufferAttribute(full.slice(), 1));
     }
   }
+  // Session 176 - a mask computed in the fit worker is put back as it was
+  // installed; only a mask this thread computed itself is recomputed.
+  const installed = installedMask.get(root);
+  if (installed) {
+    return () => { for (const [mesh, idx] of installed) if (mesh.geometry.index.count !== idx.length) mesh.geometry.setIndex(new THREE.BufferAttribute(idx.slice(), 1)); };
+  }
   const store = layerState.get(root) || {};
   return () => applySkinLayers(root, store);
+}
+
+// Session 176 - the mask now runs in the fit worker (see fitWorker.js) on a
+// mirror of the body, and comes back as one culled index per primitive. This
+// installs it on the live meshes and remembers it, so suspendSkinLayers can
+// restore it after an editable export without recomputing on this thread.
+const installedMask = new WeakMap();   // root -> Map(mesh -> index array)
+const sameIndex = (attr, arr) => {
+  if (!attr || attr.count !== arr.length) return false;
+  const a = attr.array;
+  for (let i = 0; i < arr.length; i++) if (a[i] !== arr[i]) return false;
+  return true;
+};
+export function installSkinMask(root, entries) {
+  const map = new Map();
+  let changed = 0;
+  for (const { mesh, index } of entries) {
+    if (!mesh || !index) continue;
+    map.set(mesh, index);
+    if (!sameIndex(mesh.geometry.index, index)) { mesh.geometry.setIndex(new THREE.BufferAttribute(index.slice(), 1)); changed++; }
+  }
+  installedMask.set(root, map);
+  return changed;
 }
 
 // ── Hair over clothing — the outermost layer fits what is beneath it ─────────
@@ -1219,6 +1248,31 @@ export function prepareHairRide(store, body = null) {
   });
   return { anchored, second, skin, total, clothVertices: cvMesh.length, skinVertices: bvPart.length, ms: Math.round(performance.now() - tRide0) };
 }
+
+// Session 176 - the anchors are computed in the fit worker on the mirror
+// store; these move the per-store state across. exportHairRideState names
+// each cloth mesh by garment url + part so the live thread can map it back to
+// its own mesh (the same order the worker built the cloth soup in);
+// installHairRide rebuilds rideState for the live store from those arrays,
+// with the live cloth meshes and body primitives in that order.
+export function exportHairRideState(store) {
+  const st = rideState.get(store);
+  if (!st) return null;
+  return {
+    cloth: st.cloth.map((m) => ({ url: m.userData.accessoryUrl, matName: m.userData.accessoryMatName })),
+    hasBody: !!st.bodyParts,
+    cvMesh: st.cvMesh, cvVi: st.cvVi, bvPart: st.bvPart, bvLocal: st.bvLocal, bvBase: st.bvBase,
+  };
+}
+export function installHairRide(store, data, clothMeshes, bodyParts) {
+  if (!data) { rideState.delete(store); return; }
+  rideState.set(store, {
+    cloth: clothMeshes, cvMesh: data.cvMesh, cvVi: data.cvVi, posed: new Float32Array(data.cvMesh.length * 3),
+    bodyParts: data.hasBody ? bodyParts : null, bvPart: data.bvPart, bvLocal: data.bvLocal, bvBase: data.bvBase, bposed: new Float32Array(data.bvPart.length * 3),
+    paused: false, lastPushed: 0,
+  });
+}
+export function clearHairRide(store) { rideState.delete(store); }
 
 const HAIR_RIDE_PAUSE_MAX_MS = 15000;   // no export takes this long; a pause older than this was never resumed
 export function pauseHairRide(store, paused) {
