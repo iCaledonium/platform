@@ -1000,8 +1000,17 @@ export function prepareHairRide(store, body = null) {
     const push = (vi) => { tri.push(pos.getX(vi), pos.getY(vi), pos.getZ(vi)); cMesh.push(mi); cVi.push(vi); };
     if (g.index) for (let i = 0; i < g.index.count; i++) push(g.index.getX(i)); else for (let i = 0; i < pos.count; i++) push(i);
   });
-  let g = null, bvh = null;
-  if (tri.length) { g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3)); bvh = new MeshBVH(g); }
+  let g = null, bvh = null, cbox = null;
+  if (tri.length) { g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3)); bvh = new MeshBVH(g); g.computeBoundingBox(); cbox = g.boundingBox.clone().expandByScalar(HAIR_RIDE_REACH + 0.005); }
+  // Session 175 - same two box tests as the rig transfer: no fabric within
+  // reach, or no non-head skin within reach, and the query is skipped.
+  let nbox = null;
+  if (partOf) {
+    nbox = new THREE.Box3(); const bp = body.geom.attributes.position; const tmpv = new THREE.Vector3();
+    for (let mv = 0; mv < zoneOf.length; mv++) if (zoneOf[mv] !== "head") nbox.expandByPoint(tmpv.fromBufferAttribute(bp, mv));
+    nbox.expandByScalar(HAIR_RIDE_REACH + 0.005);
+  }
+  const tRide0 = performance.now();
   // unique cloth vertex table
   const cvKey = new Map(); const cvMesh = [], cvVi = [];
   const cvId = (corner) => { const key = cMesh[corner] * 4294967296 + cVi[corner]; let id = cvKey.get(key); if (id === undefined) { id = cvMesh.length; cvKey.set(key, id); cvMesh.push(cMesh[corner]); cvVi.push(cVi[corner]); } return id; };
@@ -1055,10 +1064,10 @@ export function prepareHairRide(store, body = null) {
       p.set(base[i * 3], base[i * 3 + 1], base[i * 3 + 2]);
       // anchor 1: the nearest fabric
       let first = -1;
-      if (bvh && bvh.closestPointToPoint(p, hit, 0, HAIR_RIDE_REACH) && makeAnchor(hit.faceIndex, hit.point, corner, bary, sign, i)) { first = hit.faceIndex; anchored++; }
+      if (bvh && cbox.containsPoint(p) && bvh.closestPointToPoint(p, hit, 0, HAIR_RIDE_REACH) && makeAnchor(hit.faceIndex, hit.point, corner, bary, sign, i)) { first = hit.faceIndex; anchored++; }
       // skin anchor: the nearest skin within reach (fabric or not - a strand
       // on a bare shoulder has no fabric, one over a bra band has both)
-      if (partOf && body.bvh.closestPointToPoint(p, bhit, 0, HAIR_RIDE_REACH) && makeBodyAnchor(bhit.faceIndex, bhit.point, cornerB, baryB, signB, i)) skin++;
+      if (partOf && nbox.containsPoint(p) && body.bvh.closestPointToPoint(p, bhit, 0, HAIR_RIDE_REACH) && makeBodyAnchor(bhit.faceIndex, bhit.point, cornerB, baryB, signB, i)) skin++;
       // anchor 2: the fabric directly beneath, along the inward radial - the
       // surface the parity verdict measures against. DISABLED (Magnus, on the
       // desktop app: "still melts on both shoulders, you had it right but
@@ -1083,7 +1092,7 @@ export function prepareHairRide(store, body = null) {
     bodyParts: bodyOk ? body.parts : null, bvPart: Int32Array.from(bvPart), bvLocal: Uint32Array.from(bvLocal), bvBase: Float32Array.from(bvBase), bposed: new Float32Array(bvPart.length * 3),
     paused: false, lastPushed: 0,
   });
-  return { anchored, second, skin, total, clothVertices: cvMesh.length, skinVertices: bvPart.length };
+  return { anchored, second, skin, total, clothVertices: cvMesh.length, skinVertices: bvPart.length, ms: Math.round(performance.now() - tRide0) };
 }
 
 const HAIR_RIDE_PAUSE_MAX_MS = 15000;   // no export takes this long; a pause older than this was never resumed

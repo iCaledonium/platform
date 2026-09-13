@@ -1109,7 +1109,11 @@ const ACCESSORY_SHRINKWRAP = {
   // real penetration. The transfer now carries the body's proportions onto
   // the garment, which is what the resolver was standing in for when the
   // path was added; so the top keeps transfer + weld and skips the resolver.
-  pathFragments: ["/underwear/", "/legs/", "/feet/"],
+  // Session 175 - the Basic Shirt is a TIGHT tee, the case this list exists
+  // for: as a torso item it lost the resolver and the shoulder skin came
+  // straight through the sleeve seam (found live on Frida). Its own path,
+  // exactly as the Session 148 note prescribes for a tight top.
+  pathFragments: ["/underwear/", "/legs/", "/feet/", "/torso/top/top_short_basic_shirt"],
   // Session 157 — the /torso/ retraction above was written as a FOLDER
   // category, and a shirt is not filed under /torso/. "Basic Shirt" lives at
   // /underwear/top/underwear_shirt_basic_shirt, so it matches "/underwear/"
@@ -1213,7 +1217,9 @@ const ACCESSORY_SHRINKWRAP = {
 // Data-driven seating — correct for any future character/garment pair,
 // no hardcoded nudges.
 const ACCESSORY_REGISTRATION = {
-  pathFragments: ["/underwear/"],
+  // Session 175 - the tee copy under /torso/top/ registers like its
+  // /underwear/ twin did; same asset, same bones.
+  pathFragments: ["/underwear/", "/torso/top/top_short_basic_shirt"],
   enabled: true,
 };
 
@@ -1578,9 +1584,20 @@ function transferSurfaceSkinToHair(hairEntries, store, mainSkinnedMesh) {
       else for (let i = 0; i < pos.count; i++) push(i);
     }
   }
-  let cbvh = null, cgeom = null;
-  if (tri.length) { const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3)); cgeom = g; cbvh = new MeshBVH(g); }
+  let cbvh = null, cgeom = null, cbox = null;
+  if (tri.length) { const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3)); cgeom = g; cbvh = new MeshBVH(g); g.computeBoundingBox(); cbox = g.boundingBox.clone().expandByScalar(HAIR_SKIN_CLOTH_REACH + 0.005); }
   if (!cbvh && !bodyOk) return null;
+  // Session 175 - a vertex farther from every non-head skin vertex than the
+  // reach can only find head faces, which this rig discards anyway; the crown
+  // and bangs of a 72k-vertex hairdo skip both queries on a box test.
+  let nbox = null;
+  if (bodyOk) {
+    nbox = new THREE.Box3();
+    const bp = body.geom.attributes.position; let off = 0;
+    for (const part of body.parts) { const z = part.geometry.userData.bodyZones; const n = part.geometry.attributes.position.count; for (let i = 0; i < n; i++) { if (!Array.isArray(z) || z[i] !== "head") nbox.expandByPoint(cand.fromBufferAttribute(bp, off + i)); } off += n; }
+    nbox.expandByScalar(HAIR_SKIN_BODY_REACH + 0.005);
+  }
+  const tRig0 = performance.now();
 
   const p = new THREE.Vector3(), cand = new THREE.Vector3();
   const hit = { point: new THREE.Vector3(), distance: 0, faceIndex: 0 };
@@ -1603,7 +1620,7 @@ function transferSurfaceSkinToHair(hairEntries, store, mainSkinnedMesh) {
     for (let i = 0; i < N; i++) {
       p.set(pos.getX(i), pos.getY(i), pos.getZ(i));
       let m = null;
-      if (cbvh && cbvh.closestPointToPoint(p, hit, 0, HAIR_SKIN_CLOTH_REACH)) {
+      if (cbvh && cbox.containsPoint(p) && cbvh.closestPointToPoint(p, hit, 0, HAIR_SKIN_CLOTH_REACH)) {
         // Session 173 - corners through the BVH's REORDERED index (it rewrites
         // the index of the geometry it is built on); fc+k addressed the wrong
         // triangle before.
@@ -1611,7 +1628,7 @@ function transferSurfaceSkinToHair(hairEntries, store, mainSkinnedMesh) {
         for (let k = 0; k < 3; k++) { const ci = cgeom.index.getX(fc + k); cand.fromArray(tri, ci * 3); const d = cand.distanceToSquared(p); if (d < bestD) { bestD = d; best = ci; } }
         const sm = srcMesh[best]; m = readSkin(sm.geometry.attributes.skinIndex, sm.geometry.attributes.skinWeight, srcVert[best]);
         summary.cloth++;
-      } else if (bodyOk && body.bvh.closestPointToPoint(p, hit, 0, HAIR_SKIN_BODY_REACH)) {
+      } else if (bodyOk && nbox.containsPoint(p) && body.bvh.closestPointToPoint(p, hit, 0, HAIR_SKIN_BODY_REACH)) {
         const fc = hit.faceIndex * 3; let best = -1, bestD = Infinity;
         for (let k = 0; k < 3; k++) { const vi = body.geom.index.getX(fc + k); cand.fromBufferAttribute(body.geom.attributes.position, vi); const d = cand.distanceToSquared(p); if (d < bestD) { bestD = d; best = vi; } }
         const part = body.parts[partOf[best]], li = localOf[best];
@@ -1673,6 +1690,7 @@ function transferSurfaceSkinToHair(hairEntries, store, mainSkinnedMesh) {
     }
     hSI.needsUpdate = true; hSW.needsUpdate = true;
   }
+  summary.ms = Math.round(performance.now() - tRig0);
   return summary;
 }
 
@@ -2338,7 +2356,14 @@ function verifyHairUnderIdle(loadedRoot, store, mixer) {
 // skins 70k+ hair vertices eight times over (a second and more on Kin hair)
 // and is a diagnostic, not a fit. Loads and body refits keep it; the slider
 // path, which settles after every rest of the pointer, does not.
-function settleLayers(loadedRoot, store, accessories, mixer = null, { verify = true } = {}) {
+// Session 175 - `deferRig`: the rig transfer and ride anchoring (the two
+// per-vertex passes that remain after the layering caches) run in their own
+// task a moment later, so the garment's new fit paints first and a follow-up
+// tweak cancels the work instead of paying for it. Loads and refits keep the
+// synchronous order; the slider path defers.
+let _deferredRigTimer = null;
+function settleLayers(loadedRoot, store, accessories, mixer = null, { verify = true, deferRig = false } = {}) {
+  if (_deferredRigTimer) { clearTimeout(_deferredRigTimer); _deferredRigTimer = null; }
   // Session 173 - the manual-fit effect's debounced settle can fire before the
   // body has loaded; there is nothing to layer against yet (found live as a
   // TypeError inside findBodySkinMesh(null) from the rig transfer).
@@ -2395,18 +2420,25 @@ function settleLayers(loadedRoot, store, accessories, mixer = null, { verify = t
   // 4. Session 172 - the hair's RIG follows the surface it now rests on
   //    (fabric first, skin otherwise), so the layering above survives the
   //    idle clip: see transferSurfaceSkinToHair.
-  try {
-    const r = transferSurfaceSkinToHair(hairEntries.map((h) => h.e), store, findBodySkinMesh(loadedRoot));
-    if (r) console.log(`[MiniGlbViewer] Hair rig follows its resting surface: ${r.cloth} vertex(es) near fabric, ${r.body} near skin, ${r.ramp} on the head-to-surface ramp, ${r.kept} kept the hair's own rig.`);
-  } catch (e) { console.warn("[MiniGlbViewer] Hair rig transfer failed, hair keeps its own rig:", e); }
-
   // 4b. Session 173 - anchors for the per-frame ride (see bodyLayers
   //     prepareHairRide / rideHairOnCloth): what is left after the rig
   //     transfer is corrected in the posed space, every frame.
-  try {
-    const r = prepareHairRide(store, bodySurface);
-    if (r) console.log(`[MiniGlbViewer] Hair ride: ${r.anchored} of ${r.total} hair vertex(es) anchored to fabric, ${r.skin} to skin; ${r.clothVertices} fabric + ${r.skinVertices} skin vertex(es) posed per frame; corrected per frame from here on.`);
-  } catch (e) { console.warn("[MiniGlbViewer] Hair ride anchors failed, hair keeps its settled shape only:", e); }
+  const rigAndRide = () => {
+    try {
+      const r = transferSurfaceSkinToHair(hairEntries.map((h) => h.e), store, findBodySkinMesh(loadedRoot));
+      if (r) console.log(`[MiniGlbViewer] Hair rig follows its resting surface: ${r.cloth} vertex(es) near fabric, ${r.body} near skin, ${r.ramp} on the head-to-surface ramp, ${r.kept} kept the hair's own rig (${r.ms}ms).`);
+    } catch (e) { console.warn("[MiniGlbViewer] Hair rig transfer failed, hair keeps its own rig:", e); }
+    try {
+      const r = prepareHairRide(store, bodySurface);
+      if (r) console.log(`[MiniGlbViewer] Hair ride: ${r.anchored} of ${r.total} hair vertex(es) anchored to fabric, ${r.skin} to skin; ${r.clothVertices} fabric + ${r.skinVertices} skin vertex(es) posed per frame; corrected per frame from here on (${r.ms}ms).`);
+    } catch (e) { console.warn("[MiniGlbViewer] Hair ride anchors failed, hair keeps its settled shape only:", e); }
+  };
+  if (deferRig && hairEntries.length) {
+    for (const { e } of hairEntries) e.ride = null;   // no stale anchors ride a re-layered hair in the meantime
+    _deferredRigTimer = setTimeout(() => { _deferredRigTimer = null; rigAndRide(); }, 1000);
+  } else {
+    rigAndRide();
+  }
 
   applySkinLayers(loadedRoot, store);
 
@@ -4518,7 +4550,7 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
       // Session 152 - a manual fit change moves a LAYER, so the layers above
       // and beneath it are stale once the slider settles (found live, red
       // ring around her yoke). One settle per rest, after the re-wrap.
-      settleLayers(loadedRootRef.current, accessoryMeshesRef.current, accessories, mixerRef.current, { verify: false });
+      settleLayers(loadedRootRef.current, accessoryMeshesRef.current, accessories, mixerRef.current, { verify: false, deferRig: true });
     }, 200);
     // Dependency key covers scale, offset, rotation, per-part adjustments,
     // tint AND hidden - `hidden` matters on its own: removing a top changes
