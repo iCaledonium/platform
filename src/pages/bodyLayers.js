@@ -414,6 +414,21 @@ const HAIR_BODY_SEARCH = 0.05;  // no skin within 5cm means the vertex cannot be
 // The verdict is logged per hair primitive as ASSERT PASS / ENFORCED / FAILED,
 // the same vocabulary as the garment wrap, so a screenshot claim ("hair melts
 // into the top") can be checked against numbers instead of eyes.
+// Session 175 - what a settle re-derived from scratch every time, cached:
+// the strand adjacency (topology never changes) and the scalp mask (three
+// raycasts per vertex; only changes when the hair or the body moves, which a
+// position fingerprint catches). Both keyed on the geometry object.
+const _hairAdjCache = new WeakMap();
+const _hairScalpCache = new WeakMap();
+const _scalpFingerprint = (pos, bbvh) => {
+  const N = pos.count, step = Math.max(1, Math.floor(N / 97));
+  let h = N * 7919;
+  for (let i = 0; i < N; i += step) h = (h * 31 + Math.round((pos.getX(i) + pos.getY(i) * 3 + pos.getZ(i) * 7) * 1e4)) | 0;
+  return `${h}:${N}`;
+};
+const _bvhTag = new WeakMap(); let _bvhSeq = 0;
+const _bvhId = (bvh) => { if (!bvh) return "none"; if (!_bvhTag.has(bvh)) _bvhTag.set(bvh, ++_bvhSeq); return String(_bvhTag.get(bvh)); };
+
 export function fitOuterLayers(root, store, body = null) {
   const clothing = [];
   const hair = [];
@@ -438,11 +453,16 @@ export function fitOuterLayers(root, store, body = null) {
     if (geo.index) for (let i = 0; i < geo.index.count; i++) push(geo.index.getX(i));
     else for (let i = 0; i < pos.count; i++) push(i);
   }
-  let cbvh = null;
+  let cbvh = null, cbox = null;
   if (tri.length) {
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.Float32BufferAttribute(tri, 3));
     cbvh = new MeshBVH(g);
+    // Session 175 - the cloth's box, padded by the farthest any cloth rule
+    // reaches. Most of a long hairdo (scalp, crown, bangs) sits above every
+    // garment and never needed the raycasts it was paying for.
+    g.computeBoundingBox();
+    cbox = g.boundingBox.clone().expandByScalar(Math.max(HAIR_SEARCH, HAIR_CLEARANCE) + 0.01);
   }
 
   // The intact body surface (getBodySurfaceBVH's cache: bvh + merged geom +
@@ -535,7 +555,7 @@ export function fitOuterLayers(root, store, body = null) {
         return 1;
       }
     }
-    if (cbvh) {
+    if (cbvh && cbox.containsPoint(p)) {
       // Beneath or outside is decided by PARITY along the outward radial from
       // the torso axis, not by the sign of the closest face: on a pleated
       // blouse the closest face is often the far wall of a fold, whose normal
@@ -597,21 +617,34 @@ export function fitOuterLayers(root, store, body = null) {
     const N = pos.count;
 
     // Scalp mask, taken BEFORE anything moves: inside the body, head nearest.
-    const scalp = new Uint8Array(N);
-    if (bbvh) {
-      for (let i = 0; i < N; i++) {
-        v.set(pos.getX(i), pos.getY(i), pos.getZ(i));
-        if (bbvh.closestPointToPoint(v, bt, 0, HAIR_BODY_SEARCH) && bodyZoneAt(bt.faceIndex) === "head" && insideBody(v)) scalp[i] = 1;
+    let scalp;
+    {
+      const key = `${_bvhId(bbvh)}|${_scalpFingerprint(pos, bbvh)}`;
+      const cached = _hairScalpCache.get(geo);
+      if (cached && cached.key === key) scalp = cached.scalp;
+      else {
+        scalp = new Uint8Array(N);
+        if (bbvh) {
+          for (let i = 0; i < N; i++) {
+            v.set(pos.getX(i), pos.getY(i), pos.getZ(i));
+            if (bbvh.closestPointToPoint(v, bt, 0, HAIR_BODY_SEARCH) && bodyZoneAt(bt.faceIndex) === "head" && insideBody(v)) scalp[i] = 1;
+          }
+        }
+        _hairScalpCache.set(geo, { key, scalp });
       }
     }
 
     // Strand topology, once, for the smoothing and the feather.
     let adj = null;
     if (geo.index) {
-      adj = Array.from({ length: N }, () => new Set());
-      for (let i = 0; i < geo.index.count; i += 3) {
-        const x = geo.index.getX(i), y = geo.index.getX(i + 1), z = geo.index.getX(i + 2);
-        adj[x].add(y); adj[x].add(z); adj[y].add(x); adj[y].add(z); adj[z].add(x); adj[z].add(y);
+      adj = _hairAdjCache.get(geo) || null;
+      if (!adj || adj.length !== N) {
+        adj = Array.from({ length: N }, () => new Set());
+        for (let i = 0; i < geo.index.count; i += 3) {
+          const x = geo.index.getX(i), y = geo.index.getX(i + 1), z = geo.index.getX(i + 2);
+          adj[x].add(y); adj[x].add(z); adj[y].add(x); adj[y].add(z); adj[z].add(x); adj[z].add(y);
+        }
+        _hairAdjCache.set(geo, adj);
       }
     }
 
@@ -622,11 +655,19 @@ export function fitOuterLayers(root, store, body = null) {
     const clearScaleAt = (y) => scalpBaseY === null ? 1 : Math.min(1, Math.max(0.4, 0.4 + 0.6 * (scalpBaseY - y) / 0.10));
     const disp = new Float32Array(N * 3);
     const kindOf = new Uint8Array(N);   // 1 skin, 2 cloth (violations), 3 clearance nudge
-    const computeField = (mode = "exit") => {
+    // Session 175 - the cloth and the body do not move during a settle, so
+    // after the first full measurement only a vertex that MOVED (apply,
+    // feather, raw snap) or was violating can change its verdict. Later
+    // fields evaluate that set only; everything else keeps a clean zero.
+    const moved = new Uint8Array(N);
+    const cand = new Uint8Array(N);
+    const markCand = () => { for (let i = 0; i < N; i++) cand[i] = (kindOf[i] !== 0 || moved[i]) ? 1 : 0; };
+    const computeField = (mode = "exit", only = null) => {
       disp.fill(0); kindOf.fill(0);
       let skin = 0, cloth = 0, near = 0;
       for (let i = 0; i < N; i++) {
         if (scalp[i]) continue;
+        if (only && !only[i]) continue;
         v.set(pos.getX(i), pos.getY(i), pos.getZ(i));
         const kind = evaluate(v, mode, clearScaleAt(v.y));
         if (!kind) continue;
@@ -693,14 +734,16 @@ export function fitOuterLayers(root, store, body = null) {
       return out;
     };
     const apply = (field) => {
-      let moved = 0;
+      let n = 0;
+      moved.fill(0);
       for (let i = 0; i < N; i++) {
         const dx = field[i * 3], dy = field[i * 3 + 1], dz = field[i * 3 + 2];
         if (dx === 0 && dy === 0 && dz === 0) continue;
         pos.setXYZ(i, pos.getX(i) + dx, pos.getY(i) + dy, pos.getZ(i) + dz);
-        moved++;
+        moved[i] = 1;
+        n++;
       }
-      return moved;
+      return n;
     };
 
     let counts = computeField("normal");
@@ -713,11 +756,12 @@ export function fitOuterLayers(root, store, body = null) {
     //    exit, which always converges.
     let passes = 0;
     while (counts.total > 0 && passes < HAIR_MAX_PASSES) {
-      const moved = apply(smoothed(disp));   // (the envelope variant spread locks into wings over the shoulders - see enveloped)
+      const n = apply(smoothed(disp));   // (the envelope variant spread locks into wings over the shoulders - see enveloped)
       passes++;
       const mode = passes < 2 ? "normal" : "exit";
-      counts = computeField(mode);
-      trace.push(`p${passes}:${moved}m>${counts.cloth}c/${counts.skin}s${mode === "normal" ? "n" : "x"}`);
+      markCand();
+      counts = computeField(mode, cand);
+      trace.push(`p${passes}:${n}m>${counts.cloth}c/${counts.skin}s${mode === "normal" ? "n" : "x"}`);
     }
 
     // 2. Assert: pin the leftovers to their exact lift, feather the free
@@ -743,18 +787,22 @@ export function fitOuterLayers(root, store, body = null) {
         }
       }
       feathered = apply(field) - pinned;
-      counts = computeField();
+      markCand();
+      counts = computeField("exit", cand);
       trace.push(`feather:${pinned}pin>${counts.cloth}c/${counts.skin}s`);
       if (counts.total > 0) {
         raw = counts.total;
-        let moved = 0;
+        let n = 0;
+        moved.fill(0);
         for (let i = 0; i < N; i++) {
           if (kindOf[i] !== 1 && kindOf[i] !== 2) continue;
           pos.setXYZ(i, pos.getX(i) + disp[i * 3], pos.getY(i) + disp[i * 3 + 1], pos.getZ(i) + disp[i * 3 + 2]);
-          moved++;
+          moved[i] = 1;
+          n++;
         }
-        counts = computeField();
-        trace.push(`raw:${moved}m>${counts.cloth}c/${counts.skin}s`);
+        markCand();
+        counts = computeField("exit", cand);
+        trace.push(`raw:${n}m>${counts.cloth}c/${counts.skin}s`);
       }
     }
 

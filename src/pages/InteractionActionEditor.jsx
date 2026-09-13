@@ -98,6 +98,16 @@ export default function InteractionActionEditor({ rig, step, stepIndex, onStepCh
   const [bone, setBone] = useState(kind === "reaction" ? "head" : "right_upper_arm");
   const [t, setT] = useState(0);
   const [busy, setBusy] = useState(false);
+  // Clear-all arms on the first click and fires on the second (Magnus,
+  // 2026-09-13). A confirm dialog would break the pose-tuning rhythm; a
+  // silent one-click wipe would throw away a pose that took nine rounds to
+  // find. Disarms by itself after 3s so it cannot lie in wait.
+  const [armClear, setArmClear] = useState(false);
+  useEffect(() => {
+    if (!armClear) return;
+    const id = setTimeout(() => setArmClear(false), 3000);
+    return () => clearTimeout(id);
+  }, [armClear]);
 
   const names = rig?.state?.() || {};
   const nameOf = (r) => names?.[r]?.name || r;
@@ -170,6 +180,14 @@ export default function InteractionActionEditor({ rig, step, stepIndex, onStepCh
     // left to look wrong in playback.
     if (!tr.keys.some(k => k[0] === 0)) tr.keys.unshift([0, [0, 0, 0]]);
     publish(next, true);
+  };
+
+  // Every track, every bone — back to an unposed body, name and length kept.
+  const clearAllKeys = () => {
+    const next = structuredClone(draft);
+    next.tracks = [];
+    publish(next, true);
+    setArmClear(false);
   };
 
   const removeKey = () => {
@@ -322,6 +340,11 @@ export default function InteractionActionEditor({ rig, step, stepIndex, onStepCh
           ))}
           <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
             <button style={{ ...btn(), fontSize: 11, padding: "4px 8px" }} onClick={removeKey}>Delete key at t</button>
+            <button style={{ ...btn(armClear ? "primary" : "plain"), fontSize: 11, padding: "4px 8px" }}
+                    title="Remove every keyframe on every bone — the pose goes back to an unposed body. Click twice."
+                    onClick={() => (armClear ? clearAllKeys() : setArmClear(true))}>
+              {armClear ? "Clear all keys — sure?" : "Clear all keys"}
+            </button>
           </div>
           <div style={{ fontSize: 11, color: "#8b8781", marginTop: 6 }}>
             Moving a slider writes a keyframe at t. Keys on this bone:{" "}

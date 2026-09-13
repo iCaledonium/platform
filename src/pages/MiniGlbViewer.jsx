@@ -2334,7 +2334,11 @@ function verifyHairUnderIdle(loadedRoot, store, mixer) {
   if (bad === 0) console.log(line); else console.warn(line);
 }
 
-function settleLayers(loadedRoot, store, accessories, mixer = null) {
+// Session 175 - `verify` gates the 8-pose hair-under-idle assertion: it
+// skins 70k+ hair vertices eight times over (a second and more on Kin hair)
+// and is a diagnostic, not a fit. Loads and body refits keep it; the slider
+// path, which settles after every rest of the pointer, does not.
+function settleLayers(loadedRoot, store, accessories, mixer = null, { verify = true } = {}) {
   // Session 173 - the manual-fit effect's debounced settle can fire before the
   // body has loaded; there is nothing to layer against yet (found live as a
   // TypeError inside findBodySkinMesh(null) from the rig transfer).
@@ -2407,7 +2411,7 @@ function settleLayers(loadedRoot, store, accessories, mixer = null) {
   applySkinLayers(loadedRoot, store);
 
   // 5. Session 172 - and measured in motion, off this frame.
-  if (mixer) setTimeout(() => { try { verifyHairUnderIdle(loadedRoot, store, mixer); } catch (e) { console.warn("[MiniGlbViewer] hair-under-idle check failed:", e); } }, 60);
+  if (mixer && verify) setTimeout(() => { try { verifyHairUnderIdle(loadedRoot, store, mixer); } catch (e) { console.warn("[MiniGlbViewer] hair-under-idle check failed:", e); } }, 60);
 }
 
 function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loadedRoot, dracoLoader, isMounted, manualScale, manualOffset, manualRotation, manualParts, accessoryMeshesStore, statureHeightM = null, manualTint = null, manualHidden = false) {
@@ -2569,10 +2573,24 @@ function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loade
               m.needsUpdate = true;
               console.log(`[MiniGlbViewer] Accessory material "${m.name}": converted alpha BLEND -> alpha CUTOUT (transparent=false, alphaTest=0.5, depthWrite=true) to fix garment depth-sorting artifacts.`);
             } else if (m.transparent && accessoryUrl.includes("/hair/")) {
+              // Session 175 - the Session 147 middle path (blend + depthWrite
+              // + alphaTest 0.15) held for dense hair cards (Charm: ~50% of
+              // texels opaque) and fell apart on soft strand hair (Kin: 3.4%
+              // of texels above alpha 0.5, 12% above 0.15). There every
+              // 15-50%-alpha fragment wrote depth and occluded the strands
+              // behind it while covering nothing itself - a sparse, greyish
+              // ghost of a hairdo, seen live on Frida. Alpha-to-coverage
+              // instead: the fragment's alpha becomes MSAA sample coverage,
+              // so soft edges resolve without sorting, depth is written by
+              // what is actually visible, and the melting Session 147 fixed
+              // stays fixed. Every renderer here is created with
+              // antialias: true, which is what A2C needs.
+              m.transparent = false;
+              m.alphaToCoverage = true;
               m.depthWrite = true;
-              m.alphaTest = 0.15;
+              m.alphaTest = 0.05;
               m.needsUpdate = true;
-              console.log(`[MiniGlbViewer] Accessory material "${m.name}": hair depth fix (blend kept, depthWrite=true, alphaTest=0.15) so hair occludes garments instead of melting into them.`);
+              console.log(`[MiniGlbViewer] Accessory material "${m.name}": hair alpha-to-coverage (transparent=false, alphaToCoverage=true, depthWrite=true, alphaTest=0.05).`);
             }
           });
 
@@ -4349,6 +4367,9 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
   // stays baked in the prefit snapshot and is not recomputed.
   const refitTimerRef = useRef(null);
   const layerSettleTimerRef = useRef(null);
+  const wrapTimerRef = useRef(null);
+  const pendingWrapRef = useRef([]);
+  const manualFitKeysRef = useRef(new Map());
   useEffect(() => {
     if (refitTimerRef.current) clearTimeout(refitTimerRef.current);
     // Session 162 - RETRY instead of giving up.
@@ -4445,48 +4466,63 @@ export default function MiniGlbViewer({ glbUrl, accessories = [], bodyTorsoLengt
   // is the fix for the loading-spinner-on-every-drag bug — scale used
   // to live inside the load effect's own dependencies above, so every
   // tick re-triggered a full reload; now it's fully separate.
+  // Session 175 - a slider tick used to cost the whole wardrobe: every
+  // primitive of every garment re-scaled, every shrinkwrap-eligible one
+  // re-wrapped and re-welded (20-120ms each, fourteen of them on a dressed
+  // body), then a settle - on EVERY input event of a drag. Two changes:
+  // only garments whose transform actually changed are touched at all (a
+  // tint on the bra no longer re-wraps the jeans), and the re-wrap is
+  // debounced so the drag shows the cheap transform live and pays for one
+  // shrinkwrap + weld when the pointer rests, with the settle after that.
   useEffect(() => {
+    const prev = manualFitKeysRef.current;
+    const next = new Map();
+    const toWrap = [];
     for (const { url, scale, offset, rotation, parts, tint, hidden } of accessories) {
-      // One entry PER PRIMITIVE — a multi-material accessory (e.g. the
-      // shorts: Trim + Pants + Waistband, or the bra: Bra_Heart /
-      // Bra_Main / Bra_Upper_Border / Bra_Straps / Bra_Underbust). Each
-      // primitive gets the garment-level transform combined with its
-      // own optional per-part adjustment (scales multiply, offsets add).
       const entries = accessoryMeshesRef.current[url];
-      if (entries) {
-        for (const entry of entries) {
-          // GARMENT-level visibility first (Session 163 — an occluded
-          // garment, e.g. underwear under a top, stays loaded so it
-          // exports, but must not render live), THEN per-part visibility:
-          // hidden unless explicitly set false — lets the wizard toggle
-          // individual parts (e.g. hide the bra's heart ornament, or
-          // isolate the band while fitting it). Lives inside the same
-          // parts object, so the dependency key below already covers it.
+      if (!entries) continue;
+      const key = JSON.stringify([scale, offset, rotation, parts]);
+      const visKey = JSON.stringify([tint, hidden, parts && Object.fromEntries(Object.entries(parts).map(([k, v]) => [k, [v?.visible, v?.tint]]))]);
+      next.set(url, { key, visKey });
+      const was = prev.get(url);
+      const transformChanged = !was || was.key !== key;
+      const visChanged = !was || was.visKey !== visKey;
+      if (!transformChanged && !visChanged) continue;
+      for (const entry of entries) {
+        if (visChanged) {
+          // GARMENT-level visibility first (Session 163 - an occluded garment
+          // stays loaded so it exports, but must not render live), THEN
+          // per-part visibility, then the live tint (Session 141).
           entry.mesh.visible = hidden ? false : (parts?.[entry.matName]?.visible !== false);
-          const t = effectiveTransform(scale, offset, rotation, parts, entry.matName);
-          applyManualFit(entry, t, mainMeshRef.current);
-          // Session 141 — live tint, same whole/part rule (see
-          // applyAccessoryTint for why this was never live before).
           applyAccessoryTint(entry.mesh, parts?.[entry.matName]?.tint || tint);
+        }
+        if (transformChanged) {
+          const t = effectiveTransform(scale, offset, rotation, parts, entry.matName);
+          entry.ride = null;
+          applyAccessoryScale(entry.mesh, entry.originalPositions, entry.center, t.scale, t.offset, t.rotation);
+          toWrap.push([entry, t]);
         }
       }
     }
-    // Session 152 — a manual fit change moves a LAYER, so the layers above
-    // and beneath it are stale the moment the slider settles: scale a top's Z
-    // to 1.15x and the yoke grows out over hair that was fitted against the
-    // smaller top (found live, red ring around her yoke), while the skin mask
-    // keeps culling for the old surface. Debounced like the body refit, so a
-    // drag costs one settle, not sixty.
+    manualFitKeysRef.current = next;
+    if (toWrap.length) pendingWrapRef.current.push(...toWrap);
+    if (wrapTimerRef.current) clearTimeout(wrapTimerRef.current);
     if (layerSettleTimerRef.current) clearTimeout(layerSettleTimerRef.current);
-    layerSettleTimerRef.current = setTimeout(() => {
-      settleLayers(loadedRootRef.current, accessoryMeshesRef.current, accessories, mixerRef.current);
-    }, 350);
-    // Dependency key covers scale, offset, per-part adjustments, tint AND
-    // hidden — all re-apply live on every drag/pick/occlusion change, with
-    // no model reload. `hidden` matters on its own: removing a top changes
-    // the BRA's occlusion state without touching the bra's own scale/
-    // offset/parts/tint, so it has to be in this key or the visibility flip
-    // above would never re-run.
+    wrapTimerRef.current = setTimeout(() => {
+      const batch = pendingWrapRef.current; pendingWrapRef.current = [];
+      const seen = new Set();
+      for (const [entry, t] of batch) {
+        if (seen.has(entry)) continue; seen.add(entry);
+        applyManualFit(entry, t, mainMeshRef.current);
+      }
+      // Session 152 - a manual fit change moves a LAYER, so the layers above
+      // and beneath it are stale once the slider settles (found live, red
+      // ring around her yoke). One settle per rest, after the re-wrap.
+      settleLayers(loadedRootRef.current, accessoryMeshesRef.current, accessories, mixerRef.current, { verify: false });
+    }, 200);
+    // Dependency key covers scale, offset, rotation, per-part adjustments,
+    // tint AND hidden - `hidden` matters on its own: removing a top changes
+    // the BRA's occlusion state without touching the bra's own transform.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [JSON.stringify(accessories.map(a => [a.scale, a.offset, a.rotation, a.parts, a.tint, a.hidden]))]);
 

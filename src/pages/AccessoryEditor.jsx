@@ -1,3 +1,4 @@
+import { useState as useVbState, useEffect as useVbEffect } from "react";
 // AccessoryEditor.jsx
 // The ONE wardrobe-editing surface — region/slot picker, per-garment and
 // per-part fit (scale/offset/rotation), and tint. Extracted verbatim from
@@ -198,6 +199,34 @@ const S = {
 // Every prop below is state or a setter the CALLER owns. This component
 // reads and writes through the setters exactly as CharacterWizard's inline
 // version did — no behavior change from the extraction, only location.
+
+// Session 175 (Magnus: "all sliders shall have an input field to type the
+// value, and the slider shall follow"). One box beside every range input:
+// shows the same number the read-out did, accepts a typed value (live, as
+// soon as it parses), commits on Enter/blur, and the unit label still resets
+// on click. `display` is in the unit shown (x, cm, degrees); `onCommit` gets
+// that same unit back and the caller converts (cm -> m for offsets).
+function ValueBox({ display, decimals, step, unit, onCommit, onReset }) {
+  const fmt = (v) => Number(v).toFixed(decimals);
+  const [txt, setTxt] = useVbState(fmt(display));
+  const [focused, setFocused] = useVbState(false);
+  useVbEffect(() => { if (!focused) setTxt(fmt(display)); }, [display, focused]); // eslint-disable-line react-hooks/exhaustive-deps
+  const commit = (raw) => { const v = parseFloat(String(raw).replace(",", ".")); if (Number.isFinite(v)) onCommit(v); };
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 3, flexShrink: 0 }}>
+      <input
+        type="number" step={step} value={txt}
+        onFocus={() => setFocused(true)}
+        onBlur={() => { setFocused(false); commit(txt); }}
+        onChange={(e) => { setTxt(e.target.value); commit(e.target.value); }}
+        onKeyDown={(e) => { if (e.key === "Enter") { commit(txt); e.currentTarget.blur(); } }}
+        style={{ ...S.sliderVal, width: 58, textAlign: "right", border: "1px solid rgba(0,0,0,0.15)", borderRadius: 4, padding: "2px 4px", background: "#fff" }}
+      />
+      <span onClick={onReset} title="Click to reset" style={{ ...S.sliderVal, width: "auto", cursor: "pointer" }}>{unit}</span>
+    </span>
+  );
+}
+
 export default function AccessoryEditor({
   accessories, setAccessories,
   dynamicAccessoryOptions,
@@ -408,11 +437,9 @@ export default function AccessoryEditor({
                               onChange={e => axis ? editScale({ [axis]: parseFloat(e.target.value) }) : editUniform(parseFloat(e.target.value))}
                               style={{flex:1,accentColor:"#b05c08",height:4,cursor:"pointer"}}
                             />
-                            <span
-                              onClick={() => axis ? editScale({ [axis]: 1 }) : editUniform(1)}
-                              title="Click to reset"
-                              style={{...S.sliderVal,width:52,cursor:"pointer"}}
-                            >{value.toFixed(2)}x</span>
+                            <ValueBox display={value} decimals={2} step={0.01} unit="x"
+                              onCommit={(v) => axis ? editScale({ [axis]: v }) : editUniform(v)}
+                              onReset={() => axis ? editScale({ [axis]: 1 }) : editUniform(1)} />
                           </div>
                         );
                       })}
@@ -434,11 +461,9 @@ export default function AccessoryEditor({
                               onChange={e => editOffset({ [axis]: parseFloat(e.target.value) })}
                               style={{flex:1,accentColor:"#b05c08",height:4,cursor:"pointer"}}
                             />
-                            <span
-                              onClick={() => editOffset({ [axis]: 0 })}
-                              title="Click to reset"
-                              style={{...S.sliderVal,width:52,cursor:"pointer"}}
-                            >{(value * 100).toFixed(1)}cm</span>
+                            <ValueBox display={value * 100} decimals={1} step={0.1} unit="cm"
+                              onCommit={(cm) => editOffset({ [axis]: cm / 100 })}
+                              onReset={() => editOffset({ [axis]: 0 })} />
                           </div>
                         );
                       })}
@@ -460,11 +485,9 @@ export default function AccessoryEditor({
                               onChange={e => editRotation({ [axis]: parseFloat(e.target.value) })}
                               style={{flex:1,accentColor:"#b05c08",height:4,cursor:"pointer"}}
                             />
-                            <span
-                              onClick={() => editRotation({ [axis]: 0 })}
-                              title="Click to reset"
-                              style={{...S.sliderVal,width:52,cursor:"pointer"}}
-                            >{value.toFixed(0)}°</span>
+                            <ValueBox display={value} decimals={0} step={1} unit="°"
+                              onCommit={(deg) => editRotation({ [axis]: deg })}
+                              onReset={() => editRotation({ [axis]: 0 })} />
                           </div>
                         );
                       })}
