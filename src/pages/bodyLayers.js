@@ -404,7 +404,7 @@ export function installSkinMask(root, entries) {
 // along the fabric normal — then smooth the displacements through the strand
 // topology so ribbons bend instead of kinking. Vertices nowhere near fabric —
 // which is almost all of the hair — are untouched.
-const HAIR_CLEARANCE = 0.02;   // hair floats ~2cm proud of cloth (and 2cm out of skin) - a visible gap, not a decal (Session 172: 4mm z-fought with the fabric on screen and read as "melting")
+const HAIR_CLEARANCE = 0.008;  // hair floats 8mm proud of cloth (and 8mm out of skin). Was 2cm, chosen on Lindsey's PLEATED Angie blouse where a strand has to clear the fold ridges; on Frida's smooth basic shirt the same 2cm reads as hair hovering off the shoulder. Measured in the running app, nearest hair-to-shirt vertex in the chest/shoulder band: as authored p10 5.7mm / p50 15.4mm, after the settle 18.7 / 23.5, after the ride 20.5 / 27.5 - i.e. the pipeline was holding the closest strands at exactly the 2cm it was told to. 4mm z-fought (Session 172), so 8mm is the floor that still reads as contact.
 const HAIR_SEARCH = 0.15;       // a strand up to 15cm beneath the cloth is still brought out (parity makes "beneath" reliable; 4 of Lindsey's sat 8-11cm in)
 const HAIR_MAX_LIFT = 0.08;     // and no vertex teleports
 const HAIR_MAX_PASSES = 4;      // lift+smooth rounds before the assertion takes over
@@ -1081,7 +1081,7 @@ export function fitOuterLayers(root, store, body = null) {
 // frame's correction) and invalidated by a manual-fit change until the
 // next settle rebuilds the anchors.
 const HAIR_RIDE_REACH = 0.06;   // anchor a hair vertex to fabric within 6cm of it at settle (10cm anchored 2000 more and read as melting on the shoulders in the desktop app; the 41 residual tips were anchored anyway)
-const HAIR_RIDE_GAP = 0.02;     // and never let it come closer than 2cm to that fabric in motion - the same float the settle gives it (8mm let strands sink into the pleat valleys of the blouse back, below the ridge tops, and read as inside the fabric)
+const HAIR_RIDE_GAP = 0.008;    // and never let it come closer than 8mm to that fabric in motion - the same float the settle gives it. Was 2cm for the pleated blouse back, whose valleys sit ~1cm below the ridge tops so a smaller gap let strands sink under a ridge and read as inside the fabric; a smooth shirt has no such ridges and 2cm just floats. If a pleated garment melts again the answer is a gap that follows the local fabric roughness, not a bigger global one.
 const HAIR_RIDE_SECOND_ANCHOR = false;   // see anchor 2 in prepareHairRide
 const rideState = new WeakMap();  // store -> { cloth, cvMesh, cvVi, posed, paused, frame }
 const _rq = new THREE.Vector3(), _racc = new THREE.Vector3(), _rt = new THREE.Vector3(), _rm = new THREE.Matrix4();
