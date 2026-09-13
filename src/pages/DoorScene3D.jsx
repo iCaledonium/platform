@@ -3189,6 +3189,19 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         console.log("[door] no leaf in the mesh — using the built door");
       }
       a.landing.blank.visible = false;
+
+      // Session 174 (UC-18 prop interactions) -- resolve declared props to
+      // real nodes by name, same pattern as the door leaf above. A prop is
+      // furniture the rig may later walk her to, sit her on, or pull out
+      // (see interactionScript.js walk-to-prop/sit-on/pull-prop); today this
+      // only keeps it OUT of the static collider -- a chair is not a wall.
+      a.propNodes = {};
+      for (const [slot, entry] of Object.entries(spec?.props || {})) {
+        const node = entry?.node && home.getObjectByName(entry.node);
+        if (node) a.propNodes[slot] = node;
+        else console.warn(`[door] prop "${slot}" declares node "${entry?.node}", not found in ${HOME}.glb`);
+      }
+
       buildCollider(home);
       if (a.pendingOpen) openDoor();
 
@@ -3374,7 +3387,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       // — and both swing, so a BVH baked while either is closed would wall off
       // a doorway you can see standing open. Walk the whole ancestor chain:
       // the leaf is a descendant, not a direct child, of its pivot.
-      if (isUnderAny(o, [a.leafPivot, a.landing?.hinge])) return;
+      if (isUnderAny(o, [a.leafPivot, a.landing?.hinge, ...Object.values(a.propNodes || {})])) return;
       box.setFromObject(o);
       const size = box.getSize(new THREE.Vector3());
       if (Math.max(size.x, size.z) < 0.15) return;  // too small to walk into
