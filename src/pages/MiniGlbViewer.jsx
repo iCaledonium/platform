@@ -1034,6 +1034,9 @@ function groundAndMeasure(loadedRoot, lowCandidates, highCandidates, hipCandidat
 
   loadedRoot.position.y -= minY;
   loadedRoot.userData.groundOffset = -minY;
+  // Detached garments take the root's offset twice (see the accessory bind
+  // site); their node cancels it, and must follow every re-grounding.
+  loadedRoot.traverse((o) => { if (o.userData?.isAccessoryMesh) o.position.y = minY; });
   return { heightM, torsoM, legsM };
 }
 
@@ -1094,7 +1097,19 @@ const ACCESSORY_SHRINKWRAP = {
   // only fitting can. Shrinkwrap moves nothing on the parts of a loose blouse
   // that are already outside the body, so the drape survives; the bust region
   // gets pushed out to surface+2.5mm like every other fitted garment.
-  pathFragments: ["/underwear/", "/legs/", "/feet/", "/torso/top/top_long_angie_top"],
+  // Session 175 - the Angie top is OUT again, and here is the saying-so the
+  // Session 162 note asks for. Measured on Lindsey (3D panel, groundOffset 0,
+  // garments correctly placed by the transfer): the resolver still declared
+  // 142/7363 body and 91/3298 sleeve vertices "inside" and hauled them
+  // 124mm/120mm radially - shoulders and sleeve tops in shards, hair fanned
+  // out over them (342 sleeve edges over 30mm in the exported runtime, 16 in
+  // an older export). That is the second cause the note predicted: loose
+  // fabric spanning between the arm and the torso reads as inside whichever
+  // limb is nearest, and no displacement-size threshold separates it from a
+  // real penetration. The transfer now carries the body's proportions onto
+  // the garment, which is what the resolver was standing in for when the
+  // path was added; so the top keeps transfer + weld and skips the resolver.
+  pathFragments: ["/underwear/", "/legs/", "/feet/"],
   // Session 157 — the /torso/ retraction above was written as a FOLDER
   // category, and a shirt is not filed under /torso/. "Basic Shirt" lives at
   // /underwear/top/underwear_shirt_basic_shirt, so it matches "/underwear/"
@@ -2481,7 +2496,7 @@ function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loade
         }
         // Session 175 - the GROUNDING COMPENSATION that used to sit here
         // (Session 102/103: shift every garment vertex by -groundOffset) is
-        // gone, and the bind mode further down is what replaced it. It was
+        // gone, and a node-level cancel at the bind site replaced it. It was
         // cancelling a real bug at render time by corrupting bind space:
         // grounding moves loadedRoot, and a garment bound DETACHED under that
         // root received the offset twice (once through the bone matrices, once
@@ -2498,7 +2513,7 @@ function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loade
         // (+4.6cm) were fitted the same distance too LOW; her moderate bust
         // morphs just made it survivable. Exports carried the shifted vertices
         // too, so every dressed/runtime GLB placed garments groundOffset off
-        // the body. Binding attached ends all of it at once.
+        // the body. Cancelling the offset on the node ends all of it at once.
 
         console.log(`[MiniGlbViewer] Accessory (${accessoryUrl}): ${accessoryMeshes.length} SkinnedMesh primitive(s) found [${accessoryMeshes.map((m) => `"${m.name}" ${m.geometry.attributes.position.count}v`).join(", ")}], ${accessoryBones.length} bones in its own skeleton.`);
 
@@ -2943,20 +2958,31 @@ function loadAndBindAccessory(accessoryUrl, mainSkinnedMesh, mainSkeleton, loade
         // confirmed-good combination from the Session 100 investigation
         // (see SAD.md, Accessory Skinning Investigation) — do not change
         // without new evidence.
-        // Session 175 - this is the new evidence Session 100 asked for.
-        // Detached keeps bindMatrixInverse fixed, so a garment's world
-        // position is modelMatrix * skin(v), and modelMatrix carries the
-        // grounding offset the bone matrices already contain: the garment
-        // moved by groundOffset twice, the attached body once. Attached, with
-        // the body's own bindMatrix, gives skin(bindMatrix * v) - identical to
-        // the body in every pose and through every re-grounding - with v left
-        // in true bind space for everything that fits, masks or exports it.
-        // GLTFExporter bakes boneInverse * bindMatrix into the skin regardless
-        // of mode, so the exported skinning is the body's too.
-        accessoryMesh.bindMode = "attached";
+        // Session 175 - stays DETACHED, and the grounding fix moved to the
+        // node transform below. Attached was tried first (it makes the garment's
+        // world position skin(bindMatrix * v) like the body's, so the root's
+        // grounding offset stops applying twice) and the fit was unaffected -
+        // measured A/B on Lindsey: every bra shrinkwrap line identical. But the
+        // hair pipeline was built against detached semantics: ridePose /
+        // rideMatrix in bodyLayers use mesh.bindMatrixInverse, which attached
+        // re-derives from matrixWorld every frame, and the settle that follows
+        // saw 2803 hair vertices beneath the cloth against 343 detached - her
+        // hair fanned out over the blouse shoulders in every frame. Detached
+        // keeps bindMatrixInverse = inverse(bindMatrix), the invariant that
+        // code depends on.
+        accessoryMesh.bindMode = "detached";
         accessoryMesh.bind(mainSkeleton, mainSkinnedMesh.bindMatrix);
 
         loadedRoot.add(accessoryMesh);
+        // The double-offset itself (see the Session 175 note by the removed
+        // grounding compensation): detached world position is
+        // modelMatrix * skin(v), and modelMatrix is loadedRoot's, which carries
+        // groundOffset that the bone matrices already contain. Cancel it on the
+        // garment's own node - a transform, never the vertices - so v stays in
+        // true bind space for the fit, the mask and the export (loaders ignore a
+        // skinned mesh's node transform; the skin carries boneInverse *
+        // bindMatrix). groundAndMeasure keeps this in step on re-grounding.
+        accessoryMesh.position.y = -(loadedRoot.userData.groundOffset || 0);
         // Self-identifying from the moment it's live, independent of
         // accessoryMeshesStore below — that registration doesn't happen
         // until AFTER real per-primitive work (bounding box, shrinkwrap
