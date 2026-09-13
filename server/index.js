@@ -2563,6 +2563,45 @@ app.post("/api/worlds/:id/stop", async (req, res) => {
   catch { res.status(502).json({ error: "simulator unreachable" }); }
 });
 
+// ── POST /api/worlds/:world_id/actors/:actor_id/pause and /resume ────────────
+// One level down from world start/stop: halts a single character's decision
+// loop (ActorEngine) without taking the rest of the world offline. Same
+// platform-actor-id → simulator-actor-id resolution as the other per-actor
+// proxies below (resolveSimActor is a hoisted function declaration).
+app.get("/api/worlds/:world_id/actors/:actor_id/ticking-status", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
+  if (!ok) return;
+  const { world_id, actor_id } = req.params;
+  try {
+    const sim = resolveSimActor(world_id, actor_id);
+    const r = await fetch(`${SIMULATOR_URL}/internal/worlds/${world_id}/actors/${sim}/state`,
+      { headers: { "X-Service-Token": SERVICE_TOKEN } });
+    if (!r.ok) return res.status(r.status).json({ error: `simulator returned ${r.status}` });
+    const state = await r.json();
+    res.json({ paused: state.paused ?? null });
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+app.post("/api/worlds/:world_id/actors/:actor_id/pause", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
+  const { world_id, actor_id } = req.params;
+  try {
+    const sim = resolveSimActor(world_id, actor_id);
+    res.json(await simFetch(`/internal/worlds/${world_id}/actors/${sim}/pause`, "POST"));
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
+app.post("/api/worlds/:world_id/actors/:actor_id/resume", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "owner");
+  if (!ok) return;
+  const { world_id, actor_id } = req.params;
+  try {
+    const sim = resolveSimActor(world_id, actor_id);
+    res.json(await simFetch(`/internal/worlds/${world_id}/actors/${sim}/resume`, "POST"));
+  } catch { res.status(502).json({ error: "simulator unreachable" }); }
+});
+
 // ── GET /api/worlds/:world_id/actors/:actor_id/videos ────────────────────────
 // ── GET /api/tax/estimate?country=&gross= ────────────────────────────────────
 //
