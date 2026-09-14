@@ -84,6 +84,14 @@ function sameOriginMedia(u) {
   return i > 0 ? u.slice(i) : u;   // i === 0 is already a bare path
 }
 
+const PROP_INTERACT_RANGE = 2.4;
+const PROP_FOOTPRINTS = {
+  chair: { hw: 0.24, hd: 0.24, h: 0.90, seat: 0.48, seatFacing: 0 },
+};
+
+const _propRay = new THREE.Raycaster();
+const _propDir = new THREE.Vector3();
+
 function isTyping() {
   const el = document.activeElement;
   return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
@@ -506,6 +514,18 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   const [inside,    setInside]    = useState(false);  // pointer lock held
   const [narrativeGone, setNarrativeGone] = useState(false);
   const [panelHidden, setPanelHidden] = useState(false);
+  // UC-18 (prop interactions) manual test harness -- Magnus, 2026-09-14:
+  // "wouldn't it be best if the user/player tests the script initially?
+  // make the props clickable so we get an action menu". Pointer lock owns
+  // the raw mouse while walking, so there is no cursor to click a prop with
+  // -- this follows the shooter convention instead: look at it (crosshair
+  // raycast), a prompt names what is there, E opens a real menu (which
+  // releases the pointer, same as the chat panel already does, so the menu
+  // CAN be clicked).
+  const [hoveredProp, setHoveredProp] = useState(null);   // { slot, label }
+  const [interactMenu, setInteractMenu] = useState(null); // { slot }
+  const interactMenuRef = useRef(null);
+  useEffect(() => { interactMenuRef.current = interactMenu; }, [interactMenu]);
   const panelHiddenRef = useRef(false);
   const [lockError, setLockError] = useState(null);
   const [chatOpen,  setChatOpen]  = useState(false);
@@ -1126,6 +1146,36 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       api.current.meMixer?.update(dt);
       if (api.current.herRide) stepHairRide(api.current.herRide, api.current.her);
       if (api.current.meRide)  stepHairRide(api.current.meRide,  api.current.me);
+      // Pull/push tween, eased like the door's own swing.
+      for (const meta of Object.values(api.current.propMeta || {})) {
+        if (!meta.tween) continue;
+        const k = Math.min(1, (performance.now() - meta.tween.t0) / PULL_MS);
+        const e = k * k * (3 - 2 * k);
+        meta.node.position.lerpVectors(meta.tween.from, meta.tween.to, e);
+        if (k >= 1) meta.tween = null;
+      }
+
+      // Crosshair raycast: what is she -- the player -- looking at, and is it
+      // close enough to use? Only while actually walking (pointer locked);
+      // the menu is open, or a click has not yet grabbed the pointer, either
+      // way there is no "looking at" to report.
+      {
+        const a = api.current;
+        let hit = null;
+        if (a.walkMode && !interactMenuRef.current && a.propMeta && Object.keys(a.propMeta).length) {
+          _propRay.set(camera.position, camera.getWorldDirection(_propDir));
+          _propRay.far = PROP_INTERACT_RANGE;
+          for (const [slot, meta] of Object.entries(a.propMeta)) {
+            const hits = _propRay.intersectObjects(meta.meshes, false);
+            if (hits.length && (!hit || hits[0].distance < hit.distance)) hit = { slot, distance: hits[0].distance };
+          }
+        }
+        const next = hit ? hit.slot : null;
+        if (a.hoveredPropSlot !== next) {
+          a.hoveredPropSlot = next;
+          setHoveredProp(next ? { slot: next, label: next.charAt(0).toUpperCase() + next.slice(1) } : null);
+        }
+      }
       // Session 153 — the scripted step to the threshold ENDS.
       //
       // Clearing this was wired to the pointer-lock event, so when the browser
@@ -2403,7 +2453,107 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     console.log("[door] she is coming to you");
   }
 
+  // World-space (x, z) of a prop node right now, home rotation included --
+  // it is a descendant of `home`, so Three has already composed that for us.
+  function propWorldXZ(node) {
+    const v = new THREE.Vector3();
+    node.getWorldPosition(v);
+    return { x: v.x, z: v.z };
+  }
+
+  // Where the manifest's yaw actually points. The number in homes.json is
+  // measured in the FLAT'S OWN raw frame (same as `door`/`facing` above --
+  // node dump, not runtime scene), so it has to pick up home.rotation.y the
+  // same way the door leaf's swing direction does.
+  function propWorldYaw(slot) {
+    const a = api.current;
+    const meta = a.propMeta?.[slot];
+    if (!meta) return 0;
+    return (a.home?.rotation.y || 0) + meta.yaw;
+  }
+
+  // The point a body stands at to use this prop -- in front of it, along its
+  // own facing, same geometry Studio's sitOn uses for the chair's entry
+  // point (Interaction Studio, InteractionStudioScene.jsx ~2890), without
+  // that function's obstacle-avoidance routing: one prop, no table to walk
+  // around yet.
+  function propApproachPoint(slot, dist = 0.55) {
+    const a = api.current;
+    const meta = a.propMeta[slot];
+    const { x, z } = propWorldXZ(meta.node);
+    const facing = propWorldYaw(slot) + (PROP_FOOTPRINTS[meta.type]?.seatFacing || 0);
+    const hw = PROP_FOOTPRINTS[meta.type]?.hw ?? 0.3;
+    return { x: x + Math.sin(facing) * (hw + dist), z: z + Math.cos(facing) * (hw + dist), facing };
+  }
+
+  // Walks her to a prop and turns her to face it, using the SAME tick-driven
+  // walk (a.herWalk / stepHer) "come here" already runs -- faceYaw is new:
+  // stepHer's arrival used to always face the player, which is right for
+  // "come here" and wrong for a chair.
+  function walkHerToProp(slot) {
+    const a = api.current;
+    if (!a.her || !a.propMeta?.[slot]) return;
+    const { x, z, facing } = propApproachPoint(slot);
+    a.herRoom = null;
+    a.seatedOn = null;
+    a.herWalk = { state: "waiting", startAt: performance.now(),
+                  to: new THREE.Vector3(x, 0, z), faceYaw: facing };
+    console.log(`[door] walking to the ${slot}`);
+  }
+
+  // "Sit down" -- POSITIONAL ONLY. Studio's real seated pose (playMotion +
+  // applyPose in InteractionStudioScene.jsx ~1512-1230) composes onto a
+  // captured idle/rest base, dampens the mixer's arm sway under a held
+  // pose, and handles release -- three sessions of hard-won correctness
+  // (the "bird flying" bug, the compounding-delta bug, still-mode) that
+  // this pass does not attempt to re-derive. She walks to the chair,
+  // turns her back to it, and stays standing there with `a.seatedOn` set:
+  // enough to prove the menu/walk/state plumbing this was actually built
+  // to test, not a finished seated animation.
+  function sitOnProp(slot) {
+    const a = api.current;
+    if (!a.her || !a.propMeta?.[slot]) return;
+    walkHerToProp(slot);
+    a.pendingSit = slot;   // claimed once stepHer reports arrival, see the tick
+  }
+
+  function standUpFromProp() {
+    const a = api.current;
+    a.seatedOn = null;
+    a.pendingSit = null;
+  }
+
+  // Pull the prop itself along its own facing, away from wherever it sits
+  // (a table, a wall) -- purely visual/state, safe because a prop is
+  // already excluded from the static collider (see buildCollider above).
+  // Eased over PULL_MS like the door's own swing, not snapped.
+  const PULL_DISTANCE = 0.5, PULL_MS = 550;
+  function pullProp(slot) {
+    const a = api.current;
+    const meta = a.propMeta?.[slot];
+    if (!meta) return;
+    // The node's own .position is in its PARENT'S local space, which for a
+    // prop under this Sketchfab export sits behind a ~0.0103 scale (see
+    // armHairRide's neighbour note on the chair's matrix) -- adding a
+    // world-metre offset straight to .position moved it 5mm, not 50cm.
+    // Measured live 2026-09-14. Go through world space and back instead:
+    // that is correct regardless of whatever scale/rotation sits between
+    // this node and the scene root.
+    if (!meta.baseLocal) meta.baseLocal = meta.node.position.clone();
+    meta.node.updateWorldMatrix(true, false);
+    const baseWorld = meta.node.parent.localToWorld(meta.baseLocal.clone());
+    const facing = propWorldYaw(slot);
+    const targetWorld = meta.pulled
+      ? baseWorld
+      : baseWorld.clone().add(new THREE.Vector3(Math.sin(facing) * PULL_DISTANCE, 0, Math.cos(facing) * PULL_DISTANCE));
+    const targetLocal = meta.node.parent.worldToLocal(targetWorld.clone());
+    meta.pulled = !meta.pulled;
+    meta.tween = { from: meta.node.position.clone(), to: targetLocal, t0: performance.now() };
+    console.log(`[door] ${meta.pulled ? "pulling out" : "pushing back"} the ${slot}`);
+  }
+
   function walkHerTo(room) {
+
     const a = api.current;
     if (!a.her) return;
     const key = normaliseRoom(room);
@@ -2741,6 +2891,12 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       }
       if (e.code === "KeyM" && !isTyping() && decision === "open_door") {
         setPanelHidden(h => !h);
+        return;
+      }
+      if (e.code === "KeyE" && !isTyping() && api.current?.walkMode && api.current?.hoveredPropSlot) {
+        const slot = api.current.hoveredPropSlot;
+        api.current.exitWalk?.();
+        setInteractMenu({ slot });
         return;
       }
       if (e.code === "Enter" && !chatOpen && decision === "open_door" && ready) {
@@ -3200,6 +3356,18 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         const node = entry?.node && home.getObjectByName(entry.node);
         if (node) a.propNodes[slot] = node;
         else console.warn(`[door] prop "${slot}" declares node "${entry?.node}", not found in ${HOME}.glb`);
+      }
+
+      // Cache each prop's world footprint + mesh list once, at load: a
+      // slot's meshes for the crosshair raycast, its manifest yaw carried
+      // forward for the actions below. Position is read live from the node
+      // at USE time (propWorldXZ), never cached here -- a pulled prop moves.
+      a.propMeta = {};
+      for (const [slot, node] of Object.entries(a.propNodes)) {
+        const entry = spec.props[slot];
+        const meshes = [];
+        node.traverse(o => { if (o.isMesh) meshes.push(o); });
+        a.propMeta[slot] = { node, meshes, type: entry.type, yaw: entry.yaw || 0, pulled: false, base: null };
       }
 
       buildCollider(home);
@@ -3842,13 +4010,24 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       // the kitchen was luck rather than attention. Arriving somewhere near
       // you means looking at you; only if you are across the room does she
       // keep her travelling facing.
-      const cam = api.current.camera;
-      const fx = cam.position.x - her.position.x;
-      const fz = cam.position.z - her.position.z;
-      api.current.herFacing = Math.hypot(fx, fz) > 0.25
-        ? Math.atan2(fx, fz)
-        : her.rotation.y;
+      if (w.faceYaw != null) {
+        api.current.herFacing = w.faceYaw;
+      } else {
+        const cam = api.current.camera;
+        const fx = cam.position.x - her.position.x;
+        const fz = cam.position.z - her.position.z;
+        api.current.herFacing = Math.hypot(fx, fz) > 0.25
+          ? Math.atan2(fx, fz)
+          : her.rotation.y;
+      }
       api.current.idleTurn = api.current.herFacing;   // idle eases her round
+      // sitOnProp asked to walk here and then sit -- claim it now that she
+      // has actually arrived, rather than assuming the walk succeeds.
+      if (api.current.pendingSit) {
+        api.current.seatedOn = api.current.pendingSit;
+        api.current.pendingSit = null;
+        console.log(`[door] seated at the ${api.current.seatedOn} (positional only -- see sitOnProp)`);
+      }
       aimSun();
       if (a.actions?.walk) {
         a.actions.idle.reset().play();
@@ -4359,6 +4538,56 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
             device. Open <b>Sound</b> and pick another output, or unplug and replug the headphone jack.
           </div>
         )}
+
+        {/* UC-18 -- the crosshair prompt: only when nothing else has your
+            attention (no menu open already). */}
+        {hoveredProp && !interactMenu && (
+          <div style={{ position: "absolute", left: "50%", bottom: "38%", transform: "translateX(-50%)",
+                        zIndex: 30, padding: "6px 12px", borderRadius: 5,
+                        background: "rgba(10,9,8,.7)", border: "0.5px solid rgba(255,255,255,.18)",
+                        fontSize: 10.5, letterSpacing: ".08em", color: "rgba(255,255,255,.85)",
+                        pointerEvents: "none" }}>
+            <b style={{ color: "rgba(201,151,58,.95)" }}>E</b> — {hoveredProp.label}
+          </div>
+        )}
+        {/* The action menu. Opening it already released the pointer (see the
+            KeyE handler), so this is clickable exactly like the chat panel
+            is -- click a canvas point afterward to re-enter walk mode, the
+            same way leaving chat already works. */}
+        {interactMenu && (() => {
+          const slot = interactMenu.slot;
+          const meta = api.current.propMeta?.[slot];
+          const label = slot.charAt(0).toUpperCase() + slot.slice(1);
+          const seated = api.current.seatedOn === slot;
+          const type = meta?.type;
+          const canSit = PROP_FOOTPRINTS[type]?.seat != null;
+          const canPull = type === "chair";
+          const close = () => setInteractMenu(null);
+          const Item = ({ onClick, children }) => (
+            <button onClick={() => { onClick(); close(); }}
+              style={{ display: "block", width: "100%", textAlign: "left", padding: "9px 14px",
+                       background: "transparent", border: "none", borderTop: "0.5px solid rgba(255,255,255,.08)",
+                       color: "rgba(255,255,255,.85)", fontSize: 12, letterSpacing: ".02em", cursor: "pointer" }}
+              onMouseEnter={e => e.currentTarget.style.background = "rgba(201,151,58,.12)"}
+              onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+              {children}
+            </button>
+          );
+          return (
+            <div className="interact-menu" style={{ position: "absolute", left: "50%", top: "50%",
+                          transform: "translate(-50%, -50%)", zIndex: 45, minWidth: 220, borderRadius: 8,
+                          background: "rgba(14,13,11,.94)", border: "0.5px solid rgba(255,255,255,.16)",
+                          boxShadow: "0 12px 40px rgba(0,0,0,.5)", overflow: "hidden" }}>
+              <div style={{ padding: "10px 14px", fontSize: 9.5, letterSpacing: ".14em", textTransform: "uppercase",
+                            color: "rgba(255,255,255,.4)" }}>{label}</div>
+              <Item onClick={() => walkHerToProp(slot)}>Walk to the {label.toLowerCase()}</Item>
+              {canSit && !seated && <Item onClick={() => sitOnProp(slot)}>Sit down</Item>}
+              {canSit && seated && <Item onClick={() => standUpFromProp()}>Stand up</Item>}
+              {canPull && <Item onClick={() => pullProp(slot)}>{meta?.pulled ? "Push back" : "Pull out"}</Item>}
+              <Item onClick={() => {}}>Cancel</Item>
+            </div>
+          );
+        })()}
         {/* Session 153 — her vitals, top left, as the old presence view had
             them. Never interactive: this is something you read while she is
             talking, not something you click, and in walk mode the pointer is
