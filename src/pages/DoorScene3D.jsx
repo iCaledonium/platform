@@ -89,9 +89,6 @@ const PROP_FOOTPRINTS = {
   chair: { hw: 0.24, hd: 0.24, h: 0.90, seat: 0.48, seatFacing: 0 },
 };
 
-const _propRay = new THREE.Raycaster();
-const _propDir = new THREE.Vector3();
-
 function isTyping() {
   const el = document.activeElement;
   return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
@@ -1155,22 +1152,25 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         if (k >= 1) meta.tween = null;
       }
 
-      // Crosshair raycast: what is she -- the player -- looking at, and is it
-      // close enough to use? Only while actually walking (pointer locked);
-      // the menu is open, or a click has not yet grabbed the pointer, either
-      // way there is no "looking at" to report.
+      // Proximity, not a raycast: Magnus, 2026-09-14 -- "the camera is
+      // always behind the avatar... abandon the crosshair idea. You close
+      // enough to a prop should show the menu." A screen-center ray from the
+      // camera was never aiming where the avatar himself stands, and there
+      // is nothing to visually aim WITH in third person anyway. Nearest prop
+      // within PROP_INTERACT_RANGE of the avatar's own (x, z) wins; only
+      // while actually walking and no menu already open.
       {
         const a = api.current;
-        let hit = null;
+        let nearest = null;
         if (a.walkMode && !interactMenuRef.current && a.propMeta && Object.keys(a.propMeta).length) {
-          _propRay.set(camera.position, camera.getWorldDirection(_propDir));
-          _propRay.far = PROP_INTERACT_RANGE;
+          const avatar = (a.thirdPerson && a.body) ? a.body : camera.position;
           for (const [slot, meta] of Object.entries(a.propMeta)) {
-            const hits = _propRay.intersectObjects(meta.meshes, false);
-            if (hits.length && (!hit || hits[0].distance < hit.distance)) hit = { slot, distance: hits[0].distance };
+            const { x, z } = propWorldXZ(meta.node);
+            const dist = Math.hypot(avatar.x - x, avatar.z - z);
+            if (dist <= PROP_INTERACT_RANGE && (!nearest || dist < nearest.distance)) nearest = { slot, distance: dist };
           }
         }
-        const next = hit ? hit.slot : null;
+        const next = nearest ? nearest.slot : null;
         if (a.hoveredPropSlot !== next) {
           a.hoveredPropSlot = next;
           setHoveredProp(next ? { slot: next, label: next.charAt(0).toUpperCase() + next.slice(1) } : null);
@@ -4527,25 +4527,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
           </div>
         )}
 
-        {/* UC-18 -- there was no actual reticle drawn anywhere: "crosshair
-            raycast" only ever meant a ray cast from screen center, nothing
-            painted there for the player to aim with. Confirmed the hard way
-            (Magnus: no visible crosshair, no "E - Chair" ever showing) --
-            without a dot to aim, the thin chair frame is easy to miss
-            entirely by ray, same lesson this pass's own test rig hit
-            (aiming at a bounding-sphere/centroid also misses this chair).
-            Shown only while walking, and only when nothing else has your
-            attention -- no menu, no chat. */}
-        {inside && !interactMenu && !chatOpen && (
-          <div style={{ position: "absolute", left: "50%", top: "50%",
-                        transform: "translate(-50%, -50%)", zIndex: 25,
-                        width: 6, height: 6, borderRadius: "50%",
-                        background: hoveredProp ? "rgba(201,151,58,.95)" : "rgba(255,255,255,.55)",
-                        boxShadow: hoveredProp ? "0 0 0 4px rgba(201,151,58,.25)" : "none",
-                        pointerEvents: "none" }} />
-        )}
-
-        {/* UC-18 -- the crosshair prompt: only when nothing else has your
+        {/* UC-18 -- the interact prompt: only when nothing else has your
             attention (no menu open already). */}
         {hoveredProp && !interactMenu && (
           <div style={{ position: "absolute", left: "50%", bottom: "38%", transform: "translateX(-50%)",
