@@ -520,9 +520,17 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   // releases the pointer, same as the chat panel already does, so the menu
   // CAN be clicked).
   const [hoveredProp, setHoveredProp] = useState(null);   // { slot, label }
-  const [interactMenu, setInteractMenu] = useState(null); // { slot }
-  const interactMenuRef = useRef(null);
-  useEffect(() => { interactMenuRef.current = interactMenu; }, [interactMenu]);
+  // pullProp/sitOnProp/standUpFromProp mutate plain fields on api.current
+  // (meta.pulled, a.playerSeatedOn) -- deliberately, the game loop reads
+  // those every frame and a useState round-trip there would be pure
+  // overhead. But the prompt below computes its number+verb from those same
+  // fields at RENDER time, and nothing about that mutation tells React a
+  // render is owed. Live repro, Magnus 2026-09-14: pulled the chair, the
+  // prompt kept reading "1 -- Pull out the chair" forever after, because no
+  // React state had actually changed. This is the deliberately-dumb fix --
+  // bump a counter nothing else reads, forcing the one render that picks up
+  // the mutation already sitting there.
+  const [, forcePropRender] = useState(0);
   const panelHiddenRef = useRef(false);
   const [lockError, setLockError] = useState(null);
   const [chatOpen,  setChatOpen]  = useState(false);
@@ -1143,13 +1151,20 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       api.current.meMixer?.update(dt);
       if (api.current.herRide) stepHairRide(api.current.herRide, api.current.her);
       if (api.current.meRide)  stepHairRide(api.current.meRide,  api.current.me);
-      // Pull/push tween, eased like the door's own swing.
+      // Pull/push tween, eased like the door's own swing -- one per PART
+      // (the chair's frame and its seat cushion are separate nodes that
+      // must arrive together, see pullProp).
       for (const meta of Object.values(api.current.propMeta || {})) {
-        if (!meta.tween) continue;
-        const k = Math.min(1, (performance.now() - meta.tween.t0) / PULL_MS);
-        const e = k * k * (3 - 2 * k);
-        meta.node.position.lerpVectors(meta.tween.from, meta.tween.to, e);
-        if (k >= 1) meta.tween = null;
+        if (!meta.tweens) continue;
+        let anyActive = false;
+        for (const tw of meta.tweens) {
+          if (!tw) continue;
+          const k = Math.min(1, (performance.now() - tw.t0) / PULL_MS);
+          const e = k * k * (3 - 2 * k);
+          tw.node.position.lerpVectors(tw.from, tw.to, e);
+          if (k < 1) anyActive = true;
+        }
+        if (!anyActive) meta.tweens = null;
       }
 
       // Proximity, not a raycast: Magnus, 2026-09-14 -- "the camera is
@@ -1162,7 +1177,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       {
         const a = api.current;
         let nearest = null;
-        if (a.walkMode && !interactMenuRef.current && a.propMeta && Object.keys(a.propMeta).length) {
+        if (a.walkMode && a.propMeta && Object.keys(a.propMeta).length) {
           const avatar = (a.thirdPerson && a.body) ? a.body : camera.position;
           for (const [slot, meta] of Object.entries(a.propMeta)) {
             const { x, z } = propWorldXZ(meta.node);
@@ -2514,39 +2529,54 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     walker.z = z;
     a.playerSeatedOn = slot;
     console.log(`[door] you sit at the ${slot} (positional only -- see sitOnProp)`);
+    forcePropRender(n => n + 1);
   }
 
   function standUpFromProp() {
     api.current.playerSeatedOn = null;
+    forcePropRender(n => n + 1);
   }
 
   // Pull the prop itself along its own facing, away from wherever it sits
-  // (a table, a wall) -- purely visual/state, safe because a prop is
-  // already excluded from the static collider (see buildCollider above).
-  // Eased over PULL_MS like the door's own swing, not snapped.
+  // (a table, a wall) -- purely visual/state, safe because a prop (and
+  // every node linked to it) is already excluded from the static collider
+  // (see buildCollider above). Eased over PULL_MS like the door's own
+  // swing, not snapped.
+  //
+  // Every LINKED node moves the same delta as the main one. Live repro,
+  // Magnus 2026-09-14: pulling the chair split it visually in two -- the
+  // seat cushion ("stul_sidenie") is a second, wholly separate node sitting
+  // at the same base spot as the frame ("chair") in this GLB, never joined
+  // to it by any parent/child relationship, so moving only the frame left
+  // the cushion behind. homes.json now declares that pairing explicitly
+  // (props.chair.linked); this treats the whole list as one rigid unit.
   const PULL_DISTANCE = 0.5, PULL_MS = 550;
   function pullProp(slot) {
     const a = api.current;
     const meta = a.propMeta?.[slot];
     if (!meta) return;
+    const parts = [meta.node, ...(meta.linkedNodes || [])];
     // The node's own .position is in its PARENT'S local space, which for a
     // prop under this Sketchfab export sits behind a ~0.0103 scale (see
     // armHairRide's neighbour note on the chair's matrix) -- adding a
     // world-metre offset straight to .position moved it 5mm, not 50cm.
     // Measured live 2026-09-14. Go through world space and back instead:
     // that is correct regardless of whatever scale/rotation sits between
-    // this node and the scene root.
-    if (!meta.baseLocal) meta.baseLocal = meta.node.position.clone();
-    meta.node.updateWorldMatrix(true, false);
-    const baseWorld = meta.node.parent.localToWorld(meta.baseLocal.clone());
+    // a part and the scene root -- and each part gets its own base and
+    // round-trip, since two parts need not share a parent.
+    if (!meta.baseLocals) meta.baseLocals = parts.map(n => n.position.clone());
     const facing = propWorldYaw(slot);
-    const targetWorld = meta.pulled
-      ? baseWorld
-      : baseWorld.clone().add(new THREE.Vector3(Math.sin(facing) * PULL_DISTANCE, 0, Math.cos(facing) * PULL_DISTANCE));
-    const targetLocal = meta.node.parent.worldToLocal(targetWorld.clone());
+    const delta = new THREE.Vector3(Math.sin(facing) * PULL_DISTANCE, 0, Math.cos(facing) * PULL_DISTANCE);
+    meta.tweens = parts.map((n, i) => {
+      n.updateWorldMatrix(true, false);
+      const baseWorld = n.parent.localToWorld(meta.baseLocals[i].clone());
+      const targetWorld = meta.pulled ? baseWorld : baseWorld.clone().add(delta);
+      const targetLocal = n.parent.worldToLocal(targetWorld.clone());
+      return { node: n, from: n.position.clone(), to: targetLocal, t0: performance.now() };
+    });
     meta.pulled = !meta.pulled;
-    meta.tween = { from: meta.node.position.clone(), to: targetLocal, t0: performance.now() };
-    console.log(`[door] ${meta.pulled ? "pulling out" : "pushing back"} the ${slot}`);
+    console.log(`[door] ${meta.pulled ? "pulling out" : "pushing back"} the ${slot} (${parts.length} part${parts.length === 1 ? "" : "s"})`);
+    forcePropRender(n => n + 1);
   }
 
   function walkHerTo(room) {
@@ -2890,11 +2920,26 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         setPanelHidden(h => !h);
         return;
       }
-      if (e.code === "KeyE" && !isTyping() && api.current?.walkMode && api.current?.hoveredPropSlot) {
-        const slot = api.current.hoveredPropSlot;
-        api.current.exitWalk?.();
-        setInteractMenu({ slot });
+      // Standing up is NEVER gated on walkMode/hoveredPropSlot the way
+      // pulling and sitting are. Live repro, Magnus 2026-09-14: those can
+      // drop out from under you while you're seated (chat opening, pointer
+      // lock lost, alt-tab) with no way back, since WASD stays disabled by
+      // a.playerSeatedOn regardless -- you'd be stuck. If you're seated,
+      // period, Digit2 always frees you.
+      if (e.code === "Digit2" && !isTyping() && api.current?.playerSeatedOn) {
+        standUpFromProp();
         return;
+      }
+      if ((e.code === "Digit1" || e.code === "Digit2") && !isTyping()
+          && api.current?.walkMode && api.current?.hoveredPropSlot) {
+        const slot = api.current.hoveredPropSlot;
+        const meta = api.current.propMeta?.[slot];
+        if (!meta) return;
+        if (e.code === "Digit1" && !meta.pulled) { pullProp(slot); return; }
+        if (e.code === "Digit2" && meta.pulled && api.current.playerSeatedOn !== slot) {
+          sitOnProp(slot);
+          return;
+        }
       }
       if (e.code === "Enter" && !chatOpen && decision === "open_door" && ready) {
         setPanelHidden(false);
@@ -3349,22 +3394,30 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       // (see interactionScript.js walk-to-prop/sit-on/pull-prop); today this
       // only keeps it OUT of the static collider -- a chair is not a wall.
       a.propNodes = {};
+      a.propLinkedNodes = {};
       for (const [slot, entry] of Object.entries(spec?.props || {})) {
         const node = entry?.node && home.getObjectByName(entry.node);
         if (node) a.propNodes[slot] = node;
         else console.warn(`[door] prop "${slot}" declares node "${entry?.node}", not found in ${HOME}.glb`);
+        // Some props are more than one node in this GLB -- e.g. the chair's
+        // frame ("chair") and its seat cushion ("stul_sidenie") are two
+        // separate, unlinked meshes sitting at the same base spot. Anything
+        // the manifest lists under `linked` moves WITH the main node (see
+        // pullProp) instead of being left behind.
+        a.propLinkedNodes[slot] = (entry?.linked || [])
+          .map(n => home.getObjectByName(n))
+          .filter(Boolean);
       }
 
-      // Cache each prop's world footprint + mesh list once, at load: a
-      // slot's meshes for the crosshair raycast, its manifest yaw carried
-      // forward for the actions below. Position is read live from the node
-      // at USE time (propWorldXZ), never cached here -- a pulled prop moves.
+      // Cache each prop's world footprint once, at load: its manifest yaw
+      // carried forward for the actions below. Position is read live from
+      // the node at USE time (propWorldXZ), never cached here -- a pulled
+      // prop moves.
       a.propMeta = {};
       for (const [slot, node] of Object.entries(a.propNodes)) {
         const entry = spec.props[slot];
-        const meshes = [];
-        node.traverse(o => { if (o.isMesh) meshes.push(o); });
-        a.propMeta[slot] = { node, meshes, type: entry.type, yaw: entry.yaw || 0, pulled: false, base: null };
+        a.propMeta[slot] = { node, linkedNodes: a.propLinkedNodes[slot],
+                              type: entry.type, yaw: entry.yaw || 0, pulled: false };
       }
 
       buildCollider(home);
@@ -3552,7 +3605,9 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       // — and both swing, so a BVH baked while either is closed would wall off
       // a doorway you can see standing open. Walk the whole ancestor chain:
       // the leaf is a descendant, not a direct child, of its pivot.
-      if (isUnderAny(o, [a.leafPivot, a.landing?.hinge, ...Object.values(a.propNodes || {})])) return;
+      if (isUnderAny(o, [a.leafPivot, a.landing?.hinge,
+                          ...Object.values(a.propNodes || {}),
+                          ...Object.values(a.propLinkedNodes || {}).flat()])) return;
       box.setFromObject(o);
       const size = box.getSize(new THREE.Vector3());
       if (Math.max(size.x, size.z) < 0.15) return;  // too small to walk into
@@ -4527,51 +4582,26 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
           </div>
         )}
 
-        {/* UC-18 -- the interact prompt: only when nothing else has your
-            attention (no menu open already). */}
-        {hoveredProp && !interactMenu && (
-          <div style={{ position: "absolute", left: "50%", bottom: "38%", transform: "translateX(-50%)",
-                        zIndex: 30, padding: "6px 12px", borderRadius: 5,
-                        background: "rgba(10,9,8,.7)", border: "0.5px solid rgba(255,255,255,.18)",
-                        fontSize: 10.5, letterSpacing: ".08em", color: "rgba(255,255,255,.85)",
-                        pointerEvents: "none" }}>
-            <b style={{ color: "rgba(201,151,58,.95)" }}>E</b> — {hoveredProp.label}
-          </div>
-        )}
-        {/* The action menu. Opening it already released the pointer (see the
-            KeyE handler), so this is clickable exactly like the chat panel
-            is -- click a canvas point afterward to re-enter walk mode, the
-            same way leaving chat already works. */}
-        {interactMenu && (() => {
-          const slot = interactMenu.slot;
+        {/* UC-18 -- Magnus, 2026-09-14: no aiming, no click menu. Proximity
+            (see the tick above) is angle-independent already; this is just
+            the one action the chair's own state actually allows right now,
+            numbered so the matching Digit1/Digit2 handler above can fire it
+            straight from the keyboard -- no pointer-lock release needed. */}
+        {hoveredProp && (() => {
+          const slot = hoveredProp.slot;
           const meta = api.current.propMeta?.[slot];
-          const label = slot.charAt(0).toUpperCase() + slot.slice(1);
+          if (!meta) return null;
           const seated = api.current.playerSeatedOn === slot;
-          const type = meta?.type;
-          const canSit = PROP_FOOTPRINTS[type]?.seat != null;
-          const canPull = type === "chair";
-          const close = () => setInteractMenu(null);
-          const Item = ({ onClick, children }) => (
-            <button onClick={() => { onClick(); close(); }}
-              style={{ display: "block", width: "100%", textAlign: "left", padding: "9px 14px",
-                       background: "transparent", border: "none", borderTop: "0.5px solid rgba(255,255,255,.08)",
-                       color: "rgba(255,255,255,.85)", fontSize: 12, letterSpacing: ".02em", cursor: "pointer" }}
-              onMouseEnter={e => e.currentTarget.style.background = "rgba(201,151,58,.12)"}
-              onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
-              {children}
-            </button>
-          );
+          const [num, verb] = !meta.pulled ? [1, `Pull out the ${hoveredProp.label.toLowerCase()}`]
+            : seated ? [2, "Stand up"]
+            : [2, `Sit on the ${hoveredProp.label.toLowerCase()}`];
           return (
-            <div className="interact-menu" style={{ position: "absolute", left: "50%", top: "50%",
-                          transform: "translate(-50%, -50%)", zIndex: 45, minWidth: 220, borderRadius: 8,
-                          background: "rgba(14,13,11,.94)", border: "0.5px solid rgba(255,255,255,.16)",
-                          boxShadow: "0 12px 40px rgba(0,0,0,.5)", overflow: "hidden" }}>
-              <div style={{ padding: "10px 14px", fontSize: 9.5, letterSpacing: ".14em", textTransform: "uppercase",
-                            color: "rgba(255,255,255,.4)" }}>{label}</div>
-              {canSit && !seated && <Item onClick={() => sitOnProp(slot)}>Sit down</Item>}
-              {canSit && seated && <Item onClick={() => standUpFromProp()}>Stand up</Item>}
-              {canPull && <Item onClick={() => pullProp(slot)}>{meta?.pulled ? "Push back" : "Pull out"}</Item>}
-              <Item onClick={() => {}}>Cancel</Item>
+            <div style={{ position: "absolute", left: "50%", bottom: "38%", transform: "translateX(-50%)",
+                          zIndex: 30, padding: "6px 12px", borderRadius: 5,
+                          background: "rgba(10,9,8,.7)", border: "0.5px solid rgba(255,255,255,.18)",
+                          fontSize: 10.5, letterSpacing: ".08em", color: "rgba(255,255,255,.85)",
+                          pointerEvents: "none" }}>
+              <b style={{ color: "rgba(201,151,58,.95)" }}>{num}</b> — {verb}
             </div>
           );
         })()}
