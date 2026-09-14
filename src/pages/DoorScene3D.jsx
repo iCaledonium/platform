@@ -4527,6 +4527,24 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
           </div>
         )}
 
+        {/* UC-18 -- there was no actual reticle drawn anywhere: "crosshair
+            raycast" only ever meant a ray cast from screen center, nothing
+            painted there for the player to aim with. Confirmed the hard way
+            (Magnus: no visible crosshair, no "E - Chair" ever showing) --
+            without a dot to aim, the thin chair frame is easy to miss
+            entirely by ray, same lesson this pass's own test rig hit
+            (aiming at a bounding-sphere/centroid also misses this chair).
+            Shown only while walking, and only when nothing else has your
+            attention -- no menu, no chat. */}
+        {inside && !interactMenu && !chatOpen && (
+          <div style={{ position: "absolute", left: "50%", top: "50%",
+                        transform: "translate(-50%, -50%)", zIndex: 25,
+                        width: 6, height: 6, borderRadius: "50%",
+                        background: hoveredProp ? "rgba(201,151,58,.95)" : "rgba(255,255,255,.55)",
+                        boxShadow: hoveredProp ? "0 0 0 4px rgba(201,151,58,.25)" : "none",
+                        pointerEvents: "none" }} />
+        )}
+
         {/* UC-18 -- the crosshair prompt: only when nothing else has your
             attention (no menu open already). */}
         {hoveredProp && !interactMenu && (
