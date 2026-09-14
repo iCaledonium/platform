@@ -938,12 +938,9 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // Right-click leaves, the way it does in a game. Esc leaves too and always
     // will — releasing pointer lock on Esc is enforced by the browser and
     // cannot be intercepted — so this is a second way out, not the only one.
-    // Look around by dragging, for every case where pointer lock is refused —
-    // an iframe without allow="pointer-lock", a browser that declines the
-    // gesture, a lock silently dropped. PointerLockControls drives the camera
-    // when it IS locked; this takes over only when it is not, so the two can
-    // never fight over the same rotation.
-    const look = new THREE.Euler(0, 0, 0, "YXZ");
+    // (2026-09-15: this used to also cover "look around by dragging" for a
+    // refused pointer lock -- removed along with the rest of manual look,
+    // see chaseLook/placeThirdPersonCamera.)
     // Left button takes the mode. (When pointer lock is granted the browser
     // fires 'lock' too; enterWalk is idempotent so it only runs once.)
     const onDown = (e) => {
@@ -965,21 +962,6 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       enterWalk();
     };
     const onUp = () => {};
-    // In walk mode the mouse looks — no button held. When pointer lock IS
-    // active PointerLockControls is already doing this, so stand aside.
-    const onMove = (e) => {
-      if (!api.current.walkMode) return;
-      const r = renderer.domElement.getBoundingClientRect();
-      api.current.pointer = { x: e.clientX - r.left, y: e.clientY - r.top, w: r.width, h: r.height };
-      api.current.pointerOutside = false;
-      if (fpv.isLocked) return;
-      look.setFromQuaternion(camera.quaternion);
-      look.y -= (e.movementX || 0) * 0.0022;
-      look.x -= (e.movementY || 0) * 0.0022;
-      const lim = Math.PI / 2 - 0.02;
-      look.x = Math.max(-lim, Math.min(lim, look.x));
-      camera.quaternion.setFromEuler(look);
-    };
     // The pointer leaving the document, or the window losing focus, both mean
     // "stop steering" — and re-entering means resume.
     // Session 153 — the pointer leaving the window ends walk mode outright.
@@ -1002,7 +984,6 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
 
     renderer.domElement.addEventListener("pointerdown", onDown);
     window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointermove", onMove);
 
     // Right-click leaves walk mode and gives the cursor back — the game
     // gesture, and it works whether or not pointer lock was ever granted.
@@ -1210,11 +1191,13 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       idleHer(dt);
       applyEyeToEye(dt, camera);
       // steerLook (edge-of-screen manual turning) no longer runs -- Magnus,
-      // 2026-09-15: "we do ALWAYS behind", chaseLook below is now the only
-      // thing that ever turns this camera. Left defined (still reachable at
+      // 2026-09-15: "we do ALWAYS behind". placeThirdPersonCamera below is
+      // now the only thing that ever turns this camera, via cam.lookAt()
+      // recomputed fresh from the body's own position every frame -- see
+      // its own notes for why that replaced the old chaseLook/quaternion
+      // approach outright. Left steerLook defined (still reachable at
       // api.current.steerLook for the console), just not called every frame.
       stepPlayer(dt, camera);
-      chaseLook(dt);
       placeThirdPersonCamera(dt);
 
       // Session 153 — the landing is scenery for the OUTSIDE of the door.
@@ -1255,7 +1238,6 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       window.removeEventListener("focus", onPointerBack);
       renderer.domElement.removeEventListener("pointerdown", onDown);
       window.removeEventListener("pointerup", onUp);
-      window.removeEventListener("pointermove", onMove);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", onBlur);
@@ -3859,40 +3841,28 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   }
 
   // Magnus, 2026-09-15: "the click mouse camera is disturbing, let's do
-  // like in the last of us or uncharted, camera always behind" -- and then,
-  // seeing walkMode's own pointer-lock mouse-look still doing exactly that:
-  // "remove that clicking the mouse starts looking around with the camera.
-  // We do ALWAYS behind." So this now runs on EVERY frame, walkMode or not,
-  // and always wins: it is called after stepPlayer and before
-  // placeThirdPersonCamera reads cam.getWorldDirection(), so it overwrites
-  // whatever a pointer-lock mouse delta wrote to camera.quaternion earlier
-  // in the same tick. Pointer lock itself stays (it still hides the cursor
-  // and gates WASD/chat), only its rotation now goes nowhere.
+  // like in the last of us or uncharted, camera always behind" -- then,
+  // watching walkMode's own pointer-lock mouse-look still doing exactly
+  // that: "remove that clicking the mouse starts looking around with the
+  // camera. We do ALWAYS behind." Then, live, after a chaseLook that eased
+  // a separately-tracked camera quaternion toward the walk direction every
+  // frame: "pressing w forward makes the camera earth quake" -- and it was
+  // real. chaseLook and the raw pointer-lock-refused mouse-look (removed
+  // separately, see the onDown/onMove history above) were BOTH writing to
+  // camera.quaternion on different event cadences, each undoing the
+  // other's work the next tick: a textbook two-controllers-one-value
+  // fight, not a one-off glitch.
   //
-  // "walking towards the camera flips the camera behind the character when
-  // the character gets too close" -- normally this EASES toward the walk
-  // direction, which reads as a natural trailing turn; but ease alone would
-  // let you walk face-first into your own camera when you turn around and
-  // head back the way you came. Below CAM_FLIP_DIST it snaps instead, the
-  // same instant reorientation a chase cam does when you reverse course.
-  const CAM_FLIP_DIST = 1.1;
-  function chaseLook(dt) {
-    const a = api.current;
-    if (!a.thirdPerson || a.eyeToEye || a.dolly) return;
-    if (!a.moving || !a.moveDir) return;
-    const cam = a.camera;
-    if (!cam || !a.body) return;
-    const targetYaw = Math.atan2(a.moveDir.x, a.moveDir.z);
-    const eu = _steerEuler;
-    eu.setFromQuaternion(cam.quaternion);
-    let d = targetYaw - eu.y;
-    while (d >  Math.PI) d -= Math.PI * 2;
-    while (d < -Math.PI) d += Math.PI * 2;
-    const dx = a.body.x - cam.position.x, dz = a.body.z - cam.position.z;
-    const close = Math.hypot(dx, dz) < CAM_FLIP_DIST;
-    eu.y += d * (close ? 1 : (1 - Math.exp(-3 * dt)));
-    cam.quaternion.setFromEuler(eu);
-  }
+  // Replaced the whole approach per Magnus's own reference (a standard
+  // three.js third-person pattern: offset + lerp + camera.lookAt(target)
+  // every frame, no manual quaternion bookkeeping at all). cam.lookAt()
+  // below is now the ONLY thing that ever rotates this camera, recomputed
+  // fresh from stable position data every single frame -- nothing
+  // accumulates, so there is no state left for anything to fight over.
+  // "Flip behind when you walk toward the camera" falls out of this for
+  // free: the character's own facing (a.me.rotation.y, eased below) is
+  // what `look`/`right` derive from, so when he turns around, the boom
+  // recomputes from his new heading immediately, no separate case needed.
 
   function steerLook(delta) {
     const a = api.current;
@@ -4177,15 +4147,25 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     if (a.eyeToEye || a.eyeRestore || a.dolly) return;
     const cam = a.camera;
     if (!cam) return;
-
-    const look = new THREE.Vector3();
-    cam.getWorldDirection(look);
-    look.y = 0;
-    if (look.lengthSq() < 1e-6) return;
-    look.normalize();
-
     const floorY = a.floorY ?? 0;
-    const right  = new THREE.Vector3().crossVectors(look, UP).normalize();
+
+    // His own facing is the ONE source of truth "behind" is measured from
+    // now -- not a separately-tracked camera yaw fighting to catch up to
+    // it. Eased here, once, before anything below reads it, so his turn
+    // and the camera's boom both run off the same already-smooth number.
+    // Turned toward the target rather than snapped -- a body that changes
+    // heading in one frame reads as a sprite, not a person.
+    if (a.me) {
+      const want = (a.moving && a.moveDir) ? Math.atan2(a.moveDir.x, a.moveDir.z) : a.me.rotation.y;
+      let dFace = want - a.me.rotation.y;
+      while (dFace >  Math.PI) dFace -= Math.PI * 2;
+      while (dFace < -Math.PI) dFace += Math.PI * 2;
+      a.me.rotation.y += dFace * (1 - Math.exp(-9 * dt));
+      a.me.position.set(a.body.x, floorY, a.body.z);
+    }
+    const facing = a.me ? a.me.rotation.y : 0;
+    const look  = new THREE.Vector3(Math.sin(facing), 0, Math.cos(facing));
+    const right = new THREE.Vector3().crossVectors(look, UP).normalize();
 
     // How far back we can actually sit. A wall behind you must not put the
     // camera inside it — pull in instead, which is what every third-person
@@ -4235,20 +4215,31 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // in a corner or a narrow room. Magnus, 2026-09-15: "don't film outside
     // the walls." One more raycast, along the ACTUAL combined direction to
     // the target (back + shoulder together, not just back), catches every
-    // case the boom-only test couldn't -- if it hits a wall before reaching
-    // _camTarget, pull the target back along that same ray instead.
+    // case the boom-only test couldn't.
+    //
+    // FIRST CUT of this pulled the target straight to the hit point, no
+    // easing -- Magnus, live: "pressing w forward makes the camera earth
+    // quake". The raycast flickers hit/no-hit across a wall edge exactly
+    // the way the comment three lines above THIS block already warned
+    // about (2026-09-03's shake, on the boom-only raycast) -- I made the
+    // same mistake in my own addition instead of learning from it. Eased
+    // now, same kBack pattern as `back` above, for the same reason.
     if (bt) {
       const origin = _camRay.origin.set(a.body.x, floorY + CAM_UP, a.body.z);
       const toTarget = _camTarget.clone().sub(origin);
       const targetDist = toTarget.length();
       if (targetDist > 1e-4) {
-        _camRay.direction.copy(toTarget).normalize();
+        const dir = toTarget.normalize();
+        _camRay.direction.copy(dir);
         _camRay.far = targetDist + 0.2;
         const hit2 = bt.raycastFirst(_camRay, THREE.DoubleSide);
-        if (hit2 && hit2.distance < targetDist) {
-          const pulled = Math.max(CAM_MIN_BACK, hit2.distance - 0.18);
-          _camTarget.copy(origin).addScaledVector(_camRay.direction, pulled);
-        }
+        const desiredDist = (hit2 && hit2.distance < targetDist)
+          ? Math.max(CAM_MIN_BACK, hit2.distance - 0.18)
+          : targetDist;
+        a.camLateralDist = (a.camLateralDist == null)
+          ? desiredDist
+          : a.camLateralDist + (desiredDist - a.camLateralDist) * kBack;
+        _camTarget.copy(origin).addScaledVector(dir, a.camLateralDist);
       }
     }
 
@@ -4276,21 +4267,14 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // to it so nothing above can jitter the actual view.
     cam.position.lerp(_camTarget, 1 - Math.exp(-14 * dt));
 
-    // He faces where the camera is looking. Yaw only — a body that pitches
-    // with the camera looks like a hinge, not a person.
-    if (a.me) {
-      a.me.position.set(a.body.x, floorY, a.body.z);
-      // Facing: where he WALKS while moving, where the camera looks when still.
-      // Turned toward the target rather than snapped — a body that changes
-      // heading in one frame reads as a sprite, not a person.
-      const want = (a.moving && a.moveDir)
-        ? Math.atan2(a.moveDir.x, a.moveDir.z)
-        : Math.atan2(look.x, look.z);
-      let d = want - a.me.rotation.y;
-      while (d >  Math.PI) d -= Math.PI * 2;
-      while (d < -Math.PI) d += Math.PI * 2;
-      a.me.rotation.y += d * (1 - Math.exp(-9 * dt));
-    }
+    // Aim it. Every three.js third-person writeup lands here for a reason
+    // (Magnus's own reference: offset + lerp + camera.lookAt(target), every
+    // frame, no manual quaternion bookkeeping) -- called fresh from this
+    // frame's actual position and the body's actual position, it cannot
+    // drift or fight anything else, because it keeps no memory between
+    // frames to fight WITH. Aimed a little below eye height, standard
+    // over-the-shoulder framing, not straight at his hairline.
+    cam.lookAt(a.body.x, floorY + EYE_HEIGHT - 0.12, a.body.z);
   }
 
   // The player's own body.
