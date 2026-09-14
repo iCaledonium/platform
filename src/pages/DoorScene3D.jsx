@@ -532,7 +532,6 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   // the mutation already sitting there.
   const [, forcePropRender] = useState(0);
   const panelHiddenRef = useRef(false);
-  const [lockError, setLockError] = useState(null);
   const [chatOpen,  setChatOpen]  = useState(false);
   // Session 153 — the right dock holds two things now, so it has tabs.
   const [tab, setTab] = useState("chat");
@@ -815,95 +814,15 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       a.keys.clear();
       if (isTyping()) document.activeElement.blur();
       setChatOpen(false);
-      // Exclusive: the cursor goes everywhere, not just over the canvas.
-      // Hiding it on the canvas alone meant it reappeared the moment you moved
-      // over the chat panel, and the panel stayed clickable underneath it.
-      // the .anima-walking class does the hiding — see the cursor effect
-      // The lens is not set here — it follows the shot, and tick eases it.
       setInside(true);
-      requestLock();
-    };
-
-    // Ask for the pointer ourselves rather than through controls.lock().
-    //
-    // three's lock() calls requestPointerLock({unadjustedMovement}) and drops
-    // the promise on the floor: a rejection surfaces only as "Uncaught (in
-    // promise)" in the console, and a browser that refuses the OPTIONS form
-    // gets no second try without them. unadjustedMovement only disables mouse
-    // acceleration, which nothing here needs, so the plain call is both more
-    // compatible and the one to fall back to.
-    //
-    // three still notices success on its own — it listens for pointerlockchange
-    // on the document — so isLocked stays correct either way.
-    // Session 153 — ask the permissions policy before asking for the pointer.
-    //
-    // Measured in the Claude desktop app: allowsFeature('pointer-lock') is
-    // false while fullscreen is true. Requesting anyway produces a SecurityError
-    // that looks like a bug in the page, and dragging the user into fullscreen
-    // to retry a thing that is categorically forbidden is worse than useless.
-    const lockAllowed = (() => {
-      try {
-        const fp = document.featurePolicy || document.permissionsPolicy;
-        return fp?.allowsFeature ? fp.allowsFeature("pointer-lock") : true;
-      } catch { return true; }
-    })();
-    if (!lockAllowed) {
-      api.current.lockBlocked = true;
-      console.warn("[door] pointer lock is disallowed by this surface's permissions policy " +
-        "— mouse-look falls back to edge steering. A normal browser window will capture properly.");
-    }
-
-    const requestLock = () => {
-      if (!lockAllowed) { api.current.lockError = "blocked"; setLockError("blocked"); return; }
-      const el = renderer.domElement;
-      const host = el.parentElement || el;
-
-      // Session 153 — trapping the pointer for real.
-      //
-      // A bare requestPointerLock is refused when the document is not focused
-      // or its frame tree is not the primary one (measured here: hasFocus()
-      // false on a perfectly visible page). Fullscreen fixes both — it forces
-      // focus and promotes the element — which is why every browser game asks
-      // for the two together. Both calls are made INSIDE the click gesture,
-      // because a promise continuation is no longer a user activation and the
-      // second request would be refused on that ground instead.
-
-      const fail = (err) => {
-        const name = err?.name || String(err || "unknown");
-        api.current.lockError = name;
-        setLockError(name);
-        console.warn("[door] pointer lock refused:", name,
-          window.self !== window.top
-            ? "— page is in an iframe; it needs allow=\"pointer-lock\" or a normal browser window"
-            : "");
-      };
-      try {
-        // Pointer lock is refused outright unless the document has focus —
-        // measured here as hasFocus() === false while the page was perfectly
-        // visible, which is what produced "the root document of this element
-        // is not valid for pointer lock". Claim focus first; it costs nothing
-        // when we already have it.
-        if (!document.hasFocus()) { window.focus(); el.focus?.({ preventScroll: true }); }
-        const p = el.requestPointerLock();
-        if (p && typeof p.catch === "function") {
-          p.then(() => { api.current.lockError = null; setLockError(null); }).catch(fail);
-        }
-      } catch (err) {
-        fail(err);
-      }
     };
 
     // The transition finishes after the gesture, so try again here: by now the
     // document is focused and the element is the fullscreen one, which is
     // exactly the state a refused lock was missing.
     const onFullscreenChange = () => {
-      if (!document.fullscreenElement) {
-        // Left fullscreen (Esc) — leave walk mode with it, rather than
-        // stranding a hidden cursor in a windowed page.
-        if (api.current.walkMode) exitWalk();
-        return;
-      }
-      if (api.current.walkMode && !fpv.isLocked) requestLock();
+      // Left fullscreen (Esc) — leave walk mode with it.
+      if (!document.fullscreenElement && api.current.walkMode) exitWalk();
     };
     document.addEventListener("fullscreenchange", onFullscreenChange);
 
@@ -915,25 +834,15 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       renderer.domElement.style.cursor = "";
       document.body.style.cursor = "";
       setInside(false);
-      if (fpv.isLocked) fpv.unlock();
       // Deliberately NOT leaving fullscreen. Walk mode and fullscreen are
       // different things now that the encounter is fullscreen by default:
       // right-clicking to type in the chat should hand back the cursor, not
       // collapse the whole scene back into a page. Esc leaves fullscreen (the
-      // browser's own gesture) and the handler below releases the look with it.
+      // browser's own gesture) and the handler above releases the mode with it.
     };
 
     api.current.enterWalk = enterWalk;
     api.current.exitWalk = exitWalk;
-
-    // Esc is the browser's own way out of pointer lock and cannot be
-    // intercepted, so leaving the lock must leave the mode with it.
-    fpv.addEventListener("lock", () => {
-      api.current.lockError = null;
-      setLockError(null);
-      if (!api.current.walkMode) enterWalk();
-    });
-    fpv.addEventListener("unlock", () => exitWalk());
 
     // Right-click leaves, the way it does in a game. Esc leaves too and always
     // will — releasing pointer lock on Esc is enforced by the browser and
@@ -946,19 +855,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     const onDown = (e) => {
       if (e.button !== 0) return;
       if (!api.current.canWalk) return;
-      // Session 153 — a click while ALREADY in walk mode retries the lock.
-      //
-      // This is the gap that left the pointer loose in fullscreen. The first
-      // click asks for the lock while the page is still windowed; if that is
-      // refused we go fullscreen, but the retry fires from the
-      // fullscreenchange handler, which is NOT a user activation and is
-      // refused on that ground. enterWalk() then early-returned on every
-      // later click, so no trusted gesture ever asked again — with fullscreen
-      // active, focus held, and the answer likely yes.
-      if (api.current.walkMode) {
-        if (!fpv.isLocked && !document.pointerLockElement) requestLock();
-        return;
-      }
+      if (api.current.walkMode) return;
       enterWalk();
     };
     const onUp = () => {};
@@ -1001,7 +898,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // stepPlayer is hung on here deliberately, same reason __checkRuntimeWalk
     // and __skinDebug exist: requestAnimationFrame does not run in a hidden
     // tab, so walking can only be verified by driving frames by hand —
-    //   const a = window.__door; a.fpv.isLocked = true; a.keys.add("KeyW");
+    //   const a = window.__door; a.keys.add("KeyW");
     //   for (let i = 0; i < 180; i++) a.stepPlayer(1/60, a.camera);
     window.__door = api.current;
     api.current.stepPlayer = stepPlayer;
@@ -2531,14 +2428,21 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   // set and WASD held (see stepPlayer's guard above): enough to prove the
   // menu/state plumbing this was actually built to test, not a finished
   // seated animation.
+  // propApproachPoint's default 0.55m is right for "walk up to and look
+  // at this prop" -- Magnus, live, sitting: "he should be attached to the
+  // seat, now he is sitting in the air." A 0.55m + half-width standoff put
+  // him roughly 0.8m in front of the chair, nowhere near it. Sitting wants
+  // the OPPOSITE: pulled back past the front edge, onto the seat itself.
+  const SIT_DIST = -0.2; // offset from centre = hw - 0.2 -- ~4cm out for this chair (hw 0.24)
   function sitOnProp(slot) {
     const a = api.current;
     if (!a.propMeta?.[slot]) return;
-    const { x, z } = propApproachPoint(slot);
+    const { x, z, facing } = propApproachPoint(slot, SIT_DIST);
     const walker = (a.thirdPerson && a.body) ? a.body : a.camera.position;
     walker.x = x;
     walker.z = z;
     a.playerSeatedOn = slot;
+    a.seatedFacing = facing;   // read by placeThirdPersonCamera's own facing-ease
     console.log(`[door] you sit at the ${slot} (positional only -- see sitOnProp)`);
     forcePropRender(n => n + 1);
   }
@@ -2994,6 +2898,12 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         setEyeToEye(false);
       } else if (e.code === "Escape" && chatOpen) {
         setChatOpen(false);
+      } else if (e.code === "Escape" && api.current?.walkMode) {
+        // Used to happen for free: Escape released pointer lock, the browser
+        // fired 'unlock', and that called exitWalk(). With pointer lock gone
+        // entirely (2026-09-15, "remove it all") nothing does that any more,
+        // so it needs its own case now.
+        api.current.exitWalk?.();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -3066,31 +2976,10 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     return () => clearInterval(id);
   }, [tab]);
 
-  // Session 153 — one authority for the cursor.
-  //
-  // enterWalk hid it imperatively and then openDoor, re-running on a later
-  // render, set it straight back to a crosshair: walk mode was on with the
-  // pointer plainly visible. Deriving it from state instead means every
-  // render re-asserts the correct answer, whoever else has been writing to
-  // the style.
-  useEffect(() => {
-    // A class on <html> with !important, rather than inline styles on two
-    // elements. Setting body and canvas alone left every element carrying its
-    // own cursor rule — buttons, the chat panel, the header — free to show a
-    // pointer the moment you crossed onto one, which is why it reappeared at
-    // the edges of the window.
-    const ID = "anima-walk-cursor";
-    if (!document.getElementById(ID)) {
-      const tag = document.createElement("style");
-      tag.id = ID;
-      tag.textContent = "html.anima-walking, html.anima-walking * { cursor: none !important; }";
-      document.head.appendChild(tag);
-    }
-    document.documentElement.classList.toggle("anima-walking", !!inside);
-    const cv = api.current.renderer?.domElement;
-    if (cv) cv.style.cursor = "";      // the class decides; no inline override
-    return () => document.documentElement.classList.remove("anima-walking");
-  });
+  // Magnus, 2026-09-15: "the mouse pointer is hidden, remove it all." There
+  // is no more manual look to hide it FOR -- pointer lock is never
+  // requested any more (see enterWalk) -- so the cursor now just stays
+  // whatever it normally is.
 
   // New bubbles must be visible without scrolling for them.
   useEffect(() => {
@@ -4165,8 +4054,16 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // from -9 to -6 -- Magnus: "the left and right A & D are far too
     // sensitive", and a light strafe tap used to spin him hard toward 90
     // degrees on the same fast rate everything else used.
+    //
+    // Seated is its own case: sitOnProp captures the chair's own facing
+    // (a.seatedFacing) the moment you sit, and he eases to face it the
+    // same way he eases to face a walk direction -- otherwise he sits down
+    // still facing wherever he happened to be looking a moment before,
+    // which is a large part of what read as "attached to nothing" rather
+    // than the chair.
     if (a.me) {
-      const want = (a.moving && a.moveDir) ? Math.atan2(a.moveDir.x, a.moveDir.z) : a.me.rotation.y;
+      const want = a.playerSeatedOn != null && a.seatedFacing != null ? a.seatedFacing
+        : (a.moving && a.moveDir) ? Math.atan2(a.moveDir.x, a.moveDir.z) : a.me.rotation.y;
       let dFace = want - a.me.rotation.y;
       while (dFace >  Math.PI) dFace -= Math.PI * 2;
       while (dFace < -Math.PI) dFace += Math.PI * 2;
@@ -4728,18 +4625,6 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
           <div
             onClick={() => api.current.enterWalk?.()}
             style={{ position: "absolute", inset: 0, cursor: "pointer" }} />
-        )}
-
-        {/* The pointer cannot be trapped without pointer lock, and no amount of
-            CSS substitutes for it. Say why rather than let it look broken. */}
-        {inside && lockError && (
-          <div style={{ position: "absolute", left: "50%", bottom: 22, transform: "translateX(-50%)",
-                        fontSize: 10, letterSpacing: ".1em", textTransform: "uppercase",
-                        color: "rgba(255,255,255,.34)", background: "rgba(6,5,4,.55)",
-                        border: "0.5px solid rgba(255,255,255,.1)", borderRadius: 999,
-                        padding: "6px 14px", pointerEvents: "none", whiteSpace: "nowrap" }}>
-            Mouse capture blocked here · steer by pushing to the edges
-          </div>
         )}
 
         {/* The chat widget. It floats over the flat rather than sitting under
