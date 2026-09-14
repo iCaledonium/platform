@@ -1154,12 +1154,20 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       // enough to a prop should show the menu." A screen-center ray from the
       // camera was never aiming where the avatar himself stands, and there
       // is nothing to visually aim WITH in third person anyway. Nearest prop
-      // within PROP_INTERACT_RANGE of the avatar's own (x, z) wins; only
-      // while actually walking and no menu already open.
+      // within PROP_INTERACT_RANGE of the avatar's own (x, z) wins.
+      //
+      // NOT gated on walkMode -- Magnus, 2026-09-15: "the menu is only
+      // shown when mouse captured, that is wrong." Third-person movement
+      // has never needed walk mode/pointer lock (Session 155 unlock), so
+      // requiring it just for the prompt meant you could walk right up to
+      // the chair without ever seeing it, unless you'd also clicked to
+      // capture the mouse for a camera that no longer does anything with
+      // that capture. canWalk is the real gate: the world is interactive
+      // and you are not typing to her.
       {
         const a = api.current;
         let nearest = null;
-        if (a.walkMode && a.propMeta && Object.keys(a.propMeta).length) {
+        if (a.canWalk && !isTyping() && a.propMeta && Object.keys(a.propMeta).length) {
           const avatar = (a.thirdPerson && a.body) ? a.body : camera.position;
           for (const [slot, meta] of Object.entries(a.propMeta)) {
             const { x, z } = propWorldXZ(meta.node);
@@ -2964,7 +2972,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         return;
       }
       if ((e.code === "Digit1" || e.code === "Digit2") && !isTyping()
-          && api.current?.walkMode && api.current?.hoveredPropSlot) {
+          && api.current?.canWalk && api.current?.hoveredPropSlot) {
         const slot = api.current.hoveredPropSlot;
         const meta = api.current.propMeta?.[slot];
         if (!meta) return;
@@ -4060,10 +4068,14 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     }
 
     const look = new THREE.Vector3();
-    camera.getWorldDirection(look);
-    look.y = 0;
-    if (look.lengthSq() < 1e-6) return;
-    look.normalize();
+    if (a.thirdPerson && a.camFacing != null) {
+      look.set(Math.sin(a.camFacing), 0, Math.cos(a.camFacing));
+    } else {
+      camera.getWorldDirection(look);
+      look.y = 0;
+      if (look.lengthSq() < 1e-6) return;
+      look.normalize();
+    }
     const right = new THREE.Vector3().crossVectors(look, UP).normalize();
     const move = look.multiplyScalar(forward).add(right.multiplyScalar(strafe));
     if (move.lengthSq() < 1e-6) return;
@@ -4149,21 +4161,56 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     if (!cam) return;
     const floorY = a.floorY ?? 0;
 
-    // His own facing is the ONE source of truth "behind" is measured from
-    // now -- not a separately-tracked camera yaw fighting to catch up to
-    // it. Eased here, once, before anything below reads it, so his turn
-    // and the camera's boom both run off the same already-smooth number.
-    // Turned toward the target rather than snapped -- a body that changes
-    // heading in one frame reads as a sprite, not a person.
+    // His own facing turns toward wherever he's actually walking. Slowed
+    // from -9 to -6 -- Magnus: "the left and right A & D are far too
+    // sensitive", and a light strafe tap used to spin him hard toward 90
+    // degrees on the same fast rate everything else used.
     if (a.me) {
       const want = (a.moving && a.moveDir) ? Math.atan2(a.moveDir.x, a.moveDir.z) : a.me.rotation.y;
       let dFace = want - a.me.rotation.y;
       while (dFace >  Math.PI) dFace -= Math.PI * 2;
       while (dFace < -Math.PI) dFace += Math.PI * 2;
-      a.me.rotation.y += dFace * (1 - Math.exp(-9 * dt));
+      a.me.rotation.y += dFace * (1 - Math.exp(-6 * dt));
       a.me.position.set(a.body.x, floorY, a.body.z);
     }
-    const facing = a.me ? a.me.rotation.y : 0;
+
+    // camFacing is a SEPARATE, deliberately-lagged heading: what the
+    // camera's boom position is measured from, and (see stepPlayer) the
+    // one stable "forward" WASD itself reads -- never the camera's own
+    // post-lookAt direction, which live testing showed drifting into a
+    // steady counter-clockwise circle (a lagging, shoulder-offset lookAt
+    // is not the same direction as the body's actual forward; feeding
+    // that back in as "forward" compounds the skew every frame).
+    //
+    // Magnus: "you have to let the character walk a few steps towards the
+    // camera before flipping it." An ordinary turn or a strafe round a
+    // corner still tracks his facing continuously (small deltas below
+    // CAM_REORIENT_ANGLE). Only once he's turned more than that -- a real
+    // reversal -- does the gate close, and it opens again only once he's
+    // actually covered CAM_REORIENT_DIST in the new direction: a distance
+    // check gives "a few steps" for free where a pure angle or timer
+    // would not (standing there facing the wrong way would never resolve).
+    const CAM_REORIENT_ANGLE = 0.6;  // ~34 degrees: a real reversal, not a curve
+    const CAM_REORIENT_DIST  = 0.7;  // metres he has to actually cover first
+    if (a.camFacing == null) a.camFacing = a.me ? a.me.rotation.y : 0;
+    const wantCam = a.me ? a.me.rotation.y : a.camFacing;
+    let dCam = wantCam - a.camFacing;
+    while (dCam >  Math.PI) dCam -= Math.PI * 2;
+    while (dCam < -Math.PI) dCam += Math.PI * 2;
+    if (Math.abs(dCam) > CAM_REORIENT_ANGLE) {
+      if (a.camReorientAnchor == null) a.camReorientAnchor = { x: a.body.x, z: a.body.z };
+      const travelled = Math.hypot(a.body.x - a.camReorientAnchor.x, a.body.z - a.camReorientAnchor.z);
+      if (travelled >= CAM_REORIENT_DIST) {
+        a.camFacing += dCam * (1 - Math.exp(-6 * dt));
+        a.camReorientAnchor = null;
+      }
+      // else: held back on purpose -- he is still catching up on foot.
+    } else {
+      a.camFacing += dCam * (1 - Math.exp(-6 * dt));
+      a.camReorientAnchor = null;
+    }
+
+    const facing = a.camFacing;
     const look  = new THREE.Vector3(Math.sin(facing), 0, Math.cos(facing));
     const right = new THREE.Vector3().crossVectors(look, UP).normalize();
 
