@@ -2486,41 +2486,38 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     return { x: x + Math.sin(facing) * (hw + dist), z: z + Math.cos(facing) * (hw + dist), facing };
   }
 
-  // Walks her to a prop and turns her to face it, using the SAME tick-driven
-  // walk (a.herWalk / stepHer) "come here" already runs -- faceYaw is new:
-  // stepHer's arrival used to always face the player, which is right for
-  // "come here" and wrong for a chair.
-  function walkHerToProp(slot) {
-    const a = api.current;
-    if (!a.her || !a.propMeta?.[slot]) return;
-    const { x, z, facing } = propApproachPoint(slot);
-    a.herRoom = null;
-    a.seatedOn = null;
-    a.herWalk = { state: "waiting", startAt: performance.now(),
-                  to: new THREE.Vector3(x, 0, z), faceYaw: facing };
-    console.log(`[door] walking to the ${slot}`);
-  }
-
-  // "Sit down" -- POSITIONAL ONLY. Studio's real seated pose (playMotion +
-  // applyPose in InteractionStudioScene.jsx ~1512-1230) composes onto a
-  // captured idle/rest base, dampens the mixer's arm sway under a held
-  // pose, and handles release -- three sessions of hard-won correctness
-  // (the "bird flying" bug, the compounding-delta bug, still-mode) that
-  // this pass does not attempt to re-derive. She walks to the chair,
-  // turns her back to it, and stays standing there with `a.seatedOn` set:
-  // enough to prove the menu/walk/state plumbing this was actually built
-  // to test, not a finished seated animation.
+  // Reworked per Magnus: "it was the user/me not the lindsea or any other
+  // actor we should try to do actions with" -- these act on the PLAYER'S OWN
+  // body (a.body in third person, the camera itself in first), not her. The
+  // player already self-navigated here via WASD to get within
+  // PROP_INTERACT_RANGE and look at the prop before E could even open this
+  // menu, so there is no separate "walk to the chair" action to build --
+  // sitting snaps straight to the prop's own approach point instead of
+  // trusting wherever the player happened to be standing.
+  //
+  // "Sit down" is POSITIONAL ONLY, same honest scope as the studio's real
+  // seated pose (playMotion + applyPose in InteractionStudioScene.jsx
+  // ~1512-1230): that composes onto a captured idle/rest base, dampens the
+  // mixer's arm sway under a held pose, and handles release -- three
+  // sessions of hard-won correctness (the "bird flying" bug, the
+  // compounding-delta bug, still-mode) this pass does not attempt to
+  // re-derive. The player is placed at the chair with `a.playerSeatedOn`
+  // set and WASD held (see stepPlayer's guard above): enough to prove the
+  // menu/state plumbing this was actually built to test, not a finished
+  // seated animation.
   function sitOnProp(slot) {
     const a = api.current;
-    if (!a.her || !a.propMeta?.[slot]) return;
-    walkHerToProp(slot);
-    a.pendingSit = slot;   // claimed once stepHer reports arrival, see the tick
+    if (!a.propMeta?.[slot]) return;
+    const { x, z } = propApproachPoint(slot);
+    const walker = (a.thirdPerson && a.body) ? a.body : a.camera.position;
+    walker.x = x;
+    walker.z = z;
+    a.playerSeatedOn = slot;
+    console.log(`[door] you sit at the ${slot} (positional only -- see sitOnProp)`);
   }
 
   function standUpFromProp() {
-    const a = api.current;
-    a.seatedOn = null;
-    a.pendingSit = null;
+    api.current.playerSeatedOn = null;
   }
 
   // Pull the prop itself along its own facing, away from wherever it sits
@@ -4010,9 +4007,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       // the kitchen was luck rather than attention. Arriving somewhere near
       // you means looking at you; only if you are across the room does she
       // keep her travelling facing.
-      if (w.faceYaw != null) {
-        api.current.herFacing = w.faceYaw;
-      } else {
+      {
         const cam = api.current.camera;
         const fx = cam.position.x - her.position.x;
         const fz = cam.position.z - her.position.z;
@@ -4021,13 +4016,6 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
           : her.rotation.y;
       }
       api.current.idleTurn = api.current.herFacing;   // idle eases her round
-      // sitOnProp asked to walk here and then sit -- claim it now that she
-      // has actually arrived, rather than assuming the walk succeeds.
-      if (api.current.pendingSit) {
-        api.current.seatedOn = api.current.pendingSit;
-        api.current.pendingSit = null;
-        console.log(`[door] seated at the ${api.current.seatedOn} (positional only -- see sitOnProp)`);
-      }
       aimSun();
       if (a.actions?.walk) {
         a.actions.idle.reset().play();
@@ -4071,7 +4059,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // exactly: isTyping() still holds the feet, so typing "was" to her cannot
     // walk you into the sofa. First person is untouched and still needs
     // walk mode, where the hidden cursor is what tells you the keys are yours.
-    if (!a.canWalk || a.eyeToEye) return;
+    if (!a.canWalk || a.eyeToEye || a.playerSeatedOn) return;
     if (!a.walkMode && !(a.thirdPerson && !isTyping())) return;
     const keys = a.keys;
     let forward = 0, strafe = 0;
@@ -4558,7 +4546,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
           const slot = interactMenu.slot;
           const meta = api.current.propMeta?.[slot];
           const label = slot.charAt(0).toUpperCase() + slot.slice(1);
-          const seated = api.current.seatedOn === slot;
+          const seated = api.current.playerSeatedOn === slot;
           const type = meta?.type;
           const canSit = PROP_FOOTPRINTS[type]?.seat != null;
           const canPull = type === "chair";
@@ -4580,7 +4568,6 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
                           boxShadow: "0 12px 40px rgba(0,0,0,.5)", overflow: "hidden" }}>
               <div style={{ padding: "10px 14px", fontSize: 9.5, letterSpacing: ".14em", textTransform: "uppercase",
                             color: "rgba(255,255,255,.4)" }}>{label}</div>
-              <Item onClick={() => walkHerToProp(slot)}>Walk to the {label.toLowerCase()}</Item>
               {canSit && !seated && <Item onClick={() => sitOnProp(slot)}>Sit down</Item>}
               {canSit && seated && <Item onClick={() => standUpFromProp()}>Stand up</Item>}
               {canPull && <Item onClick={() => pullProp(slot)}>{meta?.pulled ? "Push back" : "Pull out"}</Item>}
