@@ -1149,6 +1149,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       }
       api.current.mixer?.update(dt);
       api.current.meMixer?.update(dt);
+      applySitPose();
       if (api.current.herRide) stepHairRide(api.current.herRide, api.current.her);
       if (api.current.meRide)  stepHairRide(api.current.meRide,  api.current.me);
       // Pull/push tween, eased like the door's own swing -- one per PART
@@ -1208,8 +1209,12 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       stepHer(dt);
       idleHer(dt);
       applyEyeToEye(dt, camera);
-      steerLook(dt);
+      // steerLook (edge-of-screen manual turning) no longer runs -- Magnus,
+      // 2026-09-15: "we do ALWAYS behind", chaseLook below is now the only
+      // thing that ever turns this camera. Left defined (still reachable at
+      // api.current.steerLook for the console), just not called every frame.
       stepPlayer(dt, camera);
+      chaseLook(dt);
       placeThirdPersonCamera(dt);
 
       // Session 153 — the landing is scenery for the OUTSIDE of the door.
@@ -2476,6 +2481,22 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     return { x: v.x, z: v.z };
   }
 
+  // The actions this prop actually offers right now, numbered fresh for
+  // each state -- not pulled: just Pull; pulled and empty: Sit AND Push,
+  // together; seated: just Stand up. Shared by the keydown handler and the
+  // prompt below so the two can never show/accept different things.
+  function propActions(slot, meta) {
+    const a = api.current;
+    const label = slot.charAt(0).toUpperCase() + slot.slice(1);
+    const l = label.toLowerCase();
+    if (!meta.pulled) return [{ num: 1, verb: `Pull ${l}`, run: () => pullProp(slot) }];
+    if (a.playerSeatedOn === slot) return [{ num: 1, verb: "Stand up", run: () => standUpFromProp() }];
+    return [
+      { num: 1, verb: `Sit ${l}`, run: () => sitOnProp(slot) },
+      { num: 2, verb: `Push ${l}`, run: () => pullProp(slot) },
+    ];
+  }
+
   // Where the manifest's yaw actually points. The number in homes.json is
   // measured in the FLAT'S OWN raw frame (same as `door`/`facing` above --
   // node dump, not runtime scene), so it has to pick up home.rotation.y the
@@ -2535,6 +2556,35 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   function standUpFromProp() {
     api.current.playerSeatedOn = null;
     forcePropRender(n => n + 1);
+  }
+
+  // Magnus, 2026-09-15: "the sit animation is not working." There is no
+  // real one to play -- the player's rig exports only idle/walk (checked
+  // the GLB directly), and the actual seated pose elsewhere in this app
+  // (playMotion + applyPose, InteractionStudioScene.jsx ~1512-1230) is the
+  // hard-won blending system already ruled out of scope for this pass. So
+  // this is a static, bone-level approximation instead: bend hip and knee
+  // on both legs by a fixed amount, every frame, laid on top of whatever
+  // the idle mixer just wrote -- it has to run AFTER meMixer.update() each
+  // tick or the mixer's own per-frame reset erases it before the next
+  // paint. rotateX is LOCAL, relative to the bone's current (freshly-reset)
+  // orientation, so the same delta lands the same way every frame instead
+  // of compounding across frames.
+  const SIT_LEG_BONES = ["l_thigh", "r_thigh", "l_shin", "r_shin"];
+  function applySitPose() {
+    const a = api.current;
+    if (!a.playerSeatedOn || !a.me) return;
+    if (!a.sitBones) {
+      a.sitBones = {};
+      for (const n of SIT_LEG_BONES) a.sitBones[n] = a.me.getObjectByName(n);
+    }
+    const b = a.sitBones;
+    const THIGH_BEND = -1.55;  // hip: thigh lifts forward toward horizontal
+    const KNEE_BEND  =  1.65;  // knee: shin folds back down toward vertical
+    b.l_thigh?.rotateX(THIGH_BEND);
+    b.r_thigh?.rotateX(THIGH_BEND);
+    b.l_shin?.rotateX(KNEE_BEND);
+    b.r_shin?.rotateX(KNEE_BEND);
   }
 
   // Pull the prop itself along its own facing, away from wherever it sits
@@ -2920,13 +2970,14 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         setPanelHidden(h => !h);
         return;
       }
-      // Standing up is NEVER gated on walkMode/hoveredPropSlot the way
-      // pulling and sitting are. Live repro, Magnus 2026-09-14: those can
+      // Standing up is NEVER gated on walkMode/hoveredPropSlot the way the
+      // other prop actions are. Live repro, Magnus 2026-09-14: those can
       // drop out from under you while you're seated (chat opening, pointer
       // lock lost, alt-tab) with no way back, since WASD stays disabled by
       // a.playerSeatedOn regardless -- you'd be stuck. If you're seated,
-      // period, Digit2 always frees you.
-      if (e.code === "Digit2" && !isTyping() && api.current?.playerSeatedOn) {
+      // period, Digit1 always frees you (seated is a single-action state,
+      // see propActions -- Stand up is always num 1 there too).
+      if (e.code === "Digit1" && !isTyping() && api.current?.playerSeatedOn) {
         standUpFromProp();
         return;
       }
@@ -2935,11 +2986,10 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         const slot = api.current.hoveredPropSlot;
         const meta = api.current.propMeta?.[slot];
         if (!meta) return;
-        if (e.code === "Digit1" && !meta.pulled) { pullProp(slot); return; }
-        if (e.code === "Digit2" && meta.pulled && api.current.playerSeatedOn !== slot) {
-          sitOnProp(slot);
-          return;
-        }
+        const num = e.code === "Digit1" ? 1 : 2;
+        const action = propActions(slot, meta).find(act => act.num === num);
+        if (action) action.run();
+        return;
       }
       if (e.code === "Enter" && !chatOpen && decision === "open_door" && ready) {
         setPanelHidden(false);
@@ -3808,135 +3858,44 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     if (a.sunOffset) a.key.position.copy(a.sunTarget.position).add(a.sunOffset);
   }
 
-  // Look-around when the pointer is NOT captured.
+  // Magnus, 2026-09-15: "the click mouse camera is disturbing, let's do
+  // like in the last of us or uncharted, camera always behind" -- and then,
+  // seeing walkMode's own pointer-lock mouse-look still doing exactly that:
+  // "remove that clicking the mouse starts looking around with the camera.
+  // We do ALWAYS behind." So this now runs on EVERY frame, walkMode or not,
+  // and always wins: it is called after stepPlayer and before
+  // placeThirdPersonCamera reads cam.getWorldDirection(), so it overwrites
+  // whatever a pointer-lock mouse delta wrote to camera.quaternion earlier
+  // in the same tick. Pointer lock itself stays (it still hides the cursor
+  // and gates WASD/chat), only its rotation now goes nowhere.
   //
-  // Raw movement deltas alone stall at the screen edge: the cursor runs out of
-  // desk, movementX becomes 0, and a 360 is impossible without lifting the
-  // mouse and dragging again — the two faults reported. So near an edge the
-  // camera keeps turning on its own, at a rate that grows as the pointer gets
-  // closer to it. In the middle of the screen nothing changes: deltas drive it
-  // 1:1 and it feels like an ordinary mouse-look.
-  //
-  // None of this runs when pointer lock is held — there the pointer is
-  // infinite and deltas are all you need.
-  // GTA-style mouse look, on a held right button.
-  //
-  // GTA V orbits the camera continuously with the mouse and never asks you to
-  // click for it. This scene cannot take the mouse outright: you also have to
-  // TYPE to her, and pointer lock steals the cursor from the chat input. The
-  // "unlock" change earlier tonight fixed walking without a click, but it also
-  // gated steerLook off (it requires walkMode), leaving GTA-style movement
-  // with no camera control at all -- the worst of both.
-  //
-  // So: hold the right button and the camera is yours, with real mouse look
-  // and no edge-steering approximation; release and the cursor is yours again
-  // for the chat. Holding IS the mode indicator, so nothing has to be
-  // remembered or displayed. Movement stays camera-relative, which is what
-  // makes W walk where you are looking, as it does in GTA.
-  useEffect(() => {
+  // "walking towards the camera flips the camera behind the character when
+  // the character gets too close" -- normally this EASES toward the walk
+  // direction, which reads as a natural trailing turn; but ease alone would
+  // let you walk face-first into your own camera when you turn around and
+  // head back the way you came. Below CAM_FLIP_DIST it snaps instead, the
+  // same instant reorientation a chase cam does when you reverse course.
+  const CAM_FLIP_DIST = 1.1;
+  function chaseLook(dt) {
     const a = api.current;
-    // Bound to the DOCUMENT, not to renderer.domElement.
-    //
-    // The first version read a.renderer?.domElement at mount and bailed when it
-    // was undefined -- which it always is, because the renderer is built by a
-    // later effect. The listeners were therefore never attached and the right
-    // button did nothing. Measured before shipping: _mouseLook false and no
-    // pointer lock after a synthetic right-button press. Same shape as the
-    // audio-arming bug earlier tonight: work gated on a thing that is not
-    // ready yet, silently skipped, with nothing to show for it.
-    //
-    // Document-level listeners have no ordering problem, and the canvas is
-    // looked up at EVENT time, by which point it certainly exists.
-    const canvas = () => api.current?.renderer?.domElement || null;
-
-    // EITHER button holds the camera.
-    //
-    // Right-button-only assumed a gaming mouse. On a Magic Mouse or trackpad a
-    // sustained button:2 is awkward at best -- a two-finger press-and-hold does
-    // not deliver one -- so "hold right to look" was unusable on the hardware
-    // this actually runs on. Measured 2026-09-05 from the event trace: every
-    // press Magnus made arrived as button:0 while the handler waited for
-    // button:2, so nothing happened and it read as "hold is not working".
-    //
-    // Left-drag is also the natural look gesture on a trackpad, so accept
-    // both. The scene has nothing else bound to a left DRAG (a left CLICK on
-    // the doorway still enters first-person walk mode, which is untouched --
-    // see the guard in onUp).
-    const onDown = (e) => {
-      if (e.button !== 0 && e.button !== 2) return;
-      const el = canvas();
-      if (!el) return;
-      // WHITELIST the canvas; do not blacklist controls.
-      //
-      // This used to exclude input/textarea/button/select/a, which meant a
-      // press anywhere ELSE on the watcher panel -- its header, its body, its
-      // scrollbar, the empty space between messages -- still grabbed the
-      // camera, so the panel could not be dragged or scrolled. Reported
-      // 2026-09-06: "if the mouse pointer is over the watcher i must be able to
-      // move it, now the hold camera movement jumps in".
-      //
-      // The camera belongs to the 3D view and nothing else. Anything overlaid
-      // on it -- this panel, the chat dock, the tabs, anything added later --
-      // then keeps its own mouse behaviour for free, without having to be
-      // listed here and without this list going stale the next time the UI
-      // grows a control.
-      if (e.target !== el && !el.contains(e.target)) return;
-      e.preventDefault();
-      if (isTyping()) document.activeElement.blur();
-      a._mouseLook = true;
-      el.requestPointerLock?.();
-    };
-    const onUp = (e) => {
-      if (e.button !== 0 && e.button !== 2) return;
-      a._mouseLook = false;
-      // Unconditional: if the lock has not arrived yet, onLockChange above
-      // will drop it as soon as it does.
-      document.exitPointerLock?.();
-    };
-    // Losing the lock any other way (Esc, focus loss) must clear the flag too,
-    // or the next frame keeps applying deltas that are no longer arriving.
-    // requestPointerLock() is ASYNCHRONOUS, and that made hold behave like a
-    // toggle. On a quick press-release the lock engages AFTER mouseup, so onUp
-    // ran while there was still nothing to exit -- exitPointerLock() was a
-    // no-op -- and the lock then arrived and stayed. Reported live 2026-09-05:
-    // "It is not hold it is click now."
-    //
-    // So the authority is the FLAG, not the ordering: whenever the lock state
-    // changes, if the button is no longer held, drop the lock immediately.
-    // A release that beats the lock is now corrected the moment it lands.
-    const onLockChange = () => {
-      const el = canvas();
-      if (document.pointerLockElement !== el) { a._mouseLook = false; return; }
-      if (!a._mouseLook) document.exitPointerLock?.();   // released before it engaged
-    };
-    const onMove = (e) => {
-      if (!a._mouseLook || document.pointerLockElement !== canvas()) return;
-      if (a.eyeToEye) return;                  // she has the frame; leave it alone
-      const SENS = 0.0022;                     // rad per pixel, tuned to steerLook's feel
-      const eu = _steerEuler;
-      eu.setFromQuaternion(a.camera.quaternion);
-      eu.y -= e.movementX * SENS;
-      eu.x -= e.movementY * SENS;
-      const lim = Math.PI / 2 - 0.02;
-      eu.x = Math.max(-lim, Math.min(lim, eu.x));
-      a.camera.quaternion.setFromEuler(eu);
-    };
-
-    document.addEventListener("mousedown", onDown, true);
-    window.addEventListener("mouseup", onUp);
-    window.addEventListener("mousemove", onMove);
-    document.addEventListener("pointerlockchange", onLockChange);
-    return () => {
-      document.removeEventListener("mousedown", onDown, true);
-      window.removeEventListener("mouseup", onUp);
-      window.removeEventListener("mousemove", onMove);
-      document.removeEventListener("pointerlockchange", onLockChange);
-    };
-  }, []);
+    if (!a.thirdPerson || a.eyeToEye || a.dolly) return;
+    if (!a.moving || !a.moveDir) return;
+    const cam = a.camera;
+    if (!cam || !a.body) return;
+    const targetYaw = Math.atan2(a.moveDir.x, a.moveDir.z);
+    const eu = _steerEuler;
+    eu.setFromQuaternion(cam.quaternion);
+    let d = targetYaw - eu.y;
+    while (d >  Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    const dx = a.body.x - cam.position.x, dz = a.body.z - cam.position.z;
+    const close = Math.hypot(dx, dz) < CAM_FLIP_DIST;
+    eu.y += d * (close ? 1 : (1 - Math.exp(-3 * dt)));
+    cam.quaternion.setFromEuler(eu);
+  }
 
   function steerLook(delta) {
     const a = api.current;
-    if (a._mouseLook) return;   // the held right button owns the camera
     if (!a.walkMode || a.eyeToEye || a.fpv?.isLocked || document.pointerLockElement) return;
     const p = a.pointer;
     // Left the window, or the window lost focus: freeze. Without this the last
@@ -4270,6 +4229,29 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       a.body.z - look.z * back + right.z * shoulder
     );
 
+    // The boom raycast above only tested straight back, never the LATERAL
+    // shoulder offset added afterward -- exactly the gap the note above
+    // this function names, and exactly what put the camera through a wall
+    // in a corner or a narrow room. Magnus, 2026-09-15: "don't film outside
+    // the walls." One more raycast, along the ACTUAL combined direction to
+    // the target (back + shoulder together, not just back), catches every
+    // case the boom-only test couldn't -- if it hits a wall before reaching
+    // _camTarget, pull the target back along that same ray instead.
+    if (bt) {
+      const origin = _camRay.origin.set(a.body.x, floorY + CAM_UP, a.body.z);
+      const toTarget = _camTarget.clone().sub(origin);
+      const targetDist = toTarget.length();
+      if (targetDist > 1e-4) {
+        _camRay.direction.copy(toTarget).normalize();
+        _camRay.far = targetDist + 0.2;
+        const hit2 = bt.raycastFirst(_camRay, THREE.DoubleSide);
+        if (hit2 && hit2.distance < targetDist) {
+          const pulled = Math.max(CAM_MIN_BACK, hit2.distance - 0.18);
+          _camTarget.copy(origin).addScaledVector(_camRay.direction, pulled);
+        }
+      }
+    }
+
     // The landing is a CLOSED BOX, not open air: 3.7m deep with a plaster wall
     // across the back (Landing.js builds it). You stand at z≈2.82 to knock, so
     // a camera 2.45m behind you sits at z≈5.2 — through that wall, and the shot
@@ -4583,25 +4565,29 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         )}
 
         {/* UC-18 -- Magnus, 2026-09-14: no aiming, no click menu. Proximity
-            (see the tick above) is angle-independent already; this is just
-            the one action the chair's own state actually allows right now,
-            numbered so the matching Digit1/Digit2 handler above can fire it
-            straight from the keyboard -- no pointer-lock release needed. */}
+            (see the tick above) is angle-independent already. 2026-09-15:
+            "it is never 1 pull chair, 2 sit chair -- it is 1 pull chair,
+            then 1 sit chair 2 push chair" -- every option the chair's
+            state actually allows right now, all listed together and
+            renumbered fresh per state (see propActions), not one action
+            swapping its own number. Digit1/Digit2 above fire straight off
+            this same list -- no pointer-lock release needed. */}
         {hoveredProp && (() => {
           const slot = hoveredProp.slot;
           const meta = api.current.propMeta?.[slot];
           if (!meta) return null;
-          const seated = api.current.playerSeatedOn === slot;
-          const [num, verb] = !meta.pulled ? [1, `Pull out the ${hoveredProp.label.toLowerCase()}`]
-            : seated ? [2, "Stand up"]
-            : [2, `Sit on the ${hoveredProp.label.toLowerCase()}`];
+          const actions = propActions(slot, meta);
           return (
             <div style={{ position: "absolute", left: "50%", bottom: "38%", transform: "translateX(-50%)",
                           zIndex: 30, padding: "6px 12px", borderRadius: 5,
                           background: "rgba(10,9,8,.7)", border: "0.5px solid rgba(255,255,255,.18)",
                           fontSize: 10.5, letterSpacing: ".08em", color: "rgba(255,255,255,.85)",
-                          pointerEvents: "none" }}>
-              <b style={{ color: "rgba(201,151,58,.95)" }}>{num}</b> — {verb}
+                          pointerEvents: "none", display: "flex", flexDirection: "column", gap: 4 }}>
+              {actions.map(act => (
+                <div key={act.num}>
+                  <b style={{ color: "rgba(201,151,58,.95)" }}>{act.num}</b> — {act.verb}
+                </div>
+              ))}
             </div>
           );
         })()}
