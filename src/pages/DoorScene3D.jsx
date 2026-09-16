@@ -2457,7 +2457,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // collision to add here without real cost, so the honest fix is not
     // to sit him close enough to need one -- pulled FORWARD, off the
     // backrest, rather than nudged toward it.
-    const backNudge = -0.08;   // clearance off the backrest, not into it
+    const backNudge = -0.02;   // clearance off the backrest, not into it -- -0.08 was too much, Magnus live: "that is to much" (put him off the front of the seat)
     const toX = x + Math.sin(backrestFacing) * backNudge;
     const toZ = z + Math.cos(backrestFacing) * backNudge;
 
