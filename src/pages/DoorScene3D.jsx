@@ -1106,6 +1106,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       // its own notes for why that replaced the old chaseLook/quaternion
       // approach outright. Left steerLook defined (still reachable at
       // api.current.steerLook for the console), just not called every frame.
+      stepSeatedLook(dt);
       stepPlayer(dt, camera);
       placeThirdPersonCamera(dt);
 
@@ -4027,6 +4028,47 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
 
   // Direction comes from where you are looking, so it behaves like any
   // first-person control. Inert unless the pointer is actually locked.
+  // Magnus, 2026-09-16: "it is hard to see since i can't move the camera
+  // ... we need to let the user look around then sitting." Real gap:
+  // chaseLook only ever turns the camera in response to WASD (a.moveDir),
+  // and WASD is deliberately dead while seated -- so sitting down left no
+  // way to look around at all, mouse-look having been removed on purpose
+  // last pass ("remove that clicking the mouse starts looking around").
+  // Reusing A/D for this rather than bringing mouse-look back: they
+  // already do nothing while seated, and orbiting the camera is exactly
+  // the motion "turn left/right" already means everywhere else.
+  //
+  // Deliberately an ADDITIVE offset on top of a.camFacing, not a rewrite
+  // of it -- his own facing (and therefore camFacing) stays exactly where
+  // sitOnProp put it, so standing back up returns the camera to the same
+  // place it would have been without ever having looked around. Reset
+  // the moment he's seated somewhere new (a fresh sit starts centred).
+  // W/S are exactly as dead as A/D while seated (stepPlayer's WASD gate
+  // does not carve out an exception for any of the four), so Magnus:
+  // "you need to add up and down too" reuses them the same way -- W looks
+  // up, S looks down. A vertical shift of the look-AT point rather than
+  // an actual pitch rotation, but at this boom distance (CAM_BACK) the
+  // two read the same to the eye and this one is one line, not a second
+  // orbit axis to keep in sync with the first.
+  const SEATED_LOOK_RATE  = 1.8;  // rad/s, yaw
+  const SEATED_PITCH_RATE = 1.1;  // m/s, vertical look-at shift
+  const SEATED_PITCH_MAX  = 1.1;  // metres, either way
+  function stepSeatedLook(dt) {
+    const a = api.current;
+    if (!a.playerSeatedOn) { a.seatedLookOffset = 0; a.seatedLookPitch = 0; return; }
+    if (isTyping()) return;
+    let turn = 0, pitch = 0;
+    if (a.keys.has("KeyD") || a.keys.has("ArrowRight")) turn += 1;
+    if (a.keys.has("KeyA") || a.keys.has("ArrowLeft"))  turn -= 1;
+    if (a.keys.has("KeyW") || a.keys.has("ArrowUp"))    pitch += 1;
+    if (a.keys.has("KeyS") || a.keys.has("ArrowDown"))  pitch -= 1;
+    if (turn)  a.seatedLookOffset = (a.seatedLookOffset || 0) + turn * SEATED_LOOK_RATE * dt;
+    if (pitch) {
+      const p = (a.seatedLookPitch || 0) + pitch * SEATED_PITCH_RATE * dt;
+      a.seatedLookPitch = Math.max(-SEATED_PITCH_MAX, Math.min(SEATED_PITCH_MAX, p));
+    }
+  }
+
   function stepPlayer(delta, camera) {
     const a = api.current;
     // Session 153 — gated on walk MODE, and never on pointer LOCK.
@@ -4220,7 +4262,13 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       a.camReorientAnchor = null;
     }
 
-    const facing = a.camFacing;
+    // Orbit only -- a.camFacing itself (his own base facing) is untouched,
+    // so standing up lands the camera exactly where it would have been
+    // without ever looking around. cam.lookAt(...) below still aims AT him
+    // regardless of this offset -- only where the boom sits around him
+    // changes, which is what makes this read as looking around rather
+    // than the character himself turning to face somewhere new.
+    const facing = a.camFacing + (a.playerSeatedOn ? (a.seatedLookOffset || 0) : 0);
     const look  = new THREE.Vector3(Math.sin(facing), 0, Math.cos(facing));
     const right = new THREE.Vector3().crossVectors(look, UP).normalize();
 
@@ -4331,7 +4379,8 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // drift or fight anything else, because it keeps no memory between
     // frames to fight WITH. Aimed a little below eye height, standard
     // over-the-shoulder framing, not straight at his hairline.
-    cam.lookAt(a.body.x, floorY + EYE_HEIGHT - 0.12, a.body.z);
+    const lookY = floorY + EYE_HEIGHT - 0.12 + (a.playerSeatedOn ? (a.seatedLookPitch || 0) : 0);
+    cam.lookAt(a.body.x, lookY, a.body.z);
   }
 
   // The player's own body.
