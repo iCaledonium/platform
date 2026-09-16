@@ -2509,22 +2509,46 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     forcePropRender(n => n + 1);
   }
 
+  // Magnus, 2026-09-16: "the stand up animation is that from interaction
+  // studio too? cuz there is one." It was not -- this used to be an
+  // instant snap, everything reset in one frame. Ported from
+  // InteractionStudioScene's own standUp: release the pose GENTLY rather
+  // than cut it, and rise over the feet's own actual position rather than
+  // wherever the seated root happened to be sitting -- "a person does not
+  // levitate off a chair, they stand OVER THEIR FEET." Reuses a.sitting
+  // for the rise the same way the source reuses fig.sitting for both
+  // directions -- one state machine, stepSitting reads st.releasing to
+  // know which way it's going.
   function standUpFromProp() {
     const a = api.current;
-    // Nothing else ever reclaims these bones -- idle does not animate legs
-    // (that is WHY a held pose does not fight idle sway on them), which
-    // cuts both ways: standing up has to put them back itself, or he
-    // walks off still folded into the sitting shape.
-    if (a.sitting?.bones && a.meRestQuat) {
-      for (const [rigBone, bone] of a.sitting.bones) {
-        const restQ = a.meRestQuat.get(rigBone);
-        if (restQ) bone.quaternion.copy(restQ);
-      }
+    if (!a.playerSeatedOn || !a.me) return;
+    if (a.sitting?.releasing) return;   // already rising -- Digit1 twice must not restart it
+    const priorTracks = a.sitting?.tracks || [];
+    const priorBones = a.sitting?.bones || new Map();
+    const releaseFrom = new Map();
+    for (const [rigBone, bone] of priorBones) releaseFrom.set(rigBone, bone.quaternion.clone());
+
+    // Rising happens OVER THE FEET, not wherever the seated root was --
+    // the same reasoning the source names explicitly: rising in place
+    // would carry the root (and the rest of him) to wherever sitting had
+    // put it, which is not necessarily where his feet actually are once
+    // the legs start to straighten.
+    let fx = 0, fz = 0, n = 0;
+    for (const name of ["l_foot", "r_foot"]) {
+      const b = a.me.getObjectByName(name);
+      if (!b) continue;
+      const v = b.getWorldPosition(new THREE.Vector3());
+      fx += v.x; fz += v.z; n++;
     }
-    a.playerSeatedOn = null;
-    a.sitting = null;
-    a.seatedY = null;
-    if (a.me) a.me.position.y = a.floorY ?? 0;
+    const to = n ? { x: fx / n, z: fz / n } : { x: a.body.x, z: a.body.z };
+
+    a.sitting = {
+      t: 0, dur: 0.9,
+      from: { x: a.body.x, z: a.body.z }, to,
+      floorAnkle: a.sitting?.floorAnkle,
+      tracks: priorTracks, bones: priorBones, releaseFrom,
+      releasing: true, standLean: true,
+    };
     forcePropRender(n => n + 1);
   }
 
@@ -2546,14 +2570,18 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   }
 
 
-  // Runs every tick while seated: eases position, applies the authored
-  // pose's bone tracks as ABSOLUTE rotations (not additive -- idle sway
-  // has no business surviving under a held pose, the same reasoning
-  // behind why the previous, replaced version of this function had to
-  // stop using rotateX), then blends the root's height from
-  // "feet on the floor" to "thighs on the seat" over the back fifth of the
-  // transition -- InteractionStudioScene's stepSitting, trimmed of the
-  // stand-lean, chair-scoot-with-you, and raycast-measured seat variants.
+  // Runs every tick a.sitting exists, in EITHER direction --
+  // InteractionStudioScene's own stepSitting reuses fig.sitting the same
+  // way for standing up, and this mirrors that rather than being two
+  // separate functions. Sitting down (st.releasing falsy): applies the
+  // authored pose's bone tracks as ABSOLUTE rotations composed onto rest
+  // (idle sway has no business surviving under a held pose). Standing up
+  // (st.releasing true): blends each bone from wherever it was when the
+  // rise began back to rest instead, plus the standLean bell-curve torso
+  // lean, and clears a.playerSeatedOn itself once fully released --
+  // standUpFromProp only starts the rise, this is what finishes it. Root
+  // height either way comes from footHeightForMe alone (feet planted);
+  // trimmed of chair-scoot-with-you and the raycast-measured seat variant.
   function stepSitting(dt) {
     const a = api.current;
     const st = a.sitting;
@@ -2567,14 +2595,45 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     a.me.position.x = a.body.x;
     a.me.position.z = a.body.z;
 
-    for (const tr of st.tracks) {
-      const bone = st.bones.get(tr.rigBone);
-      const restQ = a.meRestQuat?.get(tr.rigBone);
-      if (!bone || !restQ) continue;
-      const [rx, ry, rz] = sampleTrack(tr, st.t);
-      _poseE.set(rx * DEG, ry * DEG, rz * DEG);
-      _poseQ.setFromEuler(_poseE);
-      bone.quaternion.copy(restQ).multiply(_poseQ);
+    if (st.releasing) {
+      // Standing up: blend EACH bone from wherever it was when he started
+      // to rise back to rest, not the other way the sit itself samples the
+      // pose forward. releaseFrom is captured once, in standUpFromProp, at
+      // the moment he began -- never here, or a re-entrant frame would
+      // fold an already-half-released value into its own starting point.
+      for (const tr of st.tracks) {
+        const bone = st.bones.get(tr.rigBone);
+        const restQ = a.meRestQuat?.get(tr.rigBone);
+        const fromQ = st.releaseFrom?.get(tr.rigBone);
+        if (!bone || !restQ || !fromQ) continue;
+        bone.quaternion.copy(fromQ).slerp(restQ, e);
+      }
+      // "feet down, torso forward, knees straighten, torso back" (Magnus,
+      // via InteractionStudioScene's own comment, 2026-09-12) -- a bell,
+      // zero at both ends, peaking mid-rise. Multiplied onto whatever the
+      // release loop above (or idle) just left spine1/spine3 at, so it
+      // applies once per frame the same way the source's own standLean
+      // does, rather than accumulating.
+      if (st.standLean) {
+        const bell = Math.sin(Math.PI * Math.min(1, e));
+        for (const [name, deg] of [["spine1", 10], ["spine3", 8]]) {
+          const bone = a.me.getObjectByName(name);
+          if (!bone) continue;
+          _poseE.set(deg * bell * DEG, 0, 0);
+          _poseQ.setFromEuler(_poseE);
+          bone.quaternion.multiply(_poseQ);
+        }
+      }
+    } else {
+      for (const tr of st.tracks) {
+        const bone = st.bones.get(tr.rigBone);
+        const restQ = a.meRestQuat?.get(tr.rigBone);
+        if (!bone || !restQ) continue;
+        const [rx, ry, rz] = sampleTrack(tr, st.t);
+        _poseE.set(rx * DEG, ry * DEG, rz * DEG);
+        _poseQ.setFromEuler(_poseE);
+        bone.quaternion.copy(restQ).multiply(_poseQ);
+      }
     }
 
     // seatHeightForMe -- InteractionStudioScene's own analytic, non-raycast
@@ -2594,6 +2653,24 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     // at all -- so foot-planted alone should already land the hips close.
     const footY = footHeightForMe(a, st.floorAnkle);
     if (footY != null) a.seatedY = footY;
+
+    // The rise finishes here, not at a fixed timer -- once fully released
+    // there is nothing left for a.playerSeatedOn to be gating, so this is
+    // the one place that actually clears it (standUpFromProp only STARTS
+    // the rise). Snapped fully to rest as a defensive final step: slerp at
+    // e=1 should already equal restQ exactly, but floating point is not a
+    // promise, and a residual fraction of a degree held forever is a bug
+    // nobody would ever see coming.
+    if (st.releasing && st.t >= st.dur) {
+      for (const [rigBone, bone] of st.bones) {
+        const restQ = a.meRestQuat?.get(rigBone);
+        if (restQ) bone.quaternion.copy(restQ);
+      }
+      a.playerSeatedOn = null;
+      a.sitting = null;
+      a.seatedY = null;
+      a.me.position.y = a.floorY ?? 0;
+    }
   }
 
   // Pull the prop itself along its own facing, away from wherever it sits
