@@ -2428,21 +2428,36 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   // set and WASD held (see stepPlayer's guard above): enough to prove the
   // menu/state plumbing this was actually built to test, not a finished
   // seated animation.
-  // propApproachPoint's default 0.55m is right for "walk up to and look
-  // at this prop" -- Magnus, live, sitting: "he should be attached to the
-  // seat, now he is sitting in the air." A 0.55m + half-width standoff put
-  // him roughly 0.8m in front of the chair, nowhere near it. Sitting wants
-  // the OPPOSITE: pulled back past the front edge, onto the seat itself.
-  const SIT_DIST = -0.2; // offset from centre = hw - 0.2 -- ~4cm out for this chair (hw 0.24)
+  // propApproachPoint's `facing` is "which way you'd stand to approach and
+  // look at this prop" -- i.e. facing the chair, which is the BACKREST
+  // side. Sitting needs the opposite: facing OUT of the chair, the way an
+  // actual seated person looks. Confirmed live, 2026-09-15 (Magnus: "he is
+  // sitting on the back of the chair and in the wrong direction, should be
+  // turned 180 degrees and seated on the seat not the back support") by
+  // sampling the seat cushion's own mesh geometry directly -- its tallest
+  // vertices (the backrest, ~0.42m above the seat) sit on the SAME side as
+  // propApproachPoint's `facing` vector, not the opposite side, so both the
+  // stand-in-front-of-it approach point AND naive use of that facing for
+  // sitting were pointing at the backrest, not the seat's open front.
+  //
+  // propApproachPoint's own 0.55m default is separately wrong for sitting
+  // regardless of direction -- Magnus, live: "he should be attached to the
+  // seat, now he is sitting in the air." That standoff is sized for
+  // "walk up and look at this", not "sit on this": a 0.55m + half-width
+  // offset put him roughly 0.8m from the chair, nowhere near it.
   function sitOnProp(slot) {
     const a = api.current;
-    if (!a.propMeta?.[slot]) return;
-    const { x, z, facing } = propApproachPoint(slot, SIT_DIST);
+    const meta = a.propMeta?.[slot];
+    if (!meta) return;
+    const { x, z } = propWorldXZ(meta.node);
+    const backrestFacing = propWorldYaw(slot) + (PROP_FOOTPRINTS[meta.type]?.seatFacing || 0);
+    const seatedFacing = backrestFacing + Math.PI;   // away from the backrest, not toward it
+    const backNudge = 0.05;   // a real seated body settles toward the backrest a little, not dead-centre on the cushion
     const walker = (a.thirdPerson && a.body) ? a.body : a.camera.position;
-    walker.x = x;
-    walker.z = z;
+    walker.x = x + Math.sin(backrestFacing) * backNudge;
+    walker.z = z + Math.cos(backrestFacing) * backNudge;
     a.playerSeatedOn = slot;
-    a.seatedFacing = facing;   // read by placeThirdPersonCamera's own facing-ease
+    a.seatedFacing = seatedFacing;   // read by placeThirdPersonCamera's own facing-ease
     console.log(`[door] you sit at the ${slot} (positional only -- see sitOnProp)`);
     forcePropRender(n => n + 1);
   }
@@ -2458,12 +2473,23 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
   // (playMotion + applyPose, InteractionStudioScene.jsx ~1512-1230) is the
   // hard-won blending system already ruled out of scope for this pass. So
   // this is a static, bone-level approximation instead: bend hip and knee
-  // on both legs by a fixed amount, every frame, laid on top of whatever
-  // the idle mixer just wrote -- it has to run AFTER meMixer.update() each
-  // tick or the mixer's own per-frame reset erases it before the next
-  // paint. rotateX is LOCAL, relative to the bone's current (freshly-reset)
-  // orientation, so the same delta lands the same way every frame instead
-  // of compounding across frames.
+  // on both legs by a fixed amount, every frame -- it has to run AFTER
+  // meMixer.update() each tick or the mixer's own per-frame reset erases
+  // it before the next paint.
+  //
+  // 2026-09-16, Magnus: "the idle animation on the leg is not dampened."
+  // Real bug, not a nitpick -- this used to call rotateX(), which is a
+  // rotation RELATIVE to whatever the bone's current orientation already
+  // is. The idle clip keeps a small, asymmetric sway alive on these same
+  // bones every frame (measured live: the two thighs came back roughly
+  // 1.5 degrees and 10 degrees off from the intended bend, not identical,
+  // which is the idle's own per-frame motion leaking straight through) --
+  // rotateX added the SAME fixed delta on top of that moving base, so the
+  // sway never went away, it just got carried along. Setting an ABSOLUTE
+  // Euler rotation instead (zeroing y/z too) ignores whatever the mixer
+  // just wrote entirely, which is the actual "dampening": full override,
+  // not a partial blend -- there's nothing here sophisticated enough to
+  // blend fractionally, and a full override is honest about that.
   const SIT_LEG_BONES = ["l_thigh", "r_thigh", "l_shin", "r_shin"];
   function applySitPose() {
     const a = api.current;
@@ -2475,10 +2501,10 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     const b = a.sitBones;
     const THIGH_BEND = -1.55;  // hip: thigh lifts forward toward horizontal
     const KNEE_BEND  =  1.65;  // knee: shin folds back down toward vertical
-    b.l_thigh?.rotateX(THIGH_BEND);
-    b.r_thigh?.rotateX(THIGH_BEND);
-    b.l_shin?.rotateX(KNEE_BEND);
-    b.r_shin?.rotateX(KNEE_BEND);
+    b.l_thigh?.rotation.set(THIGH_BEND, 0, 0);
+    b.r_thigh?.rotation.set(THIGH_BEND, 0, 0);
+    b.l_shin?.rotation.set(KNEE_BEND, 0, 0);
+    b.r_shin?.rotation.set(KNEE_BEND, 0, 0);
   }
 
   // Pull the prop itself along its own facing, away from wherever it sits
