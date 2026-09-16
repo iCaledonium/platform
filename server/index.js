@@ -8497,6 +8497,29 @@ app.post("/api/worlds/:world_id/encounter/:encounter_id/typing", async (req, res
   } catch { res.json({ ok: true }); }
 });
 
+// ── POST /api/worlds/:world_id/encounter/:encounter_id/player_action ──────────
+// The player's own sit/stand in the 3D scene (DoorScene3D.jsx sitOnProp /
+// standUpFromProp) — fire-and-forget like /typing above, not request/response
+// like /message, since there is nothing for the scene to do with the reply.
+app.post("/api/worlds/:world_id/encounter/:encounter_id/player_action", async (req, res) => {
+  const ok = requireWorld(req, res, worldIdOf(req), "player");
+  if (!ok) return;
+  const user = ok.user;
+  const { seated } = req.body;
+  if (typeof seated !== "boolean") return res.status(400).json({ error: "seated (boolean) required" });
+  try {
+    fetch(
+      `${SIMULATOR_URL}/internal/worlds/${req.params.world_id}/encounter/${req.params.encounter_id}/player_action`,
+      {
+        method:  "POST",
+        headers: { "X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json" },
+        body:    JSON.stringify({ seated })
+      }
+    ).catch(() => {});
+    res.json({ ok: true });
+  } catch { res.json({ ok: true }); }
+});
+
 // ── POST /api/worlds/:world_id/encounter/:encounter_id/resume ─────────────────
 // Session 154 — the 3D door scene declines the missing-media pause. That pause
 // exists for the video views (freeze, offer generation, resume on media_ready);
