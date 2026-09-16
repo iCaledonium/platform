@@ -2452,7 +2452,12 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     const { x, z } = propWorldXZ(meta.node);
     const backrestFacing = propWorldYaw(slot) + (PROP_FOOTPRINTS[meta.type]?.seatFacing || 0);
     const seatedFacing = backrestFacing + Math.PI;   // away from the backrest, not toward it
-    const backNudge = 0.05;   // a real seated body settles toward the backrest a little, not dead-centre on the cushion
+    // Magnus, live: "the garment leaks thru the chairs back... if it had
+    // some collision detection the body had been moved forward." No
+    // collision to add here without real cost, so the honest fix is not
+    // to sit him close enough to need one -- pulled FORWARD, off the
+    // backrest, rather than nudged toward it.
+    const backNudge = -0.08;   // clearance off the backrest, not into it
     const toX = x + Math.sin(backrestFacing) * backNudge;
     const toZ = z + Math.cos(backrestFacing) * backNudge;
 
