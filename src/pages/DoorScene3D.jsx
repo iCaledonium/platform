@@ -11,6 +11,7 @@ import { loadDisplay, applyDisplay, DISPLAY_DEFAULTS, sunPosition } from "./expl
 import styles from "./Scene.module.css";
 import { attachKtx2 } from "../lib/gltfKtx2.js";
 import { prepareHairRide, rideHairOnCloth } from "./bodyLayers.js";
+import { getAction, resolveTracks, sampleTrack } from "../lib/bodyActions.js";
 
 // ── DoorScene3D ──────────────────────────────────────────────────────────────
 //
@@ -115,6 +116,9 @@ const readLab = () => {
 };
 
 const UP = new THREE.Vector3(0, 1, 0);
+const DEG = Math.PI / 180; // bodyActions.js tracks are authored in degrees
+const _poseE = new THREE.Euler();
+const _poseQ = new THREE.Quaternion();
 // Scratch ray for the third-person wall clamp — allocated once, like the
 // capsule scratch objects, because this runs every frame.
 const _camRay = new THREE.Ray();
@@ -1027,7 +1031,7 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       }
       api.current.mixer?.update(dt);
       api.current.meMixer?.update(dt);
-      applySitPose();
+      stepSitting(dt);
       if (api.current.herRide) stepHairRide(api.current.herRide, api.current.her);
       if (api.current.meRide)  stepHairRide(api.current.meRide,  api.current.me);
       // Pull/push tween, eased like the door's own swing -- one per PART
@@ -2411,100 +2415,179 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
 
   // Reworked per Magnus: "it was the user/me not the lindsea or any other
   // actor we should try to do actions with" -- these act on the PLAYER'S OWN
-  // body (a.body in third person, the camera itself in first), not her. The
-  // player already self-navigated here via WASD to get within
-  // PROP_INTERACT_RANGE and look at the prop before E could even open this
-  // menu, so there is no separate "walk to the chair" action to build --
-  // sitting snaps straight to the prop's own approach point instead of
-  // trusting wherever the player happened to be standing.
+  // body, not her. The player already self-navigated here via WASD, so
+  // there is no separate "walk to the chair" action to build -- sitting
+  // snaps straight to the prop's own seat point.
   //
-  // "Sit down" is POSITIONAL ONLY, same honest scope as the studio's real
-  // seated pose (playMotion + applyPose in InteractionStudioScene.jsx
-  // ~1512-1230): that composes onto a captured idle/rest base, dampens the
-  // mixer's arm sway under a held pose, and handles release -- three
-  // sessions of hard-won correctness (the "bird flying" bug, the
-  // compounding-delta bug, still-mode) this pass does not attempt to
-  // re-derive. The player is placed at the chair with `a.playerSeatedOn`
-  // set and WASD held (see stepPlayer's guard above): enough to prove the
-  // menu/state plumbing this was actually built to test, not a finished
-  // seated animation.
-  // propApproachPoint's `facing` is "which way you'd stand to approach and
-  // look at this prop" -- i.e. facing the chair, which is the BACKREST
-  // side. Sitting needs the opposite: facing OUT of the chair, the way an
-  // actual seated person looks. Confirmed live, 2026-09-15 (Magnus: "he is
-  // sitting on the back of the chair and in the wrong direction, should be
-  // turned 180 degrees and seated on the seat not the back support") by
-  // sampling the seat cushion's own mesh geometry directly -- its tallest
-  // vertices (the backrest, ~0.42m above the seat) sit on the SAME side as
-  // propApproachPoint's `facing` vector, not the opposite side, so both the
-  // stand-in-front-of-it approach point AND naive use of that facing for
-  // sitting were pointing at the backrest, not the seat's open front.
+  // 2026-09-16, Magnus: "the script shall be used here that is the whole
+  // intention. There is a walk to prop and sit on chair script in
+  // interaction studio trimmed for this action." So: the REAL thing, not
+  // another guessed bone-bend. Ported from InteractionStudioScene.jsx's
+  // sitOn/stepSitting/footHeightFor/seatHeightFor, trimmed of what that
+  // scene needs and this one does not -- obstacle-avoidance walkTo (the
+  // player already walked here himself), corner-routing around other
+  // furniture (one chair, nothing to route around), the scoot-to-table
+  // settle, and the CCD leg/lean/hand solves in stepSettling (polish AFTER
+  // landing, not what determines the landing height). What's kept is the
+  // actual fix for "hanging in the air": the authored `sit` pose (bodyActions.js,
+  // the SAME shared, rig-mapped library Lindsey's own poses come from) bends
+  // the body into the shape of sitting; footHeightFor/seatHeightFor below
+  // then blend the root's height from "feet stay on the floor" early in the
+  // transition to "thighs rest on the seat" late in it -- exactly
+  // InteractionStudioScene's own two-constraint blend, just without the
+  // raycast-measured variant (the analytic THIGH_RADIUS fallback only,
+  // which is what that scene falls back to for a body it hasn't measured
+  // either).
   //
-  // propApproachPoint's own 0.55m default is separately wrong for sitting
-  // regardless of direction -- Magnus, live: "he should be attached to the
-  // seat, now he is sitting in the air." That standoff is sized for
-  // "walk up and look at this", not "sit on this": a 0.55m + half-width
-  // offset put him roughly 0.8m from the chair, nowhere near it.
+  // Facing: propApproachPoint's `facing` points at the chair's BACKREST
+  // (confirmed 2026-09-15 by sampling the seat mesh's own geometry --
+  // its tallest vertices, the backrest, sit on the same side as that
+  // vector). Sitting needs the opposite, the way an actual seated person
+  // looks outward.
   function sitOnProp(slot) {
     const a = api.current;
     const meta = a.propMeta?.[slot];
-    if (!meta) return;
+    if (!meta || !a.me) return;
     const { x, z } = propWorldXZ(meta.node);
     const backrestFacing = propWorldYaw(slot) + (PROP_FOOTPRINTS[meta.type]?.seatFacing || 0);
     const seatedFacing = backrestFacing + Math.PI;   // away from the backrest, not toward it
     const backNudge = 0.05;   // a real seated body settles toward the backrest a little, not dead-centre on the cushion
-    const walker = (a.thirdPerson && a.body) ? a.body : a.camera.position;
-    walker.x = x + Math.sin(backrestFacing) * backNudge;
-    walker.z = z + Math.cos(backrestFacing) * backNudge;
+    const toX = x + Math.sin(backrestFacing) * backNudge;
+    const toZ = z + Math.cos(backrestFacing) * backNudge;
+
+    // floorAnkle: how high the foot sits above the root WHILE STANDING,
+    // measured now rather than assumed -- "the reference comes from the
+    // body a moment before it started to move" (InteractionStudioScene).
+    // No global constant: this body's own proportions, read off itself.
+    let floorAnkle = null;
+    {
+      const ys = [];
+      for (const n of ["l_foot", "r_foot"]) {
+        const b = a.me.getObjectByName(n);
+        if (b) ys.push(b.getWorldPosition(new THREE.Vector3()).y - a.me.position.y);
+      }
+      if (ys.length) floorAnkle = Math.min(...ys);
+    }
+
+    const def = getAction("sit");
+    const tracks = resolveTracks(def);
+    const bones = new Map();
+    // The pose composes ONTO each bone's REST quaternion, never replaces
+    // it -- InteractionStudioScene's applyPose does exactly this
+    // (p.base.set(...); bone.quaternion.copy(base).multiply(delta)), and
+    // skipping it is what broke this on the first attempt: this rig's
+    // bones are not necessarily axis-aligned at rest, so setting the
+    // pose's Euler numbers as an ABSOLUTE rotation (discarding whatever
+    // orientation the bone actually rests at) folded the leg somewhere
+    // the geometry never intended -- measured live, the foot ended up
+    // 1.5m from the root, more than a whole leg's length. Captured once,
+    // ever, the first time any bone is posed (never re-captured -- a
+    // second sit must not fold an already-posed value into "rest").
+    if (!a.meRestQuat) a.meRestQuat = new Map();
+    for (const tr of tracks) {
+      const bone = a.me.getObjectByName(tr.rigBone);
+      if (!bone) continue;
+      bones.set(tr.rigBone, bone);
+      if (!a.meRestQuat.has(tr.rigBone)) a.meRestQuat.set(tr.rigBone, bone.quaternion.clone());
+    }
+
+    a.sitting = {
+      t: 0, dur: def?.duration || 0.55,
+      from: { x: a.body.x, z: a.body.z }, to: { x: toX, z: toZ },
+      seat: PROP_FOOTPRINTS[meta.type]?.seat ?? 0.48,
+      floorAnkle, tracks, bones,
+    };
     a.playerSeatedOn = slot;
     a.seatedFacing = seatedFacing;   // read by placeThirdPersonCamera's own facing-ease
-    console.log(`[door] you sit at the ${slot} (positional only -- see sitOnProp)`);
+    console.log(`[door] you sit at the ${slot}`);
     forcePropRender(n => n + 1);
   }
 
   function standUpFromProp() {
-    api.current.playerSeatedOn = null;
+    const a = api.current;
+    // Nothing else ever reclaims these bones -- idle does not animate legs
+    // (that is WHY a held pose does not fight idle sway on them), which
+    // cuts both ways: standing up has to put them back itself, or he
+    // walks off still folded into the sitting shape.
+    if (a.sitting?.bones && a.meRestQuat) {
+      for (const [rigBone, bone] of a.sitting.bones) {
+        const restQ = a.meRestQuat.get(rigBone);
+        if (restQ) bone.quaternion.copy(restQ);
+      }
+    }
+    a.playerSeatedOn = null;
+    a.sitting = null;
+    a.seatedY = null;
+    if (a.me) a.me.position.y = a.floorY ?? 0;
     forcePropRender(n => n + 1);
   }
 
-  // Magnus, 2026-09-15: "the sit animation is not working." There is no
-  // real one to play -- the player's rig exports only idle/walk (checked
-  // the GLB directly), and the actual seated pose elsewhere in this app
-  // (playMotion + applyPose, InteractionStudioScene.jsx ~1512-1230) is the
-  // hard-won blending system already ruled out of scope for this pass. So
-  // this is a static, bone-level approximation instead: bend hip and knee
-  // on both legs by a fixed amount, every frame -- it has to run AFTER
-  // meMixer.update() each tick or the mixer's own per-frame reset erases
-  // it before the next paint.
-  //
-  // 2026-09-16, Magnus: "the idle animation on the leg is not dampened."
-  // Real bug, not a nitpick -- this used to call rotateX(), which is a
-  // rotation RELATIVE to whatever the bone's current orientation already
-  // is. The idle clip keeps a small, asymmetric sway alive on these same
-  // bones every frame (measured live: the two thighs came back roughly
-  // 1.5 degrees and 10 degrees off from the intended bend, not identical,
-  // which is the idle's own per-frame motion leaking straight through) --
-  // rotateX added the SAME fixed delta on top of that moving base, so the
-  // sway never went away, it just got carried along. Setting an ABSOLUTE
-  // Euler rotation instead (zeroing y/z too) ignores whatever the mixer
-  // just wrote entirely, which is the actual "dampening": full override,
-  // not a partial blend -- there's nothing here sophisticated enough to
-  // blend fractionally, and a full override is honest about that.
-  const SIT_LEG_BONES = ["l_thigh", "r_thigh", "l_shin", "r_shin"];
-  function applySitPose() {
-    const a = api.current;
-    if (!a.playerSeatedOn || !a.me) return;
-    if (!a.sitBones) {
-      a.sitBones = {};
-      for (const n of SIT_LEG_BONES) a.sitBones[n] = a.me.getObjectByName(n);
+  // The root height that keeps the LOWER foot exactly on the floor it was
+  // standing on, whatever the pose just did to the legs. Ported verbatim
+  // (as the maths, not the code) from InteractionStudioScene's
+  // footHeightFor: ties to floorAnkle, which was measured a moment before
+  // he started to move, not to any constant.
+  function footHeightForMe(a, floorAnkle) {
+    let lowest = Infinity;
+    for (const n of ["l_foot", "r_foot"]) {
+      const f = a.me.getObjectByName(n);
+      if (!f) continue;
+      lowest = Math.min(lowest, f.getWorldPosition(new THREE.Vector3()).y);
     }
-    const b = a.sitBones;
-    const THIGH_BEND = -1.55;  // hip: thigh lifts forward toward horizontal
-    const KNEE_BEND  =  1.65;  // knee: shin folds back down toward vertical
-    b.l_thigh?.rotation.set(THIGH_BEND, 0, 0);
-    b.r_thigh?.rotation.set(THIGH_BEND, 0, 0);
-    b.l_shin?.rotation.set(KNEE_BEND, 0, 0);
-    b.r_shin?.rotation.set(KNEE_BEND, 0, 0);
+    if (!Number.isFinite(lowest)) return null;
+    if (!Number.isFinite(floorAnkle)) return a.me.position.y;
+    return a.me.position.y - (lowest - floorAnkle);
+  }
+
+
+  // Runs every tick while seated: eases position, applies the authored
+  // pose's bone tracks as ABSOLUTE rotations (not additive -- idle sway
+  // has no business surviving under a held pose, the same reasoning
+  // behind why the previous, replaced version of this function had to
+  // stop using rotateX), then blends the root's height from
+  // "feet on the floor" to "thighs on the seat" over the back fifth of the
+  // transition -- InteractionStudioScene's stepSitting, trimmed of the
+  // stand-lean, chair-scoot-with-you, and raycast-measured seat variants.
+  function stepSitting(dt) {
+    const a = api.current;
+    const st = a.sitting;
+    if (!st || !a.me) return;
+    st.t = Math.min(st.dur, st.t + dt);
+    const u = st.dur > 0 ? st.t / st.dur : 1;
+    const e = u * u * (3 - 2 * u);
+
+    a.body.x = st.from.x + (st.to.x - st.from.x) * e;
+    a.body.z = st.from.z + (st.to.z - st.from.z) * e;
+    a.me.position.x = a.body.x;
+    a.me.position.z = a.body.z;
+
+    for (const tr of st.tracks) {
+      const bone = st.bones.get(tr.rigBone);
+      const restQ = a.meRestQuat?.get(tr.rigBone);
+      if (!bone || !restQ) continue;
+      const [rx, ry, rz] = sampleTrack(tr, st.t);
+      _poseE.set(rx * DEG, ry * DEG, rz * DEG);
+      _poseQ.setFromEuler(_poseE);
+      bone.quaternion.copy(restQ).multiply(_poseQ);
+    }
+
+    // seatHeightForMe -- InteractionStudioScene's own analytic, non-raycast
+    // fallback (root height that would rest the thigh at `seat + THIGH_RADIUS`)
+    // -- was tried here and dropped. Live-checked, and it hit exactly the
+    // failure their own comment already named: "Benny's legs are not
+    // Lindsey's -- with her constant he sat with his thighs melted into
+    // the slab." On this body it drove the root to roughly -0.4m, sinking
+    // the whole mesh out of view entirely -- a bigger break than the
+    // problem it was meant to fix; that fallback only ever worked for the
+    // one body it was measured against. footHeightForMe alone is body-
+    // correct BY CONSTRUCTION (it solves for "the foot returns to where it
+    // was standing", not a guessed constant), and the authored pose's
+    // angles were independently probed against actual foot length ("found
+    // by probing the angle against the foot's measured height") to close
+    // the geometry for a 0.48m seat without a separate seat-height solve
+    // at all -- so foot-planted alone should already land the hips close.
+    const footY = footHeightForMe(a, st.floorAnkle);
+    if (footY != null) a.seatedY = footY;
   }
 
   // Pull the prop itself along its own facing, away from wherever it sits
@@ -4094,7 +4177,11 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
       while (dFace >  Math.PI) dFace -= Math.PI * 2;
       while (dFace < -Math.PI) dFace += Math.PI * 2;
       a.me.rotation.y += dFace * (1 - Math.exp(-6 * dt));
-      a.me.position.set(a.body.x, floorY, a.body.z);
+      // Seated, stepSitting has already computed the correct root height
+      // (the foot/seat blend, ported from InteractionStudioScene) into
+      // a.seatedY -- floorY would silently discard it every frame.
+      const meY = (a.playerSeatedOn != null && a.seatedY != null) ? a.seatedY : floorY;
+      a.me.position.set(a.body.x, meY, a.body.z);
     }
 
     // camFacing is a SEPARATE, deliberately-lagged heading: what the
