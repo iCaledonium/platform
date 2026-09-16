@@ -4164,6 +4164,31 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
         walker.z = her.position.z + (hz / hd) * MIN;
       }
     }
+    // Props are solid too. Magnus, live: "when walking i can walk thru the
+    // chair." True, and for the same reason her position above is checked
+    // fresh rather than baked: a prop can MOVE (pullProp), so putting it in
+    // the static BVH at load time would fight its own current position the
+    // instant it moved. A live cylinder, read fresh every frame straight
+    // off wherever the prop actually is right now (propWorldXZ, the exact
+    // same read pullProp and the interact prompt already use), gets solidity
+    // that automatically follows a pull/push -- a baked collider could not.
+    // A cylinder, not the prop's true rotated footprint: a chair is not a
+    // circle, but this is the same order of approximation "her" already is,
+    // and enough to stop walking straight through the seat you are not
+    // sitting in.
+    for (const [slot, meta] of Object.entries(a.propMeta || {})) {
+      if (a.playerSeatedOn === slot) continue;   // don't collide with the chair you're sitting in
+      const { x: px0, z: pz0 } = propWorldXZ(meta.node);
+      const ppx = walker.x - px0, ppz = walker.z - pz0;
+      const ppd = Math.hypot(ppx, ppz);
+      const footprint = PROP_FOOTPRINTS[meta.type];
+      const pRadius = Math.max(footprint?.hw ?? 0.3, footprint?.hd ?? 0.3);
+      const PMIN = CAPSULE_RADIUS + pRadius;
+      if (ppd > 1e-4 && ppd < PMIN) {
+        walker.x = px0 + (ppx / ppd) * PMIN;
+        walker.z = pz0 + (ppz / ppd) * PMIN;
+      }
+    }
     const b = a.bounds;
     if (b) {
       walker.x = Math.max(b.minX, Math.min(b.maxX, walker.x));
