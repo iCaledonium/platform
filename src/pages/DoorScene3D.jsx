@@ -2507,6 +2507,16 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     a.seatedFacing = seatedFacing;   // read by placeThirdPersonCamera's own facing-ease
     console.log(`[door] you sit at the ${slot}`);
     forcePropRender(n => n + 1);
+    // Magnus, 2026-09-17: "if the player sits down it shall be sent to the
+    // LLM and Lindsey must be aware of it" -- fire-and-forget, same as the
+    // /resume decline above; nothing in the scene waits on the reply.
+    if (encounter_id) {
+      fetch(`/api/worlds/${world.id}/encounter/${encounter_id}/player_action`, {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ seated: true }),
+      }).catch(() => {});
+    }
   }
 
   // Magnus, 2026-09-16: "the stand up animation is that from interaction
@@ -2523,6 +2533,16 @@ export default function DoorScene3D({ world, user, sceneData, actorName, actorId
     const a = api.current;
     if (!a.playerSeatedOn || !a.me) return;
     if (a.sitting?.releasing) return;   // already rising -- Digit1 twice must not restart it
+    // Same notification as sitOnProp, reversed -- fired once, here at the
+    // start of the rise, not per-frame in stepSitCore where the seat
+    // actually clears; twice mid-rise would just be a wasted fetch.
+    if (encounter_id) {
+      fetch(`/api/worlds/${world.id}/encounter/${encounter_id}/player_action`, {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ seated: false }),
+      }).catch(() => {});
+    }
     const priorTracks = a.sitting?.tracks || [];
     const priorBones = a.sitting?.bones || new Map();
     const releaseFrom = new Map();
